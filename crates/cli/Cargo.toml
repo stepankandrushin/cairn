@@ -1,0 +1,25 @@
+[package]
+name = "cairn-cli"
+description = "The Cairn command-line client."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cairn"
+path = "src/main.rs"
+
+[dependencies]
+cairn-protocol.workspace = true
+cairn-engine.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[features]
+failpoints = ["cairn-engine/failpoints"]

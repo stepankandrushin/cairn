@@ -1,0 +1,26 @@
+[package]
+name = "cairn-harness"
+description = "Failure harness: real binaries, killed and starved at every step, checked against the invariants."
+license = "AGPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "h-cairn"
+path = "src/bin/h_cairn.rs"
+
+[[bin]]
+name = "h-cairn-server"
+path = "src/bin/h_cairn_server.rs"
+
+[dependencies]
+cairn-cli = { workspace = true, features = ["failpoints"] }
+cairn-server = { workspace = true, features = ["failpoints"] }
+cairn-engine = { workspace = true, features = ["failpoints"] }
+cairn-protocol.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+rustix.workspace = true
+serde_json.workspace = true

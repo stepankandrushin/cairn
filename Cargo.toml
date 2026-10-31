@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+cairn-protocol = { path = "crates/protocol" }
+cairn-store = { path = "crates/store" }
+cairn-engine = { path = "crates/engine" }
+cairn-server = { path = "crates/server" }
+cairn-cli = { path = "crates/cli" }
+cairn-failpoint = { path = "crates/failpoint" }
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+fastcdc = "3"
+hex = "0.4"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1", features = ["fs", "process", "system", "pipe", "linux_latest"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
+ureq = { version = "3", features = ["rustls", "platform-verifier"], default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = true

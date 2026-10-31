@@ -115,25 +115,27 @@ at it.
 
 ## Sync
 
-**Committing a change.** Wait for a stable candidate (close_write, or size and mtime steady for a short
-window) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
+**Committing a change.** Wait for a stable candidate (close_write, or unchanged for a short window; the
+one-shot CLI waits until a file's ctime is 250 ms old) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
 its base revision and a unique operation ID → durable acknowledgement. A retried operation ID returns
 the first result, so a lost response is harmless. Small files take a simpler batched path.
 
 **Applying a change.** Download to a temp file in the same directory → verify hashes → fsync → set
 metadata → check the destination has not changed locally → atomic `rename()`.
 
-**Three-way merge per entry** (base, local, remote):
+**Three-way merge per object** (base, local, remote). It is state-based: each round works from what is on
+disk and what the journal says, so a crash only means the next run finds some of the work done, which
+merges as agreement.
 
 | Changes | Result |
 |---|---|
 | One side only | Apply it |
 | Metadata on both, different fields | Merge field by field |
-| Metadata on both, same field | Server order wins; the loser is in the revision history and the activity log |
+| Metadata on both, same field | Server order wins; the loser is in the activity log |
 | Content on one, metadata or rename on the other | Apply both |
 | Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox |
-| Edit against delete | The edit survives, and it is reported |
-| Same new name, different objects | Keep both under a conflict name |
+| Edit against delete | The edit survives, and it is reported. This includes each side removing a different hard link of a file someone edited |
+| Same new name, different objects | Identical content or two directories become one object; otherwise keep both under a conflict name |
 | Concurrent moves that would form a cycle | The server rejects the second; that client rebases |
 
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
@@ -195,10 +197,10 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | # | Work | Done when |
 |---|---|---|
 | 0 | Protocol and on-disk format written down; Cargo workspace: protocol, store, engine, server, CLI crates | The types cover every row of the metadata table; a license is chosen |
-| 1 | Chunk store, manifests, journal; a CLI that syncs one Linux folder with full metadata, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
-| 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants | The harness runs in CI and finds no violation |
-| 3 | Daemon: watcher, reconcile, three-way merge, conflicts, the acceptance scenario | Runs for weeks on real trees with no silent loss |
-| 4 | History and trash API, retention, GC, `fsck` | GC under load never removes a reachable chunk |
+| 1 | Chunk store, manifests, journal; a one-shot CLI that syncs one Linux folder with full metadata and three-way merge, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
+| 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
+| 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss |
+| 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass |
@@ -215,10 +217,11 @@ it when a decision leans on it, and save the page in sources/.
 
 ## Open
 
-- **License.** Leaning AGPL-3.0 for the server and Apache-2.0 for the protocol and core crates, so any
-  client can embed them. The owner decides before the first outside contribution, since changing it
-  afterwards needs every contributor's consent.
+- **License.** AGPL-3.0-only for the server and storage, Apache-2.0 for the protocol, engine and client,
+  so any client can embed them. Applied to meet milestone 0; the owner confirms it before the first
+  outside contribution, since changing it afterwards needs every contributor's consent.
 - **Name.** Check "cairn" on crates.io, GitHub and for trademarks before publishing.
 - **Moves between namespaces.** Two journals cannot share one atomic entry: decide whether object
   identity and history survive, or a move is a copy plus a delete.
-- **Offline interval.** How long tombstones live, against how long a device may stay away.
+- **Offline interval.** How long tombstones live, against how long a device may stay away. No limit so
+  far, since the journal is kept whole; retention in milestone 4 has to set one.

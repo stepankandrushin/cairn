@@ -1,0 +1,11 @@
+[package]
+name = "cairn-failpoint"
+description = "Named crash, full-disk and pause points for the failure harness; a no-op unless built with `enabled`."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+enabled = []

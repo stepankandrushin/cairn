@@ -220,7 +220,9 @@ it when a decision leans on it, and save the page in sources/.
 - **License.** AGPL-3.0-only for the server and storage, Apache-2.0 for the protocol, engine and client,
   so any client can embed them. Applied to meet milestone 0; the owner confirms it before the first
   outside contribution, since changing it afterwards needs every contributor's consent.
-- **Name.** Check "cairn" on crates.io, GitHub and for trademarks before publishing.
+- **Name.** "cairn", "cairn-cli" and "cairn-sync" are other projects' crates on crates.io, so publishing
+  crates there needs other names. GitHub has many unrelated "cairn" repos, none of them a file sync tool
+  when checked at the first release. No trademark register has been searched yet.
 - **Moves between namespaces.** Two journals cannot share one atomic entry: decide whether object
   identity and history survive, or a move is a copy plus a delete.
 - **Offline interval.** How long tombstones live, against how long a device may stay away. No limit so

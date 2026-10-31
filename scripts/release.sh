@@ -6,6 +6,12 @@ cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 target=x86_64-unknown-linux-musl
 
+# The binaries are published, and panic messages carry source paths: keep the build machine's out.
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup --remap-path-prefix=$PWD=/cairn"
+export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$PWD=/cairn"
+
 # -p, never --workspace: the harness turns failpoints on for whatever is built together with it.
 cargo build --release --locked --target "$target" -p cairn-cli -p cairn-server
 out="target/$target/release"
@@ -17,6 +23,10 @@ for bin in cairn cairn-server; do
     fi
     if grep -q 'CAIRN_FP_' "$out/$bin"; then
         echo "$bin was built with failpoints" >&2
+        exit 1
+    fi
+    if grep -a -q -e "$HOME" -e "$PWD" "$out/$bin"; then
+        echo "$bin names a path of the build machine" >&2
         exit 1
     fi
     test "$("$out/$bin" --version | awk '{print $2}')" = "$version"

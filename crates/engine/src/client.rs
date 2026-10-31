@@ -1,5 +1,5 @@
 //! The HTTP client. Every call is safe to retry; the client does not retry on its own, since a
-//! later `cairn sync` picks up from durable state.
+//! later sync picks up from durable state.
 
 use crate::root::Config;
 use anyhow::{anyhow, bail, Context, Result};
@@ -185,6 +185,28 @@ impl Client {
             "reading changes",
             &format!("/changes?after={after}&limit=1000"),
         )
+    }
+
+    /// The head, once it is not `after` or `wait` has gone by. A plain request and answer, so it
+    /// passes through any reverse proxy. Bounded here too: a connection a firewall silently dropped
+    /// answers nothing, ever.
+    pub fn wait_for_head(&self, after: u64, wait: Duration) -> Result<u64> {
+        let what = "waiting for changes";
+        let resp = self
+            .agent
+            .get(format!(
+                "{}/changes?after={after}&limit=0&wait={}",
+                self.base,
+                wait.as_secs()
+            ))
+            .config()
+            .timeout_recv_response(Some(wait + Duration::from_secs(15)))
+            .build()
+            .header("Authorization", &self.auth)
+            .call()
+            .with_context(|| format!("{what}: cannot reach the server"))?;
+        let answer: ChangesResponse = serde_json::from_slice(&self.read(what, resp)?)?;
+        Ok(answer.head)
     }
 
     pub fn conflicts(&self) -> Result<Vec<ConflictEntry>> {

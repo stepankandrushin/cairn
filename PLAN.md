@@ -115,8 +115,8 @@ at it.
 
 ## Sync
 
-**Committing a change.** Wait for a stable candidate (close_write, or unchanged for a short window; the
-one-shot CLI waits until a file's ctime is 250 ms old) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
+**Committing a change.** Wait for a stable candidate (a file's ctime 250 ms old, for the daemon as for the
+one-shot CLI, since a watcher's close_write says nothing about a program that writes again) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
 its base revision and a unique operation ID → durable acknowledgement. A retried operation ID returns
 the first result, so a lost response is harmless. Small files take a simpler batched path.
 
@@ -141,8 +141,42 @@ merges as agreement.
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
 before submitting old state, comparing against history, so deleted files do not come back.
 
-**Selection.** Ignore rules in `.gitignore` syntax, selective sync per folder. No ignored names by
-default. On-demand files are an addition: ordinary fully downloaded folders stay, above all for
+**The daemon** decides when to sync and nothing else: it runs the same state-based sync a person runs. An
+event from the watcher or the change feed only says "look", and says nothing about what to look at, so a
+lost event, a stale path or a missed folder delays a change and cannot lose one, and the full reconcile
+covers whatever both miss. A watch is always placed before the sync it leads to. Change feed: a long-poll
+of `GET /changes`, not a stream, since a plain response survives any proxy; when one cuts it off, the
+client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, and
+it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
+unmounted, but says nothing when only a bind mount goes away, or when anything is mounted back: the
+reconcile finds the first, and retrying while paused the second.
+
+**Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
+`cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree
+rules file: both are one device's choice, as in Syncthing, so they cannot conflict, a rule cannot arrive from
+another device and stop syncing something here, and a new device's rules are in place before anything comes
+down. A project's own `.gitignore` means nothing to Cairn.
+
+The merge works on a *view*, the base and the server's tree with the excluded entries taken out. The merge's
+base also holds only the entries this device holds, per entry and recorded before any removal, because a delete
+needs proof that the thing was here: whatever a scan finds is held again, so a killed removal costs nothing.
+This holds with no rules too, for a delete elsewhere that is undone before this device has finished. So:
+
+| Situation | Result |
+|---|---|
+| Excluded here, on the server or not | Neither side touches it, in either direction; deleting the copy here means nothing to the server |
+| A rule lifted, or a folder included | What this device does not hold comes down, and never reads as deleted. What is here merges as new: what changed keeps both versions |
+| A copy left by `cairn exclude` | Left alone, by inode wherever it moves here, and by path for anything new this device has no record of, so a folder generated again stays out too, whatever the server's folder does, even if that is deleted. It joins in only with `cairn include --merge`, which has to be asked for since an old copy can bring back what was deleted since and leave conflict copies for everyone. If the server gets something else at its path, sync reports what is in the way and waits for a person |
+| `mv` into an excluded path here | As in git, a delete of what moved, for everyone: the copy here is out of sight, and the server's history keeps it |
+| `cairn exclude` when what is here is not what the server has at that path, or anything under it differs | Refused: leaving the wrong thing out would read the right one as deleted or as new. A rule needs no such agreement, and a folder this device holds nothing of can always be excluded |
+| A rule by path, when a sync is about to move the folder and the rule would not match there | Stays out by inode, as a copy left by `cairn exclude` does, reported, and listed by `cairn status`: nobody here chose that. `cairn include --merge` brings it in. A person's own `mv` here is a choice: the rule is about paths, so it goes up, as in git |
+| Moved out of view elsewhere | Goes from here like anything deleted there, if unchanged. Changed here: it stays as a new object, and the server's stays where it moved to |
+| A folder deleted elsewhere, holding what is excluded here | What is excluded stays, and so does the folder, here only: it does not come back for anyone unless something real is put in it, or it is emptied, since an empty folder is real |
+| A folder deleted here, holding on the server what is excluded here | The folder comes back here, empty of that, since the server's copy is not this device's to delete |
+| A name here taken on the server by something out of view | Keep both under a conflict name |
+| `cairn exclude --remove-local` | Syncs first, then goes the way a delete from elsewhere goes: unchanged files only, and nothing excluded. Without the flag, nothing is synced first: what is new in the copy was not meant to go up |
+
+On-demand files are an addition: ordinary fully downloaded folders stay, above all for
 projects and anything needing faithful metadata.
 
 **Failure handling, where most of the test effort goes:** watchers plus reconcile, durable queues,
@@ -199,7 +233,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 0 | Protocol and on-disk format written down; Cargo workspace: protocol, store, engine, server, CLI crates | The types cover every row of the metadata table; a license is chosen |
 | 1 | Chunk store, manifests, journal; a one-shot CLI that syncs one Linux folder with full metadata and three-way merge, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
-| 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss |
+| 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment has not started |
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |

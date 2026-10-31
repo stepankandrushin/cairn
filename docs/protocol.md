@@ -29,7 +29,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `POST /chunks/upload` | chunk batch | 204: all durable. 400: damaged batch |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
 | `POST /commit` | `CommitRequest` | `CommitResponse` |
-| `GET /changes?after=N&limit=M` | | `{changes, head}`: journal entries after sequence N |
+| `GET /changes?after=N&limit=M&wait=S` | | `{changes, head}`: journal entries after sequence N. With `wait`, see [Waiting](#waiting) |
 | `GET /conflicts` | | The conflict inbox |
 
 401 means a missing or wrong token, 404 an unknown namespace, and 507 a full disk on the server, in
@@ -101,5 +101,17 @@ Change { seq, op_id, device, device_name, time, ops }
 `seq` is per namespace, starts at 1 and has no gaps. Replaying every change after `N` onto the tree as
 of `N` gives exactly the tree at the head; that is how clients learn what happened, how `export` reads
 the past, and what `fsck` checks the tables against. This release keeps the whole journal, so a device
-can come back after any time away. The persistent change feed is milestone 3; until then a client asks
-when it syncs.
+can come back after any time away.
+
+## Waiting
+
+`wait=S` holds the answer for up to S seconds, at most 120, until the head is no longer `after`, and then
+answers as usual. That is the change feed: an ordinary request and response, so it passes through anything
+that passes HTTP, and carries nothing a later `GET /changes` would not. `limit=0` asks for the head alone.
+The head differing either way answers at once, since a head behind `after` means a server restored from a
+backup. A commit is durable before it wakes anyone. The answer says `Cache-Control: no-store`.
+
+A server that ignores `wait`, or a proxy that answers for it, only makes a client poll: the daemon backs off
+when it gets no news without having waited. A reverse proxy's read timeout has to be longer than the wait
+to be of use; the daemon waits 25 seconds, under nginx's default 60, and when something cuts its requests off
+it waits for less from then on.

@@ -192,6 +192,19 @@ impl Server {
         self.spawn();
     }
 
+    /// SIGTERM, returning how long the server took to go.
+    pub fn stop_gently(&mut self) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        if let Some(mut c) = self.child.take() {
+            Command::new("kill")
+                .arg(c.id().to_string())
+                .status()
+                .unwrap();
+            let _ = c.wait();
+        }
+        start.elapsed()
+    }
+
     /// Whether the process is still up. A failpoint may have killed it.
     pub fn alive(&mut self) -> bool {
         self.child

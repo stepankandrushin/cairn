@@ -49,6 +49,11 @@ pub struct InitOptions {
 #[error("{0}")]
 pub struct Paused(pub String);
 
+/// Another process is working on this root right now.
+#[derive(Debug, thiserror::Error)]
+#[error("another cairn is already working on {0}")]
+pub struct Busy(pub String);
+
 pub struct Root {
     pub path: PathBuf,
     pub dir: Dir,
@@ -116,6 +121,20 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
     Ok(())
 }
 
+/// This root's marker, without taking its lock.
+pub fn read_root_id(path: &Path) -> std::io::Result<String> {
+    let state = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    Ok(std::fs::read_to_string(state.join(MARKER))?
+        .trim()
+        .to_string())
+}
+
+/// This root's configuration, without taking its lock.
+pub fn read_config(path: &Path) -> Result<Config> {
+    let state = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    serde_json::from_slice(&std::fs::read(state.join(CONFIG))?).context("read the configuration")
+}
+
 impl Root {
     pub fn open(path: &Path) -> Result<Self> {
         let dir =
@@ -138,9 +157,8 @@ impl Root {
             .open_dir(STATE_DIR)
             .context("open the state directory")?;
         let lock = File::create(state_path.join("lock"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
-            |_| anyhow::anyhow!("another cairn is already working on {}", path.display()),
-        )?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(|_| Busy(path.display().to_string()))?;
         let state = State::open(&state_path.join("state.sqlite"))?;
         if state.get(KEY_ROOT_ID)?.as_deref() != Some(marker.trim()) {
             return Err(Paused(format!(

@@ -23,7 +23,14 @@ use std::sync::Arc;
 struct App {
     repo: Repo,
     token: String,
+    /// Moves after every durable commit, in any namespace: what a waiting `GET /changes` sleeps on.
+    commits: tokio::sync::watch::Sender<u64>,
+    /// Set when the server is stopping, so that no waiting request holds the shutdown up.
+    closing: tokio::sync::watch::Sender<bool>,
 }
+
+/// The longest a `GET /changes` may wait. A reverse proxy's read timeout is the client's to stay under.
+const MAX_WAIT_SECS: u64 = 120;
 
 /// An error as the API reports it. A full disk has its own status, so a client can say so plainly.
 struct ApiError(anyhow::Error);
@@ -166,7 +173,10 @@ async fn commit(
     Path(ns): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> ApiResult<Response> {
-    let result = blocking(move || app.repo.commit(&ns, &req, now())).await?;
+    let repo = app.clone();
+    let result = blocking(move || repo.repo.commit(&ns, &req, now())).await?;
+    // Durable by now, so a device that wakes reads it. A retried commit wakes them for nothing.
+    app.commits.send_modify(|n| *n = n.wrapping_add(1));
     // The acknowledgement goes out only now that the commit is durable.
     cairn_failpoint::hit("server.commit.before_ack");
     Ok(Json(result).into_response())
@@ -177,16 +187,47 @@ struct ChangesQuery {
     #[serde(default)]
     after: u64,
     limit: Option<u32>,
+    /// Hold the answer for up to this many seconds until the head is no longer `after`.
+    #[serde(default)]
+    wait: u64,
+}
+
+/// Until the head differs from `after`, the time is up, or the server is stopping. A head behind
+/// `after` also answers at once: that device is ahead of a server restored from a backup.
+async fn wait_for_change(app: &Arc<App>, ns: &str, after: u64, secs: u64) -> ApiResult<()> {
+    // Subscribed before the head is read, so a commit between the two still wakes this.
+    let mut commits = app.commits.subscribe();
+    let mut closing = app.closing.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let (repo, name) = (app.clone(), ns.to_string());
+        if blocking(move || repo.repo.head(&name)).await? != after || *closing.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = commits.changed() => {}
+            _ = closing.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+        }
+    }
 }
 
 async fn changes(
     State(app): State<Arc<App>>,
     Path(ns): Path<String>,
     Query(q): Query<ChangesQuery>,
-) -> ApiResult<Json<ChangesResponse>> {
+) -> ApiResult<Response> {
     let limit = q.limit.unwrap_or(1000).min(10_000);
+    if q.wait > 0 {
+        wait_for_change(&app, &ns, q.after, q.wait.min(MAX_WAIT_SECS)).await?;
+    }
     let (changes, head) = blocking(move || app.repo.changes(&ns, q.after, limit)).await?;
-    Ok(Json(ChangesResponse { changes, head }))
+    // A proxy that caches must not answer a later ask from this one.
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ChangesResponse { changes, head }),
+    )
+        .into_response())
 }
 
 async fn conflicts(
@@ -266,13 +307,14 @@ fn init(data: &FsPath) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(app: Arc<App>) {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
     }
+    app.closing.send_replace(true);
 }
 
 async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Result<()> {
@@ -291,14 +333,19 @@ async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Res
         .trim()
         .to_string();
     let repo = Repo::open(&data)?;
-    let app = Arc::new(App { repo, token });
+    let app = Arc::new(App {
+        repo,
+        token,
+        commits: tokio::sync::watch::channel(0).0,
+        closing: tokio::sync::watch::channel(false).0,
+    });
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
     println!("listening on {}", listener.local_addr()?);
     std::io::stdout().flush()?;
-    axum::serve(listener, router(app))
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(listener, router(app.clone()))
+        .with_graceful_shutdown(shutdown_signal(app))
         .await?;
     Ok(())
 }

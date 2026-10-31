@@ -5,7 +5,9 @@ use crate::merge::{LNode, Shared};
 use crate::metadata::rebase_local_changes;
 use crate::scan::{ScanResult, Scanned};
 use crate::state::Row;
-use cairn_protocol::{ConflictOf, Content, Link, Name, ObjectId, OpId, Tree};
+use cairn_protocol::{
+    ConflictOf, Content, Link, Name, ObjectId, ObjectKind, OpId, Timestamp, Tree,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -16,7 +18,19 @@ pub struct CopyIntent {
     pub copy: ObjectId,
     pub dev: u64,
     pub ino: u64,
+    /// What proves it is still that inode: the mark lives until the next finished sync, and the copy
+    /// can be gone by then, its number handed to something new. Absent in a mark an older version left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is: Option<(ObjectKind, Option<Timestamp>)>,
     pub conflict_of: ConflictOf,
+}
+
+impl CopyIntent {
+    fn marks(&self, node: &Scanned) -> bool {
+        self.is
+            .as_ref()
+            .is_none_or(|(kind, btime)| *kind == node.content.kind() && *btime == node.fp.btime)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +75,7 @@ pub fn identify(
     // First the intents, then inodes: both identify a file wherever it has moved to.
     for (i, node) in scan.nodes.iter().enumerate() {
         if let Some(intent) = copies.get(&(node.fp.dev, node.fp.ino)) {
-            if claimed.insert(intent.copy) {
+            if intent.marks(node) && claimed.insert(intent.copy) {
                 ids[i] = Some(intent.copy);
             }
         }
@@ -111,10 +125,13 @@ pub fn identify(
                     parent: *dir_ids.get(parent_path)?,
                     name: name.clone(),
                 };
+                // Only what this device has a record of: anything else at that name is new here, and
+                // merges as new.
                 let by_base = base.entry_at(&link).filter(|c| {
                     base.nodes
                         .get(c)
                         .is_some_and(|n| n.kind() == node.content.kind())
+                        && rows.contains_key(c)
                 });
                 let candidate = by_base.or_else(|| {
                     synced_names
@@ -136,7 +153,14 @@ pub fn identify(
 
     let mut out = Identified::default();
     let intent_of: HashMap<ObjectId, &CopyIntent> = intents.iter().map(|i| (i.copy, i)).collect();
+    let mut found: BTreeSet<ObjectId> = assign.iter().map(|(_, id)| *id).collect();
+    found.insert(ObjectId::ROOT);
     for (id, row) in rows {
+        // What this device removed itself shares nothing with the server any more, unless it is here
+        // after all because the removal did not happen.
+        if !found.contains(id) && !holds_what_it_synced(row) {
+            continue;
+        }
         if let Some(s) = shared_state(row, *id, remote, landed) {
             out.shared.insert(*id, s);
         }
@@ -145,6 +169,12 @@ pub fn identify(
         // Something new that cannot be fully read is not pushed half-described; it waits, reported.
         let known = base.is_live(id) || remote.is_live(id);
         if node.metadata_incomplete && !known {
+            return;
+        }
+        // A folder here only for the sake of what this device excludes is nothing to anyone else, or
+        // deleting it on another device would bring it back for ever. If the server has one at that
+        // path, the two are merged as usual.
+        if node.only_excluded && !known && !node.paths.iter().any(|p| remote.resolve(p).is_some()) {
             return;
         }
         let (stored, apply_from) = stored_terms(id, node, base, remote, rows, &out.shared);
@@ -184,6 +214,13 @@ pub fn identify(
     drop_orphans_of_skipped(&mut out, base, remote);
     carry_unobserved(scan, base, remote, rows, &dir_ids, &mut out);
     out
+}
+
+fn holds_what_it_synced(row: &Row) -> bool {
+    match (&row.held, &row.synced) {
+        (Some(held), Some(synced)) => !held.is_disjoint(&synced.links),
+        _ => true,
+    }
 }
 
 /// What the filesystem and the record were last known to agree on, while the server's head still
@@ -381,7 +418,7 @@ fn carry_unobserved(
 mod tests {
     use super::*;
     use crate::state::{Fingerprint, Synced};
-    use cairn_protocol::{Hash, Metadata, RevisionBody, Timestamp};
+    use cairn_protocol::{ConflictOf, Hash, Metadata, RevisionBody, RevisionId};
 
     const STALE_BTIME: Timestamp = Timestamp { sec: 100, nsec: 0 };
     const LIVE_BTIME: Timestamp = Timestamp { sec: 200, nsec: 0 };
@@ -417,6 +454,7 @@ mod tests {
             applied: None,
             synced: None,
             incomplete: false,
+            held: None,
         }
     }
 
@@ -428,6 +466,8 @@ mod tests {
             content,
             metadata: Metadata::default(),
             metadata_incomplete: false,
+            holds_excluded: false,
+            only_excluded: false,
         }
     }
 
@@ -443,6 +483,7 @@ mod tests {
             unstable: false,
             new_manifests: Vec::new(),
             stale_temps: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 
@@ -497,6 +538,47 @@ mod tests {
         let path = vec![vec![Name::new(b"new".to_vec()).unwrap()]];
         let scan = scan_of(vec![scanned(path, fp(7, 20, Some(LIVE_BTIME)), file())]);
         assert!(!run(&scan, &rows).contains(&id));
+    }
+
+    fn copy_found(is: Option<(ObjectKind, Option<Timestamp>)>, node: Scanned) -> bool {
+        let copy = ObjectId::random();
+        let intent = CopyIntent {
+            copy,
+            dev: 1,
+            ino: 7,
+            is,
+            conflict_of: ConflictOf {
+                object: ObjectId::random(),
+                competing_revision: RevisionId::random(),
+            },
+        };
+        identify(
+            &scan_of(vec![node]),
+            &Tree::default(),
+            &Tree::default(),
+            &BTreeMap::new(),
+            &[intent],
+            &BTreeSet::new(),
+        )
+        .local
+        .contains_key(&copy)
+    }
+
+    /// The copy was deleted, and its number went to something else before the sync finished: pushed
+    /// under the copy's identity, a symlink is refused by the server on every round.
+    #[test]
+    fn a_conflict_copys_inode_number_reused_is_no_identity() {
+        let path = || vec![vec![Name::new(b"new".to_vec()).unwrap()]];
+        let at = |btime| fp(7, 10, Some(btime));
+        let mark = Some((ObjectKind::File, Some(STALE_BTIME)));
+        assert!(copy_found(mark, scanned(path(), at(STALE_BTIME), file())));
+        assert!(!copy_found(mark, scanned(path(), at(LIVE_BTIME), file())));
+        let link = Content::Symlink {
+            target: cairn_protocol::Bytes(b"a".to_vec()),
+        };
+        assert!(!copy_found(mark, scanned(path(), at(STALE_BTIME), link)));
+        // A mark an older version left says only the number.
+        assert!(copy_found(None, scanned(path(), at(LIVE_BTIME), file())));
     }
 
     /// Missing from the carried set, the unreadable file would read as deleted.

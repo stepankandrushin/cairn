@@ -35,11 +35,24 @@ pub struct Shared {
     pub links: Option<BTreeSet<Link>>,
 }
 
+/// What the server holds that this device's view of it leaves out (selection.rs). The merge sees only
+/// the view, and these are the three ways the real tree can still refuse what it decides.
+#[derive(Debug, Default)]
+pub struct Hidden {
+    /// Directories that are not empty on the server, so that deleting them would be refused.
+    pub pinned: BTreeSet<ObjectId>,
+    /// Entries in use on the server, by something that is not in the view.
+    pub reserved: BTreeSet<Link>,
+    /// Objects alive on the server, out of view, so that they cannot be created or brought back.
+    pub moved_away: BTreeSet<ObjectId>,
+}
+
 pub struct MergeInput<'a> {
     pub base: &'a Tree,
     pub local: &'a BTreeMap<ObjectId, LNode>,
     pub remote: &'a Tree,
     pub shared: &'a BTreeMap<ObjectId, Shared>,
+    pub hidden: &'a Hidden,
     pub host: &'a str,
     pub date: &'a str,
     pub fresh_id: &'a mut dyn FnMut() -> ObjectId,
@@ -443,13 +456,22 @@ pub fn merge(mut input: MergeInput<'_>) -> Plan {
                 let changed = r.body.content != b.content
                     || r.links != b_links
                     || meta_changed(r.kind(), &b.metadata, &r.body.metadata);
-                if changed {
-                    plan.reports.push(Report {
-                        kind: ReportKind::EditSurvivedDelete,
-                        object: id,
-                        detail:
-                            "deleted here but changed on another device; the change is back here"
-                                .into(),
+                let pinned = input.hidden.pinned.contains(&id);
+                if changed || pinned {
+                    plan.reports.push(if changed {
+                        Report {
+                            kind: ReportKind::EditSurvivedDelete,
+                            object: id,
+                            detail:
+                                "deleted here but changed on another device; the change is back here"
+                                    .into(),
+                        }
+                    } else {
+                        Report {
+                            kind: ReportKind::KeptForChild,
+                            object: id,
+                            detail: "deleted here, but the server holds something inside it that this device does not sync; the folder stays".into(),
+                        }
                     });
                     plan.target.insert(
                         id,
@@ -504,6 +526,7 @@ pub fn merge(mut input: MergeInput<'_>) -> Plan {
 
     plan.local = local;
     repair_orphans(&input, &mut plan);
+    detach_moved_away(&mut input, &mut plan);
     repair_cycles(&input, &mut plan);
     resolve_collisions(&input, &mut plan);
     one_entry_per_directory(&input, &mut plan);
@@ -717,6 +740,60 @@ fn repair_orphans(input: &MergeInput<'_>, plan: &mut Plan) {
     }
 }
 
+/// Something to keep here, under an object that the server holds out of this device's view: another
+/// device moved it out of view while this one changed it, or a file was moved here from an excluded
+/// path. The server's object stays where it is, and what is here goes on as a new object, reported
+/// like any other edit that outlived its object.
+fn detach_moved_away(input: &mut MergeInput<'_>, plan: &mut Plan) {
+    let caught: Vec<ObjectId> = plan
+        .target
+        .keys()
+        .filter(|id| input.hidden.moved_away.contains(id))
+        .copied()
+        .collect();
+    if caught.is_empty() {
+        return;
+    }
+    let mut fresh: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
+    for id in caught {
+        let new = (input.fresh_id)();
+        fresh.insert(id, new);
+        plan.adopted.insert(id, new);
+        plan.reports.push(Report {
+            kind: ReportKind::EditSurvivedDelete,
+            object: new,
+            detail: "on the server this has moved somewhere this device does not sync; what is here stays, as a new entry".into(),
+        });
+    }
+    let renew = |id: ObjectId| fresh.get(&id).copied().unwrap_or(id);
+    for report in &mut plan.reports {
+        report.object = renew(report.object);
+    }
+    let renew_links = |links: &BTreeSet<Link>| -> BTreeSet<Link> {
+        links
+            .iter()
+            .map(|l| Link {
+                parent: renew(l.parent),
+                name: l.name.clone(),
+            })
+            .collect()
+    };
+    plan.target = std::mem::take(&mut plan.target)
+        .into_iter()
+        .map(|(id, mut t)| {
+            t.links = renew_links(&t.links);
+            (renew(id), t)
+        })
+        .collect();
+    plan.local = std::mem::take(&mut plan.local)
+        .into_iter()
+        .map(|(id, mut l)| {
+            l.links = renew_links(&l.links);
+            (renew(id), l)
+        })
+        .collect();
+}
+
 fn reroot_children(plan: &mut Plan, parent: ObjectId) {
     for (id, t) in plan.target.iter_mut() {
         let moved: BTreeSet<Link> = t
@@ -806,8 +883,11 @@ fn resolve_collisions(input: &MergeInput<'_>, plan: &mut Plan) {
     }
     let mut used: BTreeSet<Link> = by_link.keys().cloned().collect();
     used.extend(input.remote.entries().map(|(l, _)| l.clone()));
+    used.extend(input.hidden.reserved.iter().cloned());
     for (link, owners) in by_link {
-        if owners.len() < 2 {
+        // Taken on the server by something out of view: nobody here can have that name.
+        let taken = input.hidden.reserved.contains(&link);
+        if owners.len() < 2 && !taken {
             continue;
         }
         let rank = |id: &ObjectId| {
@@ -823,7 +903,7 @@ fn resolve_collisions(input: &MergeInput<'_>, plan: &mut Plan) {
             .iter()
             .min_by_key(|id| (rank(id), **id))
             .expect("at least two owners");
-        for loser in owners.into_iter().filter(|o| *o != winner) {
+        for loser in owners.into_iter().filter(|o| taken || *o != winner) {
             let mut attempt = 0;
             let renamed = loop {
                 let candidate = Link {
@@ -937,6 +1017,7 @@ mod tests {
                 local: &self.local,
                 remote: &self.remote,
                 shared: &BTreeMap::new(),
+                hidden: &Hidden::default(),
                 host: "host",
                 date: "2026-10-31",
                 fresh_id: &mut ObjectId::random,
@@ -1237,6 +1318,7 @@ mod tests {
             local: &t.local,
             remote: &t.remote,
             shared: &shared,
+            hidden: &Hidden::default(),
             host: "host",
             date: "2026-10-31",
             fresh_id: &mut ObjectId::random,
@@ -1502,6 +1584,7 @@ mod tests {
             local: &t.local,
             remote: &t.remote,
             shared: &shared,
+            hidden: &Hidden::default(),
             host: "host",
             date: "2026-10-31",
             fresh_id: &mut ObjectId::random,

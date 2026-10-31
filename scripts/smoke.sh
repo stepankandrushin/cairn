@@ -4,8 +4,10 @@ set -euo pipefail
 bin=$(cd "$1" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-proxy_pid="" server_pid=""
+proxy_pid="" server_pid="" daemon_a="" daemon_b=""
 cleanup() {
+    [ -n "$daemon_a" ] && kill "$daemon_a" 2>/dev/null || true
+    [ -n "$daemon_b" ] && kill "$daemon_b" 2>/dev/null || true
     [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null || true
     [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
     chmod -R u+rwx "$work" 2>/dev/null || true
@@ -70,6 +72,35 @@ mkdir "$work/gone"
 status=0; "$bin/cairn" --root "$work/gone" sync >"$work/paused.out" || status=$?
 test "$status" = 2
 grep -q "Sync is paused" "$work/paused.out"
+
+# Daemons keep two roots in step through the proxy, from the watcher and the change feed alone.
+"$bin/cairn" --root "$work/b" sync >/dev/null
+"$bin/cairn" --root "$work/a" daemon --reconcile-secs 86400 >"$work/daemon-a.out" &
+daemon_a=$!
+"$bin/cairn" --root "$work/b" daemon --reconcile-secs 86400 >"$work/daemon-b.out" &
+daemon_b=$!
+wait_for() {
+    for _ in $(seq 400); do
+        [ "$(cat "$1" 2>/dev/null)" = "$2" ] && return 0
+        sleep 0.05
+    done
+    echo "$1 never held $2" >&2
+    return 1
+}
+sleep 1
+echo pushed >"$work/a/from-daemon"
+wait_for "$work/b/from-daemon" pushed
+echo pulled >"$work/b/from-daemon"
+wait_for "$work/a/from-daemon" pulled
+kill "$daemon_a" "$daemon_b"; wait "$daemon_a" "$daemon_b" 2>/dev/null || true; daemon_a="" daemon_b=""
+
+# Rules leave a path out, and nothing about it reaches the server.
+echo '*.secret' >"$work/a/.cairn/ignore"
+echo s >"$work/a/x.secret"
+"$bin/cairn" --root "$work/a" sync >/dev/null
+"$bin/cairn" --root "$work/b" sync >/dev/null
+test ! -e "$work/b/x.secret"
+test -e "$work/a/x.secret"
 
 # A server's TLS certificate is checked.
 unset SSL_CERT_FILE

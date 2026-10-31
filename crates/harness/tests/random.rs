@@ -245,7 +245,10 @@ fn mutate(
     }
 }
 
-fn run_seed(seed: u64) {
+/// What one device leaves out in the variant with rules: names `mutate` really uses.
+const RULES: &str = "f.txt\ndir-a/\n*.tar.gz\n*-mv\n!a-mv\n";
+
+fn run_seed(seed: u64, with_rules: bool) {
     let mut rng = StdRng::seed_from_u64(seed);
     let sb = Sandbox::fast("random");
     let mut server = Server::start(sb.path("server"));
@@ -259,9 +262,20 @@ fn run_seed(seed: u64) {
     let steps = rng.random_range(30..70);
     let mut log: Vec<String> = Vec::new();
     let context = |msg: String| format!("seed {seed}: {msg}");
+    let rules_file = devices[0].path(".cairn/ignore");
+    if with_rules {
+        std::fs::write(&rules_file, RULES).unwrap();
+    }
 
     for step in 0..steps {
         let d = &devices[rng.random_range(0..devices.len())];
+        // The rules come and go: everything at those paths is left out, then merged back in.
+        if with_rules && rng.random_bool(0.08) {
+            let on = std::fs::read(&rules_file).is_ok_and(|t| !t.is_empty());
+            std::fs::write(&rules_file, if on { "" } else { RULES }).unwrap();
+            log.push(format!("d0 rules {}", if on { "off" } else { "on" }));
+            continue;
+        }
         match rng.random_range(0..100) {
             0..=59 => {
                 for _ in 0..rng.random_range(1..4) {
@@ -350,6 +364,10 @@ fn run_seed(seed: u64) {
         }
     }
 
+    // Whatever was left out, all of it comes back in here.
+    if with_rules {
+        std::fs::write(&rules_file, "").unwrap();
+    }
     let refs: Vec<&Device> = devices.iter().collect();
     let p = converge(&refs);
     let found = token::all_in(&p);
@@ -379,8 +397,17 @@ fn run_seed(seed: u64) {
 
 #[test]
 fn random_operations_on_three_devices_lose_nothing() {
+    many_seeds(false);
+}
+
+#[test]
+fn random_operations_with_rules_coming_and_going_on_one_device_lose_nothing() {
+    many_seeds(true);
+}
+
+fn many_seeds(with_rules: bool) {
     if let Ok(seed) = std::env::var("CAIRN_SEED") {
-        run_seed(seed.parse().expect("CAIRN_SEED is a number"));
+        run_seed(seed.parse().expect("CAIRN_SEED is a number"), with_rules);
         return;
     }
     let seeds: u64 = std::env::var("CAIRN_SEEDS")
@@ -399,7 +426,7 @@ fn random_operations_on_three_devices_lose_nothing() {
                 if seed >= seeds {
                     return;
                 }
-                if let Err(e) = std::panic::catch_unwind(|| run_seed(seed)) {
+                if let Err(e) = std::panic::catch_unwind(|| run_seed(seed, with_rules)) {
                     let msg = e
                         .downcast_ref::<String>()
                         .cloned()

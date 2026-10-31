@@ -65,6 +65,12 @@ pub struct Row {
     /// Some of `scan` could not be read: it proves nothing and is no baseline.
     #[serde(default)]
     pub incomplete: bool,
+    /// The entries this device holds. Only what is here can be deleted here, so an entry missing from
+    /// disk and from this set was never here, or this device removed it itself, and if the server
+    /// has it, it comes down. Given up before removing, and taken back if a scan still finds it.
+    /// `None` in a row from before this field: all that the base says.
+    #[serde(default)]
+    pub held: Option<BTreeSet<Link>>,
 }
 
 pub struct State {

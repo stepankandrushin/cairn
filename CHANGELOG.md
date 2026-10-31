@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+**New:**
+
+- `cairn daemon` keeps a root in sync: an inotify watcher, a long-poll change feed that passes through a
+  reverse proxy, and a full sync every hour as the safety net. It reports through its output, `cairn status`
+  and `.cairn/daemon.json`. A kill at any moment is an ordinary crash, and it pauses and resumes around a
+  missing mount without holding the disk busy. This has not yet run on real trees for any length of time.
+- `GET /changes` takes `wait`. A client of this version works with an older server, which only makes it poll.
+- Ignore rules: `.cairn/ignore`, in `.gitignore` syntax, one device's own. There are still no ignored names by
+  default, and a project's `.gitignore` means nothing.
+- Selective sync: `cairn exclude <path>` and `cairn include <path>`. An excluded folder stays excluded through a
+  rename, and `--remove-local` also removes the copy here, except what differs from the server.
+  What a rule covers stays out when a sync moves its folder to where the rule would not match; your own `mv` is
+  your choice, as in git.
+
+**Fixed:**
+
+- A file deleted on one device and restored before another had finished applying the delete could be deleted again
+  by that other device, which had never deleted it. History kept it.
+- A hard-linked file being replaced by a sync could overwrite a save made to its second name in the moment before
+  the replacement, and that text was lost. The version here now stays.
+- A sync interrupted after making a conflict copy could stop finishing for a while, ending in "the tree kept changing
+  for 12 rounds", if the copy was then deleted and a symlink or folder took its inode number. Nothing was lost.
+
 ## 0.1.1
 
 **Fixed:**

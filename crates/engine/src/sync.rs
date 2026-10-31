@@ -8,19 +8,21 @@ use crate::apply::{
     self, cur_from_identified, read_for_upload, recover, Applier, CurNode, INTENT_COPY,
 };
 use crate::client::Client;
-use crate::identify::{identify, CopyIntent};
+use crate::identify::{identify, CopyIntent, Identified};
 use crate::merge::{merge, MergeInput, Plan, ReportKind, TNode};
 use crate::metadata::Accounts;
 use crate::root::{Paused, Root};
 use crate::scan::{scan, ScanOptions, ScanResult};
 use crate::schedule::{schedule, Topo, TopoOp};
+use crate::selection::Selection;
 use crate::state::{Row, Synced};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::wire::{self, CommitRequest, CommitResponse, MAX_CHUNK_BATCH_BYTES};
 use cairn_protocol::{
-    ChunkRef, Content, Hash, Manifest, ObjectId, Op, OpId, RevisionId, Skip, Tree,
+    ChunkRef, Content, Hash, Manifest, Name, ObjectId, Op, OpId, RevisionId, Skip, Tree,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -67,6 +69,10 @@ pub struct SyncReport {
     pub head: u64,
     /// What a dry run would have done.
     pub planned: Vec<String>,
+    /// The topmost entries here left alone because this device excludes them.
+    pub excluded_here: Vec<String>,
+    /// The topmost entries on the server that this device does not sync.
+    pub not_synced_here: Vec<String>,
 }
 
 impl SyncReport {
@@ -85,6 +91,8 @@ impl SyncReport {
             rounds: 0,
             head: 0,
             planned: Vec::new(),
+            excluded_here: Vec::new(),
+            not_synced_here: Vec::new(),
         }
     }
 }
@@ -176,6 +184,7 @@ fn scan_stable(
     rows: &BTreeMap<ObjectId, Row>,
     accounts: &Accounts,
     remove_temps: bool,
+    excluded: &dyn Fn(&[cairn_protocol::Name], &crate::fsops::Stat) -> bool,
 ) -> Result<ScanResult> {
     let by_inode: HashMap<(u64, u64), &Row> =
         rows.values().map(|r| ((r.fp.dev, r.fp.ino), r)).collect();
@@ -185,6 +194,7 @@ fn scan_stable(
         accounts,
         rows: &by_inode,
         remove_own_temps: remove_temps,
+        excluded,
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
     if !result.stale_temps.is_empty() {
@@ -429,12 +439,18 @@ fn upload(
 
 /// Before anything else: commits queued by an earlier run go out with their original IDs, so a
 /// response lost to a crash or the network is harmless.
-fn replay_outbox(root: &Root, client: &Client, report: &mut SyncReport) -> Result<()> {
+fn replay_outbox(root: &mut Root, client: &Client, report: &mut SyncReport) -> Result<()> {
     for req in root.state.outbox()? {
         hit("sync.outbox.replay");
         let resp = client.commit(&req)?;
         if matches!(resp, CommitResponse::Committed { .. }) {
             report.commits += 1;
+        } else {
+            let mut rows = root.state.load_rows()?;
+            let changed = take_back_refused(&req, &mut rows);
+            let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
+            // Before the commit leaves the queue, so that dying here costs nothing.
+            root.state.store_rows(&list, &[])?;
         }
         root.state.dequeue(&req.op_id)?;
         hit("sync.outbox.replayed");
@@ -446,28 +462,31 @@ fn update_rows(
     root: &mut Root,
     rows: &mut BTreeMap<ObjectId, Row>,
     identified: &crate::identify::Identified,
+    base: &Tree,
 ) -> Result<()> {
     let mut changed = Vec::new();
     for (id, s) in &identified.scanned {
-        let new = match rows.get(id) {
-            Some(old) => Row {
-                fp: s.fp.clone(),
-                racy: s.racy,
-                content: s.content.clone(),
-                scan: s.metadata.clone(),
-                applied: old.applied.clone(),
-                synced: old.synced.clone(),
-                incomplete: s.metadata_incomplete,
-            },
-            None => Row {
-                fp: s.fp.clone(),
-                racy: s.racy,
-                content: s.content.clone(),
-                scan: s.metadata.clone(),
-                applied: None,
-                synced: None,
-                incomplete: s.metadata_incomplete,
-            },
+        let found = identified.local.get(id).map(|n| &n.links);
+        let old = rows.get(id);
+        // Never narrowed by a scan: an entry held and not found is what a delete here looks like.
+        let mut held = match old {
+            Some(o) => o
+                .held
+                .clone()
+                .or_else(|| base.nodes.get(id).map(|n| n.links.clone())),
+            None => None,
+        }
+        .unwrap_or_default();
+        held.extend(found.into_iter().flatten().cloned());
+        let new = Row {
+            fp: s.fp.clone(),
+            racy: s.racy,
+            content: s.content.clone(),
+            scan: s.metadata.clone(),
+            applied: old.and_then(|o| o.applied.clone()),
+            synced: old.and_then(|o| o.synced.clone()),
+            incomplete: s.metadata_incomplete,
+            held: Some(held),
         };
         if rows.get(id) != Some(&new) {
             rows.insert(*id, new);
@@ -478,11 +497,13 @@ fn update_rows(
     root.state.store_rows(&list, &[])
 }
 
-/// A new local object recognised as a remote one takes the remote identity.
+/// A new local object recognised as a remote one takes the remote identity. One the server does not
+/// have is starting over, and shares nothing with it yet.
 fn adopt_rows(
     root: &mut Root,
     rows: &mut BTreeMap<ObjectId, Row>,
     adopted: &BTreeMap<ObjectId, ObjectId>,
+    remote: &Tree,
 ) -> Result<()> {
     if adopted.is_empty() {
         return Ok(());
@@ -490,7 +511,10 @@ fn adopt_rows(
     let mut changed = Vec::new();
     let mut gone = Vec::new();
     for (x, y) in adopted {
-        if let Some(row) = rows.remove(x) {
+        if let Some(mut row) = rows.remove(x) {
+            if !remote.nodes.contains_key(y) {
+                row.synced = None;
+            }
             rows.insert(*y, row);
             changed.push(*y);
             gone.push(*x);
@@ -517,16 +541,18 @@ fn finalize(
     for (id, row) in rows.iter_mut() {
         match plan.local.get(id) {
             Some(n) if n.carried => {}
-            // What could not be read fully is no baseline.
-            Some(_) if row.incomplete => {
-                if row.synced.take().is_some() {
-                    changed.push(*id);
-                }
-            }
-            Some(_) => {
-                if row.applied.as_ref() != Some(&row.scan) || row.synced.is_some() {
+            Some(n) => {
+                let mut dirty = row.held.as_ref() != Some(&n.links);
+                row.held = Some(n.links.clone());
+                // What could not be read fully is no baseline.
+                if row.incomplete {
+                    dirty |= row.synced.take().is_some();
+                } else if row.applied.as_ref() != Some(&row.scan) || row.synced.is_some() {
                     row.applied = Some(row.scan.clone());
                     row.synced = None;
+                    dirty = true;
+                }
+                if dirty {
                     changed.push(*id);
                 }
             }
@@ -557,6 +583,31 @@ fn finalize(
         let _ = cache.unlink(&name);
     }
     Ok(())
+}
+
+/// Where the folders here will be after this plan, for those that will not be where they are.
+fn folders_moving(plan: &Plan, identified: &Identified) -> BTreeMap<Vec<Name>, Vec<Name>> {
+    let after = |id: ObjectId| {
+        let mut parts = Vec::new();
+        let mut at = plan.adopted.get(&id).copied().unwrap_or(id);
+        while at != ObjectId::ROOT {
+            let link = plan.target.get(&at)?.links.iter().next()?;
+            parts.push(link.name.clone());
+            at = link.parent;
+        }
+        parts.reverse();
+        Some(parts)
+    };
+    identified
+        .scanned
+        .iter()
+        .filter(|(_, node)| node.content == Content::Dir)
+        .filter_map(|(id, node)| {
+            let to = after(*id)?;
+            let from = node.paths.first()?;
+            (*from != to).then(|| (from.clone(), to))
+        })
+        .collect()
 }
 
 fn event_path(plan: &Plan, id: ObjectId) -> String {
@@ -599,6 +650,8 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     };
     let client = Client::new(&root.config)?;
     let accounts = Accounts::load();
+    // Read once, before anything is touched: a rule that cannot be read must stop the sync.
+    let mut selection = Selection::load(&root)?;
     // Purely local, and first: anything else may send a person to act on this folder.
     if !opts.dry_run {
         report.events.extend(recover(&mut root)?);
@@ -609,7 +662,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         return Ok(report);
     }
     if !opts.dry_run {
-        replay_outbox(&root, &client, &mut report)?;
+        replay_outbox(&mut root, &client, &mut report)?;
     }
 
     let mut base = root.state.load_base()?;
@@ -636,8 +689,37 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         fetch_changes(&client, &mut remote, &mut seq, &mut seen)?;
         report.head = seq;
 
-        let scanned = scan_stable(&root, &rows, &accounts, !opts.dry_run)?;
+        // From here to the push, everything sees only what this device takes part in. `base` and
+        // `remote` stay the real record, for the cursor and for the next round.
+        let mut view = selection.view(&base, &remote, &mut rows);
+        {
+            let list: Vec<(ObjectId, &Row)> =
+                view.changed.iter().map(|id| (*id, &rows[id])).collect();
+            if !opts.dry_run && !(list.is_empty() && view.purge.is_empty()) {
+                root.state.store_rows(&list, &view.purge)?;
+            }
+        }
+        report.not_synced_here = view
+            .hidden
+            .reserved
+            .iter()
+            .filter_map(|link| remote.path_of_link(link))
+            .map(|path| crate::scan::display_path(&path))
+            .collect();
+
+        let moved = RefCell::new(Vec::new());
+        let scanned = scan_stable(&root, &rows, &accounts, !opts.dry_run, &|path, st| {
+            selection.leaves_out(path, st, &view, &rows, &mut moved.borrow_mut())
+        })?;
+        if selection.follow_copies(&moved.into_inner()) && !opts.dry_run {
+            selection.store(&root)?;
+        }
         hit("sync.scanned");
+        report.excluded_here = scanned
+            .excluded
+            .iter()
+            .map(|path| crate::scan::display_path(path))
+            .collect();
         root.state.put_manifests(&scanned.new_manifests)?;
         let unstable = scanned.unstable;
         report.skips = scanned.skips.clone();
@@ -649,12 +731,21 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             .into_iter()
             .map(|(_, i)| i)
             .collect();
-        let identified = identify(&scanned, &base, &remote, &rows, &intents, &seen.commits);
-        update_rows(&mut root, &mut rows, &identified)?;
+        let identified = identify(
+            &scanned,
+            &view.base,
+            &view.remote,
+            &rows,
+            &intents,
+            &seen.commits,
+        );
+        update_rows(&mut root, &mut rows, &identified, &view.base)?;
+        // Found here means held, however that came about. Not found, and given up, is no delete.
+        view.settle(&rows);
         hit("sync.identified");
 
         if !opts.allow_mass_delete {
-            if let Some(why) = check_vanished(&base, &remote, &rows, &identified.local) {
+            if let Some(why) = check_vanished(&view.base, &view.remote, &rows, &identified.local) {
                 return Ok(SyncReport {
                     outcome: SyncOutcome::Paused(why),
                     ..report
@@ -664,10 +755,11 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
 
         let host = root.config.device_name.clone();
         let plan = merge(MergeInput {
-            base: &base,
+            base: &view.base,
             local: &identified.local,
-            remote: &remote,
+            remote: &view.remote,
             shared: &identified.shared,
+            hidden: &view.hidden,
             host: &host,
             date: &date,
             fresh_id: &mut ObjectId::random,
@@ -705,17 +797,39 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                         .push(format!("local: new content for {}", event_path(&plan, *id)));
                 }
             }
-            for op in remote_ops(&remote, &plan)? {
+            for op in remote_ops(&view.remote, &plan)? {
                 report.planned.push(format!("server: {}", describe_op(&op)));
             }
             break SyncOutcome::Synced;
         }
 
-        adopt_rows(&mut root, &mut rows, &plan.adopted)?;
+        // Before anything moves, so that dying in between cannot let it go up.
+        let kept_out = selection.keep_out_what_moves(
+            &root,
+            &scanned.excluded,
+            &folders_moving(&plan, &identified),
+        );
+        if !kept_out.is_empty() {
+            selection.store(&root)?;
+            for path in &kept_out {
+                report.events.push(format!(
+                    "{}: its folder is moving, and the rule that leaves it out would not match there; it stays out, and `cairn include --merge` brings it in",
+                    crate::scan::display_path(path)
+                ));
+            }
+        }
+
+        adopt_rows(&mut root, &mut rows, &plan.adopted, &view.remote)?;
         let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
-        let (outcome, cur) =
-            Applier::new(&mut root, Some(&client), &accounts, cur, &mut rows, &remote)
-                .run(&plan)?;
+        let (outcome, cur) = Applier::new(
+            &mut root,
+            Some(&client),
+            &accounts,
+            cur,
+            &mut rows,
+            &view.remote,
+        )
+        .run(&plan)?;
         hit("sync.applied");
         report.steps_applied += outcome.applied_steps;
         for w in outcome.warnings {
@@ -737,11 +851,15 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         report
             .skips
             .extend(outcome.changed.into_iter().map(|mut s| {
-                s.kind = cairn_protocol::SkipKind::CannotApply;
+                s.kind = if report.excluded_here.contains(&s.path) {
+                    cairn_protocol::SkipKind::ExcludedInTheWay
+                } else {
+                    cairn_protocol::SkipKind::CannotApply
+                };
                 s
             }));
 
-        let mut ops = remote_ops(&remote, &plan)?;
+        let mut ops = remote_ops(&view.remote, &plan)?;
         // The loser of a metadata conflict goes in the log even when nothing else is to be pushed.
         // Unless applying failed: the conflict stands, and would be logged on every run.
         if !failed || !ops.is_empty() {
@@ -760,6 +878,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                 // The filesystem was written: confirm it with a fresh scan before calling this agreed.
                 continue;
             }
+            drop(view);
             finalize(
                 &mut root, &mut base, &remote, seq, seen.last, &mut rows, &plan,
             )?;
@@ -791,12 +910,18 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             device_name: root.config.device_name.clone(),
             ops,
         };
-        let pushed = mark_synced(&mut rows, &remote, &cur, &req);
+        let pushed = mark_synced(&mut rows, &view.remote, &cur, &req);
         let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
         root.state.enqueue(&req, &list)?;
         hit("sync.enqueued");
         let resp = client.commit(&req)?;
         hit("sync.committed");
+        // Before the commit leaves the queue, so that dying here costs nothing.
+        if matches!(resp, CommitResponse::Rejected { .. }) {
+            let changed = take_back_refused(&req, &mut rows);
+            let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
+            root.state.store_rows(&list, &[])?;
+        }
         root.state.dequeue(&req.op_id)?;
         hit("sync.dequeued");
         match resp {
@@ -840,10 +965,20 @@ fn mark_synced(
 ) -> Vec<ObjectId> {
     let mut after = remote.clone();
     let mut touched: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut gave_up: BTreeSet<ObjectId> = BTreeSet::new();
     for op in &req.ops {
         // It would be refused, and there is nothing to record.
         if after.apply(op).is_err() {
             return Vec::new();
+        }
+        // Said to the server once: from now on this device has no claim on it, so if the server has
+        // it later, by a restore, say, this device's own old delete is not made again.
+        if let Op::Unlink { object, link, .. } = op {
+            if let Some(held) = rows.get_mut(object).and_then(|r| r.held.as_mut()) {
+                if held.remove(link) {
+                    gave_up.insert(*object);
+                }
+            }
         }
         touched.insert(match op {
             Op::Create { object, .. }
@@ -878,7 +1013,23 @@ fn mark_synced(
             out.push(id);
         }
     }
-    out
+    gave_up.extend(out);
+    gave_up.into_iter().collect()
+}
+
+/// A refused commit said nothing: what its deletes gave up is still this device's to delete.
+fn take_back_refused(req: &CommitRequest, rows: &mut BTreeMap<ObjectId, Row>) -> Vec<ObjectId> {
+    let mut changed = BTreeSet::new();
+    for op in &req.ops {
+        if let Op::Unlink { object, link, .. } = op {
+            if let Some(held) = rows.get_mut(object).and_then(|r| r.held.as_mut()) {
+                if held.insert(link.clone()) {
+                    changed.insert(*object);
+                }
+            }
+        }
+    }
+    changed.into_iter().collect()
 }
 
 /// Fail plainly if the configured server is unreachable or refuses the token.

@@ -4,8 +4,9 @@ Self-hosted file sync with versioned history that keeps everything about your fi
 owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes. A central server keeps
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
-**Status: 0.1.1, early.** Linux only, sync on demand, one user. It has been through a harsh failure
-harness but has no long history on real data, so keep another copy of anything you put through it. See
+**Status: 0.1.1, early.** Linux only, one user. It has been through a harsh failure harness but has no long
+history on real data, so keep another copy of anything you put through it. The daemon is newer than the
+release and has run on no real tree yet. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
 
 ## Why
@@ -53,7 +54,58 @@ cairn conflicts
 ```
 
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with
-`--behind-tls-proxy`, and use an `https://` URL.
+`--behind-tls-proxy`, and use an `https://` URL. A read timeout above 25 seconds lets changes arrive at once
+(nginx's default of 60 is fine); with a shorter one the daemon asks more often.
+
+## The daemon
+
+```sh
+cairn daemon --root ~/Sync       # stays in the foreground; run one per root under your service manager
+cairn status                     # what it last said, and what a sync would do now
+```
+
+It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
+events can be lost. Its output says what it did and what it could not do, each thing once. A paused or failing
+root keeps being retried, and `cairn sync` beside it works as usual. As a systemd user unit:
+
+```ini
+[Service]
+ExecStart=%h/.local/bin/cairn daemon --root %h/Sync
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+On a big tree, the kernel's limit on watches may need raising (`fs.inotify.max_user_watches`); the daemon says
+so if it does, and until then those folders wait for the hourly sync.
+
+## Leaving things out
+
+Nothing is left out unless you say so. Rules go in `.cairn/ignore`, in `.gitignore` syntax, for this device
+only:
+
+```gitignore
+*.log
+/build/
+node_modules/
+```
+
+To keep a server folder off this device, including one that does not exist here yet:
+
+```sh
+cairn exclude photos                  # stays excluded if it is renamed; the copy here stays too
+cairn exclude photos --remove-local   # removes the copy here, except what differs from the server
+cairn include photos                  # brings it back
+cairn include photos --merge          # the same, with a copy left here merging in
+```
+
+Either way, what this device does not sync stays untouched on the server and on other devices, and deleting
+your copy deletes nothing else. A copy merging in counts as new: what changed keeps both versions, and an old
+copy can bring back what was deleted since, which is why that has to be asked for. Moving something into a left
+out path here is a delete for everyone, as in git. A rule is about paths, so your own `mv` out of it uploads. If a sync moves
+the folder instead, because another device renamed it, what the rule covered stays out and is listed. `cairn
+status` lists what is left out.
 
 `cairn sync` exits 0 when both sides agree (anything excluded is listed), 2 when it paused and is waiting
 for you, 3 when another run is needed, and 1 on an error. In every case nothing is lost.

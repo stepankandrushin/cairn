@@ -14,6 +14,8 @@ pub enum SkipKind {
     KeepsChanging,
     VanishedDuringScan,
     CannotApply,
+    /// The server has something at a path where this device has something it excludes.
+    ExcludedInTheWay,
     ReadError,
 }
 
@@ -26,6 +28,7 @@ impl SkipKind {
                 | SkipKind::KeepsChanging
                 | SkipKind::VanishedDuringScan
                 | SkipKind::CannotApply
+                | SkipKind::ExcludedInTheWay
                 | SkipKind::ReadError
         )
     }
@@ -43,6 +46,7 @@ impl SkipKind {
             SkipKind::KeepsChanging => "file keeps changing",
             SkipKind::VanishedDuringScan => "vanished while being scanned",
             SkipKind::CannotApply => "destination cannot represent this",
+            SkipKind::ExcludedInTheWay => "something this device excludes is at that name",
             SkipKind::ReadError => "could not be read",
         }
     }
@@ -59,6 +63,9 @@ impl SkipKind {
             SkipKind::KeepsChanging => "sync again once it has stopped changing",
             SkipKind::VanishedDuringScan => "sync again",
             SkipKind::CannotApply => "the server keeps the data; read it with `cairn export`",
+            SkipKind::ExcludedInTheWay => {
+                "move what is here, or change the rule, and the server's will come"
+            }
             SkipKind::ReadError => "check the disk, then sync again",
         }
     }

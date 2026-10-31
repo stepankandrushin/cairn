@@ -3,6 +3,7 @@
 pub mod apply;
 pub mod chunker;
 pub mod client;
+pub mod daemon;
 pub mod export;
 pub mod fsops;
 pub mod identify;
@@ -12,8 +13,10 @@ pub mod restore;
 pub mod root;
 pub mod scan;
 pub mod schedule;
+pub mod selection;
 pub mod state;
 pub mod sync;
+pub mod watch;
 
 pub use metadata::{ApplyPolicy, OwnerPolicy};
 pub use root::{init_root, InitOptions, Root};

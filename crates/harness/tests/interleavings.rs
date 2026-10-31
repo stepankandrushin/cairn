@@ -881,3 +881,54 @@ fn a_change_too_big_for_one_commit_goes_in_several() {
     b.synced();
     assert_eq!(b.read("d20/20999"), b"20999");
 }
+
+/// A conflict copy's mark lives until the next finished sync. Here the copy is gone by then, deleted on
+/// both sides, and a symlink has its inode number: under the copy's identity the server refuses that
+/// symlink on every round, and the sync never finishes.
+#[test]
+fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
+    let (_sb, _s, a, b) = pair("copy-ino");
+    a.write("f", "base");
+    a.synced();
+    b.synced();
+    a.write("f", "edit here");
+    b.write("f", "edit there");
+    b.synced();
+    let run = a.cairn_env(&["sync"], &[("CAIRN_FP_CRASH", "sync.committed")]);
+    assert!(run.was_killed(), "{}", run.text());
+    b.synced();
+    let copies = b.conflict_copies("", "f");
+    assert_eq!(copies.len(), 1);
+    std::fs::remove_file(b.path(&copies[0])).unwrap();
+    b.synced();
+
+    let copy = a.path(&copies[0]);
+    let ino = std::fs::metadata(&copy).unwrap().ino();
+    std::fs::remove_file(&copy).unwrap();
+    let mut made = Vec::new();
+    let mut reused = false;
+    for i in 0..2000 {
+        let path = a.path(&format!("try-{i}"));
+        std::os::unix::fs::symlink("f", &path).unwrap();
+        if std::fs::symlink_metadata(&path).unwrap().ino() == ino {
+            std::fs::rename(&path, a.path("link")).unwrap();
+            reused = true;
+            break;
+        }
+        made.push(path);
+    }
+    for path in made {
+        std::fs::remove_file(path).unwrap();
+    }
+    if !reused {
+        eprintln!("this filesystem did not reuse the inode number: nothing was tested");
+        return;
+    }
+
+    a.synced();
+    b.synced();
+    assert_eq!(
+        std::fs::read_link(b.path("link")).unwrap(),
+        PathBuf::from("f")
+    );
+}

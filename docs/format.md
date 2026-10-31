@@ -60,7 +60,9 @@ the root.
 .cairn/
   root-id        random ID, also in state.sqlite: the marker that proves this is the root
   config.json    server, token, device, apply policy; 0600
+  ignore         this device's rules, optional: never synced, and written only by a person
   lock           flock held while a sync runs
+  daemon.json    what a running daemon last reported; for reading only, and never needed
   state.sqlite   WAL, synchronous=FULL
   stage/         entries lifted out for a moment, for swaps and cycles
   chunks/        downloads in progress, by hash; resumes after an interruption
@@ -68,9 +70,9 @@ the root.
 
 | Table | Holds |
 |---|---|
-| `kv` | Root ID, journal cursor, and the operation at the cursor, which shows whether the server still has this history |
+| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move |
 | `base` | The server's tree as of the cursor: the common ancestor for merging |
-| `rows` | Per object: the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal |
+| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal |
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
 | `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file |
@@ -78,6 +80,16 @@ the root.
 `rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field
 this client cannot hold is not a change.
+
+`ignore` is `.gitignore` syntax relative to the root, UTF-8, with git's meaning, checked against
+`git check-ignore`; a rule can match names that are not UTF-8. POSIX classes such as `[:digit:]` are refused, since
+the matcher would quietly match nothing with them. In the few other odd patterns where it differs from git (`[a`,
+`a[/]b`, `doc\/`) it leaves out more. Anything wrong with the file stops the sync, since "no rules" would upload
+what the rules hold back. A symlink or a FIFO there counts as wrong. Save it in place or by rename: while it does
+not exist at all, there are no rules.
+
+A daemon holds no file in the root while idle, so a disk can be unmounted under it: its single-instance lock is
+the abstract socket `cairn-daemon-<root id>`.
 
 Temporary files are `.cairn-tmp-<device id>-<random>` in the destination's own directory. A scan removes
 its own device's, which can only be left by a killed run. They never hold anything at a synced path.

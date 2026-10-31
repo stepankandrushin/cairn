@@ -2,17 +2,20 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_engine::client::Client;
-use cairn_engine::restore;
+use cairn_engine::daemon::DaemonOptions;
 use cairn_engine::root::Paused;
 use cairn_engine::scan::display_path;
 use cairn_engine::{
     init_root, sync, ApplyPolicy, InitOptions, OwnerPolicy, Root, SyncOptions, SyncOutcome,
 };
+use cairn_engine::{restore, selection};
 use cairn_protocol::{Name, RevisionId};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 /// The tree synced, and anything excluded was listed.
 const EXIT_OK: u8 = 0;
@@ -83,6 +86,39 @@ enum Command {
         /// Say what would happen and change nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Keep this root in sync: watch it and the server, and sync whenever either changes.
+    Daemon {
+        /// Seconds between full syncs when nothing asks for one: the safety net for missed events.
+        #[arg(long, default_value_t = 3600)]
+        reconcile_secs: u64,
+        /// The longest wait in seconds before trying again after a failure, or while paused.
+        #[arg(long, default_value_t = 60)]
+        retry_secs: u64,
+        /// Do not watch the filesystem, where inotify does not work: only full syncs find changes here.
+        #[arg(long)]
+        no_watch: bool,
+        /// Do not wait on the server: only full syncs find changes there.
+        #[arg(long)]
+        no_feed: bool,
+    },
+    /// Stop syncing a folder on the server. It stays excluded however it is renamed.
+    Exclude {
+        /// Relative to the root.
+        path: PathBuf,
+        /// Also remove the copy here, except what differs from the server. By default it stays,
+        /// no longer looked at.
+        #[arg(long)]
+        remove_local: bool,
+    },
+    /// Sync an excluded folder again, or a copy of one left here.
+    Include {
+        /// Relative to the root.
+        path: PathBuf,
+        /// A copy left at that path merges as new: what differs goes to the server, and what changed
+        /// keeps both versions. Without this, such a copy stops the command.
+        #[arg(long)]
+        merge: bool,
     },
     /// What a sync would do now.
     Status,
@@ -181,6 +217,13 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     for w in &report.warnings {
         println!("not applied here: {w}");
     }
+    if !report.excluded_here.is_empty() || !report.not_synced_here.is_empty() {
+        println!(
+            "by this device's choice: {} entries here not synced, {} on the server not here; `cairn status` lists them",
+            report.excluded_here.len(),
+            report.not_synced_here.len()
+        );
+    }
     match &report.outcome {
         SyncOutcome::Synced => {
             println!(
@@ -198,6 +241,42 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
             EXIT_PAUSED
         }
     }
+}
+
+fn print_daemon(s: &cairn_engine::daemon::Status) {
+    println!(
+        "daemon: running as process {}, {}{}; last sync {}, last fully synced {}; {} folders watched",
+        s.pid,
+        if s.state.is_empty() { "starting" } else { &s.state },
+        s.detail.as_ref().map_or(String::new(), |d| format!(" ({d})")),
+        date_time(s.last_sync),
+        if s.last_synced == 0 {
+            "never".to_string()
+        } else {
+            date_time(s.last_synced)
+        },
+        s.watched,
+    );
+    if s.unwatched > 0 {
+        println!(
+            "daemon: {} folders are not watched, so changes in them wait for a full sync{}",
+            s.unwatched,
+            if s.watch_limit_reached {
+                ": raise fs.inotify.max_user_watches"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(why) = &s.feed_down {
+        println!("daemon: the change feed is down: {why}");
+    }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn run_sync(root: &Path, opts: SyncOptions) -> Result<u8> {
@@ -283,9 +362,67 @@ fn run_inner() -> Result<u8> {
                 dry_run,
             },
         ),
+        Command::Daemon {
+            reconcile_secs,
+            retry_secs,
+            no_watch,
+            no_feed,
+        } => {
+            let root = find_root(cli.root)?;
+            let opts = DaemonOptions {
+                reconcile: Duration::from_secs(reconcile_secs.max(1)),
+                retry: Duration::from_secs(retry_secs.max(1)),
+                watch: !no_watch,
+                feed: !no_feed,
+            };
+            // Whoever reads this going away is no reason to stop syncing.
+            let say = |line: &str| {
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "{} {line}", date_time(now()));
+                let _ = out.flush();
+            };
+            say(&format!("starting for {}", root.display()));
+            cairn_engine::daemon::run(&root, &opts, &mut |line| say(line))?;
+            Ok(EXIT_ERROR)
+        }
+        Command::Exclude { path, remove_local } => {
+            let root_path = find_root(cli.root)?;
+            let names = to_names(&path)?;
+            selection::check_excludable(&Root::open(&root_path)?, &names)?;
+            // Only when the copy here is to go: first, so that what is only here is on the server.
+            // A copy that stays is left as it is, and what is new in it was never meant to go up.
+            if remove_local && Root::open(&root_path)?.state.cursor()? > 0 {
+                let first = sync(&root_path, &SyncOptions::default())?;
+                print_sync(&first);
+                if first.outcome != SyncOutcome::Synced {
+                    bail!("this root is not fully synced, so nothing was excluded: fix what is above and try again");
+                }
+            }
+            {
+                let mut root = Root::open(&root_path)?;
+                selection::exclude(&mut root, &names, remove_local)?;
+            }
+            println!("{} is no longer synced here", display_path(&names));
+            run_sync(&root_path, SyncOptions::default())
+        }
+        Command::Include { path, merge } => {
+            let root_path = find_root(cli.root)?;
+            let names = to_names(&path)?;
+            {
+                let mut root = Root::open(&root_path)?;
+                selection::include(&mut root, &names, merge)?;
+            }
+            println!("{} is synced here again", display_path(&names));
+            run_sync(&root_path, SyncOptions::default())
+        }
         Command::Status => {
+            let root_path = find_root(cli.root)?;
+            match cairn_engine::daemon::running_status(&root_path) {
+                Some(s) => print_daemon(&s),
+                None => println!("daemon: not running"),
+            }
             let report = sync(
-                &find_root(cli.root)?,
+                &root_path,
                 &SyncOptions {
                     allow_mass_delete: true,
                     dry_run: true,
@@ -293,6 +430,31 @@ fn run_inner() -> Result<u8> {
             )?;
             if report.planned.is_empty() {
                 println!("nothing to do at sequence {}", report.head);
+            }
+            for path in &report.excluded_here {
+                println!("not synced, by .cairn/ignore or `cairn exclude`: {path}");
+            }
+            for path in &report.not_synced_here {
+                println!("on the server, not synced here: {path}");
+            }
+            if let Ok(root) = Root::open(&root_path) {
+                let excluded = selection::excluded_paths(&root).unwrap_or_default();
+                for path in excluded.on_server {
+                    println!("excluded with `cairn exclude`: {}", display_path(&path));
+                }
+                for (path, there) in excluded.copies {
+                    if there {
+                        println!(
+                            "left here when it was excluded: {0}; delete it, or `cairn include --merge {0}`",
+                            display_path(&path)
+                        );
+                    } else {
+                        println!(
+                            "anything new at {0} stays out too, until `cairn include {0}`",
+                            display_path(&path)
+                        );
+                    }
+                }
             }
             print_sync(&report);
             Ok(status_code(&report))

@@ -22,6 +22,9 @@ const STABLE_WINDOW_NS: i128 = 250_000_000;
 /// How often a file that changed under a read is tried again within one scan.
 const READ_ATTEMPTS: u32 = 3;
 
+/// In the state directory: what a running daemon last reported.
+pub const STATE_FILE_DAEMON: &str = "daemon.json";
+
 /// One inode: several paths when hard-linked.
 #[derive(Clone, Debug)]
 pub struct Scanned {
@@ -32,6 +35,10 @@ pub struct Scanned {
     pub metadata: Metadata,
     /// Some metadata could not be read, so this scan says nothing about what changed.
     pub metadata_incomplete: bool,
+    /// A directory with something excluded somewhere under it, which deleting it would destroy.
+    pub holds_excluded: bool,
+    /// A directory with nothing under it but what is excluded.
+    pub only_excluded: bool,
 }
 
 #[derive(Debug)]
@@ -52,6 +59,8 @@ pub struct ScanResult {
     pub new_manifests: Vec<(Hash, Vec<u8>)>,
     /// This device's leftover temporaries that a read-only directory kept from being removed.
     pub stale_temps: Vec<(Vec<Name>, Vec<u8>)>,
+    /// The topmost entries left alone because this device excludes them.
+    pub excluded: Vec<Vec<Name>>,
 }
 
 pub struct ScanOptions<'a> {
@@ -60,6 +69,8 @@ pub struct ScanOptions<'a> {
     /// What is known by inode, to avoid reading unchanged files.
     pub rows: &'a HashMap<(u64, u64), &'a Row>,
     pub remove_own_temps: bool,
+    /// Whether an entry is excluded, given that its parent is not.
+    pub excluded: &'a dyn Fn(&[Name], &Stat) -> bool,
 }
 
 pub fn fingerprint(st: &Stat) -> Fingerprint {
@@ -90,7 +101,7 @@ pub fn is_racy(st: &Stat, precision_ns: u32) -> bool {
 }
 
 /// Wait out what is left of the stable window since this file last changed.
-fn wait_until_stable(st: &Stat) {
+pub(crate) fn wait_until_stable(st: &Stat) {
     let age = now_ns() - ns(st.ctime);
     if age < STABLE_WINDOW_NS {
         // A clock stepped backwards makes the age negative; the wait is still bounded.
@@ -119,6 +130,9 @@ struct Walk<'a> {
     stale_temps: Vec<(Vec<Name>, Vec<u8>)>,
     /// Each directory with what it looked like when listed.
     dirs: Vec<(Vec<Name>, Timestamp, Timestamp)>,
+    excluded: Vec<Vec<Name>>,
+    /// Entries seen so far that are neither excluded nor directories holding only what is.
+    solid: u64,
 }
 
 impl Walk<'_> {
@@ -212,6 +226,13 @@ impl Walk<'_> {
             Err(e) => return self.unobservable(path, SkipKind::ReadError, Some(e.to_string())),
         };
         self.current_inode = Some((st.dev, st.ino));
+        if (self.opts.excluded)(path, &st) {
+            self.excluded.push(path.clone());
+            return;
+        }
+        if st.file_type != FileType::Directory {
+            self.solid += 1;
+        }
         if st.mnt_id != 0 && parent_mnt != 0 && st.mnt_id != parent_mnt {
             return self.unobservable(path, SkipKind::MountPoint, None);
         }
@@ -288,6 +309,8 @@ impl Walk<'_> {
                     content: row.content.clone(),
                     metadata: row.scan.clone(),
                     metadata_incomplete: false,
+                    holds_excluded: false,
+                    only_excluded: false,
                 });
                 return;
             }
@@ -363,6 +386,8 @@ impl Walk<'_> {
                 },
                 metadata,
                 metadata_incomplete,
+                holds_excluded: false,
+                only_excluded: false,
             });
             return;
         }
@@ -391,6 +416,8 @@ impl Walk<'_> {
                     },
                     metadata,
                     metadata_incomplete,
+                    holds_excluded: false,
+                    only_excluded: false,
                 });
             }
             Err(e) => {
@@ -413,7 +440,14 @@ impl Walk<'_> {
         let raw = raw.as_bytes();
         match dir.open_dir(raw) {
             Ok(child) => {
+                let (excluded_before, solid_before) = (self.excluded.len(), self.solid);
                 let listed = self.walk_dir(&child, path, st.mnt_id);
+                let holds_excluded = self.excluded.len() > excluded_before;
+                let only_excluded = holds_excluded && listed && self.solid == solid_before;
+                // An empty directory is as real as a file, to whatever holds it.
+                if !only_excluded && self.solid == solid_before {
+                    self.solid += 1;
+                }
                 self.current_inode = Some((st.dev, st.ino));
                 // Read after the walk: removing a leftover temporary moves the times.
                 let st = match dir.stat(raw) {
@@ -429,9 +463,12 @@ impl Walk<'_> {
                     content: Content::Dir,
                     metadata,
                     metadata_incomplete,
+                    holds_excluded,
+                    only_excluded,
                 });
             }
             Err(e) if is_permission(&e) => {
+                self.solid += 1;
                 self.skip(path, SkipKind::PermissionDenied, Some(e.to_string()));
                 self.unlisted.push(path.clone());
                 // A directory no one here can read must not push that state to devices that can:
@@ -444,13 +481,19 @@ impl Walk<'_> {
                     content: Content::Dir,
                     metadata,
                     metadata_incomplete: true,
+                    holds_excluded: false,
+                    only_excluded: false,
                 });
             }
             Err(e) if is_not_found(&e) => {
+                self.solid += 1;
                 self.unobservable(path, SkipKind::VanishedDuringScan, None)
             }
             // Replaced by a symlink or a file since the stat: never walked through.
-            Err(e) => self.unobservable(path, SkipKind::VanishedDuringScan, Some(e.to_string())),
+            Err(e) => {
+                self.solid += 1;
+                self.unobservable(path, SkipKind::VanishedDuringScan, Some(e.to_string()))
+            }
         }
     }
 
@@ -480,6 +523,8 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         new_manifests: BTreeMap::new(),
         stale_temps: Vec::new(),
         dirs: Vec::new(),
+        excluded: Vec::new(),
+        solid: 0,
     };
     let st = root.stat_self()?;
     let mut path = Vec::new();
@@ -498,6 +543,8 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
             content: Content::Dir,
             metadata,
             metadata_incomplete: !problems.is_empty(),
+            holds_excluded: false,
+            only_excluded: false,
         },
         nodes: walk.nodes,
         skips: walk.skips,
@@ -508,5 +555,6 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         unstable,
         new_manifests: walk.new_manifests.into_iter().collect(),
         stale_temps: walk.stale_temps,
+        excluded: walk.excluded,
     })
 }

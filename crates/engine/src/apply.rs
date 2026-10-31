@@ -96,6 +96,8 @@ pub struct CurNode {
     pub apply_from: Metadata,
     /// `None` when it was not observed this scan: it cannot safely be touched.
     pub fp: Option<Fingerprint>,
+    /// A directory with something this device excludes under it, which never goes with it.
+    pub holds_excluded: bool,
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +133,8 @@ pub struct Applier<'a> {
     relaxed: BTreeMap<ObjectId, u32>,
     /// Objects whose metadata and content were written by this run.
     placed: BTreeSet<ObjectId>,
+    /// Objects that only got or lost an entry in this run.
+    moved: BTreeSet<ObjectId>,
     euid: u32,
     outcome: ApplyOutcome,
 }
@@ -172,6 +176,7 @@ impl<'a> Applier<'a> {
             touched_dirs: BTreeSet::new(),
             relaxed: BTreeMap::new(),
             placed: BTreeSet::new(),
+            moved: BTreeSet::new(),
             euid: rustix::process::geteuid().as_raw(),
             outcome: ApplyOutcome::default(),
         }
@@ -561,6 +566,7 @@ impl<'a> Applier<'a> {
                 content: t.body.content.clone(),
                 apply_from: t.body.metadata.clone(),
                 fp: Some(written.unwrap_or_else(|| fingerprint(&st))),
+                holds_excluded: false,
             },
         );
         self.refresh_fp(id, &dir, &name);
@@ -587,6 +593,7 @@ impl<'a> Applier<'a> {
         if let Some(n) = self.cur.get_mut(&id) {
             n.links.insert(link.clone());
         }
+        self.moved.insert(id);
         Ok(())
     }
 
@@ -662,6 +669,7 @@ impl<'a> Applier<'a> {
         }
         self.touched_dirs.insert(from.parent);
         self.touched_dirs.insert(to.parent);
+        self.moved.insert(id);
         self.refresh_fp(id, &to_dir, &to_name);
         if let Some(n) = self.cur.get_mut(&id) {
             n.links.remove(from);
@@ -705,6 +713,10 @@ impl<'a> Applier<'a> {
             self.root.state.put_intent(&relink_key, &intent)?;
             hit("apply.relink.intent");
         }
+        let replaced = self.cur[&id]
+            .fp
+            .as_ref()
+            .map(|fp| (fp.dev, fp.ino, fp.size, fp.mtime));
         hit("apply.replace.before_check");
         // The last look before the rename: an edit made since the scan is not overwritten.
         if let Err(e) = self.check_fp(id, &dir, &name) {
@@ -732,14 +744,25 @@ impl<'a> Applier<'a> {
         }
         hit("apply.replace.renamed");
         self.touched_dirs.insert(first.parent);
-        // The other hard links follow, each atomically.
+        // The other hard links follow, each atomically. Swapped, as above: a name that no longer holds
+        // what was scanned has someone's edit in it, and stays, and the others still go together.
+        let mut edited_name = false;
         for other in links.iter().skip(1) {
             let (odir, oname) = self.locate(other)?;
             self.writable(other.parent, &odir)?;
             let otmp = self.root.temp_name();
             dir.hard_link(&name, &odir, &otmp)?;
             hit("apply.replace.relink");
-            odir.rename_over(&otmp, &odir, &oname)?;
+            if odir.exchange(&otmp, &oname)? {
+                let was = odir.stat(&otmp)?;
+                if Some((was.dev, was.ino, was.size, was.mtime)) != replaced {
+                    odir.exchange(&otmp, &oname)?;
+                    edited_name = true;
+                }
+                odir.unlink(&otmp)?;
+            } else {
+                odir.rename_over(&otmp, &odir, &oname)?;
+            }
             self.touched_dirs.insert(other.parent);
         }
         if links.len() > 1 {
@@ -751,6 +774,11 @@ impl<'a> Applier<'a> {
         node.fp = Some(written);
         self.refresh_fp(id, &dir, &name);
         self.placed.insert(id);
+        if edited_name {
+            return Err(StepError::Changed(
+                "another name of this file changed during this sync".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -807,6 +835,7 @@ impl<'a> Applier<'a> {
             copy: copy.copy,
             dev: fp.dev,
             ino: fp.ino,
+            is: Some((original.kind, fp.btime)),
             conflict_of: plan.target[&copy.copy]
                 .conflict_of
                 .clone()
@@ -847,6 +876,7 @@ impl<'a> Applier<'a> {
                 content: original.content,
                 apply_from: original.apply_from,
                 fp: Some(fingerprint(&st)),
+                holds_excluded: false,
             },
         );
         self.placed.insert(copy.copy);
@@ -1056,6 +1086,13 @@ impl<'a> Applier<'a> {
             } else {
                 None
             },
+            held: Some(
+                old.and_then(|o| o.held.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(cur.links.iter().cloned())
+                    .collect(),
+            ),
         };
         self.root.state.store_rows(&[(id, &row)], &[])?;
         self.rows.insert(id, row);
@@ -1095,6 +1132,72 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
+    /// An entry that arrived from the server is shared with it, not a move made here: a device killed
+    /// before its next finalize must not push it back over what happens to the object meanwhile.
+    fn store_moved(&mut self, plan: &Plan) -> Result<()> {
+        let mut changed = Vec::new();
+        for id in &self.moved {
+            if self.placed.contains(id) {
+                continue;
+            }
+            let (Some(t), Some(r), Some(c)) = (
+                plan.target.get(id),
+                self.remote.get_live(*id),
+                self.cur.get(id),
+            ) else {
+                continue;
+            };
+            // All of it, on disk too: a content step that failed leaves a difference that is real.
+            if t.body != r.body
+                || t.links != r.links
+                || c.links != t.links
+                || c.content != t.body.content
+                || c.apply_from != t.body.metadata
+            {
+                continue;
+            }
+            let Some(row) = self.rows.get_mut(id) else {
+                continue;
+            };
+            if let Some(held) = row.held.as_mut() {
+                held.extend(t.links.iter().cloned());
+            }
+            row.synced = Some(Synced {
+                body: t.body.clone(),
+                links: t.links.clone(),
+                applied: row.scan.clone(),
+                commit: None,
+            });
+            changed.push(*id);
+        }
+        let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &self.rows[id])).collect();
+        self.root.state.store_rows(&list, &[])
+    }
+
+    /// Before any of it goes: from here on this device does not claim what it is about to remove, so
+    /// that if the server later has it after all, the absence does not read as a delete here. A scan
+    /// takes back whatever turns out still to be here.
+    fn give_up_what_goes(&mut self, steps: &[TopoOp]) -> Result<()> {
+        let mut changed = BTreeSet::new();
+        for step in steps {
+            if let TopoOp::Unlink { object, link } = step {
+                let Some(held) = self.rows.get_mut(object).and_then(|r| r.held.as_mut()) else {
+                    continue;
+                };
+                if held.remove(link) {
+                    changed.insert(*object);
+                }
+            }
+        }
+        if !changed.is_empty() {
+            let list: Vec<(ObjectId, &Row)> =
+                changed.iter().map(|id| (*id, &self.rows[id])).collect();
+            self.root.state.store_rows(&list, &[])?;
+            hit("apply.given_up");
+        }
+        Ok(())
+    }
+
     /// Reach the plan's target as far as possible.
     pub fn run(mut self, plan: &Plan) -> Result<(ApplyOutcome, BTreeMap<ObjectId, CurNode>)> {
         // Download first: a full disk or a lost server is found before anything moves.
@@ -1124,7 +1227,22 @@ impl<'a> Applier<'a> {
             .map(|(id, c)| (*id, (c.kind, c.links.clone())))
             .collect();
         let steps = schedule(&from, &to).context("ordering local changes")?;
+        self.give_up_what_goes(&steps)?;
         for step in &steps {
+            // What it holds was never synced and has no other copy, so it stays, and so does the
+            // folder. That is no change to confirm: nothing was written.
+            if let TopoOp::Unlink { object, link } = step {
+                if self.cur.get(object).is_some_and(|n| n.holds_excluded) {
+                    if let Some(n) = self.cur.get_mut(object) {
+                        n.links.remove(link);
+                    }
+                    self.cur.remove(object);
+                    // No longer anything the server knows: if it makes a folder here, they merge.
+                    self.rows.remove(object);
+                    self.root.state.store_rows(&[], &[*object])?;
+                    continue;
+                }
+            }
             let (object, display) = match step {
                 TopoOp::Create { object, link }
                 | TopoOp::Link { object, link }
@@ -1147,6 +1265,7 @@ impl<'a> Applier<'a> {
         // disk does not have, and the old file would read as a local revert.
         self.sync_touched_dirs()?;
         self.store_placed_files(plan)?;
+        self.store_moved(plan)?;
         self.finish_dirs(plan)?;
         self.outcome.touched =
             self.outcome.applied_steps > 0 || !self.placed.is_empty() || !plan.copies.is_empty();
@@ -1377,6 +1496,7 @@ pub fn cur_from_identified(
                     content: n.content.clone(),
                     apply_from: n.apply_from.clone(),
                     fp,
+                    holds_excluded: scanned.get(&original).is_some_and(|s| s.holds_excluded),
                 },
             )
         })

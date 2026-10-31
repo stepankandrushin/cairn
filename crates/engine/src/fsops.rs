@@ -174,6 +174,27 @@ impl Dir {
         Ok(out)
     }
 
+    /// The names of entries that are, or may be, directories. Most filesystems say without a stat.
+    pub fn subdirs(&self) -> io::Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut d = fs::Dir::read_from(&self.0)?;
+        d.rewind();
+        for entry in d {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name != b"."
+                && name != b".."
+                && matches!(
+                    entry.file_type(),
+                    fs::FileType::Directory | fs::FileType::Unknown
+                )
+            {
+                out.push(name.to_vec());
+            }
+        }
+        Ok(out)
+    }
+
     /// Open a regular file for reading. `O_NONBLOCK` so that a FIFO swapped in cannot hang a scan.
     pub fn open_read(&self, name: &[u8]) -> io::Result<OwnedFd> {
         Ok(fs::openat(

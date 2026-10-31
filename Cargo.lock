@@ -161,7 +161,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cairn-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cairn-engine",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -191,11 +191,11 @@ dependencies = [
 
 [[package]]
 name = "cairn-failpoint"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "cairn-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cairn-cli",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cairn-failpoint",

@@ -3,6 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# On a real disk: /tmp is often tmpfs, which never reuses an inode number, and ext4 reuses them at once.
+# A failure leaves this directory behind, since it holds the kept directories of failing seeds.
+TMPDIR=$(mktemp -d /var/tmp/cairn-ci.XXXXXX)
+export TMPDIR
+
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -19,3 +24,6 @@ for line in sys.stdin:
 else
     echo "no passwordless sudo: the root half of the round trip did not run" >&2
 fi
+
+chmod -R u+rwx "$TMPDIR"
+rm -rf "$TMPDIR"

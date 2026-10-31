@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1
+
+**Fixed:**
+
+- A device could stop finishing syncs for good on a filesystem that reuses inode numbers, such as ext4.
+  If a new file took the inode number of a file deleted in the same sync, every `cairn sync` ended with
+  "the tree kept changing for 12 rounds" and exit code 3, even on an idle tree. Nothing was lost, and
+  updating is enough: the next sync completes.
+- With the same reuse, a file that moved and then became unreadable could fail to be held back, and read
+  as deleted elsewhere. History kept it.
+- The release binaries no longer carry paths from the machine that built them.
+
 ## 0.1.0
 
 The first release: milestones 0 to 2 of [PLAN.md](PLAN.md), for Linux, with a one-shot CLI. **This is

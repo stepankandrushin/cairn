@@ -97,6 +97,16 @@ pub struct Server {
     env: Vec<(String, String)>,
 }
 
+/// Below the range the kernel hands out. A restarted server needs its port back, and one from that
+/// range can go to any other test's connection or server the moment it is free.
+fn next_port() -> u16 {
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 12_000;
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    (FIRST + (std::process::id().wrapping_mul(31).wrapping_add(n)) % COUNT) as u16
+}
+
 impl Server {
     pub fn start(data: PathBuf) -> Self {
         Self::start_with(data, Vec::new())
@@ -130,12 +140,17 @@ impl Server {
     fn spawn(&mut self) {
         let mut last = String::new();
         for _ in 0..50 {
+            let port = if self.port == 0 {
+                next_port()
+            } else {
+                self.port
+            };
             let mut cmd = Command::new(SERVER);
             cmd.arg("serve")
                 .arg("--data")
                 .arg(&self.data)
                 .arg("--listen")
-                .arg(format!("127.0.0.1:{}", self.port))
+                .arg(format!("127.0.0.1:{port}"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             for (k, v) in &self.env {

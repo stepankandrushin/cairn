@@ -27,6 +27,16 @@ pub struct Identified {
     pub scanned: BTreeMap<ObjectId, Scanned>,
 }
 
+/// Several rows can hold one inode number: a deleted file's row lives until the next finalize, and
+/// filesystems such as ext4 hand its number straight to the next new file.
+fn rows_by_inode(rows: &BTreeMap<ObjectId, Row>) -> HashMap<(u64, u64), Vec<ObjectId>> {
+    let mut by_inode: HashMap<(u64, u64), Vec<ObjectId>> = HashMap::new();
+    for (id, r) in rows {
+        by_inode.entry((r.fp.dev, r.fp.ino)).or_default().push(*id);
+    }
+    by_inode
+}
+
 pub fn identify(
     scan: &ScanResult,
     base: &Tree,
@@ -35,10 +45,7 @@ pub fn identify(
     intents: &[CopyIntent],
     landed: &BTreeSet<OpId>,
 ) -> Identified {
-    let by_inode: HashMap<(u64, u64), ObjectId> = rows
-        .iter()
-        .map(|(id, r)| ((r.fp.dev, r.fp.ino), *id))
-        .collect();
+    let by_inode = rows_by_inode(rows);
     let copies: HashMap<(u64, u64), &CopyIntent> =
         intents.iter().map(|i| ((i.dev, i.ino), i)).collect();
     let synced_names: HashMap<&Link, ObjectId> = rows
@@ -63,15 +70,22 @@ pub fn identify(
         if ids[i].is_some() {
             continue;
         }
-        let Some(id) = by_inode.get(&(node.fp.dev, node.fp.ino)) else {
+        let Some(candidates) = by_inode.get(&(node.fp.dev, node.fp.ino)) else {
             continue;
         };
-        let row = &rows[id];
-        // A birth time that differs proves the inode number was reused.
-        if row.content.kind() == node.content.kind()
-            && row.fp.btime == node.fp.btime
-            && claimed.insert(*id)
-        {
+        // A birth time that differs proves the inode number was reused. Without birth times, the row
+        // whose whole fingerprint still holds is the likeliest to be this file's.
+        let found = candidates
+            .iter()
+            .filter(|id| {
+                let row = &rows[*id];
+                row.content.kind() == node.content.kind()
+                    && row.fp.btime == node.fp.btime
+                    && !claimed.contains(*id)
+            })
+            .max_by_key(|id| rows[*id].fp == node.fp);
+        if let Some(id) = found {
+            claimed.insert(*id);
             ids[i] = Some(*id);
         }
     }
@@ -333,13 +347,11 @@ fn carry_unobserved(
             carry(id, out);
         }
     }
-    // A file that moved and then became unreadable is known by its inode, not its name.
-    let by_inode: HashMap<(u64, u64), ObjectId> = rows
-        .iter()
-        .map(|(id, r)| ((r.fp.dev, r.fp.ino), *id))
-        .collect();
+    // A file that moved and then became unreadable is known by its inode, not its name. Nothing says
+    // which row is its own, so all of them wait: a stale row's delete only comes later.
+    let by_inode = rows_by_inode(rows);
     for inode in &scan.unobserved_inodes {
-        if let Some(id) = by_inode.get(inode) {
+        for id in by_inode.get(inode).into_iter().flatten() {
             carry(*id, out);
         }
     }
@@ -361,6 +373,156 @@ fn carry_unobserved(
         let live: Vec<ObjectId> = base.live().map(|(id, _)| id).chain(pushed).collect();
         for id in live {
             carry(id, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Fingerprint, Synced};
+    use cairn_protocol::{Hash, Metadata, RevisionBody, Timestamp};
+
+    const STALE_BTIME: Timestamp = Timestamp { sec: 100, nsec: 0 };
+    const LIVE_BTIME: Timestamp = Timestamp { sec: 200, nsec: 0 };
+
+    fn fp(ino: u64, ctime_sec: i64, btime: Option<Timestamp>) -> Fingerprint {
+        let stamp = Timestamp {
+            sec: ctime_sec,
+            nsec: 0,
+        };
+        Fingerprint {
+            dev: 1,
+            ino,
+            size: 5,
+            mtime: stamp,
+            ctime: stamp,
+            btime,
+        }
+    }
+
+    fn file() -> Content {
+        Content::File {
+            manifest: Hash::of(b"body"),
+            size: 5,
+        }
+    }
+
+    fn row(fp: Fingerprint) -> Row {
+        Row {
+            fp,
+            racy: false,
+            content: file(),
+            scan: Metadata::default(),
+            applied: None,
+            synced: None,
+            incomplete: false,
+        }
+    }
+
+    fn scanned(paths: Vec<Vec<Name>>, fp: Fingerprint, content: Content) -> Scanned {
+        Scanned {
+            paths,
+            fp,
+            racy: false,
+            content,
+            metadata: Metadata::default(),
+            metadata_incomplete: false,
+        }
+    }
+
+    fn scan_of(nodes: Vec<Scanned>) -> ScanResult {
+        ScanResult {
+            root: scanned(Vec::new(), fp(1, 1, None), Content::Dir),
+            nodes,
+            skips: Vec::new(),
+            unobserved: Vec::new(),
+            unobserved_inodes: Vec::new(),
+            unidentified: false,
+            unlisted: Vec::new(),
+            unstable: false,
+            new_manifests: Vec::new(),
+            stale_temps: Vec::new(),
+        }
+    }
+
+    fn run(scan: &ScanResult, rows: &BTreeMap<ObjectId, Row>) -> Vec<ObjectId> {
+        identify(
+            scan,
+            &Tree::default(),
+            &Tree::default(),
+            rows,
+            &[],
+            &BTreeSet::new(),
+        )
+        .local
+        .keys()
+        .copied()
+        .filter(|id| *id != ObjectId::ROOT)
+        .collect()
+    }
+
+    /// Both orders, since a map keyed by the inode alone kept whichever row came last.
+    fn orderings() -> [(ObjectId, ObjectId); 2] {
+        let (a, b) = (ObjectId::random(), ObjectId::random());
+        [(a.min(b), a.max(b)), (a.max(b), a.min(b))]
+    }
+
+    fn found_under_its_own_row(stale: Fingerprint, live: Fingerprint) {
+        let path = vec![vec![Name::new(b"f".to_vec()).unwrap()]];
+        for (stale_id, live_id) in orderings() {
+            let rows =
+                BTreeMap::from([(stale_id, row(stale.clone())), (live_id, row(live.clone()))]);
+            let scan = scan_of(vec![scanned(path.clone(), live.clone(), file())]);
+            assert_eq!(run(&scan, &rows), vec![live_id]);
+        }
+    }
+
+    /// A file that read as new was adopted back on every round with its record wiped, so that a sync
+    /// of an idle tree never finished.
+    #[test]
+    fn a_deleted_files_row_does_not_hide_the_file_that_reused_its_inode() {
+        found_under_its_own_row(fp(7, 10, Some(STALE_BTIME)), fp(7, 20, Some(LIVE_BTIME)));
+    }
+
+    #[test]
+    fn without_birth_times_the_row_whose_fingerprint_holds_wins() {
+        found_under_its_own_row(fp(7, 10, None), fp(7, 20, None));
+    }
+
+    #[test]
+    fn a_reused_inode_alone_is_no_identity() {
+        let id = ObjectId::random();
+        let rows = BTreeMap::from([(id, row(fp(7, 10, Some(STALE_BTIME))))]);
+        let path = vec![vec![Name::new(b"new".to_vec()).unwrap()]];
+        let scan = scan_of(vec![scanned(path, fp(7, 20, Some(LIVE_BTIME)), file())]);
+        assert!(!run(&scan, &rows).contains(&id));
+    }
+
+    /// Missing from the carried set, the unreadable file would read as deleted.
+    #[test]
+    fn an_unreadable_inode_carries_every_row_that_holds_its_number() {
+        for (one, other) in orderings() {
+            let known = |ctime| Row {
+                synced: Some(Synced {
+                    body: RevisionBody {
+                        content: file(),
+                        metadata: Metadata::default(),
+                    },
+                    links: BTreeSet::new(),
+                    applied: Metadata::default(),
+                    commit: None,
+                }),
+                ..row(fp(7, ctime, None))
+            };
+            let rows = BTreeMap::from([(one, known(10)), (other, known(20))]);
+            let mut scan = scan_of(Vec::new());
+            scan.unobserved_inodes = vec![(1, 7)];
+            let mut carried = run(&scan, &rows);
+            carried.sort();
+            let mut both = vec![one, other];
+            both.sort();
+            assert_eq!(carried, both);
         }
     }
 }

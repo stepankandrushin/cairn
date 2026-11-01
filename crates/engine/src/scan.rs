@@ -4,6 +4,7 @@
 use crate::chunker::manifest_of;
 use crate::fsops::{is_not_found, is_permission, Dir, Stat};
 use crate::metadata::{capture, Accounts};
+use crate::root::aside_origin;
 use crate::state::{Fingerprint, Row};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
@@ -59,6 +60,11 @@ pub struct ScanResult {
     pub new_manifests: Vec<(Hash, Vec<u8>)>,
     /// This device's leftover temporaries that a read-only directory kept from being removed.
     pub stale_temps: Vec<(Vec<Name>, Vec<u8>)>,
+    /// Temporaries that are a file this device has a record of, by inode and birth time, with an edit in
+    /// them: where, and what they were.
+    pub rescued_temps: Vec<(Vec<Name>, Vec<u8>, Fingerprint)>,
+    /// The objects those were, once kept under a name of their own.
+    pub rescued: Vec<cairn_protocol::ObjectId>,
     /// The topmost entries left alone because this device excludes them.
     pub excluded: Vec<Vec<Name>>,
 }
@@ -69,6 +75,8 @@ pub struct ScanOptions<'a> {
     /// What is known by inode, to avoid reading unchanged files.
     pub rows: &'a HashMap<(u64, u64), &'a Row>,
     pub remove_own_temps: bool,
+    /// What this device was about to place, and at which names, by a run that may have been killed.
+    pub arriving: &'a [(Content, Vec<Name>)],
     /// Whether an entry is excluded, given that its parent is not.
     pub excluded: &'a dyn Fn(&[Name], &Stat) -> bool,
 }
@@ -128,11 +136,47 @@ struct Walk<'a> {
     unlisted: Vec<Vec<Name>>,
     new_manifests: BTreeMap<Hash, Vec<u8>>,
     stale_temps: Vec<(Vec<Name>, Vec<u8>)>,
+    rescued_temps: Vec<(Vec<Name>, Vec<u8>, Fingerprint)>,
     /// Each directory with what it looked like when listed.
     dirs: Vec<(Vec<Name>, Timestamp, Timestamp)>,
     excluded: Vec<Vec<Name>>,
     /// Entries seen so far that are neither excluded nor directories holding only what is.
     solid: u64,
+}
+
+/// What was moved aside by a killed run, if it can be someone's only copy of something: not while another
+/// name holds it, and not if it is the file as this device has it on record, or the finished download
+/// that was about to replace it.
+pub fn aside_holds_edit(dir: &Dir, temp: &[u8], opts: &ScanOptions) -> Option<Fingerprint> {
+    let origin = aside_origin(temp.strip_prefix(opts.temp_prefix)?)?;
+    let st = dir.stat(temp).ok()?;
+    if st.nlink > 1 && st.file_type != FileType::Directory {
+        return None;
+    }
+    let content = match st.file_type {
+        FileType::RegularFile => dir
+            .open_read(temp)
+            .and_then(|fd| manifest_of(fd, st.size))
+            .ok()
+            .map(|m| Content::File {
+                manifest: m.hash(),
+                size: st.size,
+            }),
+        FileType::Symlink => dir.read_link(temp).ok().map(|target| Content::Symlink {
+            target: Bytes(target),
+        }),
+        _ => None,
+    };
+    let same_inode = opts
+        .rows
+        .get(&(st.dev, st.ino))
+        .filter(|row| row.fp.btime == st.btime);
+    let on_record = same_inode.is_some_and(|row| Some(&row.content) == content.as_ref());
+    let on_its_way = opts.arriving.iter().any(|(on_its_way, names)| {
+        Some(on_its_way) == content.as_ref()
+            && names.iter().any(|n| n.as_bytes().starts_with(origin))
+    });
+    (!on_record && !on_its_way).then(|| fingerprint(&st))
 }
 
 impl Walk<'_> {
@@ -178,15 +222,21 @@ impl Walk<'_> {
                 continue;
             }
             if raw.starts_with(self.opts.temp_prefix) {
-                // Our own leftover from a killed run: it never held anything at a synced path.
-                if self.opts.remove_own_temps
-                    && dir
+                // Our own leftover from a killed run: nothing that has to stay, unless it is the old
+                // file of a swap with an edit in it.
+                if self.opts.remove_own_temps {
+                    if let Some(fp) = aside_holds_edit(dir, &raw, self.opts) {
+                        self.rescued_temps.push((path.clone(), raw, fp));
+                        continue;
+                    }
+                    if dir
                         .stat(&raw)
                         .is_ok_and(|s| s.file_type != FileType::Directory)
-                {
-                    match dir.unlink(&raw) {
-                        Ok(()) => removed_temp = true,
-                        Err(_) => self.stale_temps.push((path.clone(), raw)),
+                    {
+                        match dir.unlink(&raw) {
+                            Ok(()) => removed_temp = true,
+                            Err(_) => self.stale_temps.push((path.clone(), raw)),
+                        }
                     }
                 }
                 continue;
@@ -522,6 +572,7 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         unlisted: Vec::new(),
         new_manifests: BTreeMap::new(),
         stale_temps: Vec::new(),
+        rescued_temps: Vec::new(),
         dirs: Vec::new(),
         excluded: Vec::new(),
         solid: 0,
@@ -555,6 +606,8 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         unstable,
         new_manifests: walk.new_manifests.into_iter().collect(),
         stale_temps: walk.stale_temps,
+        rescued_temps: walk.rescued_temps,
+        rescued: Vec::new(),
         excluded: walk.excluded,
     })
 }

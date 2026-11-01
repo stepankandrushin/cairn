@@ -4,9 +4,10 @@
 use crate::merge::{LNode, Shared};
 use crate::metadata::rebase_local_changes;
 use crate::scan::{ScanResult, Scanned};
-use crate::state::Row;
+use crate::state::{Row, Synced};
 use cairn_protocol::{
-    ConflictOf, Content, Link, Name, ObjectId, ObjectKind, OpId, Timestamp, Tree,
+    ConflictOf, Content, Link, Metadata, Name, ObjectId, ObjectKind, OpId, RevisionBody, Timestamp,
+    Tree,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,6 +34,22 @@ impl CopyIntent {
     }
 }
 
+/// What the server held for an object when this device set about bringing it here, noted before the
+/// first step. It claims nothing: the next scan compares it with the disk to see how far that got, so
+/// that what arrived is not read as this device's own change, and a kill or a full disk costs nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Arriving {
+    pub object: ObjectId,
+    pub body: RevisionBody,
+    pub links: BTreeSet<Link>,
+    /// Where the plan puts it here, which a rename made here can make different from the server's.
+    #[serde(default)]
+    pub names: BTreeSet<Link>,
+    /// A folder something happens in, whose timestamp moves until the last pass puts it back.
+    #[serde(default)]
+    pub folder_touched: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Identified {
     pub local: BTreeMap<ObjectId, LNode>,
@@ -57,6 +74,7 @@ pub fn identify(
     remote: &Tree,
     rows: &BTreeMap<ObjectId, Row>,
     intents: &[CopyIntent],
+    arriving: &BTreeMap<ObjectId, Arriving>,
     landed: &BTreeSet<OpId>,
 ) -> Identified {
     let by_inode = rows_by_inode(rows);
@@ -66,6 +84,10 @@ pub fn identify(
         .iter()
         .filter_map(|(id, r)| r.synced.as_ref().map(|s| (id, s)))
         .flat_map(|(id, s)| s.links.iter().map(move |l| (l, *id)))
+        .collect();
+    let arriving_names: HashMap<&Link, &Arriving> = arriving
+        .values()
+        .flat_map(|a| a.links.iter().chain(&a.names).map(move |l| (l, a)))
         .collect();
 
     let mut claimed: BTreeSet<ObjectId> = BTreeSet::new();
@@ -125,6 +147,14 @@ pub fn identify(
                     parent: *dir_ids.get(parent_path)?,
                     name: name.clone(),
                 };
+                // What was on its way to this name, as far as a look can tell: `settle_arriving` decides,
+                // and what a person put there instead is new, and merges as new.
+                let on_its_way = arriving_names
+                    .get(&link)
+                    .filter(|a| {
+                        a.body.content.kind() == node.content.kind() && !claimed.contains(&a.object)
+                    })
+                    .map(|a| a.object);
                 // Only what this device has a record of: anything else at that name is new here, and
                 // merges as new.
                 let by_base = base.entry_at(&link).filter(|c| {
@@ -133,7 +163,7 @@ pub fn identify(
                         .is_some_and(|n| n.kind() == node.content.kind())
                         && rows.contains_key(c)
                 });
-                let candidate = by_base.or_else(|| {
+                let candidate = on_its_way.or(by_base).or_else(|| {
                     synced_names
                         .get(&link)
                         .copied()
@@ -216,6 +246,181 @@ pub fn identify(
     out
 }
 
+/// What this scan shows of what was on its way: for each object it can speak for, what reached the disk
+/// goes into its row as shared with the server, and the rest stays to be applied. Returns the rows
+/// changed and the objects answered; one that could not be observed is asked again next time.
+pub fn settle_arriving(
+    identified: &Identified,
+    arriving: &BTreeMap<ObjectId, Arriving>,
+    holds: &BTreeMap<ObjectId, Metadata>,
+    base: &Tree,
+    rows: &mut BTreeMap<ObjectId, Row>,
+) -> (Vec<ObjectId>, Vec<ObjectId>) {
+    let (mut changed, mut answered) = (Vec::new(), Vec::new());
+    for (id, a) in arriving {
+        let Some(l) = identified.local.get(id) else {
+            answered.push(*id);
+            continue;
+        };
+        let Some(node) = identified.scanned.get(id).filter(|_| !l.carried) else {
+            continue;
+        };
+        answered.push(*id);
+        let row = settled_row(
+            *id,
+            a,
+            holds.get(id),
+            l.links.clone(),
+            node,
+            identified,
+            base,
+            rows,
+        );
+        if let Some(row) = row {
+            rows.insert(*id, row);
+            changed.push(*id);
+        }
+    }
+    (changed, answered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settled_row(
+    id: ObjectId,
+    a: &Arriving,
+    holds: Option<&Metadata>,
+    now: BTreeSet<Link>,
+    node: &Scanned,
+    identified: &Identified,
+    base: &Tree,
+    rows: &BTreeMap<ObjectId, Row>,
+) -> Option<Row> {
+    let old = rows.get(&id);
+    let known = base.get_live(id);
+    let shared = identified.shared.get(&id);
+    let shared_body = shared.and_then(|s| s.body.clone());
+    let baseline = match &shared_body {
+        Some(_) => old
+            .and_then(|o| o.synced.as_ref())
+            .map(|s| s.applied.clone()),
+        None => old.and_then(|o| o.applied.clone()),
+    };
+    let from_body = shared_body.or_else(|| known.map(|n| n.body.clone()));
+    let is_held = |l: &Link| {
+        now.contains(l)
+            || old
+                .and_then(|o| o.held.as_ref())
+                .is_none_or(|held| held.contains(l))
+    };
+    // An entry this device gave up before moving or removing it is no ancestor of anything.
+    let from_links: BTreeSet<Link> = shared
+        .and_then(|s| s.links.clone())
+        .or_else(|| known.map(|n| n.links.clone()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_held)
+        .collect();
+
+    let whole = node.content == a.body.content;
+    // New content comes with its metadata, whole, by one rename: this is what the filesystem then held,
+    // and anything else on disk has been changed here.
+    let held = || {
+        let mut held = holds.unwrap_or(&node.metadata).clone();
+        held.btime = node.metadata.btime;
+        held
+    };
+    let (body, applied, unapplied) = match &from_body {
+        Some(from) if from.content == a.body.content => match &baseline {
+            Some(baseline) if !node.metadata_incomplete => {
+                let (metadata, applied) = crate::metadata::arrived_fields(
+                    &from.metadata,
+                    baseline,
+                    &a.body.metadata,
+                    &node.metadata,
+                );
+                (
+                    RevisionBody {
+                        content: from.content.clone(),
+                        metadata,
+                    },
+                    applied,
+                    false,
+                )
+            }
+            Some(baseline) => (from.clone(), baseline.clone(), false),
+            // Known, with no record of having matched it: the server's record stands, against the disk.
+            None => (from.clone(), node.metadata.clone(), true),
+        },
+        Some(_) if whole => (a.body.clone(), held(), false),
+        Some(from) => (
+            from.clone(),
+            baseline.unwrap_or_else(|| node.metadata.clone()),
+            false,
+        ),
+        // A folder is private until the last pass; a file was complete before its rename.
+        None if whole && node.content == Content::Dir => {
+            (a.body.clone(), node.metadata.clone(), true)
+        }
+        None if whole => (a.body.clone(), held(), false),
+        // Something else stands at that name, and this device never had this object.
+        None => return None,
+    };
+
+    // An entry that came shows the rest of the step was reached too. Otherwise nothing arrived: an
+    // entry gone with none in its place is a person's.
+    let came = a.links.difference(&from_links).any(|l| now.contains(l));
+    let links: BTreeSet<Link> = if came {
+        from_links
+            .intersection(&a.links)
+            .cloned()
+            .chain(
+                from_links
+                    .symmetric_difference(&a.links)
+                    .filter(|l| now.contains(*l))
+                    .cloned(),
+            )
+            .collect()
+    } else {
+        from_links.clone()
+    };
+
+    // Moved by the run, from what the last scan saw, which is what it goes back to.
+    let moved_from = old
+        .map(|o| o.scan.mtime)
+        .filter(|t| a.folder_touched && *t != node.metadata.mtime)
+        .filter(|_| applied.mtime != node.metadata.mtime);
+    let nothing = from_body.as_ref() == Some(&body) && !came && !unapplied && moved_from.is_none();
+    if nothing {
+        return None;
+    }
+    let folder_time = old
+        .and_then(|o| o.synced.as_ref())
+        .and_then(|s| s.folder_time)
+        .or(moved_from);
+    let held_links = match old.and_then(|o| o.held.clone()) {
+        Some(held) => Some(held.into_iter().chain(now).collect()),
+        None if old.is_some() => None,
+        None => Some(now),
+    };
+    Some(Row {
+        fp: node.fp.clone(),
+        racy: node.racy,
+        content: node.content.clone(),
+        scan: node.metadata.clone(),
+        applied: old.and_then(|o| o.applied.clone()),
+        synced: Some(Synced {
+            body,
+            links,
+            applied,
+            commit: None,
+            unapplied,
+            folder_time,
+        }),
+        incomplete: node.metadata_incomplete,
+        held: held_links,
+    })
+}
+
 fn holds_what_it_synced(row: &Row) -> bool {
     match (&row.held, &row.synced) {
         (Some(held), Some(synced)) => !held.is_disjoint(&synced.links),
@@ -227,15 +432,16 @@ fn holds_what_it_synced(row: &Row) -> bool {
 /// equals it.
 fn shared_state(row: &Row, id: ObjectId, remote: &Tree, landed: &BTreeSet<OpId>) -> Option<Shared> {
     let synced = row.synced.as_ref()?;
-    let r = remote.nodes.get(&id)?;
     // Read from the journal, or carried by a commit seen in it: it was on the server, whatever has
-    // happened to it since, so it is the ancestor. A commit not seen there may have been refused.
+    // happened to it since, moved out of this device's view included, so it is the ancestor. A commit
+    // not seen there may have been refused.
     if synced.commit.is_none_or(|op| landed.contains(&op)) {
         return Some(Shared {
             body: Some(synced.body.clone()),
             links: Some(synced.links.clone()),
         });
     }
+    let r = remote.nodes.get(&id)?;
     if !remote.is_live(id) {
         return None;
     }
@@ -263,6 +469,17 @@ fn stored_terms(
         row.and_then(|r| r.synced.as_ref()),
     ) {
         let ancestor = s.body.as_ref().expect("filtered on body");
+        if synced.unapplied && !node.metadata_incomplete {
+            return (ancestor.metadata.clone(), node.metadata.clone());
+        }
+        if let Some(time) = synced.folder_time.filter(|_| !node.metadata_incomplete) {
+            let mut seen = node.metadata.clone();
+            seen.mtime = time;
+            let stored = rebase_local_changes(&ancestor.metadata, &synced.applied, &seen);
+            let mut on_disk = stored.clone();
+            on_disk.mtime = node.metadata.mtime;
+            return (stored, on_disk);
+        }
         return if node.metadata_incomplete {
             same(ancestor.metadata.clone())
         } else {
@@ -418,7 +635,7 @@ fn carry_unobserved(
 mod tests {
     use super::*;
     use crate::state::{Fingerprint, Synced};
-    use cairn_protocol::{ConflictOf, Hash, Metadata, RevisionBody, RevisionId};
+    use cairn_protocol::{ConflictOf, Hash, RevisionBody, RevisionId};
 
     const STALE_BTIME: Timestamp = Timestamp { sec: 100, nsec: 0 };
     const LIVE_BTIME: Timestamp = Timestamp { sec: 200, nsec: 0 };
@@ -483,6 +700,8 @@ mod tests {
             unstable: false,
             new_manifests: Vec::new(),
             stale_temps: Vec::new(),
+            rescued_temps: Vec::new(),
+            rescued: Vec::new(),
             excluded: Vec::new(),
         }
     }
@@ -494,6 +713,7 @@ mod tests {
             &Tree::default(),
             rows,
             &[],
+            &BTreeMap::new(),
             &BTreeSet::new(),
         )
         .local
@@ -558,6 +778,7 @@ mod tests {
             &Tree::default(),
             &BTreeMap::new(),
             &[intent],
+            &BTreeMap::new(),
             &BTreeSet::new(),
         )
         .local
@@ -594,6 +815,8 @@ mod tests {
                     links: BTreeSet::new(),
                     applied: Metadata::default(),
                     commit: None,
+                    unapplied: false,
+                    folder_time: None,
                 }),
                 ..row(fp(7, ctime, None))
             };

@@ -72,10 +72,10 @@ the root.
 |---|---|
 | `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move |
 | `base` | The server's tree as of the cursor: the common ancestor for merging |
-| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal |
+| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
-| `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file |
+| `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here and whether it is a folder only something inside changes, which the next scan compares with the disk to tell what arrived from what this device did |
 
 `rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field
@@ -92,4 +92,9 @@ A daemon holds no file in the root while idle, so a disk can be unmounted under 
 the abstract socket `cairn-daemon-<root id>`.
 
 Temporary files are `.cairn-tmp-<device id>-<random>` in the destination's own directory. A scan removes
-its own device's, which can only be left by a killed run. They never hold anything at a synced path.
+its own device's, which can only be left by a killed run, and holds nothing at a synced path. What is moved out of
+the way of a replacement or a removal is `.cairn-tmp-<device id>-aside-<random>-<the name, as far as it fits>`,
+which a half-written file never is. If a killed run leaves one that holds neither what was on record for its inode
+nor what was on its way, and no other name has it, someone edited or saved in the moment before: it stays, under a
+conflict name of that name, reported. `.cairn/arriving-probe` is a scratch entry, there only for a moment after a
+killed run, on which the filesystem is asked what it makes of a record.

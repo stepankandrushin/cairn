@@ -1,14 +1,16 @@
 //! One sync of a root: scan, merge against the server, apply locally, push, until both sides agree.
 //!
 //! The merge is state-based: each round works from what is on disk and what the journal says. A
-//! crash anywhere only means the next run sees some of the work already done on one side or both,
-//! which merges as agreement, so recovery has no special path beyond undoing half-made moves.
+//! crash anywhere only means the next run sees some of the work already done on one side or both.
+//! What was on its way here is noted first, and the next scan says how far it got, so recovery has no
+//! special path beyond undoing half-made moves.
 
 use crate::apply::{
-    self, cur_from_identified, read_for_upload, recover, Applier, CurNode, INTENT_COPY,
+    self, cur_from_identified, read_for_upload, recover, Applier, CurNode, INTENT_ARRIVING,
+    INTENT_COPY,
 };
 use crate::client::Client;
-use crate::identify::{identify, CopyIntent, Identified};
+use crate::identify::{identify, settle_arriving, Arriving, CopyIntent, Identified};
 use crate::merge::{merge, MergeInput, Plan, ReportKind, TNode};
 use crate::metadata::Accounts;
 use crate::root::{Paused, Root};
@@ -20,7 +22,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::wire::{self, CommitRequest, CommitResponse, MAX_CHUNK_BATCH_BYTES};
 use cairn_protocol::{
-    ChunkRef, Content, Hash, Manifest, Name, ObjectId, Op, OpId, RevisionId, Skip, Tree,
+    ChunkRef, Content, Hash, Link, Manifest, Name, ObjectId, Op, OpId, RevisionId, Skip, Tree,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -179,28 +181,71 @@ fn check_history(client: &Client, cursor: u64, cursor_op: Option<OpId>) -> Resul
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_stable(
-    root: &Root,
+    root: &mut Root,
     rows: &BTreeMap<ObjectId, Row>,
     accounts: &Accounts,
     remove_temps: bool,
     excluded: &dyn Fn(&[cairn_protocol::Name], &crate::fsops::Stat) -> bool,
+    date: &str,
+    events: &mut Vec<String>,
 ) -> Result<ScanResult> {
     let by_inode: HashMap<(u64, u64), &Row> =
         rows.values().map(|r| ((r.fp.dev, r.fp.ino), r)).collect();
     let prefix = root.temp_prefix();
+    let on_its_way: Vec<(Content, Vec<Name>)> = root
+        .state
+        .intents::<Arriving>(INTENT_ARRIVING)?
+        .into_iter()
+        .map(|(_, a)| {
+            let names = a.links.iter().chain(&a.names).map(|l| l.name.clone());
+            (a.body.content, names.collect())
+        })
+        .collect();
     let opts = ScanOptions {
         temp_prefix: prefix.as_bytes(),
         accounts,
         rows: &by_inode,
         remove_own_temps: remove_temps,
+        arriving: &on_its_way,
         excluded,
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
-    if !result.stale_temps.is_empty() {
-        for (path, name) in &result.stale_temps {
-            apply::remove_stale_temp(root, path, name)
-                .context("removing a leftover temporary file")?;
+    let mut rescued = Vec::new();
+    if !result.stale_temps.is_empty() || !result.rescued_temps.is_empty() {
+        // Looked at again now that the scan has removed what it could: a name that was another's when
+        // the scan got there may be the last.
+        for (path, name) in std::mem::take(&mut result.stale_temps) {
+            let dir = root.dir.open_path(path.iter())?;
+            match crate::scan::aside_holds_edit(&dir, &name, &opts) {
+                Some(fp) => result.rescued_temps.push((path, name, fp)),
+                None => apply::remove_stale_temp(root, &path, &name)
+                    .context("removing a leftover temporary file")?,
+            }
+        }
+        for (path, name, fp) in &result.rescued_temps {
+            let found = rows
+                .iter()
+                .find(|(_, r)| (r.fp.dev, r.fp.ino, r.fp.btime) == (fp.dev, fp.ino, fp.btime));
+            let original = name
+                .strip_prefix(prefix.as_bytes())
+                .and_then(crate::root::aside_origin)
+                .and_then(|origin| Name::new(origin.to_vec()).ok())
+                .unwrap_or_else(|| Name::new(b"recovered".to_vec()).expect("a valid name"));
+            // That inode becomes a new file under its new name, no longer the object it was, and the
+            // record says so first: a kill between the two leaves the file to be found again.
+            if let Some((id, row)) = found {
+                let mut row = row.clone();
+                row.fp.dev = 0;
+                row.fp.ino = 0;
+                root.state.store_rows(&[(*id, &row)], &[])?;
+                rescued.push(*id);
+                hit("clean.rescue.noted");
+            }
+            let kept = apply::keep_rescued_temp(root, path, name, &original, date)
+                .context("keeping an edit from a leftover temporary file")?;
+            events.push(kept);
         }
         result = scan(&root.dir, &opts).context("scanning the root")?;
     }
@@ -210,7 +255,35 @@ fn scan_stable(
         }
         result = scan(&root.dir, &opts).context("scanning the root")?;
     }
+    result.rescued = rescued;
     Ok(result)
+}
+
+/// For what has arrived whole with something else than its record on disk: what this filesystem would
+/// have made of that record. Without it, on a dry run or a disk too full to ask, what is there stands.
+fn what_arrives_here(
+    root: &Root,
+    accounts: &Accounts,
+    arriving: &BTreeMap<ObjectId, Arriving>,
+    identified: &Identified,
+    dry_run: bool,
+) -> BTreeMap<ObjectId, cairn_protocol::Metadata> {
+    if dry_run {
+        return BTreeMap::new();
+    }
+    arriving
+        .values()
+        .filter_map(|a| {
+            let node = identified.scanned.get(&a.object)?;
+            let mut want = a.body.metadata.clone();
+            want.btime = node.metadata.btime;
+            if node.content != a.body.content || node.metadata == want {
+                return None;
+            }
+            let held = apply::what_arrives(root, accounts, &node.content, &a.body.metadata)?;
+            Some((a.object, held))
+        })
+        .collect()
 }
 
 /// An empty or largely vanished tree is not a mass delete until a person says so (invariant 5).
@@ -342,6 +415,10 @@ enum Upload {
 }
 
 /// Send what the server is missing. Every chunk is durable there before the commit that names it.
+/// The server syncs every chunk to disk before it answers, so small files take far longer than their
+/// bytes suggest: this keeps an answer within the client's timeout on a slow disk.
+const MAX_CHUNKS_A_REQUEST: usize = 2_000;
+
 fn upload(
     client: &Client,
     root: &Root,
@@ -403,6 +480,7 @@ fn upload(
 
     let (mut chunks, mut bytes) = (0u64, 0u64);
     let mut frames = Vec::new();
+    let mut in_frames = 0;
     let flush = |frames: &mut Vec<u8>| -> Result<()> {
         if !frames.is_empty() {
             check("sync.upload.send")?;
@@ -426,10 +504,14 @@ fn upload(
         } else {
             return Ok(Upload::FileChanged);
         };
-        if frames.len() + data.len() + 36 > MAX_CHUNK_BATCH_BYTES {
+        if frames.len() + data.len() + 36 > MAX_CHUNK_BATCH_BYTES
+            || in_frames >= MAX_CHUNKS_A_REQUEST
+        {
             flush(&mut frames)?;
+            in_frames = 0;
         }
         wire::write_frame(&mut frames, hash, &data);
+        in_frames += 1;
         chunks += 1;
         bytes += data.len() as u64;
     }
@@ -503,6 +585,7 @@ fn adopt_rows(
     root: &mut Root,
     rows: &mut BTreeMap<ObjectId, Row>,
     adopted: &BTreeMap<ObjectId, ObjectId>,
+    base: &Tree,
     remote: &Tree,
 ) -> Result<()> {
     if adopted.is_empty() {
@@ -514,6 +597,35 @@ fn adopt_rows(
         if let Some(mut row) = rows.remove(x) {
             if !remote.nodes.contains_key(y) {
                 row.synced = None;
+                // What is in it has not moved, whatever name its folder goes by now, or a kill before
+                // what is left has gone would read as a move here, and bring all of it back.
+                for (_, child) in base.children(*x) {
+                    let (Some(known), Some(row), false) = (
+                        base.nodes.get(&child),
+                        rows.get_mut(&child),
+                        adopted.contains_key(&child),
+                    ) else {
+                        continue;
+                    };
+                    let applied = row.applied.clone().unwrap_or_else(|| row.scan.clone());
+                    let synced = row.synced.get_or_insert_with(|| Synced {
+                        body: known.body.clone(),
+                        links: known.links.clone(),
+                        applied,
+                        commit: None,
+                        unapplied: false,
+                        folder_time: None,
+                    });
+                    synced.links = synced
+                        .links
+                        .iter()
+                        .map(|l| Link {
+                            parent: if l.parent == *x { *y } else { l.parent },
+                            name: l.name.clone(),
+                        })
+                        .collect();
+                    changed.push(child);
+                }
             }
             rows.insert(*y, row);
             changed.push(*y);
@@ -708,9 +820,21 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             .collect();
 
         let moved = RefCell::new(Vec::new());
-        let scanned = scan_stable(&root, &rows, &accounts, !opts.dry_run, &|path, st| {
-            selection.leaves_out(path, st, &view, &rows, &mut moved.borrow_mut())
-        })?;
+        let scanned = scan_stable(
+            &mut root,
+            &rows,
+            &accounts,
+            !opts.dry_run,
+            &|path, st| selection.leaves_out(path, st, &view, &rows, &mut moved.borrow_mut()),
+            &date,
+            &mut report.events,
+        )?;
+        for id in &scanned.rescued {
+            if let Some(row) = rows.get_mut(id) {
+                row.fp.dev = 0;
+                row.fp.ino = 0;
+            }
+        }
         if selection.follow_copies(&moved.into_inner()) && !opts.dry_run {
             selection.store(&root)?;
         }
@@ -731,14 +855,49 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             .into_iter()
             .map(|(_, i)| i)
             .collect();
-        let identified = identify(
+        let mut arriving: BTreeMap<ObjectId, Arriving> = root
+            .state
+            .intents::<Arriving>(INTENT_ARRIVING)?
+            .into_iter()
+            .map(|(_, a)| (a.object, a))
+            .collect();
+        let mut identified = identify(
             &scanned,
             &view.base,
             &view.remote,
             &rows,
             &intents,
+            &arriving,
             &seen.commits,
         );
+        // In a tree still moving, what was seen was seen, and only what was not is asked again.
+        if !arriving.is_empty() {
+            let holds = what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run);
+            let (changed, answered) =
+                settle_arriving(&identified, &arriving, &holds, &view.base, &mut rows);
+            if !opts.dry_run {
+                let list: Vec<(ObjectId, &Row)> =
+                    changed.iter().map(|id| (*id, &rows[id])).collect();
+                let marks: Vec<String> = answered
+                    .iter()
+                    .map(|id| format!("{INTENT_ARRIVING}{id}"))
+                    .collect();
+                root.state.store_rows_dropping(&list, &marks)?;
+            }
+            hit("sync.arrivals_settled");
+            for id in &answered {
+                arriving.remove(id);
+            }
+            identified = identify(
+                &scanned,
+                &view.base,
+                &view.remote,
+                &rows,
+                &intents,
+                &arriving,
+                &seen.commits,
+            );
+        }
         update_rows(&mut root, &mut rows, &identified, &view.base)?;
         // Found here means held, however that came about. Not found, and given up, is no delete.
         view.settle(&rows);
@@ -819,7 +978,13 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             }
         }
 
-        adopt_rows(&mut root, &mut rows, &plan.adopted, &view.remote)?;
+        adopt_rows(
+            &mut root,
+            &mut rows,
+            &plan.adopted,
+            &view.base,
+            &view.remote,
+        )?;
         let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
         let (outcome, cur) = Applier::new(
             &mut root,
@@ -1009,6 +1174,8 @@ fn mark_synced(
                 links: state.links.clone(),
                 applied: row.scan.clone(),
                 commit: Some(req.op_id),
+                unapplied: false,
+                folder_time: None,
             });
             out.push(id);
         }
@@ -1054,7 +1221,6 @@ pub use apply::CurNode as LocalNode;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_protocol::Link;
 
     fn stage_move(n: usize, into: bool) -> Op {
         let object = ObjectId::random();

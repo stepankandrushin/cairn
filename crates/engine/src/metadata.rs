@@ -203,6 +203,58 @@ pub fn capture(
     }
 }
 
+/// How far metadata on its way from `from` to `to` has come, going by what is on disk now: the stored
+/// state, field by field, and its pair of what the filesystem holds. A field still as it was is simply
+/// still to be applied, and one that is neither has been changed here since.
+pub fn arrived_fields(
+    from: &Metadata,
+    applied: &Metadata,
+    to: &Metadata,
+    now: &Metadata,
+) -> (Metadata, Metadata) {
+    let (mut stored, mut held) = (from.clone(), applied.clone());
+    if to.mode != from.mode && now.mode == to.mode {
+        stored.mode = to.mode;
+        held.mode = now.mode;
+    }
+    if to.owner != from.owner && now.owner == to.owner {
+        stored.owner.clone_from(&to.owner);
+        held.owner.clone_from(&now.owner);
+    }
+    if (to.mtime, to.time_precision_ns) != (from.mtime, from.time_precision_ns)
+        && now.mtime == to.mtime
+    {
+        stored.mtime = to.mtime;
+        stored.time_precision_ns = to.time_precision_ns;
+        held.mtime = now.mtime;
+        held.time_precision_ns = now.time_precision_ns;
+    }
+    if to.btime != from.btime && now.btime == to.btime {
+        stored.btime = to.btime;
+        held.btime = now.btime;
+    }
+    let keys: std::collections::BTreeSet<&RecordKey> =
+        from.records.keys().chain(to.records.keys()).collect();
+    for key in keys {
+        let want = to.records.get(key);
+        if want != from.records.get(key) && now.records.get(key) == want {
+            for side in [&mut stored, &mut held] {
+                match want {
+                    Some(v) => {
+                        side.records.insert(key.clone(), v.clone());
+                    }
+                    None => {
+                        side.records.remove(key);
+                    }
+                }
+            }
+        }
+    }
+    // Nothing on this filesystem says how far these have come, and nothing here changes them.
+    stored.streams.clone_from(&to.streams);
+    (stored, held)
+}
+
 /// The stored record after this client's local changes: start from what is stored, and carry over
 /// only what changed on this filesystem since the last sync. A field this client could not apply
 /// (`applied` differs from `stored`) but did not change stays as stored.
@@ -358,6 +410,63 @@ pub fn apply(
 mod tests {
     use super::*;
     use cairn_protocol::Timestamp;
+
+    fn with_mode(mode: u32) -> Metadata {
+        Metadata {
+            mode,
+            ..Metadata::default()
+        }
+    }
+
+    /// One field of what is on its way, each way it can stand on disk.
+    #[test]
+    fn a_field_has_arrived_only_if_the_disk_says_so() {
+        let (from, to) = (with_mode(0o644), with_mode(0o600));
+        // It got there: shared, and no local change.
+        let (stored, held) = arrived_fields(&from, &from, &to, &to);
+        assert_eq!(stored.mode, 0o600);
+        assert_eq!(rebase_local_changes(&stored, &held, &to).mode, 0o600);
+        // Not yet: still to be applied.
+        let (stored, held) = arrived_fields(&from, &from, &to, &from);
+        assert_eq!(stored.mode, 0o644);
+        assert_eq!(rebase_local_changes(&stored, &held, &from).mode, 0o644);
+        // Someone changed it since: that stays a change here.
+        let now = with_mode(0o640);
+        let (stored, held) = arrived_fields(&from, &from, &to, &now);
+        assert_eq!(stored.mode, 0o644);
+        assert_eq!(rebase_local_changes(&stored, &held, &now).mode, 0o640);
+    }
+
+    /// A field nothing was bringing is not touched by what arrives alongside it.
+    #[test]
+    fn a_change_here_stays_beside_what_arrived() {
+        let from = with_mode(0o644);
+        let mut to = with_mode(0o644);
+        to.mtime = Timestamp { sec: 9, nsec: 0 };
+        let mut now = to.clone();
+        now.mode = 0o600;
+        let (stored, held) = arrived_fields(&from, &from, &to, &now);
+        assert_eq!(stored.mtime, to.mtime, "the time arrived");
+        let local = rebase_local_changes(&stored, &held, &now);
+        assert_eq!((local.mode, local.mtime), (0o600, to.mtime));
+    }
+
+    #[test]
+    fn a_record_arrives_and_goes_by_itself() {
+        let key = record("user.a");
+        let gone = record("user.b");
+        let value = Bytes(b"v".to_vec());
+        let mut from = with_mode(0o644);
+        from.records.insert(gone.clone(), value.clone());
+        let mut to = with_mode(0o644);
+        to.records.insert(key.clone(), value.clone());
+        let (stored, held) = arrived_fields(&from, &from, &to, &to);
+        assert_eq!(stored.records, to.records);
+        assert_eq!(held.records, to.records);
+        // Neither has happened on disk yet.
+        let (stored, _) = arrived_fields(&from, &from, &to, &from);
+        assert_eq!(stored.records, from.records);
+    }
 
     fn record(k: &str) -> RecordKey {
         RecordKey {

@@ -18,6 +18,25 @@
 
 **Fixed:**
 
+- A device stopped partway through receiving something, by a kill or a full disk, read what it had received as
+  its own change. A later change from elsewhere could then be undone with no report (a revert, a chmod back), a
+  file deleted elsewhere could come back, and a restored file could get a conflict copy. History kept every
+  version. What is on its way is now noted before the first step, and the next scan checks it against the disk.
+- A conflict on a hard-linked file, killed before the second name arrived, deleted that name for everyone.
+- An edit or an editor's save in the moment before a replacement or removal, followed by a kill at that moment, was
+  left under a temporary name and removed as a leftover: the only loss in this list, with an edit made while an
+  interrupted hard-link update was being finished, which was overwritten. Both now stay, under a conflict name. A
+  leftover from a version before this one still goes, as the name did not say what it held.
+- A folder's timestamp moved by an interrupted sync went up as a change, for everyone, in a commit nobody made. It now
+  goes back to what it was.
+- The first sync of a tree of very many small files could time out on a slow disk, as one request held every chunk
+  and the server syncs each to disk before it answers. Nothing was lost, and the next sync went on. A request now
+  holds at most 2,000 chunks.
+- A swap killed halfway left one of the two files under a "recovered from interrupted sync" name. It now goes where
+  it was going.
+- A false "mode kept" note in everyone's log after a kill while a new folder arrived, and an unchanged file brought
+  back after a kill while its folder was being detached from one that moved out of view.
+
 - A file deleted on one device and restored before another had finished applying the delete could be deleted again
   by that other device, which had never deleted it. History kept it.
 - A hard-linked file being replaced by a sync could overwrite a save made to its second name in the moment before

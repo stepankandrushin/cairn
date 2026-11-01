@@ -28,7 +28,7 @@ impl Sandbox {
         Self::under(&std::env::temp_dir(), label)
     }
 
-    fn under(parent: &Path, label: &str) -> Self {
+    pub fn under(parent: &Path, label: &str) -> Self {
         let dir = parent.join(format!("cairn-{label}-{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         Self { dir }

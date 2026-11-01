@@ -882,6 +882,24 @@ fn a_change_too_big_for_one_commit_goes_in_several() {
     assert_eq!(b.read("d20/20999"), b"20999");
 }
 
+/// Each chunk is synced to disk before the server answers: on a slow disk, one request for a tree of
+/// small files outlasted the client's timeout, however few bytes it held.
+#[test]
+fn many_small_files_go_up_in_several_requests() {
+    let sb = Sandbox::fast("many-small");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    for i in 0..1_100 {
+        a.write(&format!("f{i}"), i.to_string());
+    }
+    let log = sb.path("steps");
+    a.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())])
+        .expect_ok();
+    let steps = std::fs::read_to_string(&log).unwrap();
+    let requests = steps.lines().filter(|s| *s == "sync.upload.sent").count();
+    assert!(requests >= 2, "{requests} request(s)");
+}
+
 /// A conflict copy's mark lives until the next finished sync. Here the copy is gone by then, deleted on
 /// both sides, and a symlink has its inode number: under the copy's identity the server refuses that
 /// symlink on every round, and the sync never finishes.

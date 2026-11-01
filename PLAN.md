@@ -124,8 +124,14 @@ the first result, so a lost response is harmless. Small files take a simpler bat
 metadata → check the destination has not changed locally → atomic `rename()`.
 
 **Three-way merge per object** (base, local, remote). It is state-based: each round works from what is on
-disk and what the journal says, so a crash only means the next run finds some of the work done, which
-merges as agreement.
+disk and what the journal says, so a crash only means the next run finds some of the work done. What was
+on its way is noted before the first step, in one transaction however much it is, and claims nothing: the
+next scan compares it with the disk, field by field and name by name, and what got there counts as shared
+with the server. New content arrived whole, and what its fields should read is asked of the filesystem, on a
+scratch entry, so that what it cannot hold is no change of anyone's. So what a device received does not read
+as its own change, kill or full disk, and a later change from elsewhere stands as it would have. One limit: a person who acts on a file in the moment between
+the kill and the next scan acts on something the scan cannot tell from what arrived, as a new inode has no
+record yet; a removal of a just-arrived file can be undone by the server's copy, and a rename can leave both.
 
 | Changes | Result |
 |---|---|

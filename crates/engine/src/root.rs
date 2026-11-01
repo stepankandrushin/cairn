@@ -195,4 +195,36 @@ impl Root {
         )
         .into_bytes()
     }
+
+    /// The name for whatever stands at `original` as it is moved out of the way. Only finished work and
+    /// what it displaces ever carry it, so what a killed run leaves under it may be the only copy of
+    /// someone's edit, which a half-written temporary cannot be. It says where it came from, as far as
+    /// that fits.
+    pub fn aside_name(&self, original: &[u8]) -> Vec<u8> {
+        let mut name = format!(
+            "{}{ASIDE}{}-",
+            self.temp_prefix(),
+            hex::encode(rand::random::<[u8; 8]>())
+        )
+        .into_bytes();
+        let mut keep = original.len().min(NAME_MAX.saturating_sub(name.len()));
+        if let Ok(text) = std::str::from_utf8(original) {
+            while !text.is_char_boundary(keep) {
+                keep -= 1;
+            }
+        }
+        name.extend_from_slice(&original[..keep]);
+        name
+    }
+}
+
+const ASIDE: &str = "aside-";
+/// The shortest limit on a name of any filesystem likely to hold a tree, eCryptfs's.
+const NAME_MAX: usize = 143;
+
+/// What a temporary's name says about it, given the part after the prefix: `None` if it is not one of
+/// `Root::aside_name`'s, and otherwise the name it came from.
+pub fn aside_origin(rest: &[u8]) -> Option<&[u8]> {
+    let rest = rest.strip_prefix(ASIDE.as_bytes())?;
+    Some(rest.get(17..).unwrap_or_default())
 }

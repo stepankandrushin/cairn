@@ -29,7 +29,7 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
 - PLAN.md — the design and build order; before any design or code work.
 - docs/protocol.md, docs/format.md — the wire and on-disk formats; before changing either.
 - scripts/ci.sh — everything that must pass before a commit; on the real disk in /var/tmp, since tmpfs hid
-  a bug; about 20 minutes with GitHub's `CAIRN_SEEDS=200`. scripts/release.sh — a release.
+  a bug; about 30 minutes with GitHub's `CAIRN_SEEDS=200`. scripts/release.sh — a release.
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.
 - crates/harness/tests/ — the failure tests. A failing seed reproduces with `CAIRN_SEED=n`, and its log
   and kept directory say what happened: trust the oracle until a trace proves it wrong.

@@ -44,6 +44,13 @@ pub struct Synced {
     /// may have been refused. `None` when this state was read from the journal in the first place.
     #[serde(default)]
     pub commit: Option<OpId>,
+    /// This state arrived and the filesystem is still to be brought to `body.metadata`: a folder made
+    /// private until the last pass of a run that was killed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unapplied: bool,
+    /// A killed run moved this folder's timestamp from this, which is to go back on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_time: Option<Timestamp>,
 }
 
 /// What this client knows about one local object.
@@ -297,6 +304,49 @@ impl State {
     pub fn drop_intent(&self, key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM intents WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    pub fn drop_intents(&mut self, keys: &[String]) -> Result<()> {
+        self.store_rows_dropping(&[], keys)
+    }
+
+    /// Several marks in one transaction, so one fsync however many there are.
+    pub fn put_intents<T: Serialize>(&mut self, marks: &[(String, T)]) -> Result<()> {
+        if marks.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT INTO intents (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            )?;
+            for (key, value) in marks {
+                put.execute(params![key, serde_json::to_string(value)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rows and the marks they answer, in one transaction, so that dying here repeats nothing.
+    pub fn store_rows_dropping(
+        &mut self,
+        changed: &[(ObjectId, &Row)],
+        marks: &[String],
+    ) -> Result<()> {
+        if changed.is_empty() && marks.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        put_rows(&tx, changed, &[])?;
+        {
+            let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
+            for key in marks {
+                del.execute([key])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

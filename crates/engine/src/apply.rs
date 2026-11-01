@@ -5,7 +5,7 @@
 
 use crate::client::Client;
 use crate::fsops::{self, is_exists, is_not_found, Dir};
-use crate::identify::CopyIntent;
+use crate::identify::{Arriving, CopyIntent};
 use crate::merge::{ConflictCopy, Plan, TNode};
 use crate::metadata::{self, Accounts};
 use crate::root::Root;
@@ -28,6 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 pub struct StageIntent {
     pub stage: String,
     pub origin: Vec<Name>,
+    /// Where it was going, for when something else has already taken its origin: half a swap.
+    #[serde(default)]
+    pub dest: Option<Vec<Name>>,
 }
 
 /// A directory made writable for a moment, and the mode it must get back.
@@ -43,6 +46,7 @@ pub const INTENT_STAGE: &str = "stage/";
 pub const INTENT_MODE: &str = "mode/";
 pub const INTENT_COPY: &str = "copy/";
 pub const INTENT_RELINK: &str = "relink/";
+pub const INTENT_ARRIVING: &str = "arriving/";
 
 /// New content on its way to every hard link of a file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -612,7 +616,7 @@ impl<'a> Applier<'a> {
             self.check_fp(id, &dir, &name)?;
             // Out of the way first, and looked at once more where nothing can reach it: no gap
             // between the look and the unlink for an edit to fall into.
-            let aside = self.root.temp_name();
+            let aside = self.root.aside_name(&name);
             hit("apply.unlink.before_aside");
             dir.rename_new(&name, &dir, &aside)?;
             hit("apply.unlink.aside");
@@ -640,7 +644,31 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
-    fn move_entry(&mut self, id: ObjectId, from: &Link, to: &Link) -> Result<(), StepError> {
+    /// Where an object staged now is going, once the plan has reached its target.
+    fn destination(&self, plan: &Plan, id: ObjectId, from: &Link) -> Option<Vec<Name>> {
+        let links = &plan.target.get(&id)?.links;
+        let first = links
+            .iter()
+            .find(|l| **l != *from)
+            .or(links.iter().next())?;
+        let mut path = vec![first.name.clone()];
+        let mut at = first.parent;
+        while at != ObjectId::ROOT {
+            let up = plan.target.get(&at)?.links.iter().next()?;
+            path.push(up.name.clone());
+            at = up.parent;
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    fn move_entry(
+        &mut self,
+        plan: &Plan,
+        id: ObjectId,
+        from: &Link,
+        to: &Link,
+    ) -> Result<(), StepError> {
         let (from_dir, from_name) = self.locate(from)?;
         let (to_dir, to_name) = self.locate(to)?;
         self.writable(from.parent, &from_dir)?;
@@ -654,6 +682,7 @@ impl<'a> Applier<'a> {
                 &StageIntent {
                     stage: String::from_utf8_lossy(&to_name).into_owned(),
                     origin,
+                    dest: self.destination(plan, id, from),
                 },
             )?;
             hit("apply.stage.intent");
@@ -728,19 +757,23 @@ impl<'a> Applier<'a> {
         hit("apply.replace.before_rename");
         // Swapped, not overwritten: the old file comes out under the temporary name, to be looked at
         // once more, so that no edit can fall between the last look and the replacement.
-        if dir.exchange(&tmp, &name)? {
+        let aside = self.root.aside_name(&name);
+        // Nothing can be at a random name, and not every filesystem can promise that.
+        dir.rename_over(&tmp, &dir, &aside)?;
+        hit("apply.replace.aside");
+        if dir.exchange(&aside, &name)? {
             hit("apply.replace.swapped");
-            if !self.still_as_scanned(id, &dir, &tmp) {
-                dir.exchange(&tmp, &name)?;
-                let _ = dir.unlink(&tmp);
+            if !self.still_as_scanned(id, &dir, &aside) {
+                dir.exchange(&aside, &name)?;
+                let _ = dir.unlink(&aside);
                 let _ = self.root.state.drop_intent(&relink_key);
                 return Err(StepError::Changed(
                     "the file changed during this sync".into(),
                 ));
             }
-            dir.unlink(&tmp)?;
+            dir.unlink(&aside)?;
         } else {
-            dir.rename_over(&tmp, &dir, &name)?;
+            dir.rename_over(&aside, &dir, &name)?;
         }
         hit("apply.replace.renamed");
         self.touched_dirs.insert(first.parent);
@@ -750,10 +783,11 @@ impl<'a> Applier<'a> {
         for other in links.iter().skip(1) {
             let (odir, oname) = self.locate(other)?;
             self.writable(other.parent, &odir)?;
-            let otmp = self.root.temp_name();
+            let otmp = self.root.aside_name(&oname);
             dir.hard_link(&name, &odir, &otmp)?;
             hit("apply.replace.relink");
             if odir.exchange(&otmp, &oname)? {
+                hit("apply.replace.relink.swapped");
                 let was = odir.stat(&otmp)?;
                 if Some((was.dev, was.ino, was.size, was.mtime)) != replaced {
                     odir.exchange(&otmp, &oname)?;
@@ -849,6 +883,17 @@ impl<'a> Applier<'a> {
             .state
             .put_intent(&format!("{INTENT_COPY}{}", copy.copy), &intent)?;
         hit("apply.copy.intent");
+        // Names of the copy from here on, so that one the original does not get back before a kill
+        // comes down again, and does not read as deleted here. A scan takes back what it still finds.
+        if let Some(row) = self.rows.get_mut(&copy.object) {
+            let names = copy.moves.iter().map(|m| &m.0);
+            let held = row.held.get_or_insert_with(|| original.links.clone());
+            for name in names {
+                held.remove(name);
+            }
+            self.root.state.store_rows(&[(copy.object, &*row)], &[])?;
+            hit("apply.copy.given_up");
+        }
         let mut links = BTreeSet::new();
         for (from, to) in &copy.moves {
             let (dir, name) = self.locate(from)?;
@@ -1070,6 +1115,8 @@ impl<'a> Applier<'a> {
             links: t.links.clone(),
             applied: scan.clone(),
             commit: None,
+            unapplied: false,
+            folder_time: None,
         });
         let old = self.rows.get(&id);
         let row = Row {
@@ -1167,6 +1214,8 @@ impl<'a> Applier<'a> {
                 links: t.links.clone(),
                 applied: row.scan.clone(),
                 commit: None,
+                unapplied: false,
+                folder_time: None,
             });
             changed.push(*id);
         }
@@ -1198,6 +1247,100 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
+    /// Before anything moves, in one transaction: what the server has for whatever is about to change
+    /// here, so that the next scan can tell what arrives from what this device did itself, whatever
+    /// stops this run.
+    fn note_arriving(&self, plan: &Plan) -> Vec<(String, Arriving)> {
+        let mut marks = Vec::new();
+        for (id, t) in &plan.target {
+            let Some(r) = self.remote.get_live(*id) else {
+                continue;
+            };
+            if let Some(c) = self.cur.get(id) {
+                let here = c.content == t.body.content
+                    && c.apply_from == t.body.metadata
+                    && c.links == t.links;
+                if here || c.fp.is_none() {
+                    continue;
+                }
+            }
+            marks.push((
+                format!("{INTENT_ARRIVING}{id}"),
+                Arriving {
+                    object: *id,
+                    body: r.body.clone(),
+                    links: r.links.clone(),
+                    names: t.links.clone(),
+                    folder_touched: false,
+                },
+            ));
+        }
+        self.note_touched_folders(plan, &mut marks);
+        marks
+    }
+
+    /// A step inside a folder moves the folder's own timestamp, which only the last pass puts back:
+    /// until then that is no change of anyone's.
+    fn note_touched_folders(&self, plan: &Plan, marks: &mut Vec<(String, Arriving)>) {
+        let mut at: BTreeMap<ObjectId, usize> = marks
+            .iter()
+            .enumerate()
+            .map(|(i, (_, a))| (a.object, i))
+            .collect();
+        let removed = self.cur.keys().filter(|id| !plan.target.contains_key(id));
+        let parents: BTreeSet<ObjectId> = at
+            .keys()
+            .chain(removed)
+            .flat_map(|id| {
+                let now = self.cur.get(id).into_iter().flat_map(|c| &c.links);
+                let then = plan.target.get(id).into_iter().flat_map(|t| &t.links);
+                now.chain(then).map(|l| l.parent)
+            })
+            .collect();
+        for parent in parents {
+            if let Some(i) = at.get(&parent) {
+                marks[*i].1.folder_touched = true;
+                continue;
+            }
+            let (Some(r), Some(t), Some(c)) = (
+                self.remote.get_live(parent),
+                plan.target.get(&parent),
+                self.cur.get(&parent),
+            ) else {
+                continue;
+            };
+            if r.rev == cairn_protocol::RevisionId::ZERO || c.fp.is_none() {
+                continue;
+            }
+            at.insert(parent, marks.len());
+            marks.push((
+                format!("{INTENT_ARRIVING}{parent}"),
+                Arriving {
+                    object: parent,
+                    body: r.body.clone(),
+                    links: r.links.clone(),
+                    names: t.links.clone(),
+                    folder_touched: true,
+                },
+            ));
+        }
+    }
+
+    /// What is recorded and in step with the server needs no mark any more. What the target only shares
+    /// a part of with the server keeps its mark until the next scan has answered it.
+    fn drop_settled_marks(&mut self, plan: &Plan, marks: &[(String, Arriving)]) -> Result<()> {
+        let done: Vec<String> = marks
+            .iter()
+            .filter(|(_, a)| {
+                plan.target
+                    .get(&a.object)
+                    .is_some_and(|t| t.body == a.body && t.links == a.links)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.root.state.drop_intents(&done)
+    }
+
     /// Reach the plan's target as far as possible.
     pub fn run(mut self, plan: &Plan) -> Result<(ApplyOutcome, BTreeMap<ObjectId, CurNode>)> {
         // Download first: a full disk or a lost server is found before anything moves.
@@ -1207,6 +1350,9 @@ impl<'a> Applier<'a> {
             return Ok((self.outcome, self.cur));
         }
         hit("apply.prefetched");
+        let marks = self.note_arriving(plan);
+        self.root.state.put_intents(&marks)?;
+        hit("apply.noted");
         self.make_copies(plan)?;
         if !self.outcome.clean() {
             // A local edit that did not get out of the way must not be overwritten by what comes next.
@@ -1253,7 +1399,7 @@ impl<'a> Applier<'a> {
                 TopoOp::Create { object, link } => self.create(*object, link, &plan.target[object]),
                 TopoOp::Link { object, link } => self.add_link(*object, link),
                 TopoOp::Unlink { object, link } => self.remove_link(*object, link),
-                TopoOp::Move { object, from, to } => self.move_entry(*object, from, to),
+                TopoOp::Move { object, from, to } => self.move_entry(plan, *object, from, to),
             };
             match done {
                 Ok(()) => self.outcome.applied_steps += 1,
@@ -1267,6 +1413,10 @@ impl<'a> Applier<'a> {
         self.store_placed_files(plan)?;
         self.store_moved(plan)?;
         self.finish_dirs(plan)?;
+        // Anything that did not happen is for the next scan to find out.
+        if self.outcome.clean() {
+            self.drop_settled_marks(plan, &marks)?;
+        }
         self.outcome.touched =
             self.outcome.applied_steps > 0 || !self.placed.is_empty() || !plan.copies.is_empty();
         hit("apply.finished");
@@ -1284,7 +1434,14 @@ pub fn recover(root: &mut Root) -> Result<Vec<String>> {
         hit("recover.stage");
         let name = intent.stage.as_bytes();
         if stage.try_stat(name)?.is_some() {
-            restore_staged(root, &stage, name, &intent.origin, &mut notes)?;
+            restore_staged(
+                root,
+                &stage,
+                name,
+                &intent.origin,
+                intent.dest.as_deref(),
+                &mut notes,
+            )?;
         }
         root.state.drop_intent(&key)?;
     }
@@ -1292,7 +1449,7 @@ pub fn recover(root: &mut Root) -> Result<Vec<String>> {
     for name in stage.list()? {
         let label =
             Name::new(format!("recovered-{}", String::from_utf8_lossy(&name)).into_bytes())?;
-        restore_staged(root, &stage, &name, &[label], &mut notes)?;
+        restore_staged(root, &stage, &name, &[label], None, &mut notes)?;
     }
 
     // New content that reached only some names of a file reaches the rest.
@@ -1359,10 +1516,22 @@ fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
             }
         }
         relaxed_for_a_moment(root, &dir, parents, || {
-            let tmp = root.temp_name();
+            let tmp = root.aside_name(name.as_bytes());
             first_dir.hard_link(first_name.as_bytes(), &dir, &tmp)?;
             hit("recover.relink.linked");
-            dir.rename_over(&tmp, &dir, name.as_bytes())?;
+            // Swapped, as in `replace_content`: an edit since that look is not overwritten.
+            if dir.exchange(&tmp, name.as_bytes())? {
+                hit("recover.relink.swapped");
+                let was = dir.stat(&tmp)?;
+                if (was.ino, was.size, was.mtime)
+                    != (intent.old.ino, intent.old.size, intent.old.mtime)
+                {
+                    dir.exchange(&tmp, name.as_bytes())?;
+                }
+                dir.unlink(&tmp)?;
+            } else {
+                dir.rename_over(&tmp, &dir, name.as_bytes())?;
+            }
             Ok(())
         })?;
     }
@@ -1374,17 +1543,22 @@ fn restore_staged(
     stage: &Dir,
     name: &[u8],
     origin: &[Name],
+    dest: Option<&[Name]>,
     notes: &mut Vec<String>,
 ) -> Result<()> {
-    let Some((last, parents)) = origin.split_last() else {
+    let Some(last) = origin.last() else {
         return Ok(());
     };
-    let at_origin = root.dir.open_path(parents.iter());
-    if let Ok(dir) = at_origin {
-        match stage.rename_new(name, &dir, last.as_bytes()) {
-            Ok(()) => return Ok(()),
-            Err(e) if is_exists(&e) || is_not_found(&e) => {}
-            Err(e) => return Err(e.into()),
+    for place in std::iter::once(origin).chain(dest) {
+        let Some((place_name, place_parents)) = place.split_last() else {
+            continue;
+        };
+        if let Ok(dir) = root.dir.open_path(place_parents.iter()) {
+            match stage.rename_new(name, &dir, place_name.as_bytes()) {
+                Ok(()) => return Ok(()),
+                Err(e) if is_exists(&e) || is_not_found(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     // The original place is taken or gone. It stays, under a name of its own at the top.
@@ -1414,6 +1588,79 @@ pub fn remove_stale_temp(root: &Root, path: &[Name], name: &[u8]) -> Result<()> 
         hit("clean.removed");
         Ok(())
     })
+}
+
+/// What this filesystem makes of `want` on something new, which is how new content arrives: asked of it
+/// on a scratch entry under the state directory, on the same filesystem as all of the tree. What a file
+/// holds that differs from this was changed since, and what `want` asks for and this does not hold is
+/// no one's doing. `None` if it cannot be asked, on a full disk for one.
+pub fn what_arrives(
+    root: &Root,
+    accounts: &Accounts,
+    content: &Content,
+    want: &Metadata,
+) -> Option<Metadata> {
+    const SCRATCH: &[u8] = b"arriving-probe";
+    let state = root.dir.open_dir(cairn_protocol::STATE_DIR).ok()?;
+    let _ = state.unlink(SCRATCH);
+    match content {
+        Content::File { .. } => drop(state.create_new(SCRATCH, 0o600).ok()?),
+        Content::Symlink { target } => state.symlink(&target.0, SCRATCH).ok()?,
+        Content::Dir => return None,
+    }
+    let _ = metadata::apply(
+        &state,
+        SCRATCH,
+        content.kind(),
+        want,
+        None,
+        &root.config.policy,
+        accounts,
+    );
+    let held = state.stat(SCRATCH).ok().map(|st| {
+        let precision = root.dir.fstype_precision_ns();
+        metadata::capture(&state, SCRATCH, &st, accounts, precision, &mut Vec::new())
+    });
+    let _ = state.unlink(SCRATCH);
+    held
+}
+
+/// A killed run's temporary that is a file it was replacing or removing, and no longer holds what was
+/// scanned: someone edited it in the moment before, and this is the only copy. It stays, under a conflict
+/// name, and goes up as a new file.
+pub fn keep_rescued_temp(
+    root: &Root,
+    path: &[Name],
+    temp: &[u8],
+    original: &Name,
+    date: &str,
+) -> Result<String> {
+    let dir = root.dir.open_path(path.iter())?;
+    let mut kept = None;
+    relaxed_for_a_moment(root, &dir, path, || {
+        for attempt in 0u32.. {
+            let name =
+                crate::merge::conflict_name(original, &root.config.device_name, date, attempt);
+            match dir.rename_new(temp, &dir, name.as_bytes()) {
+                Ok(()) => {
+                    kept = Some(name);
+                    break;
+                }
+                Err(e) if is_exists(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        hit("clean.rescued");
+        Ok(())
+    })?;
+    let at = kept.map_or_else(String::new, |name| {
+        let mut full = path.to_vec();
+        full.push(name);
+        show(&full)
+    });
+    Ok(format!(
+        "{at}: an edit caught by an interrupted sync, which was replacing or removing this file; it is kept under this name"
+    ))
 }
 
 /// Run `f` with a directory writable, durably noting the mode to go back to.

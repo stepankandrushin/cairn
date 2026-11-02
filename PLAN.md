@@ -239,7 +239,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 0 | Protocol and on-disk format written down; Cargo workspace: protocol, store, engine, server, CLI crates | The types cover every row of the metadata table; a license is chosen |
 | 1 | Chunk store, manifests, journal; a one-shot CLI that syncs one Linux folder with full metadata and three-way merge, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
-| 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment has not started |
+| 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |

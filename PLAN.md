@@ -95,7 +95,7 @@ What follows from it:
 | Owner, group | Numbers and names stored, with a per-client mapping, since numeric IDs differ between machines. The daemon runs unprivileged: exact restore needs a narrowly scoped helper or an explicit restore command |
 | mtime, btime | Nanoseconds, with the recorded precision kept |
 | xattrs, POSIX ACLs, Windows ACLs | Stored in per-platform namespaces; applied by an allow/deny list (`security.selinux` not applied by default) |
-| macOS resource forks, Finder metadata | Preserved explicitly |
+| macOS resource forks, Finder metadata | Preserved explicitly. For now as `macos.xattr` records, up to 1 MiB each, past which one is reported and not stored. What is about the machine rather than the file (provenance, quarantine, access grants, last opened) is neither stored nor applied |
 | Sparse files | Holes recorded, recreated where supported, never inflated on download |
 | FIFOs, sockets, devices | Excluded from ordinary sync, with the reason shown |
 
@@ -243,7 +243,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
-| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass |
+| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS CLI and daemon came early, to join milestone 3's run: a name its filesystem cannot hold is skipped and reported, not yet mapped |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |
 | 9 | WebDAV gateway, Nextcloud importer (files, versions, trash), E2EE, LAN/P2P transfers | |
 

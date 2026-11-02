@@ -4,7 +4,13 @@
 //! this filesystem, and whatever does not is kept on the server, untouched.
 
 use crate::fsops::{Dir, Stat};
-use cairn_protocol::{Bytes, Metadata, ObjectKind, Owner, RecordKey, NS_LINUX_XATTR};
+use cairn_protocol::{Bytes, Metadata, ObjectKind, Owner, RecordKey};
+
+/// Where this platform's xattrs go in a record. Another platform's stay stored and untouched here.
+#[cfg(target_os = "linux")]
+use cairn_protocol::NS_LINUX_XATTR as NS_XATTR;
+#[cfg(target_os = "macos")]
+use cairn_protocol::NS_MACOS_XATTR as NS_XATTR;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -46,6 +52,7 @@ pub struct ApplyPolicy {
 fn yes() -> bool {
     true
 }
+#[cfg(target_os = "linux")]
 fn default_xattr_allow() -> Vec<String> {
     [
         "user.",
@@ -55,8 +62,44 @@ fn default_xattr_allow() -> Vec<String> {
     .map(String::from)
     .to_vec()
 }
+#[cfg(target_os = "linux")]
 fn default_xattr_deny() -> Vec<String> {
     vec!["security.selinux".into()]
+}
+/// macOS's names have no namespaces that say who may write them.
+#[cfg(target_os = "macos")]
+fn default_xattr_allow() -> Vec<String> {
+    vec![String::new()]
+}
+#[cfg(target_os = "macos")]
+fn default_xattr_deny() -> Vec<String> {
+    MACHINE_LOCAL_XATTRS.map(String::from).to_vec()
+}
+
+/// What macOS keeps on a file about this machine rather than about the file: database keys, access
+/// grants, the time it was last opened. Copied elsewhere they mean nothing or something false, and
+/// the last changes on every open, so they are neither stored nor applied.
+#[cfg(target_os = "macos")]
+const MACHINE_LOCAL_XATTRS: [&str; 5] = [
+    "com.apple.provenance",
+    "com.apple.quarantine",
+    "com.apple.macl",
+    "com.apple.rootless",
+    "com.apple.lastuseddate#PS",
+];
+
+/// A record travels inside the metadata. A big resource fork would need the streams the format has a
+/// place for and no client writes yet, so past this it is reported and not stored.
+#[cfg(target_os = "macos")]
+const MAX_XATTR_STORED: usize = 1 << 20;
+
+#[cfg(target_os = "linux")]
+fn stored_xattr(_: &[u8]) -> bool {
+    true
+}
+#[cfg(target_os = "macos")]
+fn stored_xattr(name: &[u8]) -> bool {
+    !MACHINE_LOCAL_XATTRS.iter().any(|x| x.as_bytes() == name)
 }
 
 impl Default for ApplyPolicy {
@@ -76,14 +119,18 @@ impl ApplyPolicy {
     /// Everything this platform can apply, for an explicit restore. `security.selinux` stays out:
     /// labels belong to the destination's policy.
     pub fn exact() -> Self {
+        #[cfg(target_os = "linux")]
+        let xattr_allow = ["user.", "system.posix_acl_", "security.", "trusted."]
+            .map(String::from)
+            .to_vec();
+        #[cfg(target_os = "macos")]
+        let xattr_allow = default_xattr_allow();
         Self {
             owners: OwnerPolicy::ByNumber,
             mode: true,
             setid: true,
             capabilities: true,
-            xattr_allow: ["user.", "system.posix_acl_", "security.", "trusted."]
-                .map(String::from)
-                .to_vec(),
+            xattr_allow,
             xattr_deny: default_xattr_deny(),
         }
     }
@@ -167,11 +214,20 @@ pub fn capture(
     match dir.list_xattrs(name) {
         Ok(keys) => {
             for key in keys {
+                if !stored_xattr(&key) {
+                    continue;
+                }
                 match dir.get_xattr(name, &key) {
+                    #[cfg(target_os = "macos")]
+                    Ok(value) if value.len() > MAX_XATTR_STORED => problems.push(format!(
+                        "xattr {}: {} bytes, too big to store yet",
+                        cairn_protocol::name::display_bytes(&key),
+                        value.len()
+                    )),
                     Ok(value) => {
                         records.insert(
                             RecordKey {
-                                ns: NS_LINUX_XATTR.into(),
+                                ns: NS_XATTR.into(),
                                 name: Bytes(key),
                             },
                             Bytes(value),
@@ -352,7 +408,7 @@ pub fn apply(
     let empty = BTreeMap::new();
     let current_records = current.map_or(&empty, |c| &c.records);
     for (key, value) in &want.records {
-        if key.ns != NS_LINUX_XATTR || !policy.allows_xattr(&key.name.0) {
+        if key.ns != NS_XATTR || !policy.allows_xattr(&key.name.0) {
             continue;
         }
         let same = current_records.get(key) == Some(value);
@@ -368,14 +424,12 @@ pub fn apply(
         }
     }
     for key in current_records.keys() {
-        if key.ns == NS_LINUX_XATTR
-            && policy.allows_xattr(&key.name.0)
-            && !want.records.contains_key(key)
+        if key.ns == NS_XATTR && policy.allows_xattr(&key.name.0) && !want.records.contains_key(key)
         {
             match dir.remove_xattr(name, &key.name.0) {
                 Ok(()) => {}
                 // Stored but never applied here: already absent, which is what was asked for.
-                Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NODATA.raw_os_error()) => {}
+                Err(e) if crate::fsops::is_no_xattr(&e) => {}
                 Err(e) => note(
                     &format!(
                         "removing xattr {}",
@@ -470,7 +524,7 @@ mod tests {
 
     fn record(k: &str) -> RecordKey {
         RecordKey {
-            ns: NS_LINUX_XATTR.into(),
+            ns: NS_XATTR.into(),
             name: Bytes(k.into()),
         }
     }
@@ -606,6 +660,18 @@ mod tests {
         assert_eq!(out.unknown["from_the_future"], 1);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn what_is_about_this_machine_stays_on_it() {
+        let p = ApplyPolicy::default();
+        assert!(p.allows_xattr(b"com.apple.FinderInfo"));
+        assert!(p.allows_xattr(b"com.example.mine"));
+        assert!(!p.allows_xattr(b"com.apple.provenance"));
+        assert!(!stored_xattr(b"com.apple.quarantine"));
+        assert!(stored_xattr(b"com.apple.FinderInfo"));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_default_policy_withholds_what_needs_an_explicit_choice() {
         let p = ApplyPolicy::default();

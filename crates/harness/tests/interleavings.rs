@@ -804,14 +804,11 @@ fn a_fifo_in_the_way_does_not_hold_back_everything_else() {
     b.synced();
     b.write("taken", "from b");
     b.synced();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        a.path("taken").as_path(),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_raw_mode(0o644),
-        0,
-    )
-    .unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(a.path("taken"))
+        .status()
+        .unwrap()
+        .success());
     a.write("other", "from a");
     let run = a.sync();
     assert_eq!(run.code, Some(3), "{}", run.text());

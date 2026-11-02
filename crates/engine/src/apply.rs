@@ -477,11 +477,12 @@ impl<'a> Applier<'a> {
                     check("apply.temp.write")?;
                     fsops::write_all_at(fd.as_fd(), &data, offset)?;
                 }
+                crate::chunker::restore_holes(fd.as_fd(), &m);
                 hit("apply.temp.written");
-                rustix::fs::fsync(&fd).map_err(std::io::Error::from)?;
+                fsops::sync_fd(fd.as_fd())?;
                 hit("apply.temp.synced");
                 self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display);
-                rustix::fs::fsync(&fd).map_err(std::io::Error::from)?;
+                fsops::sync_fd(fd.as_fd())?;
                 hit("apply.temp.meta");
                 return Ok(());
             }

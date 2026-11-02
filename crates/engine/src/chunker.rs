@@ -37,6 +37,30 @@ pub fn data_runs(fd: BorrowedFd<'_>, size: u64) -> io::Result<Vec<(u64, u64)>> {
     Ok(runs)
 }
 
+/// Give a file written from a manifest the holes that manifest has. On Linux the `ftruncate` before the
+/// writes already left them. APFS fills such a gap when the file is flushed unless it is told otherwise,
+/// and the next scan would then send this file back without its holes, to every device. Where this
+/// is refused the file is whole, only bigger than it should be.
+#[cfg(target_os = "macos")]
+pub fn restore_holes(fd: BorrowedFd<'_>, m: &Manifest) {
+    const BLOCK: u64 = 4096;
+    let punch = |from: u64, to: u64| {
+        let (start, end) = (from.next_multiple_of(BLOCK), to - to % BLOCK);
+        if start < end {
+            let _ = crate::fsops::punch_hole(fd, start, end - start);
+        }
+    };
+    let mut at = 0;
+    for segment in &m.segments {
+        punch(at, segment.offset);
+        at = segment.offset + segment.len();
+    }
+    punch(at, m.size);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restore_holes(_: BorrowedFd<'_>, _: &Manifest) {}
+
 struct RunReader<'a> {
     fd: BorrowedFd<'a>,
     at: u64,

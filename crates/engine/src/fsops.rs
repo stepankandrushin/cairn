@@ -6,10 +6,12 @@
 //! outside the tree.
 
 use cairn_protocol::{Name, Timestamp};
-use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use rustix::fs::{
-    self, AtFlags, Mode, OFlags, RenameFlags, Statx, StatxFlags, Timespec, Timestamps, CWD,
-};
+#[cfg(target_os = "linux")]
+use rustix::fd::AsRawFd;
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags, Timespec, Timestamps};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Statx, StatxFlags, CWD};
 use rustix::io::Errno;
 use std::ffi::OsStr;
 use std::io;
@@ -24,7 +26,7 @@ fn os(name: &[u8]) -> &Path {
 #[derive(Debug)]
 pub struct Dir(pub OwnedFd);
 
-/// What `stat` says about an entry, all of it from one `statx` call.
+/// What `stat` says about an entry, all of it from one call.
 #[derive(Clone, Debug)]
 pub struct Stat {
     pub file_type: fs::FileType,
@@ -38,9 +40,11 @@ pub struct Stat {
     pub mtime: Timestamp,
     pub ctime: Timestamp,
     pub btime: Option<Timestamp>,
+    /// Which mount it is on. macOS has no bind mounts, so there the device number says it.
     pub mnt_id: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn stamp(t: rustix::fs::StatxTimestamp) -> Timestamp {
     Timestamp {
         sec: t.tv_sec,
@@ -48,6 +52,7 @@ fn stamp(t: rustix::fs::StatxTimestamp) -> Timestamp {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn from_statx(s: Statx) -> Stat {
     Stat {
         file_type: fs::FileType::from_raw_mode(u32::from(s.stx_mode)),
@@ -65,9 +70,51 @@ fn from_statx(s: Statx) -> Stat {
     }
 }
 
+#[cfg(target_os = "linux")]
 const STATX_WANT: StatxFlags = StatxFlags::BASIC_STATS
     .union(StatxFlags::BTIME)
     .union(StatxFlags::MNT_ID);
+
+#[cfg(target_os = "macos")]
+fn from_stat(s: fs::Stat) -> Stat {
+    let at = |sec: i64, nsec: i64| Timestamp {
+        sec,
+        nsec: nsec as u32,
+    };
+    Stat {
+        file_type: fs::FileType::from_raw_mode(s.st_mode as _),
+        mode: u32::from(s.st_mode) & 0o7777,
+        uid: s.st_uid,
+        gid: s.st_gid,
+        dev: s.st_dev as u64,
+        ino: s.st_ino,
+        nlink: u64::from(s.st_nlink),
+        size: s.st_size as u64,
+        mtime: at(s.st_mtime, s.st_mtime_nsec),
+        ctime: at(s.st_ctime, s.st_ctime_nsec),
+        btime: Some(at(s.st_birthtime, s.st_birthtime_nsec)),
+        mnt_id: s.st_dev as u64,
+    }
+}
+
+/// `true` when this error says an xattr is not there.
+pub fn is_no_xattr(e: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    let absent = Errno::NODATA;
+    #[cfg(target_os = "macos")]
+    let absent = Errno::NOATTR;
+    e.raw_os_error() == Some(absent.raw_os_error())
+}
+
+/// What survives a power cut. On macOS a plain `fsync` stops at the drive's cache, and only
+/// `F_FULLFSYNC` goes past it; the filesystems that refuse it get what they do offer.
+pub fn sync_fd(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if fs::fcntl_fullfsync(fd).is_ok() {
+        return Ok(());
+    }
+    Ok(fs::fsync(fd)?)
+}
 
 pub fn is_not_found(e: &io::Error) -> bool {
     e.raw_os_error() == Some(Errno::NOENT.raw_os_error())
@@ -79,6 +126,34 @@ pub fn is_permission(e: &io::Error) -> bool {
 
 pub fn is_exists(e: &io::Error) -> bool {
     e.raw_os_error() == Some(Errno::EXIST.raw_os_error())
+}
+
+/// `F_PUNCHHOLE`, which rustix does not have. Both must be multiples of the filesystem's block.
+#[cfg(target_os = "macos")]
+pub fn punch_hole(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
+    use rustix::fd::AsRawFd;
+    #[repr(C)]
+    struct PunchHole {
+        flags: u32,
+        reserved: u32,
+        offset: i64,
+        length: i64,
+    }
+    extern "C" {
+        fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+    const F_PUNCHHOLE: std::ffi::c_int = 99;
+    let arg = PunchHole {
+        flags: 0,
+        reserved: 0,
+        offset: offset as i64,
+        length: len as i64,
+    };
+    // SAFETY: the descriptor is open for the call, and the argument is the struct this command reads.
+    if unsafe { fcntl(fd.as_raw_fd(), F_PUNCHHOLE, &arg as *const PunchHole) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Dir {
@@ -123,7 +198,7 @@ impl Dir {
 
     /// Create a chain of directories as needed, without following symlinks. For state directories.
     pub fn ensure_dir(&self, name: &[u8], mode: u32) -> io::Result<Dir> {
-        match fs::mkdirat(&self.0, os(name), Mode::from_raw_mode(mode)) {
+        match fs::mkdirat(&self.0, os(name), Mode::from_raw_mode(mode as _)) {
             Ok(()) => {}
             Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
@@ -131,6 +206,7 @@ impl Dir {
         self.open_dir(name)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn stat_self(&self) -> io::Result<Stat> {
         Ok(from_statx(fs::statx(
             &self.0,
@@ -140,12 +216,27 @@ impl Dir {
         )?))
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn stat_self(&self) -> io::Result<Stat> {
+        Ok(from_stat(fs::fstat(&self.0)?))
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn stat(&self, name: &[u8]) -> io::Result<Stat> {
         Ok(from_statx(fs::statx(
             &self.0,
             os(name),
             AtFlags::SYMLINK_NOFOLLOW,
             STATX_WANT,
+        )?))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn stat(&self, name: &[u8]) -> io::Result<Stat> {
+        Ok(from_stat(fs::statat(
+            &self.0,
+            os(name),
+            AtFlags::SYMLINK_NOFOLLOW,
         )?))
     }
 
@@ -211,7 +302,7 @@ impl Dir {
             &self.0,
             os(name),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(mode),
+            Mode::from_raw_mode(mode as _),
         )?)
     }
 
@@ -224,7 +315,11 @@ impl Dir {
     }
 
     pub fn mkdir(&self, name: &[u8], mode: u32) -> io::Result<()> {
-        Ok(fs::mkdirat(&self.0, os(name), Mode::from_raw_mode(mode))?)
+        Ok(fs::mkdirat(
+            &self.0,
+            os(name),
+            Mode::from_raw_mode(mode as _),
+        )?)
     }
 
     pub fn unlink(&self, name: &[u8]) -> io::Result<()> {
@@ -272,20 +367,32 @@ impl Dir {
     }
 
     pub fn sync(&self) -> io::Result<()> {
-        Ok(fs::fsync(&self.0)?)
+        sync_fd(self.fd())
     }
 
     /// The path that addresses one entry through this descriptor, for the calls that only take a
     /// path. The kernel resolves the descriptor's magic link to this very directory; the entry's
     /// last component is then looked up by the `l*` call without following a symlink.
-    fn proc_entry(&self, name: &[u8]) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    fn proc_entry(&self, name: &[u8]) -> io::Result<PathBuf> {
         let mut path = PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()));
         path.push(os(name));
-        path
+        Ok(path)
+    }
+
+    /// macOS has no such link and no xattr call relative to a descriptor, so this asks the kernel for
+    /// the directory's path as it is now. A parent swapped for a symlink in the instant after that can
+    /// redirect this one call: the one place here where invariant 6 is weaker than on Linux.
+    #[cfg(target_os = "macos")]
+    fn proc_entry(&self, name: &[u8]) -> io::Result<PathBuf> {
+        let dir = fs::getpath(&self.0)?;
+        let mut path = PathBuf::from(OsStr::from_bytes(dir.as_bytes()));
+        path.push(os(name));
+        Ok(path)
     }
 
     pub fn list_xattrs(&self, name: &[u8]) -> io::Result<Vec<Vec<u8>>> {
-        let path = self.proc_entry(name);
+        let path = self.proc_entry(name)?;
         let mut buf = vec![0u8; 4096];
         loop {
             match fs::llistxattr(&path, &mut buf[..]) {
@@ -304,7 +411,7 @@ impl Dir {
     }
 
     pub fn get_xattr(&self, name: &[u8], key: &[u8]) -> io::Result<Vec<u8>> {
-        let path = self.proc_entry(name);
+        let path = self.proc_entry(name)?;
         let mut buf = vec![0u8; 4096];
         loop {
             match fs::lgetxattr(&path, os(key), &mut buf[..]) {
@@ -320,7 +427,7 @@ impl Dir {
 
     pub fn set_xattr(&self, name: &[u8], key: &[u8], value: &[u8]) -> io::Result<()> {
         Ok(fs::lsetxattr(
-            self.proc_entry(name),
+            self.proc_entry(name)?,
             os(key),
             value,
             fs::XattrFlags::empty(),
@@ -328,7 +435,7 @@ impl Dir {
     }
 
     pub fn remove_xattr(&self, name: &[u8], key: &[u8]) -> io::Result<()> {
-        Ok(fs::lremovexattr(self.proc_entry(name), os(key))?)
+        Ok(fs::lremovexattr(self.proc_entry(name)?, os(key))?)
     }
 
     pub fn chown(&self, name: &[u8], uid: u32, gid: u32) -> io::Result<()> {
@@ -344,6 +451,7 @@ impl Dir {
 
     /// `chmod` of the entry itself. A descriptor opened with `O_PATH | O_NOFOLLOW` pins the inode,
     /// and its magic link reaches that inode and nothing else. Refuses symlinks.
+    #[cfg(target_os = "linux")]
     pub fn chmod(&self, name: &[u8], mode: u32) -> io::Result<()> {
         let fd = fs::openat(
             &self.0,
@@ -358,8 +466,23 @@ impl Dir {
         Ok(fs::chmodat(
             CWD,
             format!("/proc/self/fd/{}", fd.as_raw_fd()),
-            Mode::from_raw_mode(mode),
+            Mode::from_raw_mode(mode as _),
             AtFlags::empty(),
+        )?)
+    }
+
+    /// macOS can do this directly: the flag never follows a symlink, so one swapped in at the last
+    /// moment gets the mode itself and nothing else does. Refuses symlinks otherwise.
+    #[cfg(target_os = "macos")]
+    pub fn chmod(&self, name: &[u8], mode: u32) -> io::Result<()> {
+        if self.stat(name)?.file_type == fs::FileType::Symlink {
+            return Err(Errno::LOOP.into());
+        }
+        Ok(fs::chmodat(
+            &self.0,
+            os(name),
+            Mode::from_raw_mode(mode as _),
+            AtFlags::SYMLINK_NOFOLLOW,
         )?)
     }
 

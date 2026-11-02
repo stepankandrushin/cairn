@@ -189,6 +189,7 @@ fn build_as_root(root: &Path) {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "its tree holds names APFS refuses")]
 fn every_metadata_type_round_trips_through_the_server() {
     let sb = Sandbox::on_disk("roundtrip");
     let server = Server::start(sb.path("server"));
@@ -250,6 +251,7 @@ fn every_metadata_type_round_trips_through_the_server() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "its tree holds names APFS refuses")]
 fn a_second_device_gets_the_same_tree_under_its_default_policy() {
     let sb = Sandbox::on_disk("roundtrip-two");
     let server = Server::start(sb.path("server"));
@@ -286,20 +288,50 @@ fn a_second_device_gets_the_same_tree_under_its_default_policy() {
         .contains("0 steps applied here, 0 commits"));
 }
 
+/// A hole that the receiving filesystem fills looks like a change to its next scan, which then sends
+/// the file back without its holes, to every device. APFS does that unless it is told, to a gap of a few
+/// megabytes though not to one of a gigabyte.
+#[test]
+fn a_sparse_file_arrives_sparse_and_is_not_sent_back() {
+    let sb = Sandbox::on_disk("sparse-arrives");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    let size = 5_000_003u64;
+    let file = std::fs::File::create(a.path("sparse")).unwrap();
+    file.set_len(size).unwrap();
+    file.write_all_at(b"end", 5_000_000).unwrap();
+    // The same filling would happen to this file before anything could be sent.
+    #[cfg(target_os = "macos")]
+    cairn_engine::fsops::punch_hole(std::os::fd::AsFd::as_fd(&file), 0, 4_997_120).unwrap();
+    drop(file);
+    a.synced();
+    b.synced();
+
+    let held = std::fs::symlink_metadata(b.path("sparse")).unwrap();
+    assert_eq!(std::os::unix::fs::MetadataExt::size(&held), size);
+    assert!(
+        std::os::unix::fs::MetadataExt::blocks(&held) < 4096,
+        "inflated to {} blocks",
+        std::os::unix::fs::MetadataExt::blocks(&held)
+    );
+    assert!(b
+        .synced()
+        .stdout
+        .contains("0 steps applied here, 0 commits"));
+}
+
 #[test]
 fn what_cannot_be_synced_is_named_with_a_reason_and_an_action() {
     let sb = Sandbox::on_disk("skips");
     let server = Server::start(sb.path("server"));
     let a = Device::new(&sb, &server, "a");
     a.write("keep", b"k");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        a.path("fifo").as_path(),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_raw_mode(0o644),
-        0,
-    )
-    .unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(a.path("fifo"))
+        .status()
+        .unwrap()
+        .success());
     let _socket = UnixListener::bind(a.path("socket")).unwrap();
 
     let run = a.synced();

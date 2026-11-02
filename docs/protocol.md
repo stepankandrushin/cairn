@@ -90,7 +90,7 @@ erase what a newer one wrote.
 
 Platform namespaces: `linux.xattr` (POSIX ACLs and capabilities are xattrs here), `macos.xattr`,
 `macos.finder_info`, `macos.resource_fork`, `windows.acl`, `windows.attributes`, `windows.ads`.
-Only `linux.xattr` is produced by this release; the others have their place in the record.
+Only `linux.xattr` and `macos.xattr` are produced by this release, and each platform leaves the other's untouched; a Finder info or resource fork travels as a `macos.xattr` for now. The others have their place in the record.
 
 ## Changes
 

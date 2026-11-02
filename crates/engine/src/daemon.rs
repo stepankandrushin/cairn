@@ -21,8 +21,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,14 +105,31 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+#[cfg(target_os = "linux")]
 fn lock_address(root_id: &str) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(format!("cairn-daemon-{root_id}"))
 }
 
 /// Held for the life of the daemon. A name in the abstract socket namespace rather than a file, which
 /// would be an open descriptor on the disk and keep it from being unmounted.
+#[cfg(target_os = "linux")]
 fn take_lock(root_id: &str) -> std::io::Result<UnixListener> {
     UnixListener::bind_addr(&lock_address(root_id)?)
+}
+
+/// macOS has no abstract sockets. A lock on a file in the user's library, not in the root, for the same
+/// reason; the kernel drops it when the process dies.
+#[cfg(target_os = "macos")]
+fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
+    let home = std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME is not set"))?;
+    let dir = Path::new(&home).join("Library/Application Support/Cairn");
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::File::create(dir.join(format!("daemon-{root_id}.lock")))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(std::io::ErrorKind::AddrInUse.into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// What the daemon of this root last said, if one is running.

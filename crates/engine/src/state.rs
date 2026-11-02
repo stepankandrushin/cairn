@@ -95,6 +95,9 @@ impl State {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // FULL: a queued commit or an intent survives power loss, not only a killed process.
         conn.pragma_update(None, "synchronous", "FULL")?;
+        // On macOS that needs this too, or SQLite's fsync stops at the drive's cache. Elsewhere a no-op.
+        conn.pragma_update(None, "fullfsync", "ON")?;
+        conn.pragma_update(None, "checkpoint_fullfsync", "ON")?;
         let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > MIGRATIONS.len() {
             bail!("this root's state is schema {version}, newer than this binary: upgrade cairn");

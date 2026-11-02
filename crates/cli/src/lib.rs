@@ -95,7 +95,7 @@ enum Command {
         /// The longest wait in seconds before trying again after a failure, or while paused.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
-        /// Do not watch the filesystem, where inotify does not work: only full syncs find changes here.
+        /// Do not watch the filesystem, where its events do not work: only full syncs find changes here.
         #[arg(long)]
         no_watch: bool,
         /// Do not wait on the server: only full syncs find changes there.

@@ -16,6 +16,7 @@ pub mod schedule;
 pub mod selection;
 pub mod state;
 pub mod sync;
+#[cfg_attr(target_os = "macos", path = "watch_fsevents.rs")]
 pub mod watch;
 
 pub use metadata::{ApplyPolicy, OwnerPolicy};

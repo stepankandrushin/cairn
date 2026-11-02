@@ -83,7 +83,8 @@ fn write_file(
         }
         i += batch.len();
     }
-    rustix::fs::fsync(&fd).map_err(std::io::Error::from)?;
+    crate::chunker::restore_holes(fd.as_fd(), &m);
+    fsops::sync_fd(fd.as_fd())?;
     Ok(fd)
 }
 
@@ -186,7 +187,7 @@ pub fn export(
             ),
         );
         if let Some(fd) = fd {
-            rustix::fs::fsync(&fd).map_err(std::io::Error::from)?;
+            fsops::sync_fd(fd.as_fd())?;
         }
         dir.rename_new(&tmp, &dir, name.as_bytes())?;
         first_path.insert(*id, p.clone());

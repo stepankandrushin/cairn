@@ -4,11 +4,11 @@
 use crate::client::Client;
 use crate::export::tree_at;
 use crate::merge::{conflict_name, in_git_dir};
-use crate::root::Root;
+use crate::root::{Config, Root};
 use crate::scan::display_path;
 use crate::schedule::{schedule, Topo, TopoOp};
 use anyhow::{anyhow, bail, Result};
-use cairn_protocol::wire::{Change, CommitRequest, CommitResponse};
+use cairn_protocol::wire::{Change, CommitRequest, CommitResponse, ConflictEntry};
 use cairn_protocol::{Content, Link, Name, ObjectId, Op, OpId, RevisionId, Tree};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,8 +43,8 @@ pub fn journal(client: &Client) -> Result<Vec<Change>> {
 }
 
 /// The revisions of the object at `path` as of `at`.
-pub fn history(root: &Root, path: &[Name], at: Option<u64>) -> Result<Vec<HistoryEntry>> {
-    let client = Client::new(&root.config)?;
+pub fn history(config: &Config, path: &[Name], at: Option<u64>) -> Result<Vec<HistoryEntry>> {
+    let client = Client::new(config)?;
     let (tree, seq) = tree_at(&client, at)?;
     let object = tree
         .resolve(path)
@@ -86,6 +86,68 @@ pub fn history(root: &Root, path: &[Name], at: Option<u64>) -> Result<Vec<Histor
         }
     }
     Ok(out)
+}
+
+/// One entry of the conflict inbox, and where its copy and the object it competed with are now.
+#[derive(Clone, Debug)]
+pub struct Conflict {
+    pub entry: ConflictEntry,
+    /// Where the copy was made.
+    pub made_at: Option<Vec<Name>>,
+    /// Where the copy is now; none once it is deleted.
+    pub copy_now: Option<Vec<Name>>,
+    /// Where the object it competed with is now; none once that is deleted.
+    pub object_now: Option<Vec<Name>>,
+    /// Still waiting for a person: the copy is in the folder it was made in, under the name it was
+    /// given. Deleting, renaming or moving it is what dealing with it looks like, and closes it.
+    pub open: bool,
+}
+
+/// The conflict inbox, with paths: the server keeps which copy holds whose competing version, and
+/// the journal says where each was made and where it is now.
+pub fn conflicts(config: &Config) -> Result<Vec<Conflict>> {
+    let client = Client::new(config)?;
+    let entries = client.conflicts()?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let copies: BTreeSet<ObjectId> = entries.iter().map(|e| e.copy).collect();
+    let mut tree = Tree::new();
+    let mut made = BTreeMap::new();
+    for change in journal(&client)? {
+        for op in &change.ops {
+            if let Op::Create { object, link, .. } = op {
+                if copies.contains(object) {
+                    made.insert(*object, (link.clone(), tree.path_of_link(link)));
+                }
+            }
+            tree.apply(op)
+                .map_err(|e| anyhow!("the journal does not replay at seq {}: {e}", change.seq))?;
+        }
+    }
+    let path_now = |o: ObjectId| {
+        tree.get_live(o)
+            .and_then(|n| n.links.iter().next())
+            .and_then(|l| tree.path_of_link(l))
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let (link, made_at) = match made.get(&entry.copy) {
+                Some((l, p)) => (Some(l), p.clone()),
+                None => (None, None),
+            };
+            // By the entry, not the path: renaming a folder above the copy is not dealing with it.
+            let open = link.is_some_and(|l| tree.entry_at(l) == Some(entry.copy));
+            Conflict {
+                made_at,
+                copy_now: path_now(entry.copy),
+                object_now: path_now(entry.object),
+                open,
+                entry,
+            }
+        })
+        .collect())
 }
 
 fn topo(tree: &Tree) -> Topo {

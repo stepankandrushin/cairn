@@ -37,8 +37,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const QUIET: Duration = Duration::from_millis(300);
 /// And the most that waiting can add up to, while something keeps writing.
 const MOST_QUIET: Duration = Duration::from_secs(3);
-/// Between the start of one sync and the next, at the very least.
+/// Between the end of one sync and the next, at the very least.
 const MIN_GAP: Duration = Duration::from_secs(1);
+/// A wait shorter than this is not worth writing the status for.
+const SHOW_WAIT: Duration = Duration::from_secs(2);
 /// With directories out of the watcher's reach, the safety net does more of the work.
 const DEGRADED_RECONCILE: Duration = Duration::from_secs(300);
 /// Below any reverse proxy's usual read timeout (nginx: 60 seconds).
@@ -98,6 +100,33 @@ pub struct Status {
     /// Why the change feed is down, if it is.
     pub feed_down: Option<String>,
     pub skips: Vec<String>,
+    /// Changes here or on the server that wait, until when and why.
+    pub waiting: Option<Waiting>,
+    /// Metadata the filesystem here refused, which the server keeps: each until a later sync applies
+    /// that path's in full, the path is gone, or the daemon restarts. A sync says so only once, since
+    /// after it nothing differs, so this is where it stays to be seen.
+    #[serde(default)]
+    pub not_applied: Vec<NotApplied>,
+    /// How many there are, of which `not_applied` holds the first [`MAX_NOT_APPLIED`].
+    #[serde(default)]
+    pub not_applied_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotApplied {
+    pub path: String,
+    pub text: String,
+    /// Seconds since the epoch.
+    pub since: i64,
+}
+
+pub const MAX_NOT_APPLIED: usize = 200;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting {
+    /// Seconds since the epoch.
+    pub until: i64,
+    pub why: String,
 }
 
 fn now_secs() -> i64 {
@@ -284,6 +313,25 @@ impl Schedule {
         due
     }
 
+    /// When work that waits will be done, and why it waits, if anything does.
+    fn waiting(&self, now: Instant) -> Option<(Instant, &'static str)> {
+        if self.first_event.is_none() && !self.remote {
+            return None;
+        }
+        let due = self.due();
+        if due <= now {
+            return None;
+        }
+        let why = if self.holding && self.retry_at == Some(due) {
+            "the wait after a failure, before trying again"
+        } else if self.gap_until == due {
+            "the pause after the last sync, twice as long as its scan"
+        } else {
+            "for the files to be quiet"
+        };
+        Some((due, why))
+    }
+
     fn note(&mut self, wake: Wake, synced_head: u64) {
         match wake {
             Wake::Local => {
@@ -335,6 +383,31 @@ fn say_feed(
 }
 
 /// The lines of a report, for saying each thing once rather than on every retry.
+/// Keep what this filesystem refused until it is put right or gone; see [`Status::not_applied`].
+fn note_not_applied(
+    root: &Path,
+    status: &mut Status,
+    kept: &mut Vec<NotApplied>,
+    report: &SyncReport,
+) {
+    let applied: BTreeSet<&str> = report.meta_applied.iter().map(String::as_str).collect();
+    // A name shown with escapes cannot be looked up by its display, so it stays.
+    let gone = |p: &str| !p.contains('\\') && std::fs::symlink_metadata(root.join(p)).is_err();
+    kept.retain(|n| !applied.contains(n.path.as_str()) && !gone(&n.path));
+    for w in &report.warnings {
+        let text = w.to_string();
+        if !kept.iter().any(|n| n.text == text) {
+            kept.push(NotApplied {
+                path: w.path.clone(),
+                text,
+                since: now_secs(),
+            });
+        }
+    }
+    status.not_applied_count = kept.len();
+    status.not_applied = kept.iter().take(MAX_NOT_APPLIED).cloned().collect();
+}
+
 fn report_lines(report: &SyncReport) -> BTreeSet<String> {
     let mut lines = BTreeSet::new();
     for e in &report.events {
@@ -404,6 +477,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut said: BTreeSet<String> = BTreeSet::new();
     let mut said_counts = WatchCounts::default();
     let mut said_feed: Option<String> = None;
+    let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
 
@@ -415,9 +489,26 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 while let Ok(more) = wake_rx.try_recv() {
                     schedule.note(more, synced_head.load(Ordering::SeqCst));
                 }
-                if Instant::now() < schedule.due() {
-                    if say_feed(&feed_down, &mut said_feed, log) {
+                let now = Instant::now();
+                if now < schedule.due() {
+                    let mut changed = say_feed(&feed_down, &mut said_feed, log);
+                    if changed {
                         status.feed_down.clone_from(&said_feed);
+                    }
+                    if status.waiting.is_none() {
+                        if let Some((due, why)) = schedule
+                            .waiting(now)
+                            .filter(|(due, _)| *due - now > SHOW_WAIT)
+                        {
+                            let left = (due - now).as_secs_f64().ceil() as i64;
+                            status.waiting = Some(Waiting {
+                                until: now_secs() + left,
+                                why: why.into(),
+                            });
+                            changed = true;
+                        }
+                    }
+                    if changed {
                         write_status(path, &status);
                     }
                     continue;
@@ -464,11 +555,19 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 w.walk_all();
             }
         }
+        status.waiting = None;
         hit("daemon.sync");
         let result = sync(path, &SyncOptions::default());
         hit("daemon.synced");
-        let took = started.elapsed();
-        schedule.gap_until = Instant::now() + MIN_GAP.max(took * 2);
+        // Every sync repeats its scan; the rest of a long one was moving data, which the next does not
+        // do again. Twice the scan keeps a tree that never rests from keeping the daemon scanning more
+        // than a third of the time, and a change after a big download waits about a scan, not twice
+        // the download.
+        let repeated = match &result {
+            Ok(report) => report.scan_time,
+            Err(_) => started.elapsed(),
+        };
+        schedule.gap_until = Instant::now() + MIN_GAP.max(repeated * 2);
 
         status.syncs += 1;
         status.last_sync = now_secs();
@@ -481,6 +580,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 synced_head.store(report.head, Ordering::SeqCst);
                 lines = report_lines(&report);
                 status.skips = report.skips.iter().map(ToString::to_string).collect();
+                note_not_applied(path, &mut status, &mut not_applied, &report);
                 if let Some(w) = &watcher {
                     w.set_in_motion(
                         report

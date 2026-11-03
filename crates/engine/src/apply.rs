@@ -160,6 +160,8 @@ pub struct ApplyOutcome {
     pub failed: Vec<Skip>,
     /// Metadata fields this filesystem could not take.
     pub warnings: Vec<Skip>,
+    /// Paths whose metadata this run applied in full.
+    pub meta_applied: Vec<String>,
     /// Names this filesystem cannot hold, each the topmost: what is under one was not tried.
     pub unholdable: Vec<(crate::selection::Unheld, String)>,
     pub applied_steps: u64,
@@ -167,6 +169,10 @@ pub struct ApplyOutcome {
     pub halted: bool,
     /// The filesystem was written to, so a fresh scan must confirm the result.
     pub touched: bool,
+    /// What this run placed and found gone before it could record it. A row is what proves that this
+    /// device held an entry, and rows are written once the whole run's directories are durable, so a
+    /// person removing what is arriving leaves no proof that it was here: it comes down again.
+    pub gone: Vec<String>,
 }
 
 impl ApplyOutcome {
@@ -578,6 +584,9 @@ impl<'a> Applier<'a> {
             &self.root.config.policy,
             self.accounts,
         );
+        if problems.is_empty() {
+            self.outcome.meta_applied.push(show(display));
+        }
         for p in problems {
             self.outcome.warnings.push(Skip {
                 path: show(display),
@@ -1128,10 +1137,27 @@ impl<'a> Applier<'a> {
             })();
             match finished {
                 Ok(()) => self.root.state.drop_intent(&format!("{INTENT_MODE}{id}"))?,
-                Err(e) => self.record(id, show(&display), e)?,
+                Err(e) => {
+                    if created && matches!(e, StepError::Changed(_)) && !self.dir_is_there(&cur) {
+                        self.outcome.gone.push(show(&display));
+                    }
+                    self.record(id, show(&display), e)?
+                }
             }
         }
         Ok(())
+    }
+
+    /// Whether a directory is still at its place, for telling it gone from in the way.
+    fn dir_is_there(&self, cur: &CurNode) -> bool {
+        let Some(link) = cur.links.iter().next() else {
+            return true;
+        };
+        match self.locate(link) {
+            Ok((dir, name)) => dir.try_stat(&name).map_or(true, |s| s.is_some()),
+            Err(StepError::Changed(_)) => false,
+            Err(_) => true,
+        }
     }
 
     fn depth(&self, mut id: ObjectId) -> usize {
@@ -1223,11 +1249,22 @@ impl<'a> Applier<'a> {
             let Some(link) = cur.links.iter().next().cloned() else {
                 continue;
             };
-            let Ok((dir, name)) = self.locate(&link) else {
-                continue;
+            let display = show(&step_path(&self.cur, &link));
+            let (dir, name) = match self.locate(&link) {
+                Ok(found) => found,
+                Err(StepError::Changed(_)) => {
+                    self.outcome.gone.push(display);
+                    continue;
+                }
+                Err(_) => continue,
             };
-            if let Err(e) = self.store_one(plan, id, &dir, &name) {
-                self.record(id, show(&step_path(&self.cur, &link)), e)?;
+            match self.store_one(plan, id, &dir, &name) {
+                Ok(()) => {}
+                Err(StepError::Changed(e)) if dir.try_stat(&name).is_ok_and(|s| s.is_none()) => {
+                    self.outcome.gone.push(display.clone());
+                    self.record(id, display, StepError::Changed(e))?;
+                }
+                Err(e) => self.record(id, display, e)?,
             }
         }
         Ok(())
@@ -1495,6 +1532,7 @@ impl<'a> Applier<'a> {
                 (Err(e), _) => self.record(object, display, e)?,
             }
         }
+        hit("apply.created");
         self.apply_updates(plan)?;
         // Durable before any row says so, or a power cut would leave a row claiming a file that the
         // disk does not have, and the old file would read as a local revert.

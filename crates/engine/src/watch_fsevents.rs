@@ -175,8 +175,10 @@ extern "C" fn on_events(
 ) {
     // SAFETY: `info` is the Mutex leaked in `start`, and the arrays hold `count` entries for this call.
     let inner = unsafe { &*(info as *const Mutex<Inner>) };
-    let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+    // Before the lock, as on Linux: a reader paused holding it would also stop `walk_all`, so a daemon
+    // whose first event came early never made its first sync.
     hit("daemon.watch.read");
+    let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
     let mut wake = false;
     for i in 0..count {
         let (path, flag) = unsafe { (CStr::from_ptr(*paths.add(i)).to_bytes(), *flags.add(i)) };

@@ -96,7 +96,7 @@ What follows from it:
 | mtime, btime | Nanoseconds, with the recorded precision kept |
 | xattrs, POSIX ACLs, Windows ACLs | Stored in per-platform namespaces; applied by an allow/deny list (`security.selinux` not applied by default) |
 | macOS resource forks, Finder metadata | Preserved explicitly. For now as `macos.xattr` records, up to 1 MiB each, past which one is reported and not stored. What is about the machine rather than the file (provenance, quarantine, access grants, last opened) is neither stored nor applied |
-| Sparse files | Holes recorded, recreated where supported, never inflated on download |
+| Sparse files | Holes recorded, recreated where supported, never inflated on download. Where the holes are is no change while the bytes are the same: filesystems move them on their own (APFS fills small ones and lays data runs out its own way), and a device that read that as an edit would send the file back to everyone, inflated |
 | FIFOs, sockets, devices | Excluded from ordinary sync, with the reason shown |
 
 ## Filenames
@@ -144,7 +144,7 @@ record yet; a removal of a just-arrived file can be undone by the server's copy,
 | Metadata on both, different fields | Merge field by field |
 | Metadata on both, same field | Server order wins; the loser is in the activity log |
 | Content on one, metadata or rename on the other | Apply both |
-| Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox. Inside a git directory the copy is `name.conflict-hostname-2026-10-31`, a name git takes: a copy of a branch is a branch to merge, where a space in `refs/` breaks the repository |
+| Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox, open until the copy is deleted, renamed or moved, which is how a person deals with one. Inside a git directory the copy is `name.conflict-hostname-2026-10-31`, a name git takes: a copy of a branch is a branch to merge, where a space in `refs/` breaks the repository |
 | Edit against delete | The edit survives, and it is reported. This includes each side removing a different hard link of a file someone edited |
 | Same new name, different objects | Identical content or two directories become one object; otherwise keep both under a conflict name |
 | Concurrent moves that would form a cycle | The server rejects the second; that client rebases |
@@ -163,7 +163,9 @@ unmounted, but says nothing when only a bind mount goes away, or when anything i
 reconcile finds the first, and retrying while paused the second. After a failure it backs off, up to a
 minute, and holds every change back until then. A file still being written is no failure: the daemon comes
 back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
-its close does.
+its close does. Between syncs it rests for twice the last one's scan, the part every sync repeats, so a tree
+that never rests keeps it scanning at most a third of the time; the length of a big download is no reason to
+wait, as the next sync does not repeat it. `cairn status` says when changes wait, until when, and why.
 
 **Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
 `cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree

@@ -135,24 +135,34 @@ pub fn read_config(path: &Path) -> Result<Config> {
     serde_json::from_slice(&std::fs::read(state.join(CONFIG))?).context("read the configuration")
 }
 
+fn read_marker(path: &Path) -> Result<String> {
+    let state_path = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    match std::fs::read_to_string(state_path.join(MARKER)) {
+        Ok(m) => Ok(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Paused(format!(
+            "{} has no {} marker: either it was never set up with `cairn init`, or the filesystem \
+             that holds it is not mounted. Sync is paused and nothing was changed.",
+            path.display(),
+            String::from_utf8_lossy(STATE_DIR),
+        ))
+        .into()),
+        Err(e) => Err(e).context("read the root marker"),
+    }
+}
+
+/// The configuration of a root, for what only asks the server: no lock, so it works while a sync
+/// runs, and nothing here is read or changed.
+pub fn open_config(path: &Path) -> Result<Config> {
+    read_marker(path)?;
+    read_config(path)
+}
+
 impl Root {
     pub fn open(path: &Path) -> Result<Self> {
         let dir =
             Dir::open_root(path).with_context(|| format!("open sync root {}", path.display()))?;
         let state_path = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
-        let marker = match std::fs::read_to_string(state_path.join(MARKER)) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Paused(format!(
-                    "{} has no {} marker: either it was never set up with `cairn init`, or the filesystem \
-                     that holds it is not mounted. Sync is paused and nothing was changed.",
-                    path.display(),
-                    String::from_utf8_lossy(STATE_DIR),
-                ))
-                .into());
-            }
-            Err(e) => return Err(e).context("read the root marker"),
-        };
+        let marker = read_marker(path)?;
         let state_dir = dir
             .open_dir(STATE_DIR)
             .context("open the state directory")?;

@@ -9,6 +9,8 @@
 //! - `CAIRN_FP_PAUSE=<name>:<dir>`: on the hit, create `<dir>/reached` and wait for `<dir>/go`.
 //! - `CAIRN_FP_REFUSE_NAME=<name>`: `refuse_name` refuses that name as a filesystem refuses bytes it
 //!   cannot hold (EILSEQ), as APFS does a name that is not UTF-8.
+//! - `CAIRN_FP_EPERM=<name>`: `deny` refuses that point with EPERM, as a filesystem refuses a change
+//!   to a file this user does not own. Not a step: numbered points elsewhere stay where they were.
 
 use std::io;
 
@@ -38,6 +40,19 @@ pub fn check(name: &str) -> io::Result<()> {
 pub fn refuse_name(name: &[u8]) -> io::Result<()> {
     #[cfg(feature = "enabled")]
     return imp::refuse_name(name);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = name;
+        Ok(())
+    }
+}
+
+/// Before a change to an entry's metadata: may refuse it, as the filesystem refuses one to a file this
+/// user does not own.
+#[inline]
+pub fn deny(name: &str) -> io::Result<()> {
+    #[cfg(feature = "enabled")]
+    return imp::deny(name);
     #[cfg(not(feature = "enabled"))]
     {
         let _ = name;
@@ -117,6 +132,14 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    pub fn deny(name: &str) -> io::Result<()> {
+        const EPERM: i32 = 1;
+        match std::env::var("CAIRN_FP_EPERM") {
+            Ok(point) if point == name => Err(io::Error::from_raw_os_error(EPERM)),
+            _ => Ok(()),
+        }
     }
 
     pub fn refuse_name(name: &[u8]) -> io::Result<()> {

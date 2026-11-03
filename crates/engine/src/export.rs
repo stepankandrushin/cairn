@@ -4,7 +4,7 @@
 use crate::client::Client;
 use crate::fsops::{self, Dir};
 use crate::metadata::{self, Accounts, ApplyPolicy};
-use crate::root::Root;
+use crate::root::Config;
 use crate::scan::display_path;
 use crate::sync::fetch_changes;
 use anyhow::{anyhow, bail, Context, Result};
@@ -90,13 +90,13 @@ fn write_file(
 
 /// Write the subtree at `path` as of `at` into `dest`, which must be missing or empty.
 pub fn export(
-    root: &Root,
+    config: &Config,
     at: Option<u64>,
     path: &[Name],
     dest: &Path,
     policy: &ApplyPolicy,
 ) -> Result<(u64, Vec<Skip>)> {
-    let client = Client::new(&root.config)?;
+    let client = Client::new(config)?;
     let (tree, seq) = tree_at(&client, at)?;
     let top = tree
         .resolve(path)

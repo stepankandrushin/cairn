@@ -148,7 +148,24 @@ fn content_on_both_keeps_both_and_fills_the_inbox() {
     assert_eq!(a.read(&copies[0]), b"from b");
     let inbox = a.cairn(&["conflicts"]).expect_ok();
     assert_eq!(inbox.stdout.lines().count(), 1, "{}", inbox.text());
+    let line = format!("{}: the competing version of doc.txt", copies[0]);
+    assert!(inbox.stdout.contains(&line), "{}", inbox.text());
     converge(&[&a, &b]);
+
+    // Deleting the copy is dealing with it: the inbox no longer waits for a person.
+    std::fs::remove_file(a.path(&copies[0])).unwrap();
+    a.synced();
+    let inbox = b.cairn(&["conflicts"]).expect_ok();
+    assert!(
+        inbox
+            .stdout
+            .starts_with("no conflict waits for a person\n1 more dealt with"),
+        "{}",
+        inbox.text()
+    );
+    let all = b.cairn(&["conflicts", "--all"]).expect_ok();
+    let line = format!("dealt with: {}, deleted", copies[0]);
+    assert!(all.stdout.contains(&line), "{}", all.text());
 }
 
 #[test]
@@ -826,8 +843,77 @@ fn a_second_sync_at_once_is_refused_not_interleaved() {
         "{}",
         second.text()
     );
+    // What only asks the server needs no lock, so it answers while the sync runs.
+    for args in [
+        vec!["log"],
+        vec!["history", "f"],
+        vec!["conflicts"],
+        vec!["export", sb.path("out").to_str().unwrap()],
+    ] {
+        a.cairn(&args).expect_ok();
+    }
+    let status = a.cairn(&["status"]).expect_ok();
+    assert!(
+        status.stdout.contains("a sync is running now"),
+        "{}",
+        status.text()
+    );
     std::fs::write(gate.join("go"), b"").unwrap();
     worker.join().unwrap().expect_ok();
+}
+
+#[test]
+fn init_makes_a_root_of_the_folder_given_by_root() {
+    let sb = Sandbox::on_disk("init-root");
+    let server = Server::start(sb.path("server"));
+    let here = sb.path("here");
+    let there = sb.path("there");
+    std::fs::create_dir(&here).unwrap();
+    std::fs::create_dir(&there).unwrap();
+    let token = server.token_file.to_str().unwrap();
+    let init = |dir: &std::path::Path, extra: &[&str]| {
+        let mut cmd = Command::new(CAIRN);
+        cmd.current_dir(dir)
+            .args(["init", "--server", &server.url, "--token-file", token])
+            .args(extra);
+        cmd.output().unwrap()
+    };
+    let out = init(&here, &["--root", there.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(there.join(".cairn/root-id").exists());
+    assert!(!here.join(".cairn").exists(), "--root was ignored");
+
+    // Two different folders is a mistake to say, not to guess at.
+    let other = sb.path("other");
+    std::fs::create_dir(&other).unwrap();
+    let out = init(&here, &["--root", other.to_str().unwrap(), "."]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!here.join(".cairn").exists() && !other.join(".cairn").exists());
+}
+
+#[test]
+fn output_nobody_reads_is_no_failure() {
+    // `cairn status | head`: the reader goes away, and the command neither panics nor stops.
+    let (_sb, _s, a, _b) = pair("pipe");
+    for i in 0..20 {
+        a.write(&format!("f{i}"), "x");
+    }
+    for args in [vec!["status"], vec!["sync"], vec!["log"]] {
+        let mut cmd = Command::new(CAIRN);
+        cmd.args(["--root", a.root.to_str().unwrap()])
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {:?} {err}", out.status);
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+    }
+    // The sync whose output went nowhere still did its work.
+    let status = a.cairn(&["status"]).expect_ok();
+    assert!(status.stdout.contains("nothing to do"), "{}", status.text());
 }
 
 #[test]

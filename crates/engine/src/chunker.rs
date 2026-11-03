@@ -61,6 +61,57 @@ pub fn restore_holes(fd: BorrowedFd<'_>, m: &Manifest) {
 #[cfg(not(target_os = "macos"))]
 pub fn restore_holes(_: BorrowedFd<'_>, _: &Manifest) {}
 
+/// Whether an open file holds the bytes of `m`, wherever its own holes are: each chunk of `m`, read
+/// where `m` has it, hashes the same, and what `m` has as a hole reads as zeros.
+pub fn same_bytes(fd: BorrowedFd<'_>, m: &Manifest) -> io::Result<bool> {
+    let size = rustix::fs::fstat(fd)?.st_size as u64;
+    if size != m.size {
+        return Ok(false);
+    }
+    let runs = data_runs(fd, size)?;
+    let mut buf = Vec::new();
+    let mut at = 0;
+    for segment in &m.segments {
+        if !zeros(fd, &runs, at, segment.offset, &mut buf)? {
+            return Ok(false);
+        }
+        let mut offset = segment.offset;
+        for c in &segment.chunks {
+            buf.resize(c.len as usize, 0);
+            read_exact_at(fd, &mut buf, offset)?;
+            if Hash::of(&buf) != c.hash {
+                return Ok(false);
+            }
+            offset += u64::from(c.len);
+        }
+        at = offset;
+    }
+    zeros(fd, &runs, at, size, &mut buf)
+}
+
+/// Whether `[from, to)` of a file reads as zeros. Only its data runs are read, since a hole is zeros.
+fn zeros(
+    fd: BorrowedFd<'_>,
+    runs: &[(u64, u64)],
+    from: u64,
+    to: u64,
+    buf: &mut Vec<u8>,
+) -> io::Result<bool> {
+    for &(offset, len) in runs {
+        let (mut at, end) = (offset.max(from), (offset + len).min(to));
+        while at < end {
+            let n = ((end - at).min(1 << 20)) as usize;
+            buf.resize(n, 0);
+            read_exact_at(fd, buf, at)?;
+            if buf.iter().any(|&b| b != 0) {
+                return Ok(false);
+            }
+            at += n as u64;
+        }
+    }
+    Ok(true)
+}
+
 struct RunReader<'a> {
     fd: BorrowedFd<'a>,
     at: u64,
@@ -191,6 +242,34 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].hash, Hash::of(b"hello"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_same_bytes_with_other_holes_are_the_same_bytes() {
+        const SIZE: u64 = 3 << 20;
+        let (dir, f) = temp("sparse");
+        f.set_len(SIZE).unwrap();
+        f.write_all_at(b"head", 0).unwrap();
+        f.write_all_at(b"tail", SIZE - 4).unwrap();
+        let sparse = manifest_of(&f, SIZE).unwrap();
+        // The same bytes, with the middle written as zeros rather than left a hole.
+        let (dir2, g) = temp("dense");
+        g.write_all_at(&std::fs::read(dir.join("sparse")).unwrap(), 0)
+            .unwrap();
+        let dense = manifest_of(&g, SIZE).unwrap();
+        assert_ne!(sparse, dense, "this filesystem has no holes to test with");
+        assert!(same_bytes(g.as_fd(), &sparse).unwrap());
+        assert!(same_bytes(f.as_fd(), &dense).unwrap());
+        // One byte other than zero where one of them has a hole is not.
+        g.write_all_at(b"x", 1 << 20).unwrap();
+        assert!(!same_bytes(g.as_fd(), &sparse).unwrap());
+        assert!(!same_bytes(g.as_fd(), &dense).unwrap());
+        g.write_all_at(b"\0", 1 << 20).unwrap();
+        assert!(same_bytes(g.as_fd(), &sparse).unwrap());
+        g.set_len(SIZE + 1).unwrap();
+        assert!(!same_bytes(g.as_fd(), &sparse).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
     }
 
     #[test]

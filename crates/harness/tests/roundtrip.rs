@@ -321,6 +321,60 @@ fn a_sparse_file_arrives_sparse_and_is_not_sent_back() {
         .contains("0 steps applied here, 0 commits"));
 }
 
+/// Where a file's holes are is the filesystem's business when the bytes are the same: APFS fills small
+/// ones and lays data runs out its own way. Committing that sent a sparse file back to everyone, with
+/// the same bytes, inflated.
+#[test]
+fn a_change_in_holes_alone_is_not_sent_and_a_real_edit_still_is() {
+    use std::os::unix::fs::MetadataExt;
+    let sb = Sandbox::on_disk("holes-alone");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    let size = 5_000_003u64;
+    let file = std::fs::File::create(a.path("sparse")).unwrap();
+    file.set_len(size).unwrap();
+    file.write_all_at(b"end", 5_000_000).unwrap();
+    // APFS would fill this hole when it flushes, as in the test above.
+    #[cfg(target_os = "macos")]
+    cairn_engine::fsops::punch_hole(std::os::fd::AsFd::as_fd(&file), 0, 4_997_120).unwrap();
+    drop(file);
+    a.synced();
+    b.synced();
+
+    // On b, a run of the hole written as zeros, and the time put back: the same bytes, other holes.
+    let before = std::fs::symlink_metadata(b.path("sparse")).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(b.path("sparse"))
+        .unwrap();
+    f.write_all_at(&vec![0u8; 1 << 20], 1 << 20).unwrap();
+    drop(f);
+    set_mtime(&b.path("sparse"), before.mtime(), before.mtime_nsec());
+    let filled = std::fs::symlink_metadata(b.path("sparse")).unwrap();
+    assert!(
+        filled.blocks() > before.blocks() + 1000,
+        "no hole was filled"
+    );
+    let run = b.synced();
+    assert!(run.stdout.contains(", 0 commits"), "{}", run.text());
+    a.synced();
+    let held = std::fs::symlink_metadata(a.path("sparse")).unwrap();
+    assert!(held.blocks() < 4096, "inflated to {} blocks", held.blocks());
+
+    // A byte that is not zero there is an edit, holes or not.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(b.path("sparse"))
+        .unwrap();
+    f.write_all_at(b"x", (1 << 20) + 7).unwrap();
+    drop(f);
+    let run = b.synced();
+    assert!(run.stdout.contains(", 1 commits"), "{}", run.text());
+    a.synced();
+    assert_eq!(a.read("sparse"), b.read("sparse"));
+}
+
 #[test]
 fn what_cannot_be_synced_is_named_with_a_reason_and_an_action() {
     let sb = Sandbox::on_disk("skips");

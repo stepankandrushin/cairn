@@ -585,6 +585,124 @@ fn a_failure_is_retried_with_nothing_else_to_wake_the_daemon() {
     wait_file(&db, b.path("during"), b"d");
 }
 
+/// A long sync is mostly moving data, which the next one does not repeat: the pause after it is twice
+/// its scan, not twice its length. It was twice its length, and after a 159 s download a device did
+/// not react for 318 s.
+#[test]
+fn a_long_sync_holds_the_next_change_back_only_for_its_scan() {
+    let (sb, _s, a, b) = pair("d-gap");
+    let gate = sb.path("gate");
+    std::fs::create_dir(&gate).unwrap();
+    // The first sync is held after its scan for 6 s, as one moving a lot of data would be.
+    let pause = format!("sync.scanned:{}", gate.display());
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_PAUSE", &pause)],
+    );
+    let log = da.log.clone();
+    wait_for("the first sync to be held", &log, || {
+        gate.join("reached").exists()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    std::fs::write(gate.join("go"), b"").unwrap();
+    da.wait_state("synced");
+    b.write("note", "x");
+    b.synced();
+    let start = Instant::now();
+    wait_file(&da, a.path("note"), b"x");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "took {:?}: {}",
+        start.elapsed(),
+        da.log()
+    );
+}
+
+/// A change that waits says so in `cairn status`, with until when and why.
+#[test]
+fn status_says_when_changes_wait_and_why() {
+    let (_sb, mut server, a, b) = pair("d-waiting");
+    let da = Daemon::start(
+        &a,
+        &["--no-feed", "--reconcile-secs", DAY, "--retry-secs", "30"],
+    );
+    da.wait_state("synced");
+    da.wait_rest();
+    server.kill();
+    a.write("first", "1");
+    da.wait_state("error");
+    // Each failure doubles the wait: 1, 2, 4, then 8 s.
+    let failed = da.syncs();
+    let log = da.log.clone();
+    wait_for("three more failures", &log, || da.syncs() >= failed + 3);
+    a.write("second", "2");
+    wait_for("the wait in the status", &log, || {
+        !da.status()["waiting"].is_null()
+    });
+    let waiting = &da.status()["waiting"];
+    assert!(
+        waiting["why"].as_str().unwrap().contains("after a failure"),
+        "{waiting}"
+    );
+    let status = a.cairn(&["status"]);
+    assert!(
+        status.stdout.contains("daemon: changes wait until")
+            && status.stdout.contains("after a failure"),
+        "{}",
+        status.text()
+    );
+    server.restart();
+    let db = Daemon::events_only(&b);
+    wait_file(&db, b.path("second"), b"2");
+}
+
+/// What the filesystem here refuses, such as a mode on a file another user owns, stays in the status
+/// until it is put right or gone. It was said once in the log and then only the checker's comparison
+/// showed it.
+#[test]
+fn metadata_refused_here_stays_in_the_status() {
+    let (_sb, _s, a, b) = pair("d-not-applied");
+    let da = Daemon::events_only(&a);
+    let db = Daemon::start_env(
+        &b,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_EPERM", "meta.mode")],
+    );
+    da.wait_state("synced");
+    db.wait_state("synced");
+    let held = |path: &str| {
+        db.status()["not_applied"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|n| n["path"] == path))
+    };
+    a.write("script", "x");
+    chmod(&a.path("script"), 0o755);
+    wait_file(&db, b.path("script"), b"x");
+    let log = db.log.clone();
+    wait_for("the refusal in the status", &log, || held("script"));
+    // Still there after syncs that have nothing to say about it.
+    a.write("other", "y");
+    wait_file(&db, b.path("other"), b"y");
+    db.wait_rest();
+    assert!(held("script"), "{}", db.status());
+    let status = b.cairn(&["status"]);
+    assert!(
+        status
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("daemon: not applied here since")
+                && l.contains("script: ")
+                && l.contains("mode")),
+        "{}",
+        status.text()
+    );
+    // Gone with the file.
+    std::fs::remove_file(a.path("script")).unwrap();
+    wait_gone(&db, b.path("script"));
+    wait_for("the refusal to go", &log, || !held("script"));
+}
+
 /// With nothing to sync and nothing to retry, the feed is the only thing that can notice.
 #[test]
 fn an_idle_daemon_says_when_the_server_goes_away() {

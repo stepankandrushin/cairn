@@ -947,3 +947,50 @@ fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
         PathBuf::from("f")
     );
 }
+
+/// A folder deleted here while it is still arriving. What is placed is recorded only once the whole
+/// run's folders are durable, so nothing proves that this device held it, and it comes down again: the
+/// safe way. In the deployment 1,958 of 2,000 files came back within 39 s of `rm -rf`, and nothing
+/// said so. Now the sync says so.
+#[test]
+fn a_folder_deleted_while_it_arrives_comes_back_and_says_so() {
+    let (sb, _s, a, b) = pair("rm-arriving");
+    let said = |run: &Run| -> Vec<String> {
+        run.stdout
+            .lines()
+            .filter(|l| l.contains("removed here while it was arriving"))
+            .map(|l| l.split(": removed").next().unwrap().to_string())
+            .collect()
+    };
+    // All of it in place, then removed before it is recorded.
+    for i in 0..50 {
+        a.write(&format!("dir/f{i:02}"), format!("{i}"));
+    }
+    a.synced();
+    let run = sync_with_gap(&sb, &b, "apply.created", || {
+        std::fs::remove_dir_all(b.path("dir")).unwrap();
+    });
+    assert!(run.ok(), "{}", run.text());
+    assert_eq!(
+        said(&run),
+        ["event: dir and 50 entries in it"],
+        "{}",
+        run.text()
+    );
+
+    // Removed after its first file, so the rest never got there.
+    for i in 0..50 {
+        a.write(&format!("dir2/f{i:02}"), format!("{i}"));
+    }
+    a.synced();
+    let run = sync_with_gap(&sb, &b, "apply.create.renamed", || {
+        std::fs::remove_dir_all(b.path("dir2")).unwrap();
+    });
+    assert!(run.ok(), "{}", run.text());
+    assert_eq!(said(&run), ["event: dir2"], "{}", run.text());
+
+    // Nothing was lost, and nothing went for anyone.
+    let p = converge(&[&a, &b]);
+    // Two folders of 50, and the root.
+    assert_eq!(p.names().len(), 103, "{:?}", p.names());
+}

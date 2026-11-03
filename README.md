@@ -50,7 +50,7 @@ cairn log
 cairn history hello.txt
 cairn restore hello.txt --at 1
 cairn export --at 1 /tmp/as-it-was               # into a new folder; changes nothing else
-cairn conflicts
+cairn conflicts                                  # the copies kept, until each is deleted, renamed or moved
 ```
 
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with
@@ -65,8 +65,10 @@ cairn status                     # what it last said, and what a sync would do n
 ```
 
 It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
-events can be lost. Its output says what it did and what it could not do, each thing once. A paused or failing
-root keeps being retried, and `cairn sync` beside it works as usual. As a systemd user unit:
+events can be lost. Its output says what it did and what it could not do, each thing once, and `cairn status`
+keeps what this filesystem refused (a mode on a file another user owns, say) until it is put right. A paused or
+failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log`, `history`, `export`
+and `conflicts` only ask the server, so they answer during a sync too. As a systemd user unit:
 
 ```ini
 [Service]

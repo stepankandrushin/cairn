@@ -445,7 +445,9 @@ pub fn apply(
         let bits = policy.mode_bits();
         let differs = current.is_none_or(|c| (c.mode ^ want.mode) & bits != 0);
         if differs || owner_applied {
-            if let Err(e) = dir.chmod(name, want.mode & bits) {
+            let chmod =
+                cairn_failpoint::deny("meta.mode").and_then(|()| dir.chmod(name, want.mode & bits));
+            if let Err(e) = chmod {
                 note("mode", e);
             }
         }

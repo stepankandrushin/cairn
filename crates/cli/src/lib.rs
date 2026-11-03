@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_engine::client::Client;
 use cairn_engine::daemon::DaemonOptions;
-use cairn_engine::root::Paused;
+use cairn_engine::root::{open_config, Busy, Paused};
 use cairn_engine::scan::display_path;
 use cairn_engine::{
     init_root, sync, ApplyPolicy, InitOptions, OwnerPolicy, Root, SyncOptions, SyncOutcome,
@@ -15,7 +15,35 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+macro_rules! errln {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// Set once the output cannot be written. Whoever reads it going away, as `cairn status | head`
+/// does, is no reason to panic or to stop what the command is doing: the rest goes unprinted.
+static STDOUT_GONE: AtomicBool = AtomicBool::new(false);
+
+fn out(args: std::fmt::Arguments) {
+    if STDOUT_GONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut o = std::io::stdout().lock();
+    if let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(b"\n")) {
+        STDOUT_GONE.store(true, Ordering::Relaxed);
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            errln!("cairn: the output cannot be written, so the rest is not shown: {e}");
+        }
+    }
+}
+
+macro_rules! outln {
+    ($($t:tt)*) => { out(format_args!($($t)*)) };
+}
 
 /// The tree synced, and anything excluded was listed.
 const EXIT_OK: u8 = 0;
@@ -50,8 +78,8 @@ enum OwnersArg {
 enum Command {
     /// Make a folder a sync root. Files already in it are merged with the server on the first sync.
     Init {
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// The folder to make a root. Default: --root, or else the current folder.
+        dir: Option<PathBuf>,
         #[arg(long)]
         server: String,
         /// A file holding the access token. Or set CAIRN_TOKEN.
@@ -163,8 +191,13 @@ enum Command {
         #[arg(long)]
         exact: bool,
     },
-    /// The conflict inbox.
-    Conflicts,
+    /// The conflict inbox: competing versions kept as copies, until the copy is deleted, renamed or
+    /// moved, which is how a person deals with one.
+    Conflicts {
+        /// Also those dealt with.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn find_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -200,25 +233,21 @@ fn to_names(path: &Path) -> Result<Vec<Name>> {
     Ok(out)
 }
 
-fn open_root(explicit: Option<PathBuf>) -> Result<Root> {
-    Root::open(&find_root(explicit)?)
-}
-
 fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     for line in &report.planned {
-        println!("{line}");
+        outln!("{line}");
     }
     for e in &report.events {
-        println!("event: {e}");
+        outln!("event: {e}");
     }
     for s in &report.skips {
-        println!("skipped: {s}");
+        outln!("skipped: {s}");
     }
     for w in &report.warnings {
-        println!("not applied here: {w}");
+        outln!("not applied here: {w}");
     }
     if !report.excluded_here.is_empty() || !report.not_synced_here.is_empty() {
-        println!(
+        outln!(
             "by this device's choice: {} entries here not synced, {} on the server not here; `cairn status` lists them",
             report.excluded_here.len(),
             report.not_synced_here.len()
@@ -226,25 +255,25 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     }
     match &report.outcome {
         SyncOutcome::Synced => {
-            println!(
+            outln!(
                 "synced at sequence {}: {} steps applied here, {} commits pushed, {} chunks ({} bytes) uploaded, {} conflict(s)",
                 report.head, report.steps_applied, report.commits, report.chunks_uploaded, report.bytes_uploaded, report.conflicts
             );
             EXIT_OK
         }
         SyncOutcome::Partial => {
-            println!("not fully synced yet: nothing was lost; see above, and sync again");
+            outln!("not fully synced yet: nothing was lost; see above, and sync again");
             EXIT_PARTIAL
         }
         SyncOutcome::Paused(why) => {
-            println!("paused: {why}");
+            outln!("paused: {why}");
             EXIT_PAUSED
         }
     }
 }
 
 fn print_daemon(s: &cairn_engine::daemon::Status) {
-    println!(
+    outln!(
         "daemon: running as process {}, {}{}; last sync {}, last fully synced {}; {} folders watched",
         s.pid,
         if s.state.is_empty() { "starting" } else { &s.state },
@@ -258,7 +287,7 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
         s.watched,
     );
     if s.unwatched > 0 {
-        println!(
+        outln!(
             "daemon: {} folders are not watched, so changes in them wait for a full sync{}",
             s.unwatched,
             if s.watch_limit_reached {
@@ -269,7 +298,28 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
         );
     }
     if let Some(why) = &s.feed_down {
-        println!("daemon: the change feed is down: {why}");
+        outln!("daemon: the change feed is down: {why}");
+    }
+    for n in &s.not_applied {
+        outln!(
+            "daemon: not applied here since {}: {}",
+            date_time(n.since),
+            n.text
+        );
+    }
+    if s.not_applied_count > s.not_applied.len() {
+        outln!(
+            "daemon: and {} more not applied here",
+            s.not_applied_count - s.not_applied.len()
+        );
+    }
+    if let Some(w) = s.waiting.as_ref().filter(|w| w.until > now()) {
+        outln!(
+            "daemon: changes wait until {}, {} s from now: {}",
+            date_time(w.until),
+            w.until - now(),
+            w.why
+        );
     }
 }
 
@@ -309,6 +359,16 @@ fn run_inner() -> Result<u8> {
             no_mode,
             allow_http,
         } => {
+            let dir = match (cli.root, dir) {
+                (Some(r), Some(d)) if r != d => bail!(
+                    "two folders given, {} and --root {}: say which once",
+                    d.display(),
+                    r.display()
+                ),
+                (Some(r), _) => r,
+                (None, Some(d)) => d,
+                (None, None) => PathBuf::from("."),
+            };
             let token = match token_file {
                 Some(f) => {
                     std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?
@@ -346,7 +406,7 @@ fn run_inner() -> Result<u8> {
                 .context("checking the server")?
                 .info()?
                 .head;
-            println!(
+            outln!(
                 "{} is a sync root; the server is at sequence {head}",
                 dir.display()
             );
@@ -402,7 +462,7 @@ fn run_inner() -> Result<u8> {
                 let mut root = Root::open(&root_path)?;
                 selection::exclude(&mut root, &names, remove_local)?;
             }
-            println!("{} is no longer synced here", display_path(&names));
+            outln!("{} is no longer synced here", display_path(&names));
             run_sync(&root_path, SyncOptions::default())
         }
         Command::Include { path, merge } => {
@@ -412,44 +472,50 @@ fn run_inner() -> Result<u8> {
                 let mut root = Root::open(&root_path)?;
                 selection::include(&mut root, &names, merge)?;
             }
-            println!("{} is synced here again", display_path(&names));
+            outln!("{} is synced here again", display_path(&names));
             run_sync(&root_path, SyncOptions::default())
         }
         Command::Status => {
             let root_path = find_root(cli.root)?;
             match cairn_engine::daemon::running_status(&root_path) {
                 Some(s) => print_daemon(&s),
-                None => println!("daemon: not running"),
+                None => outln!("daemon: not running"),
             }
-            let report = sync(
+            let report = match sync(
                 &root_path,
                 &SyncOptions {
                     allow_mass_delete: true,
                     dry_run: true,
                 },
-            )?;
+            ) {
+                Err(e) if e.downcast_ref::<Busy>().is_some() => {
+                    outln!("a sync is running now, so what the next one would do is not known yet");
+                    return Ok(EXIT_OK);
+                }
+                r => r?,
+            };
             if report.planned.is_empty() {
-                println!("nothing to do at sequence {}", report.head);
+                outln!("nothing to do at sequence {}", report.head);
             }
             for path in &report.excluded_here {
-                println!("not synced, by .cairn/ignore or `cairn exclude`: {path}");
+                outln!("not synced, by .cairn/ignore or `cairn exclude`: {path}");
             }
             for path in &report.not_synced_here {
-                println!("on the server, not synced here: {path}");
+                outln!("on the server, not synced here: {path}");
             }
             if let Ok(root) = Root::open(&root_path) {
                 let excluded = selection::excluded_paths(&root).unwrap_or_default();
                 for path in excluded.on_server {
-                    println!("excluded with `cairn exclude`: {}", display_path(&path));
+                    outln!("excluded with `cairn exclude`: {}", display_path(&path));
                 }
                 for (path, there) in excluded.copies {
                     if there {
-                        println!(
+                        outln!(
                             "left here when it was excluded: {0}; delete it, or `cairn include --merge {0}`",
                             display_path(&path)
                         );
                     } else {
-                        println!(
+                        outln!(
                             "anything new at {0} stays out too, until `cairn include {0}`",
                             display_path(&path)
                         );
@@ -460,12 +526,11 @@ fn run_inner() -> Result<u8> {
             Ok(status_code(&report))
         }
         Command::Log { limit } => {
-            let root = open_root(cli.root)?;
-            let client = Client::new(&root.config)?;
+            let client = Client::new(&open_config(&find_root(cli.root)?)?)?;
             let changes = restore::journal(&client)?;
             let skip = limit.map_or(0, |n| changes.len().saturating_sub(n));
             for c in &changes[skip..] {
-                println!(
+                outln!(
                     "{:>8}  {}  {:<16} {} op(s)",
                     c.seq,
                     date_time(c.time),
@@ -474,16 +539,16 @@ fn run_inner() -> Result<u8> {
                 );
                 for op in &c.ops {
                     if let cairn_protocol::Op::Note { text, .. } = op {
-                        println!("          note: {text}");
+                        outln!("          note: {text}");
                     }
                 }
             }
             Ok(EXIT_OK)
         }
         Command::History { path, at } => {
-            let root = open_root(cli.root)?;
-            for h in restore::history(&root, &to_names(&path)?, at)? {
-                println!(
+            let config = open_config(&find_root(cli.root)?)?;
+            for h in restore::history(&config, &to_names(&path)?, at)? {
+                outln!(
                     "{:>8}  {}  {:<16} {}  {:o}  {}{}",
                     h.seq,
                     date_time(h.time),
@@ -518,12 +583,12 @@ fn run_inner() -> Result<u8> {
                 }
             };
             match outcome.seq {
-                Some(seq) => println!(
+                Some(seq) => outln!(
                     "restored {} as sequence {seq} ({} op(s))",
                     display_path(&names),
                     outcome.ops
                 ),
-                None => println!("{} is already in that state", display_path(&names)),
+                None => outln!("{} is already in that state", display_path(&names)),
             }
             if no_sync {
                 return Ok(EXIT_OK);
@@ -536,7 +601,7 @@ fn run_inner() -> Result<u8> {
             path,
             exact,
         } => {
-            let root = open_root(cli.root)?;
+            let config = open_config(&find_root(cli.root)?)?;
             let names = path
                 .as_deref()
                 .map(to_names)
@@ -545,31 +610,51 @@ fn run_inner() -> Result<u8> {
             let policy = if exact {
                 ApplyPolicy::exact()
             } else {
-                root.config.policy.clone()
+                config.policy.clone()
             };
-            let (seq, warnings) = cairn_engine::export::export(&root, at, &names, &dest, &policy)?;
+            let (seq, warnings) =
+                cairn_engine::export::export(&config, at, &names, &dest, &policy)?;
             for w in &warnings {
-                println!("not applied: {w}");
+                outln!("not applied: {w}");
             }
-            println!("exported sequence {seq} to {}", dest.display());
+            outln!("exported sequence {seq} to {}", dest.display());
             Ok(if warnings.is_empty() {
                 EXIT_OK
             } else {
                 EXIT_PARTIAL
             })
         }
-        Command::Conflicts => {
-            let root = open_root(cli.root)?;
-            let client = Client::new(&root.config)?;
-            for c in client.conflicts()? {
-                println!(
-                    "{:>8}  {}  {:<16} copy {} of {}, against revision {}",
-                    c.seq,
-                    date_time(c.time),
-                    c.device_name,
-                    c.copy,
-                    c.object,
-                    c.competing_revision
+        Command::Conflicts { all } => {
+            let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;
+            let path = |p: &Option<Vec<Name>>| p.as_deref().map(display_path);
+            for c in list.iter().filter(|c| all || c.open) {
+                let e = &c.entry;
+                let made = path(&c.made_at).unwrap_or_else(|| format!("copy {}", e.copy));
+                let against = path(&c.object_now).unwrap_or_else(|| "what is since deleted".into());
+                let what = if c.open {
+                    format!("{made}: the competing version of {against}")
+                } else {
+                    let now = match path(&c.copy_now) {
+                        Some(p) => format!("now {p}"),
+                        None => "deleted".into(),
+                    };
+                    format!("dealt with: {made}, {now}")
+                };
+                outln!(
+                    "{:>8}  {}  {:<16} {what}",
+                    e.seq,
+                    date_time(e.time),
+                    e.device_name
+                );
+            }
+            let open = list.iter().filter(|c| c.open).count();
+            if open == 0 {
+                outln!("no conflict waits for a person");
+            }
+            if !all && open < list.len() {
+                outln!(
+                    "{} more dealt with, the copy deleted, renamed or moved: --all lists them",
+                    list.len() - open
                 );
             }
             Ok(EXIT_OK)
@@ -590,10 +675,10 @@ pub fn run() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             if let Some(p) = e.downcast_ref::<Paused>() {
-                println!("paused: {p}");
+                outln!("paused: {p}");
                 return ExitCode::from(EXIT_PAUSED);
             }
-            eprintln!("cairn: {e:#}");
+            errln!("cairn: {e:#}");
             ExitCode::from(EXIT_ERROR)
         }
     }

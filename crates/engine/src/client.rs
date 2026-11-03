@@ -8,9 +8,54 @@ use cairn_protocol::wire::{
 };
 use cairn_protocol::Hash;
 use serde::{de::DeserializeOwned, Serialize};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use ureq::Agent;
+
+/// How long one lookup of the server's name serves. ureq looks the name up before every request,
+/// even one that goes over a connection it already holds, and a slow resolver then costs more than
+/// the request: one sync of one small file made 8 lookups, at 55 to 125 ms each. A minute bounds
+/// how long a server that moved is looked for at its old address.
+const NAME_TTL: Duration = Duration::from_secs(60);
+
+/// The resolver, with the last answer kept for [`NAME_TTL`]. A failed lookup is not kept.
+struct CachedResolver<R> {
+    inner: R,
+    last: Mutex<Option<(String, Instant, ResolvedSocketAddrs)>>,
+}
+
+impl<R> std::fmt::Debug for CachedResolver<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CachedResolver")
+    }
+}
+
+impl<R: Resolver> Resolver for CachedResolver<R> {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let key = format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or(""),
+            uri.authority().map_or("", |a| a.as_str())
+        );
+        if let Some((k, at, addrs)) = &*self.last.lock().unwrap_or_else(|e| e.into_inner()) {
+            if *k == key && at.elapsed() < NAME_TTL {
+                return Ok(addrs.clone());
+            }
+        }
+        let addrs = self.inner.resolve(uri, config, timeout)?;
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((key, Instant::now(), addrs.clone()));
+        Ok(addrs)
+    }
+}
 
 /// The server said its disk is full; nothing there changed.
 #[derive(Debug, thiserror::Error)]
@@ -49,7 +94,7 @@ impl Client {
         } else if !url.starts_with("https://") {
             bail!("{url} is not an http:// or https:// URL");
         }
-        let agent: Agent = Agent::config_builder()
+        let config_http = Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(600)))
@@ -58,8 +103,15 @@ impl Client {
                     .root_certs(RootCerts::PlatformVerifier)
                     .build(),
             )
-            .build()
-            .into();
+            .build();
+        let agent = Agent::with_parts(
+            config_http,
+            DefaultConnector::default(),
+            CachedResolver {
+                inner: DefaultResolver::default(),
+                last: Mutex::new(None),
+            },
+        );
         let client = Self {
             agent,
             base: format!("{url}/v1/ns/{}", config.namespace),
@@ -307,6 +359,43 @@ mod tests {
         assert!(check_answer(&[a, b], &[(b, b"b"), (a, b"a")]).is_err());
         assert!(check_answer(&[a], &[(b, b"b")]).is_err());
         assert!(check_answer(&[a, b], &[(a, b"a")]).is_err());
+    }
+
+    #[derive(Debug, Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl Resolver for Counting {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            config: &ureq::config::Config,
+            timeout: NextTimeout,
+        ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            DefaultResolver::default().resolve(uri, config, timeout)
+        }
+    }
+
+    #[test]
+    fn the_server_name_is_looked_up_once_not_per_request() {
+        let r = CachedResolver {
+            inner: Counting::default(),
+            last: Mutex::new(None),
+        };
+        let config = ureq::config::Config::default();
+        let a: ureq::http::Uri = "http://localhost:1/v1/info".parse().unwrap();
+        let b: ureq::http::Uri = "http://localhost:2/v1/info".parse().unwrap();
+        for _ in 0..5 {
+            r.resolve(&a, &config, NextTimeout::default()).unwrap();
+        }
+        assert_eq!(r.inner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Another server is another name.
+        r.resolve(&b, &config, NextTimeout::default()).unwrap();
+        assert_eq!(r.inner.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // And an old answer is asked again.
+        r.last.lock().unwrap().as_mut().unwrap().1 -= NAME_TTL;
+        r.resolve(&b, &config, NextTimeout::default()).unwrap();
+        assert_eq!(r.inner.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub struct SyncReport {
     pub skips: Vec<Skip>,
     /// Metadata this filesystem could not take. The server keeps it.
     pub warnings: Vec<Skip>,
+    /// Paths whose metadata was applied here in full, which clears an earlier warning about them.
+    pub meta_applied: Vec<String>,
     /// Conflicts and other events a person should know about.
     pub events: Vec<String>,
     pub conflicts: u64,
@@ -75,6 +77,8 @@ pub struct SyncReport {
     pub excluded_here: Vec<String>,
     /// The topmost entries on the server that this device does not sync.
     pub not_synced_here: Vec<String>,
+    /// How long the scans took: the part of a sync that every one repeats, whatever there is to do.
+    pub scan_time: std::time::Duration,
 }
 
 impl SyncReport {
@@ -83,6 +87,7 @@ impl SyncReport {
             outcome: SyncOutcome::Partial,
             skips: Vec::new(),
             warnings: Vec::new(),
+            meta_applied: Vec::new(),
             events: Vec::new(),
             conflicts: 0,
             commits: 0,
@@ -95,6 +100,7 @@ impl SyncReport {
             planned: Vec::new(),
             excluded_here: Vec::new(),
             not_synced_here: Vec::new(),
+            scan_time: std::time::Duration::ZERO,
         }
     }
 }
@@ -267,7 +273,126 @@ fn scan_stable(
         result = scan(&root.dir, &opts).context("scanning the root")?;
     }
     result.rescued = rescued;
+    keep_what_only_moved_holes(root, &by_inode, &mut result);
     Ok(result)
+}
+
+/// What arrived and was removed here before it was recorded, said once for each topmost path.
+fn gone_lines(gone: &[String]) -> Vec<String> {
+    let mut paths: Vec<&String> = gone.iter().collect();
+    paths.sort();
+    paths.dedup();
+    let mut top: Vec<(&String, usize)> = Vec::new();
+    for p in paths {
+        match top.last_mut() {
+            Some((t, n))
+                if p.starts_with(t.as_str()) && p.as_bytes().get(t.len()) == Some(&b'/') =>
+            {
+                *n += 1
+            }
+            _ => top.push((p, 0)),
+        }
+    }
+    top.into_iter()
+        .map(|(path, under)| {
+            let with = match under {
+                0 => String::new(),
+                1 => " and 1 entry in it".into(),
+                n => format!(" and {n} entries in it"),
+            };
+            format!(
+                "{path}{with}: removed here while it was arriving, before this device had recorded it, \
+                 so nothing proves the delete and it comes down again, with whatever was still on its \
+                 way. Delete it again if that was meant"
+            )
+        })
+        .collect()
+}
+
+fn layout(m: &Manifest) -> Vec<(u64, u64)> {
+    m.segments.iter().map(|s| (s.offset, s.len())).collect()
+}
+
+/// A file read again whose manifest differs from its record only in where its holes are holds the
+/// same bytes, and keeps the record's: filesystems move holes by themselves. APFS fills a small one when
+/// it flushes and lays data runs out on its own boundaries, so a sparse file that arrived there would
+/// otherwise go back to everyone as a new revision with the same bytes, and inflated. Two manifests
+/// with the same layout and different hashes are different bytes, so only a layout that differs is
+/// read again.
+fn keep_what_only_moved_holes(
+    root: &Root,
+    by_inode: &HashMap<(u64, u64), &Row>,
+    result: &mut ScanResult,
+) {
+    let mut new: Option<HashMap<Hash, &[u8]>> = None;
+    for node in &mut result.nodes {
+        let Content::File {
+            manifest: now,
+            size,
+        } = node.content
+        else {
+            continue;
+        };
+        let Some(Content::File {
+            manifest: was,
+            size: was_size,
+        }) = by_inode
+            .get(&(node.fp.dev, node.fp.ino))
+            .map(|r| &r.content)
+        else {
+            continue;
+        };
+        if now == *was || size != *was_size {
+            continue;
+        }
+        let new = new.get_or_insert_with(|| {
+            result
+                .new_manifests
+                .iter()
+                .map(|(h, b)| (*h, b.as_slice()))
+                .collect()
+        });
+        let decode = |b: &[u8]| Manifest::decode(b).ok();
+        let Some(read) = new.get(&now).and_then(|b| decode(b)) else {
+            continue;
+        };
+        let Some(recorded) = root
+            .state
+            .manifest(was)
+            .ok()
+            .flatten()
+            .and_then(|b| decode(&b))
+        else {
+            continue;
+        };
+        if layout(&read) != layout(&recorded) && still_holds(root, node, &recorded) {
+            node.content = Content::File {
+                manifest: *was,
+                size,
+            };
+        }
+    }
+}
+
+/// Whether the file a scan read still is what it read, and holds the bytes of `m`.
+fn still_holds(root: &Root, node: &crate::scan::Scanned, m: &Manifest) -> bool {
+    let Some((name, parent)) = node.paths.first().and_then(|p| p.split_last()) else {
+        return false;
+    };
+    let Ok(dir) = root.dir.open_path(parent.iter()) else {
+        return false;
+    };
+    let unchanged = || {
+        dir.stat(name.as_bytes())
+            .is_ok_and(|st| crate::scan::fingerprint(&st) == node.fp)
+    };
+    let Ok(fd) = dir.open_read(name.as_bytes()) else {
+        return false;
+    };
+    unchanged()
+        && rustix::fs::fstat(&fd).is_ok_and(|st| st.st_ino == node.fp.ino)
+        && crate::chunker::same_bytes(rustix::fd::AsFd::as_fd(&fd), m).unwrap_or(false)
+        && unchanged()
 }
 
 /// For what has arrived whole with something else than its record on disk: what this filesystem would
@@ -834,6 +959,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             .collect();
 
         let moved = RefCell::new(Vec::new());
+        let scan_started = std::time::Instant::now();
         let scanned = scan_stable(
             &mut root,
             &rows,
@@ -843,6 +969,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &date,
             &mut report.events,
         )?;
+        report.scan_time += scan_started.elapsed();
         for id in &scanned.rescued {
             if let Some(row) = rows.get_mut(id) {
                 row.fp.dev = 0;
@@ -1014,6 +1141,11 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         .run(&plan)?;
         hit("sync.applied");
         report.steps_applied += outcome.applied_steps;
+        for line in gone_lines(&outcome.gone) {
+            if seen_events.insert(line.clone()) {
+                report.events.push(line);
+            }
+        }
         if !outcome.unholdable.is_empty() {
             for (unheld, _) in &outcome.unholdable {
                 report.skips.push(unheld_skip(&remote, unheld));
@@ -1024,6 +1156,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             // Out of view from the next round on, and for every later sync.
             selection.store(&root)?;
         }
+        report.meta_applied.extend(outcome.meta_applied);
         for w in outcome.warnings {
             if !report.warnings.contains(&w) {
                 report.warnings.push(w);

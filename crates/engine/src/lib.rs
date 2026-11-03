@@ -5,6 +5,7 @@ pub mod chunker;
 pub mod client;
 pub mod daemon;
 pub mod export;
+#[cfg_attr(windows, path = "fsops_windows.rs")]
 pub mod fsops;
 pub mod identify;
 pub mod merge;
@@ -17,6 +18,7 @@ pub mod selection;
 pub mod state;
 pub mod sync;
 #[cfg_attr(target_os = "macos", path = "watch_fsevents.rs")]
+#[cfg_attr(windows, path = "watch_windows.rs")]
 pub mod watch;
 
 pub use metadata::{ApplyPolicy, OwnerPolicy};
@@ -27,6 +29,6 @@ pub use sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 pub fn is_disk_full(err: &anyhow::Error) -> bool {
     err.chain().any(|e| {
         e.downcast_ref::<std::io::Error>()
-            .is_some_and(|io| matches!(io.raw_os_error(), Some(28) | Some(122)))
+            .is_some_and(fsops::is_disk_full)
     })
 }

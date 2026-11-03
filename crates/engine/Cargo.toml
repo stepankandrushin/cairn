@@ -17,11 +17,23 @@ hex.workspace = true
 ignore.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [features]
 failpoints = ["cairn-failpoint/enabled"]

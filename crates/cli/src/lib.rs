@@ -12,7 +12,6 @@ use cairn_engine::{restore, selection};
 use cairn_protocol::{Name, RevisionId};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -222,7 +221,11 @@ fn to_names(path: &Path) -> Result<Vec<Name>> {
     let mut out = Vec::new();
     for c in path.components() {
         match c {
-            Component::Normal(n) => out.push(Name::new(n.as_bytes().to_vec())?),
+            Component::Normal(n) => {
+                let bytes = cairn_engine::fsops::os_name_bytes(n)
+                    .ok_or_else(|| anyhow!("{} is not valid Unicode", path.display()))?;
+                out.push(Name::new(bytes)?)
+            }
             Component::CurDir => {}
             _ => bail!(
                 "{} must be a plain path relative to the root",

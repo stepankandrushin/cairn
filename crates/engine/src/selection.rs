@@ -11,19 +11,16 @@
 //! changed while it was excluded merges as new, keeping both versions if they differ.
 
 use crate::client::Client;
-use crate::fsops::{is_not_found, Dir, Stat};
+use crate::fsops::{is_not_found, Dir, FileType, Stat};
 use crate::root::Root;
 use crate::state::Row;
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_protocol::{Link, Name, ObjectId, ObjectKind, Timestamp, Tree};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use rustix::fs::FileType;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::ffi::OsStr;
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// In the state directory: this device's own rules, not synced, so that devices can differ.
@@ -102,7 +99,7 @@ impl Rules {
         };
         let mut rel = PathBuf::new();
         for name in path {
-            rel.push(OsStr::from_bytes(name.as_bytes()));
+            crate::fsops::push_name(&mut rel, name.as_bytes());
         }
         matcher.matched(&rel, is_dir).is_ignore()
     }

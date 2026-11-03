@@ -128,14 +128,20 @@ mod imp {
                 Err(_) => spec == name,
             };
             if full {
-                return Err(io::Error::from_raw_os_error(28));
+                // ENOSPC, or Windows's ERROR_DISK_FULL.
+                return Err(io::Error::from_raw_os_error(if cfg!(windows) {
+                    112
+                } else {
+                    28
+                }));
             }
         }
         Ok(())
     }
 
     pub fn deny(name: &str) -> io::Result<()> {
-        const EPERM: i32 = 1;
+        // ERROR_ACCESS_DENIED on Windows.
+        const EPERM: i32 = if cfg!(windows) { 5 } else { 1 };
         match std::env::var("CAIRN_FP_EPERM") {
             Ok(point) if point == name => Err(io::Error::from_raw_os_error(EPERM)),
             _ => Ok(()),
@@ -145,14 +151,20 @@ mod imp {
     pub fn refuse_name(name: &[u8]) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         const EILSEQ: i32 = 92;
-        #[cfg(not(target_os = "macos"))]
+        /// ERROR_INVALID_NAME.
+        #[cfg(windows)]
+        const EILSEQ: i32 = 123;
+        #[cfg(not(any(target_os = "macos", windows)))]
         const EILSEQ: i32 = 84;
-        match std::env::var_os("CAIRN_FP_REFUSE_NAME") {
-            Some(refused)
-                if std::os::unix::ffi::OsStrExt::as_bytes(refused.as_os_str()) == name =>
-            {
-                Err(io::Error::from_raw_os_error(EILSEQ))
-            }
+        #[cfg(unix)]
+        let refused = std::env::var_os("CAIRN_FP_REFUSE_NAME")
+            .map(|r| std::os::unix::ffi::OsStrExt::as_bytes(r.as_os_str()).to_vec());
+        #[cfg(windows)]
+        let refused = std::env::var("CAIRN_FP_REFUSE_NAME")
+            .ok()
+            .map(String::into_bytes);
+        match refused {
+            Some(refused) if refused == name => Err(io::Error::from_raw_os_error(EILSEQ)),
             _ => Ok(()),
         }
     }

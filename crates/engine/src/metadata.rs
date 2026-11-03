@@ -11,6 +11,10 @@ use cairn_protocol::{Bytes, Metadata, ObjectKind, Owner, RecordKey};
 use cairn_protocol::NS_LINUX_XATTR as NS_XATTR;
 #[cfg(target_os = "macos")]
 use cairn_protocol::NS_MACOS_XATTR as NS_XATTR;
+/// Windows reads none yet: alternate data streams would go here. Every other platform's records stay
+/// stored and untouched.
+#[cfg(windows)]
+use cairn_protocol::NS_WINDOWS_ADS as NS_XATTR;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -75,6 +79,14 @@ fn default_xattr_allow() -> Vec<String> {
 fn default_xattr_deny() -> Vec<String> {
     MACHINE_LOCAL_XATTRS.map(String::from).to_vec()
 }
+#[cfg(windows)]
+fn default_xattr_allow() -> Vec<String> {
+    Vec::new()
+}
+#[cfg(windows)]
+fn default_xattr_deny() -> Vec<String> {
+    Vec::new()
+}
 
 /// What macOS keeps on a file about this machine rather than about the file: database keys, access
 /// grants, the time it was last opened. Copied elsewhere they mean nothing or something false, and
@@ -93,7 +105,7 @@ const MACHINE_LOCAL_XATTRS: [&str; 5] = [
 #[cfg(target_os = "macos")]
 const MAX_XATTR_STORED: usize = 1 << 20;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn stored_xattr(_: &[u8]) -> bool {
     true
 }
@@ -123,7 +135,7 @@ impl ApplyPolicy {
         let xattr_allow = ["user.", "system.posix_acl_", "security.", "trusted."]
             .map(String::from)
             .to_vec();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let xattr_allow = default_xattr_allow();
         Self {
             owners: OwnerPolicy::ByNumber,
@@ -242,14 +254,16 @@ pub fn capture(
         }
         Err(e) => problems.push(format!("listing xattrs: {e}")),
     }
+    // Windows has no numeric owners: none is read, so the stored one is always kept.
+    let owner = cfg!(unix).then(|| Owner {
+        uid: st.uid,
+        gid: st.gid,
+        user: accounts.users.get(&st.uid).cloned().map(Bytes),
+        group: accounts.groups.get(&st.gid).cloned().map(Bytes),
+    });
     Metadata {
         mode: st.mode,
-        owner: Some(Owner {
-            uid: st.uid,
-            gid: st.gid,
-            user: accounts.users.get(&st.uid).cloned().map(Bytes),
-            group: accounts.groups.get(&st.gid).cloned().map(Bytes),
-        }),
+        owner,
         mtime: st.mtime,
         btime: st.btime,
         time_precision_ns: precision_ns,
@@ -322,16 +336,25 @@ pub fn rebase_local_changes(stored: &Metadata, applied: &Metadata, scanned: &Met
     let default_owner = Owner::default();
     let a = applied.owner.as_ref().unwrap_or(&default_owner);
     let s = scanned.owner.as_ref().unwrap_or(&default_owner);
-    let mut owner = stored.owner.clone().or_else(|| scanned.owner.clone());
-    if let Some(o) = owner.as_mut() {
-        if a.uid != s.uid || a.user != s.user {
-            o.uid = s.uid;
-            o.user = s.user.clone();
+    let user_changed = a.uid != s.uid || a.user != s.user;
+    let group_changed = a.gid != s.gid || a.group != s.group;
+    let mut owner = stored.owner.clone();
+    match owner.as_mut() {
+        Some(o) => {
+            if user_changed {
+                o.uid = s.uid;
+                o.user = s.user.clone();
+            }
+            if group_changed {
+                o.gid = s.gid;
+                o.group = s.group.clone();
+            }
         }
-        if a.gid != s.gid || a.group != s.group {
-            o.gid = s.gid;
-            o.group = s.group.clone();
-        }
+        // Made where files have no owners, as on Windows: it gets one when the owner here changes,
+        // not for arriving on a filesystem that has them, which would be a revision from every device
+        // that receives it.
+        None if user_changed || group_changed => owner.clone_from(&scanned.owner),
+        None => {}
     }
     out.owner = owner;
 
@@ -472,6 +495,35 @@ mod tests {
             mode,
             ..Metadata::default()
         }
+    }
+
+    /// Stored with no owner, as a file made on Windows is: arriving where files have owners is no
+    /// change of one, and a change of the owner there is.
+    #[test]
+    fn an_owner_is_stored_only_once_one_changes() {
+        let here = |uid: u32| Owner {
+            uid,
+            gid: 1000,
+            user: None,
+            group: None,
+        };
+        let stored = with_mode(0o644);
+        let applied = Metadata {
+            owner: Some(here(1000)),
+            ..with_mode(0o644)
+        };
+        assert_eq!(
+            rebase_local_changes(&stored, &applied, &applied).owner,
+            None
+        );
+        let chowned = Metadata {
+            owner: Some(here(1001)),
+            ..with_mode(0o644)
+        };
+        assert_eq!(
+            rebase_local_changes(&stored, &applied, &chowned).owner,
+            Some(here(1001))
+        );
     }
 
     /// One field of what is on its way, each way it can stand on disk.

@@ -89,10 +89,10 @@ What follows from it:
 
 | Item | Behaviour |
 |---|---|
-| Symlinks | Target verbatim, never followed. Links leaving the root sync as links, optionally flagged. Without platform support: a placeholder, with the real data on the server |
+| Symlinks | Target verbatim, never followed. Links leaving the root sync as links, optionally flagged. Without platform support: a placeholder, with the real data on the server. Until then, on Windows, an arriving symlink is out of view like a name it cannot hold, and a link or junction made there is reported and not synced |
 | Hard links | Relationship preserved inside a sync root where supported |
-| Mode | All 12 bits stored; setuid, setgid and Linux capabilities applied only by explicit policy |
-| Owner, group | Numbers and names stored, with a per-client mapping, since numeric IDs differ between machines. The daemon runs unprivileged: exact restore needs a narrowly scoped helper or an explicit restore command |
+| Mode | All 12 bits stored; setuid, setgid and Linux capabilities applied only by explicit policy. Windows holds only a file's write bits, as its read-only attribute, and reads a fixed mode otherwise, so what is stored stays |
+| Owner, group | Numbers and names stored, with a per-client mapping, since numeric IDs differ between machines. The daemon runs unprivileged: exact restore needs a narrowly scoped helper or an explicit restore command. Windows reads none, so what is made there has none stored until an owner changes on a device that has them: arriving on one is no change, or each device it reached would make a revision |
 | mtime, btime | Nanoseconds, with the recorded precision kept |
 | xattrs, POSIX ACLs, Windows ACLs | Stored in per-platform namespaces; applied by an allow/deny list (`security.selinux` not applied by default) |
 | macOS resource forks, Finder metadata | Preserved explicitly. For now as `macos.xattr` records, up to 1 MiB each, past which one is reported and not stored. What is about the machine rather than the file (provenance, quarantine, access grants, last opened) is neither stored nor applied |
@@ -253,7 +253,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
-| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS CLI and daemon came early, to join milestone 3's run: a name its filesystem cannot hold is skipped and reported, not yet mapped |
+| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |
 | 9 | WebDAV gateway, Nextcloud importer (files, versions, trash), E2EE, LAN/P2P transfers | |
 

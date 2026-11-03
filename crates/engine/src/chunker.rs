@@ -1,40 +1,17 @@
 //! Reading a file into a manifest: data segments found with `SEEK_DATA`/`SEEK_HOLE`, cut by FastCDC,
 //! hashed with BLAKE3. A hole is never read as zeros, so a sparse file costs what it occupies.
 
-use crate::fsops::read_exact_at;
+use crate::fsops::{read_at, read_exact_at, AsFd, BorrowedFd};
 use cairn_protocol::manifest::{CHUNK_AVG, CHUNK_MAX, CHUNK_MIN};
 use cairn_protocol::{ChunkRef, Hash, Manifest, Segment};
 use fastcdc::v2020::StreamCDC;
-use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{seek, SeekFrom};
-use rustix::io::Errno;
 use std::io::{self, Read};
 
-/// The data runs of a file, as (offset, length).
-pub fn data_runs(fd: BorrowedFd<'_>, size: u64) -> io::Result<Vec<(u64, u64)>> {
-    let mut runs = Vec::new();
-    let mut at = 0;
-    while at < size {
-        let start = match seek(fd, SeekFrom::Data(at)) {
-            Ok(o) => o,
-            // No data at or after `at`: the rest is a hole.
-            Err(Errno::NXIO) => break,
-            // Not supported here: treat all of it as data.
-            Err(Errno::INVAL | Errno::OPNOTSUPP) => return Ok(vec![(0, size)]),
-            Err(e) => return Err(e.into()),
-        };
-        if start >= size {
-            break;
-        }
-        let end = match seek(fd, SeekFrom::Hole(start)) {
-            Ok(o) => o.min(size),
-            Err(Errno::NXIO) => size,
-            Err(e) => return Err(e.into()),
-        };
-        runs.push((start, end - start));
-        at = end;
-    }
-    Ok(runs)
+pub use crate::fsops::data_runs;
+
+/// Whether a manifest leaves any of its file as a hole.
+pub fn has_holes(m: &Manifest) -> bool {
+    m.segments.iter().map(Segment::len).sum::<u64>() < m.size
 }
 
 /// Give a file written from a manifest the holes that manifest has. On Linux the `ftruncate` before the
@@ -64,7 +41,7 @@ pub fn restore_holes(_: BorrowedFd<'_>, _: &Manifest) {}
 /// Whether an open file holds the bytes of `m`, wherever its own holes are: each chunk of `m`, read
 /// where `m` has it, hashes the same, and what `m` has as a hole reads as zeros.
 pub fn same_bytes(fd: BorrowedFd<'_>, m: &Manifest) -> io::Result<bool> {
-    let size = rustix::fs::fstat(fd)?.st_size as u64;
+    let size = crate::fsops::fstat(fd)?.size;
     if size != m.size {
         return Ok(false);
     }
@@ -124,13 +101,7 @@ impl Read for RunReader<'_> {
         if want == 0 {
             return Ok(0);
         }
-        let n = loop {
-            match rustix::io::pread(self.fd, &mut buf[..want], self.at) {
-                Ok(n) => break n,
-                Err(Errno::INTR) => {}
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let n = read_at(self.fd, &mut buf[..want], self.at)?;
         self.at += n as u64;
         self.left -= n as u64;
         Ok(n)
@@ -178,7 +149,17 @@ pub fn manifest_of(fd: impl AsFd, size: u64) -> io::Result<Manifest> {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::unix::fs::FileExt;
+
+    /// Positional writes as the engine makes them, on every platform.
+    trait WriteAt {
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    }
+
+    impl WriteAt for File {
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            crate::fsops::write_all_at(self.as_fd(), buf, offset)
+        }
+    }
 
     fn temp(name: &str) -> (std::path::PathBuf, File) {
         let dir = std::env::temp_dir().join(format!(
@@ -248,7 +229,8 @@ mod tests {
     fn the_same_bytes_with_other_holes_are_the_same_bytes() {
         const SIZE: u64 = 3 << 20;
         let (dir, f) = temp("sparse");
-        f.set_len(SIZE).unwrap();
+        // Sparse as the engine makes a file: NTFS has to be told before the file grows.
+        crate::fsops::set_len(f.as_fd(), SIZE, true).unwrap();
         f.write_all_at(b"head", 0).unwrap();
         f.write_all_at(b"tail", SIZE - 4).unwrap();
         let sparse = manifest_of(&f, SIZE).unwrap();
@@ -277,7 +259,7 @@ mod tests {
         let (dir, f) = temp("sparse");
         // A terabyte file with two blocks of data; reading it as zeros would take hours.
         let size: u64 = 1 << 40;
-        f.set_len(size).unwrap();
+        crate::fsops::set_len(f.as_fd(), size, true).unwrap();
         f.write_all_at(&[1u8; 4096], 1 << 20).unwrap();
         f.write_all_at(&[2u8; 4096], 1 << 39).unwrap();
         let m = manifest_of(&f, size).unwrap();

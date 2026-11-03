@@ -4,7 +4,7 @@
 //! has gone away the marker has gone with it, and sync stops instead of reading an empty folder as
 //! a mass delete.
 
-use crate::fsops::Dir;
+use crate::fsops::{self, name_path, Dir};
 use crate::metadata::ApplyPolicy;
 use crate::state::{State, KEY_ROOT_ID};
 use anyhow::{bail, Context, Result};
@@ -12,8 +12,6 @@ use cairn_protocol::{DeviceId, FilenamePolicy, STATE_DIR};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const MARKER: &str = "root-id";
@@ -64,28 +62,19 @@ pub struct Root {
     _lock: File,
 }
 
-fn hostname() -> String {
-    let name = rustix::system::uname();
-    let name = name.nodename().to_string_lossy().into_owned();
-    if name.is_empty() {
-        "unknown".into()
-    } else {
-        name
-    }
-}
-
 fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     let tmp = dir.join(format!("{name}.new"));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut f = fsops::private_file(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )
+    .open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, dir.join(name))?;
-    File::open(dir)?.sync_all()?;
+    fsops::sync_dir_path(dir)?;
     Ok(())
 }
 
@@ -95,19 +84,19 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
     if !meta.is_dir() {
         bail!("{} is not a directory", path.display());
     }
-    let state = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    let state = path.join(name_path(STATE_DIR));
     if state.exists() {
         bail!("{} is already a sync root", path.display());
     }
     std::fs::create_dir(&state)?;
-    std::fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    fsops::make_private_dir(&state)?;
 
     let config = Config {
         server: opts.server.trim_end_matches('/').to_string(),
         namespace: opts.namespace,
         token: opts.token,
         device: DeviceId::random(),
-        device_name: opts.device_name.unwrap_or_else(hostname),
+        device_name: opts.device_name.unwrap_or_else(fsops::hostname),
         policy: opts.policy,
         filenames: FilenamePolicy::Faithful,
         allow_http: opts.allow_http,
@@ -117,13 +106,13 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
     let db = State::open(&state.join("state.sqlite"))?;
     db.set(KEY_ROOT_ID, &root_id)?;
     write_private(&state, MARKER, root_id.as_bytes())?;
-    File::open(path)?.sync_all()?;
+    fsops::sync_dir_path(path)?;
     Ok(())
 }
 
 /// This root's marker, without taking its lock.
 pub fn read_root_id(path: &Path) -> std::io::Result<String> {
-    let state = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    let state = path.join(name_path(STATE_DIR));
     Ok(std::fs::read_to_string(state.join(MARKER))?
         .trim()
         .to_string())
@@ -131,12 +120,12 @@ pub fn read_root_id(path: &Path) -> std::io::Result<String> {
 
 /// This root's configuration, without taking its lock.
 pub fn read_config(path: &Path) -> Result<Config> {
-    let state = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    let state = path.join(name_path(STATE_DIR));
     serde_json::from_slice(&std::fs::read(state.join(CONFIG))?).context("read the configuration")
 }
 
 fn read_marker(path: &Path) -> Result<String> {
-    let state_path = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+    let state_path = path.join(name_path(STATE_DIR));
     match std::fs::read_to_string(state_path.join(MARKER)) {
         Ok(m) => Ok(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Paused(format!(
@@ -161,14 +150,15 @@ impl Root {
     pub fn open(path: &Path) -> Result<Self> {
         let dir =
             Dir::open_root(path).with_context(|| format!("open sync root {}", path.display()))?;
-        let state_path = path.join(std::ffi::OsStr::from_bytes(STATE_DIR));
+        let state_path = path.join(name_path(STATE_DIR));
         let marker = read_marker(path)?;
         let state_dir = dir
             .open_dir(STATE_DIR)
             .context("open the state directory")?;
         let lock = File::create(state_path.join("lock"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(|_| Busy(path.display().to_string()))?;
+        if !matches!(fsops::try_lock(&lock), Ok(true)) {
+            return Err(Busy(path.display().to_string()).into());
+        }
         let state = State::open(&state_path.join("state.sqlite"))?;
         if state.get(KEY_ROOT_ID)?.as_deref() != Some(marker.trim()) {
             return Err(Paused(format!(

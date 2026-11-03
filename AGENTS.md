@@ -6,7 +6,7 @@ modes, owners, xattrs, hard links, sparse files, filename bytes). Files only: no
 platform.
 
 **Status: 0.1.1 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
-CLI and, since then, a daemon; the same on macOS, ahead of milestone 7 and not in CI. The architecture, the decisions and their reasons,
+CLI and, since then, a daemon; the same on macOS and Windows, ahead of milestone 7 and not in CI. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md: read it before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3's code and failure tests are in; what
 it still needs is its exit criterion, weeks on real trees, on trees and machines the owner chooses.
@@ -20,8 +20,8 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   speed, because a sync tool that is wrong once is not trusted again. A change that touches them comes
   with a failure test (crash, full disk, lost event, missing mount).
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
-  start the UI or another platform while the Linux engine's exit criteria are unmet. macOS is the
-  exception, at the owner's asking, to test in milestone 3's run.
+  start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
+  Windows are the exceptions, at the owner's asking, to test in milestone 3's run.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
 

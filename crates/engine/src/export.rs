@@ -2,7 +2,7 @@
 //! touches the sync root or the server.
 
 use crate::client::Client;
-use crate::fsops::{self, Dir};
+use crate::fsops::{self, AsFd, Dir, OwnedFd};
 use crate::metadata::{self, Accounts, ApplyPolicy};
 use crate::root::Config;
 use crate::scan::display_path;
@@ -10,7 +10,6 @@ use crate::sync::fetch_changes;
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_protocol::wire::MAX_CHUNK_BATCH_BYTES;
 use cairn_protocol::{Content, Hash, Manifest, Name, ObjectId, ObjectKind, Skip, SkipKind, Tree};
-use rustix::fd::AsFd;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -54,7 +53,7 @@ fn write_file(
     tmp: &[u8],
     manifest: &Hash,
     size: u64,
-) -> Result<rustix::fd::OwnedFd> {
+) -> Result<OwnedFd> {
     let got = client.download(&[*manifest])?;
     let (_, bytes) = got
         .into_iter()
@@ -63,7 +62,7 @@ fn write_file(
     let m = Manifest::decode(&bytes)?;
     let fd = dir.create_new(tmp, 0o600)?;
     // The size alone makes the holes: only data segments are ever written.
-    rustix::fs::ftruncate(&fd, size).map_err(std::io::Error::from)?;
+    fsops::set_len(fd.as_fd(), size, crate::chunker::has_holes(&m))?;
     let placed: Vec<(u64, &cairn_protocol::ChunkRef)> = m.placed_chunks().collect();
     let mut i = 0;
     while i < placed.len() {

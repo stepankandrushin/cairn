@@ -4,7 +4,7 @@
 //! synced paths (invariant 4).
 
 use crate::client::Client;
-use crate::fsops::{self, is_exists, is_not_found, Dir};
+use crate::fsops::{self, is_exists, is_not_found, AsFd, Dir};
 use crate::identify::{Arriving, CopyIntent};
 use crate::merge::{ConflictCopy, Plan, TNode};
 use crate::metadata::{self, Accounts};
@@ -19,8 +19,6 @@ use cairn_protocol::{
     Bytes, ChunkRef, Content, Hash, Link, Manifest, Metadata, Name, ObjectId, ObjectKind, Skip,
     SkipKind, Tree, STAGE_PREFIX,
 };
-use rustix::fd::AsFd;
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -87,11 +85,12 @@ enum StepError {
 
 impl From<std::io::Error> for StepError {
     fn from(e: std::io::Error) -> Self {
-        match e.raw_os_error() {
-            Some(28) | Some(122) => StepError::DiskFull(e),
-            Some(17) | Some(39) => StepError::Changed(e.to_string()),
-            _ if is_not_found(&e) => StepError::Changed(e.to_string()),
-            _ => StepError::Failed(e.to_string()),
+        if fsops::is_disk_full(&e) {
+            StepError::DiskFull(e)
+        } else if is_exists(&e) || fsops::is_not_empty(&e) || is_not_found(&e) {
+            StepError::Changed(e.to_string())
+        } else {
+            StepError::Failed(e.to_string())
         }
     }
 }
@@ -104,15 +103,14 @@ fn unholdable(dir: &Dir, name: &[u8], e: std::io::Error) -> StepError {
         why: why.into(),
         twin: false,
     };
-    match e.raw_os_error() {
-        Some(c) if c == Errno::ILSEQ.raw_os_error() => {
-            return refused("this filesystem refuses this name's bytes")
-        }
-        Some(c) if c == Errno::NAMETOOLONG.raw_os_error() => {
-            return refused("the name is too long for this filesystem")
-        }
-        Some(c) if c == Errno::EXIST.raw_os_error() => {}
-        _ => return e.into(),
+    if fsops::is_bad_name(&e) {
+        return refused(fsops::name_problem(name).unwrap_or(fsops::BAD_NAME));
+    }
+    if fsops::is_name_too_long(&e) {
+        return refused("the name is too long for this filesystem");
+    }
+    if !is_exists(&e) {
+        return e.into();
     }
     match twin_of(dir, name) {
         Some(why) => StepError::Unholdable { why, twin: true },
@@ -195,7 +193,7 @@ pub struct Applier<'a> {
     placed: BTreeSet<ObjectId>,
     /// Objects that only got or lost an entry in this run.
     moved: BTreeSet<ObjectId>,
-    euid: u32,
+    superuser: bool,
     outcome: ApplyOutcome,
 }
 
@@ -237,7 +235,7 @@ impl<'a> Applier<'a> {
             relaxed: BTreeMap::new(),
             placed: BTreeSet::new(),
             moved: BTreeSet::new(),
-            euid: rustix::process::geteuid().as_raw(),
+            superuser: fsops::is_superuser(),
             outcome: ApplyOutcome::default(),
         }
     }
@@ -272,7 +270,7 @@ impl<'a> Applier<'a> {
     /// Make a directory writable for a moment if its mode forbids this user, remembering durably to
     /// put it back.
     fn writable(&mut self, parent: ObjectId, dir: &Dir) -> Result<(), StepError> {
-        if self.euid == 0 || self.relaxed.contains_key(&parent) {
+        if self.superuser || self.relaxed.contains_key(&parent) {
             return Ok(());
         }
         let st = dir.stat_self()?;
@@ -522,7 +520,7 @@ impl<'a> Applier<'a> {
                 let fd = dir.create_new(tmp, 0o600)?;
                 hit("apply.temp.created");
                 let m = self.manifest(manifest).map_err(StepError::Other)?;
-                rustix::fs::ftruncate(&fd, *size).map_err(std::io::Error::from)?;
+                fsops::set_len(fd.as_fd(), *size, crate::chunker::has_holes(&m))?;
                 // Where the old version of this object is, to reuse its chunks.
                 let old = self.old_chunks(id)?;
                 for (offset, chunk) in m.placed_chunks() {
@@ -603,6 +601,12 @@ impl<'a> Applier<'a> {
         self.touched_dirs.insert(link.parent);
         let display = step_path(&self.cur, link);
         let mut written = None;
+        if matches!(t.body.content, Content::Symlink { .. }) && !fsops::HOLDS_SYMLINKS {
+            return Err(StepError::Unholdable {
+                why: "a symlink, which this device does not make yet".into(),
+                twin: false,
+            });
+        }
         if t.body.content == Content::Dir {
             check("apply.mkdir")?;
             // Private until the final pass gives it its real mode.
@@ -1894,7 +1898,7 @@ mod tests {
         std::fs::write(dir.join("Foo.txt"), b"x").unwrap();
         let folds = std::fs::metadata(dir.join("foo.txt")).is_ok();
         let d = Dir::open_root(&dir).unwrap();
-        let exists = || std::io::Error::from_raw_os_error(Errno::EXIST.raw_os_error());
+        let exists = fsops::exists_error;
         // Taken by exactly this name: something got there first, for another round.
         assert!(matches!(
             unholdable(&d, b"Foo.txt", exists()),
@@ -1908,7 +1912,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        let ilseq = std::io::Error::from_raw_os_error(Errno::ILSEQ.raw_os_error());
+        let ilseq = fsops::bad_name_error();
         assert!(matches!(
             unholdable(&d, b"\xff", ilseq),
             StepError::Unholdable { twin: false, .. }

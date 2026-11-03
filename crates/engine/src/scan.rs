@@ -2,15 +2,16 @@
 //! could not observe is recorded as such, so it is never mistaken for a delete.
 
 use crate::chunker::manifest_of;
-use crate::fsops::{is_not_found, is_permission, open_for_writing, Dir, Stat};
+use crate::fsops::{
+    is_busy, is_invalid, is_not_found, is_permission, open_for_writing, AsFd, Dir, FileType,
+    OwnedFd, Stat,
+};
 use crate::metadata::{capture, Accounts};
 use crate::root::aside_origin;
 use crate::state::{Fingerprint, Row};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
 use cairn_protocol::{Bytes, Content, Hash, Metadata, Name, Skip, SkipKind, Timestamp, STATE_DIR};
-use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::FileType;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -301,9 +302,11 @@ impl Walk<'_> {
             FileType::Socket => self.skip(path, SkipKind::Socket, None),
             FileType::CharacterDevice => self.skip(path, SkipKind::CharDevice, None),
             FileType::BlockDevice => self.skip(path, SkipKind::BlockDevice, None),
-            FileType::Unknown => {
-                self.skip(path, SkipKind::ReadError, Some("unknown file type".into()))
-            }
+            FileType::Unknown => self.skip(
+                path,
+                SkipKind::ReadError,
+                Some(crate::fsops::UNKNOWN_TYPE.into()),
+            ),
         }
     }
 
@@ -389,6 +392,18 @@ impl Walk<'_> {
                     self.forget_link(&st);
                     return self.unobservable(path, SkipKind::VanishedDuringScan, None);
                 }
+                // Windows: another program has it open and lets no one else read it, as a program
+                // writing a file often does. Its close is the end of that.
+                Err(e) if is_busy(&e) => {
+                    self.forget_link(&st);
+                    return self.unobservable(
+                        path,
+                        SkipKind::KeepsChanging,
+                        Some(format!(
+                            "another program has it open and lets no one read it: {e}"
+                        )),
+                    );
+                }
                 Err(e) => {
                     self.forget_link(&st);
                     return self.unobservable(path, SkipKind::ReadError, Some(e.to_string()));
@@ -417,17 +432,17 @@ impl Walk<'_> {
                     return self.unobservable(path, SkipKind::ReadError, Some(e.to_string()));
                 }
             };
-            let after = match rustix::fs::fstat(&fd) {
+            let after = match crate::fsops::fstat(fd.as_fd()) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            let same_inode = after.st_ino == before.ino;
+            let same_inode = after.ino == before.ino;
             let (mtime, ctime) = dir
                 .stat(raw)
                 .map(|s| (s.mtime, s.ctime))
                 .unwrap_or_default();
             if !same_inode
-                || after.st_size as u64 != before.size
+                || after.size != before.size
                 || mtime != before.mtime
                 || ctime != before.ctime
             {
@@ -507,7 +522,7 @@ impl Walk<'_> {
                 self.forget_link(&st);
                 let kind = if is_not_found(&e) {
                     SkipKind::VanishedDuringScan
-                } else if e.raw_os_error() == Some(rustix::io::Errno::INVAL.raw_os_error()) {
+                } else if is_invalid(&e) {
                     // Replaced by something else since the stat.
                     SkipKind::VanishedDuringScan
                 } else {

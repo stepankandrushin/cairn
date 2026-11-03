@@ -390,8 +390,8 @@ fn still_holds(root: &Root, node: &crate::scan::Scanned, m: &Manifest) -> bool {
         return false;
     };
     unchanged()
-        && rustix::fs::fstat(&fd).is_ok_and(|st| st.st_ino == node.fp.ino)
-        && crate::chunker::same_bytes(rustix::fd::AsFd::as_fd(&fd), m).unwrap_or(false)
+        && crate::fsops::fstat(crate::fsops::AsFd::as_fd(&fd)).is_ok_and(|st| st.ino == node.fp.ino)
+        && crate::chunker::same_bytes(crate::fsops::AsFd::as_fd(&fd), m).unwrap_or(false)
         && unchanged()
 }
 

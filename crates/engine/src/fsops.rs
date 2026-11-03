@@ -8,7 +8,8 @@
 use cairn_protocol::{Name, Timestamp};
 #[cfg(target_os = "linux")]
 use rustix::fd::AsRawFd;
-use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+pub use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+pub use rustix::fs::FileType;
 use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags, Timespec, Timestamps};
 #[cfg(target_os = "linux")]
 use rustix::fs::{Statx, StatxFlags, CWD};
@@ -20,6 +21,178 @@ use std::path::{Path, PathBuf};
 
 fn os(name: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(name))
+}
+
+/// Whether this platform makes symlinks. Every Unix does.
+pub const HOLDS_SYMLINKS: bool = true;
+
+/// Why a name refused for its bytes cannot be held.
+pub const BAD_NAME: &str = "this filesystem refuses this name's bytes";
+
+/// What this platform has against a name, beyond what its filesystem says. Nothing on Unix.
+pub fn name_problem(_: &[u8]) -> Option<&'static str> {
+    None
+}
+
+/// What a scan says of an entry whose type it does not know.
+pub const UNKNOWN_TYPE: &str = "unknown file type";
+
+/// A name's bytes as one path component, for the calls that take paths.
+pub fn push_name(path: &mut PathBuf, name: &[u8]) {
+    path.push(OsStr::from_bytes(name));
+}
+
+pub fn name_path(name: &[u8]) -> PathBuf {
+    os(name).to_path_buf()
+}
+
+/// A path component's bytes as a name holds them.
+pub fn os_name_bytes(name: &OsStr) -> Option<Vec<u8>> {
+    Some(name.as_bytes().to_vec())
+}
+
+/// `stat` of an open descriptor.
+#[cfg(target_os = "linux")]
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+    Ok(from_statx(fs::statx(
+        fd,
+        "",
+        AtFlags::EMPTY_PATH,
+        STATX_WANT,
+    )?))
+}
+
+#[cfg(target_os = "macos")]
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+    Ok(from_stat(fs::fstat(fd)?))
+}
+
+/// Set a file's size. Growing it leaves a hole, which is how a file written from a manifest gets its
+/// holes; `sparse` is for the platforms that have to be told first.
+pub fn set_len(fd: BorrowedFd<'_>, size: u64, _sparse: bool) -> io::Result<()> {
+    Ok(fs::ftruncate(fd, size)?)
+}
+
+/// One positional read, going on through interrupts.
+pub fn read_at(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    loop {
+        match rustix::io::pread(fd, &mut *buf, offset) {
+            Ok(n) => return Ok(n),
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The data runs of a file, as (offset, length), from `SEEK_DATA`/`SEEK_HOLE`.
+pub fn data_runs(fd: BorrowedFd<'_>, size: u64) -> io::Result<Vec<(u64, u64)>> {
+    use rustix::fs::{seek, SeekFrom};
+    let mut runs = Vec::new();
+    let mut at = 0;
+    while at < size {
+        let start = match seek(fd, SeekFrom::Data(at)) {
+            Ok(o) => o,
+            // No data at or after `at`: the rest is a hole.
+            Err(Errno::NXIO) => break,
+            // Not supported here: treat all of it as data.
+            Err(Errno::INVAL | Errno::OPNOTSUPP) => return Ok(vec![(0, size)]),
+            Err(e) => return Err(e.into()),
+        };
+        if start >= size {
+            break;
+        }
+        let end = match seek(fd, SeekFrom::Hole(start)) {
+            Ok(o) => o.min(size),
+            Err(Errno::NXIO) => size,
+            Err(e) => return Err(e.into()),
+        };
+        runs.push((start, end - start));
+        at = end;
+    }
+    Ok(runs)
+}
+
+fn is_errno(e: &io::Error, errno: Errno) -> bool {
+    e.raw_os_error() == Some(errno.raw_os_error())
+}
+
+/// A directory that still holds something.
+pub fn is_not_empty(e: &io::Error) -> bool {
+    is_errno(e, Errno::NOTEMPTY)
+}
+
+/// A full disk or quota.
+pub fn is_disk_full(e: &io::Error) -> bool {
+    is_errno(e, Errno::NOSPC) || is_errno(e, Errno::DQUOT)
+}
+
+/// A name whose bytes this filesystem refuses.
+pub fn is_bad_name(e: &io::Error) -> bool {
+    is_errno(e, Errno::ILSEQ)
+}
+
+pub fn is_name_too_long(e: &io::Error) -> bool {
+    is_errno(e, Errno::NAMETOOLONG)
+}
+
+/// What `readlink` says of something that is not a symlink.
+pub fn is_invalid(e: &io::Error) -> bool {
+    is_errno(e, Errno::INVAL)
+}
+
+/// A file another program holds so that it cannot be read now. Unix has no such thing.
+pub fn is_busy(_: &io::Error) -> bool {
+    false
+}
+
+/// The error a name refused for its bytes gives, for tests.
+pub fn bad_name_error() -> io::Error {
+    Errno::ILSEQ.into()
+}
+
+pub fn exists_error() -> io::Error {
+    Errno::EXIST.into()
+}
+
+/// Whether this process passes every permission check.
+pub fn is_superuser() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+pub fn hostname() -> String {
+    let name = rustix::system::uname();
+    let name = name.nodename().to_string_lossy().into_owned();
+    if name.is_empty() {
+        "unknown".into()
+    } else {
+        name
+    }
+}
+
+/// An exclusive lock on an open file, for as long as it stays open: `Ok(false)` if another process
+/// holds it.
+pub fn try_lock(file: &std::fs::File) -> io::Result<bool> {
+    match fs::flock(file, fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Files only this user can read.
+pub fn private_file(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600)
+}
+
+pub fn make_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Make a directory's entries durable, by its path.
+pub fn sync_dir_path(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 /// An open directory, reached without following any symlink.
@@ -581,14 +754,12 @@ impl Dir {
 pub fn read_exact_at(fd: BorrowedFd<'_>, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
-        match rustix::io::pread(fd, &mut buf[filled..], offset) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => {
+        match read_at(fd, &mut buf[filled..], offset)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => {
                 filled += n;
                 offset += n as u64;
             }
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e.into()),
         }
     }
     Ok(())

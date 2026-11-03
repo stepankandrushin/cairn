@@ -20,11 +20,9 @@ use cairn_failpoint::hit;
 use cairn_protocol::SkipKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
-use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::Path;
@@ -155,10 +153,29 @@ fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
     let dir = Path::new(&home).join("Library/Application Support/Cairn");
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::File::create(dir.join(format!("daemon-{root_id}.lock")))?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(file),
-        Err(rustix::io::Errno::WOULDBLOCK) => Err(std::io::ErrorKind::AddrInUse.into()),
-        Err(e) => Err(e.into()),
+    match crate::fsops::try_lock(&file)? {
+        true => Ok(file),
+        false => Err(std::io::ErrorKind::AddrInUse.into()),
+    }
+}
+
+/// As on macOS: a lock on a file in the user's local application data, not in the root, which the
+/// kernel drops when the process dies.
+#[cfg(windows)]
+fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
+    let dir = Path::new(&base).join("Cairn");
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!("daemon-{root_id}.lock")))?;
+    match crate::fsops::try_lock(&file)? {
+        true => Ok(file),
+        false => Err(std::io::ErrorKind::AddrInUse.into()),
     }
 }
 
@@ -173,7 +190,7 @@ pub fn running_status(path: &Path) -> Option<Status> {
 }
 
 fn state_file(path: &Path) -> std::path::PathBuf {
-    path.join(OsStr::from_bytes(cairn_protocol::STATE_DIR))
+    path.join(crate::fsops::name_path(cairn_protocol::STATE_DIR))
         .join(STATE_FILE_DAEMON)
 }
 

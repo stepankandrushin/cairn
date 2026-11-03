@@ -17,6 +17,7 @@ use crate::sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 use crate::watch::{WatchCounts, Watcher};
 use anyhow::{bail, Result};
 use cairn_failpoint::hit;
+use cairn_protocol::SkipKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -251,8 +252,10 @@ struct Schedule {
     last_event: Option<Instant>,
     remote: bool,
     reconcile_at: Instant,
-    /// After a failure, nothing but the server coming back goes before this.
+    /// When to try again. After a failure (`holding`), nothing but the server coming back goes before
+    /// it; after a sync that found only files still being written, anything else may.
     retry_at: Option<Instant>,
+    holding: bool,
     /// When the gap after the last sync ends.
     gap_until: Instant,
     backoff: Duration,
@@ -273,7 +276,7 @@ impl Schedule {
             if let Some(q) = quiet {
                 work = work.max(q);
             }
-            if let Some(retry) = self.retry_at {
+            if let Some(retry) = self.retry_at.filter(|_| self.holding) {
                 work = work.max(retry);
             }
             due = due.min(work);
@@ -301,6 +304,13 @@ impl Schedule {
     fn failed(&mut self, retry: Duration) {
         self.backoff = (self.backoff * 2).clamp(Duration::from_secs(1), retry);
         self.retry_at = Some(Instant::now() + self.backoff);
+        self.holding = true;
+    }
+
+    /// Only what is still being written stood in the way: come back for it, holding nothing back.
+    fn settling(&mut self, retry: Duration) {
+        self.failed(retry);
+        self.holding = false;
     }
 }
 
@@ -383,6 +393,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         remote: false,
         reconcile_at: now,
         retry_at: None,
+        holding: false,
         gap_until: now,
         backoff: Duration::ZERO,
     };
@@ -470,6 +481,16 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 synced_head.store(report.head, Ordering::SeqCst);
                 lines = report_lines(&report);
                 status.skips = report.skips.iter().map(ToString::to_string).collect();
+                if let Some(w) = &watcher {
+                    w.set_in_motion(
+                        report
+                            .skips
+                            .iter()
+                            .filter(|s| s.kind == SkipKind::KeepsChanging)
+                            .map(|s| s.path.clone())
+                            .collect(),
+                    );
+                }
                 match &report.outcome {
                     SyncOutcome::Synced => {
                         schedule.backoff = Duration::ZERO;
@@ -478,7 +499,15 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         status.last_synced = status.last_sync;
                     }
                     SyncOutcome::Partial => {
-                        schedule.failed(opts.retry);
+                        let stuck = report
+                            .skips
+                            .iter()
+                            .any(|s| s.kind.retryable() && !s.kind.in_motion());
+                        if stuck {
+                            schedule.failed(opts.retry);
+                        } else {
+                            schedule.settling(opts.retry);
+                        }
                         status.state = "partial".into();
                         status.detail = None;
                     }

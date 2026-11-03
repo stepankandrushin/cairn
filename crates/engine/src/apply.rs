@@ -13,13 +13,14 @@ use crate::scan::{fingerprint, Scanned};
 use crate::schedule::{is_stage, schedule, Topo, TopoOp};
 use crate::state::{Fingerprint, Row, Synced};
 use anyhow::{anyhow, Context, Result};
-use cairn_failpoint::{check, hit};
+use cairn_failpoint::{check, hit, refuse_name};
 use cairn_protocol::wire::MAX_CHUNK_BATCH_BYTES;
 use cairn_protocol::{
     Bytes, ChunkRef, Content, Hash, Link, Manifest, Metadata, Name, ObjectId, ObjectKind, Skip,
     SkipKind, Tree, STAGE_PREFIX,
 };
 use rustix::fd::AsFd;
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -73,6 +74,10 @@ enum StepError {
     /// This step cannot be done here, and repeating it now would not help.
     #[error("{0}")]
     Failed(String),
+    /// This filesystem cannot hold this name, and trying again will not change that. `twin`: another
+    /// name here is the same name to it, and that may go.
+    #[error("{why}")]
+    Unholdable { why: String, twin: bool },
     /// Stop everything: nothing more can be written.
     #[error("disk full")]
     DiskFull(#[source] std::io::Error),
@@ -89,6 +94,49 @@ impl From<std::io::Error> for StepError {
             _ => StepError::Failed(e.to_string()),
         }
     }
+}
+
+/// Why making `name` here failed for good, if it did: the name's bytes are refused, or a name already
+/// here is the same name to this filesystem (by case or Unicode normalization). Anything else, a name
+/// taken a moment ago included, is for another round.
+fn unholdable(dir: &Dir, name: &[u8], e: std::io::Error) -> StepError {
+    let refused = |why: &str| StepError::Unholdable {
+        why: why.into(),
+        twin: false,
+    };
+    match e.raw_os_error() {
+        Some(c) if c == Errno::ILSEQ.raw_os_error() => {
+            return refused("this filesystem refuses this name's bytes")
+        }
+        Some(c) if c == Errno::NAMETOOLONG.raw_os_error() => {
+            return refused("the name is too long for this filesystem")
+        }
+        Some(c) if c == Errno::EXIST.raw_os_error() => {}
+        _ => return e.into(),
+    }
+    match twin_of(dir, name) {
+        Some(why) => StepError::Unholdable { why, twin: true },
+        None => e.into(),
+    }
+}
+
+fn twin_of(dir: &Dir, name: &[u8]) -> Option<String> {
+    let names = dir.list().ok()?;
+    if names.iter().any(|n| n == name) {
+        return None;
+    }
+    let st = dir.stat(name).ok()?;
+    let twin = names.iter().find(|n| {
+        dir.stat(n)
+            .is_ok_and(|s| (s.dev, s.ino) == (st.dev, st.ino))
+    });
+    Some(match twin {
+        Some(t) => format!(
+            "`{}` here is the same name to this filesystem",
+            cairn_protocol::name::display_bytes(t)
+        ),
+        None => "another name here is the same name to this filesystem".into(),
+    })
 }
 
 /// Where one local object stands now.
@@ -112,6 +160,8 @@ pub struct ApplyOutcome {
     pub failed: Vec<Skip>,
     /// Metadata fields this filesystem could not take.
     pub warnings: Vec<Skip>,
+    /// Names this filesystem cannot hold, each the topmost: what is under one was not tried.
+    pub unholdable: Vec<(crate::selection::Unheld, String)>,
     pub applied_steps: u64,
     /// This run stopped before changing the tree's structure; nothing further should be pushed.
     pub halted: bool,
@@ -547,7 +597,9 @@ impl<'a> Applier<'a> {
         if t.body.content == Content::Dir {
             check("apply.mkdir")?;
             // Private until the final pass gives it its real mode.
-            dir.mkdir(&name, 0o700)?;
+            if let Err(e) = refuse_name(&name).and_then(|()| dir.mkdir(&name, 0o700)) {
+                return Err(unholdable(&dir, &name, e));
+            }
             hit("apply.mkdir.done");
             self.touched_dirs.insert(id);
         } else {
@@ -555,10 +607,10 @@ impl<'a> Applier<'a> {
             // Taken before the rename: any later difference but ctime is someone's edit.
             written = Some(fingerprint(&dir.stat(&tmp)?));
             hit("apply.create.before_rename");
-            let placed = dir.rename_new(&tmp, &dir, &name);
+            let placed = refuse_name(&name).and_then(|()| dir.rename_new(&tmp, &dir, &name));
             if let Err(e) = placed {
                 let _ = dir.unlink(&tmp);
-                return Err(e.into());
+                return Err(unholdable(&dir, &name, e));
             }
             hit("apply.create.renamed");
         }
@@ -591,7 +643,11 @@ impl<'a> Applier<'a> {
         self.writable(link.parent, &to_dir)?;
         self.check_fp(id, &from_dir, &from_name)?;
         check("apply.link")?;
-        from_dir.hard_link(&from_name, &to_dir, &to_name)?;
+        let linked =
+            refuse_name(&to_name).and_then(|()| from_dir.hard_link(&from_name, &to_dir, &to_name));
+        if let Err(e) = linked {
+            return Err(unholdable(&to_dir, &to_name, e));
+        }
         hit("apply.link.done");
         self.touched_dirs.insert(link.parent);
         self.refresh_fp(id, &to_dir, &to_name);
@@ -832,6 +888,13 @@ impl<'a> Applier<'a> {
                     SkipKind::CannotApply
                 },
                 detail: Some(detail),
+            }),
+            // Only a new entry is left out for it. Anything else, a move onto such a name, stands
+            // until a person changes the names, and is tried again meanwhile.
+            StepError::Unholdable { why, .. } => self.outcome.failed.push(Skip {
+                path: display,
+                kind: SkipKind::CannotApply,
+                detail: Some(why),
             }),
             StepError::DiskFull(io) => {
                 return Err(anyhow::Error::new(io)
@@ -1375,7 +1438,17 @@ impl<'a> Applier<'a> {
             .collect();
         let steps = schedule(&from, &to).context("ordering local changes")?;
         self.give_up_what_goes(&steps)?;
+        // Folders this filesystem cannot hold: what goes in them waits with them.
+        let mut unheld_dirs: BTreeSet<ObjectId> = BTreeSet::new();
         for step in &steps {
+            if let TopoOp::Create { link, .. } | TopoOp::Link { link, .. } = step {
+                if unheld_dirs.contains(&link.parent) {
+                    if let TopoOp::Create { object, .. } = step {
+                        unheld_dirs.insert(*object);
+                    }
+                    continue;
+                }
+            }
             // What it holds was never synced and has no other copy, so it stays, and so does the
             // folder. That is no change to confirm: nothing was written.
             if let TopoOp::Unlink { object, link } = step {
@@ -1402,9 +1475,24 @@ impl<'a> Applier<'a> {
                 TopoOp::Unlink { object, link } => self.remove_link(*object, link),
                 TopoOp::Move { object, from, to } => self.move_entry(plan, *object, from, to),
             };
-            match done {
-                Ok(()) => self.outcome.applied_steps += 1,
-                Err(e) => self.record(object, display, e)?,
+            match (done, step) {
+                (Ok(()), _) => self.outcome.applied_steps += 1,
+                (
+                    Err(StepError::Unholdable { why, twin }),
+                    TopoOp::Create { link, .. } | TopoOp::Link { link, .. },
+                ) => {
+                    if matches!(step, TopoOp::Create { .. }) {
+                        unheld_dirs.insert(object);
+                    }
+                    let unheld = crate::selection::Unheld {
+                        object,
+                        link: link.clone(),
+                        why,
+                        twin,
+                    };
+                    self.outcome.unholdable.push((unheld, display));
+                }
+                (Err(e), _) => self.record(object, display, e)?,
             }
         }
         self.apply_updates(plan)?;
@@ -1640,8 +1728,13 @@ pub fn keep_rescued_temp(
     let mut kept = None;
     relaxed_for_a_moment(root, &dir, path, || {
         for attempt in 0u32.. {
-            let name =
-                crate::merge::conflict_name(original, &root.config.device_name, date, attempt);
+            let name = crate::merge::conflict_name(
+                original,
+                &root.config.device_name,
+                date,
+                attempt,
+                crate::merge::in_git_dir(path),
+            );
             match dir.rename_new(temp, &dir, name.as_bytes()) {
                 Ok(()) => {
                     kept = Some(name);
@@ -1749,4 +1842,39 @@ pub fn cur_from_identified(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On a case-insensitive filesystem, as macOS has by default; elsewhere there is nothing to see.
+    #[test]
+    fn a_name_the_same_as_another_here_is_unholdable_and_a_taken_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("cairn-twin-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("Foo.txt"), b"x").unwrap();
+        let folds = std::fs::metadata(dir.join("foo.txt")).is_ok();
+        let d = Dir::open_root(&dir).unwrap();
+        let exists = || std::io::Error::from_raw_os_error(Errno::EXIST.raw_os_error());
+        // Taken by exactly this name: something got there first, for another round.
+        assert!(matches!(
+            unholdable(&d, b"Foo.txt", exists()),
+            StepError::Changed(_)
+        ));
+        if folds {
+            match unholdable(&d, b"foo.txt", exists()) {
+                StepError::Unholdable { why, twin: true } => {
+                    assert!(why.contains("Foo.txt"), "{why}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let ilseq = std::io::Error::from_raw_os_error(Errno::ILSEQ.raw_os_error());
+        assert!(matches!(
+            unholdable(&d, b"\xff", ilseq),
+            StepError::Unholdable { twin: false, .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -10,6 +10,7 @@
 //! a sync then finds out about.
 
 use crate::fsops::Dir;
+use crate::scan::display_path;
 use crate::selection::{Rules, IGNORE_FILE};
 use cairn_failpoint::hit;
 use cairn_protocol::{Name, STATE_DIR};
@@ -63,6 +64,9 @@ struct Inner {
     state_watch: Option<i32>,
     counts: WatchCounts,
     stopped: bool,
+    /// Files the last sync found still being written, by their printable paths: their writes wake
+    /// nothing, as the daemon comes back for them anyway, and their close does.
+    in_motion: HashSet<String>,
 }
 
 fn load_rules(root: &Dir) -> Rules {
@@ -235,6 +239,16 @@ impl Inner {
         if self.rules.excludes(&at, is_dir) {
             return;
         }
+        let only_written = !flags.intersects(
+            ReadFlags::CREATE
+                | ReadFlags::DELETE
+                | ReadFlags::MOVED_FROM
+                | ReadFlags::MOVED_TO
+                | ReadFlags::CLOSE_WRITE,
+        );
+        if only_written && !is_dir && self.in_motion.contains(&display_path(&at)) {
+            return;
+        }
         if is_dir {
             if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
                 self.walk_new(at);
@@ -262,6 +276,7 @@ impl Watcher {
             state_watch: None,
             counts: WatchCounts::default(),
             stopped: false,
+            in_motion: HashSet::new(),
         }));
         let shared = inner.clone();
         std::thread::spawn(move || read_events(reader, shared, wake));
@@ -272,6 +287,11 @@ impl Watcher {
     /// afterwards misses nothing.
     pub fn walk_all(&self) {
         self.lock().walk_all();
+    }
+
+    /// The files the last sync found still being written, by their printable paths.
+    pub fn set_in_motion(&self, paths: HashSet<String>) {
+        self.lock().in_motion = paths;
     }
 
     pub fn counts(&self) -> WatchCounts {

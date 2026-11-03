@@ -2308,3 +2308,65 @@ fn a_folder_moved_by_a_sync_leaves_a_rule_that_still_matches_as_it_was() {
     a.synced();
     assert_eq!(a.read("e/run.log"), b"log");
 }
+
+/// A name the filesystem here cannot hold (APFS refuses one that is not UTF-8, a case-insensitive disk
+/// a case twin) is out of view on this device: reported each time, retried by nothing, and no reason
+/// to call the sync partial, which would hold every later change back. Nothing goes from the server.
+#[test]
+fn a_name_this_filesystem_refuses_is_left_out_and_holds_nothing_back() {
+    let (sb, server, a, b) = pair("refused");
+    let refuse = [("CAIRN_FP_REFUSE_NAME", "refused")];
+    a.write("d/refused", "kept on the server\n");
+    a.write("d/fine", "fine\n");
+    a.write("refused/inner/deep", "under a folder\n");
+    a.synced();
+
+    for _ in 0..2 {
+        let run = b.sync_env(&refuse);
+        assert!(
+            run.ok(),
+            "a name left out is no partial sync: {}",
+            run.text()
+        );
+        let said = run
+            .text()
+            .matches("this filesystem cannot hold this name")
+            .count();
+        assert_eq!(
+            said,
+            2,
+            "the file and the folder, nothing under it: {}",
+            run.text()
+        );
+    }
+    assert_eq!(b.read("d/fine"), b"fine\n");
+    assert!(!b.exists("d/refused") && !b.exists("refused"));
+
+    // Nothing reads as deleted, here or anywhere.
+    b.write("d/new", "new\n");
+    assert!(b.sync_env(&refuse).ok());
+    a.synced();
+    assert_eq!(a.read("d/refused"), b"kept on the server\n");
+    assert_eq!(a.read("refused/inner/deep"), b"under a folder\n");
+    assert_eq!(a.read("d/new"), b"new\n");
+
+    // Renamed elsewhere, it comes down as anything new does.
+    std::fs::rename(a.path("d/refused"), a.path("d/accepted")).unwrap();
+    a.synced();
+    let run = b.sync_env(&refuse);
+    assert!(run.ok(), "{}", run.text());
+    assert_eq!(b.read("d/accepted"), b"kept on the server\n");
+    assert_eq!(
+        run.text()
+            .matches("this filesystem cannot hold this name")
+            .count(),
+        1,
+        "{}",
+        run.text()
+    );
+    let names = on_server(&sb, &server, "probe");
+    assert!(
+        names.contains("refused/inner/deep") && names.contains("d/accepted"),
+        "{names:?}"
+    );
+}

@@ -144,19 +144,35 @@ pub struct SeenCopy {
     stat: Stat,
 }
 
-/// Everything this device has chosen not to sync.
+/// A name on the server that this filesystem cannot hold: its bytes are refused, or another name here
+/// is the same name to it. Out of view, as if excluded, so that no sync here fails on it again, until
+/// the server's entry moves or, for a twin, the twin here has gone; then it comes down as anything this
+/// device never held does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unheld {
+    pub object: ObjectId,
+    pub link: Link,
+    pub why: String,
+    /// Another name here stands in its way, and may go.
+    pub twin: bool,
+}
+
+/// Everything this device does not sync: what it chose to leave out, and what it cannot hold.
 #[derive(Default)]
 pub struct Selection {
     pub rules: Rules,
     /// Excluded by identity, wherever on the server they go.
     pub objects: BTreeSet<ObjectId>,
     pub copies: Vec<KeptCopy>,
+    pub unheld: Vec<Unheld>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Excluded {
     objects: BTreeSet<ObjectId>,
     copies: Vec<KeptCopy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unheld: Vec<Unheld>,
 }
 
 /// The trees as this device takes part in them, and what the merge needs to know about the rest.
@@ -178,7 +194,7 @@ struct Visible {
 }
 
 /// The part of a tree that passes the rules and `hide`, walked from the root down.
-fn visible(tree: &Tree, rules: &Rules, hide: &dyn Fn(ObjectId) -> bool) -> Visible {
+fn visible(tree: &Tree, rules: &Rules, hide: &dyn Fn(ObjectId, &Link) -> bool) -> Visible {
     let mut kept: BTreeMap<ObjectId, BTreeSet<Link>> = BTreeMap::new();
     let mut left_out = Vec::new();
     let mut stack = vec![(ObjectId::ROOT, Vec::new())];
@@ -194,7 +210,7 @@ fn visible(tree: &Tree, rules: &Rules, hide: &dyn Fn(ObjectId) -> bool) -> Visib
                 parent: dir,
                 name: name.clone(),
             };
-            if hide(child) || rules.excludes(&at, is_dir) {
+            if hide(child, &link) || rules.excludes(&at, is_dir) {
                 left_out.push((link, child));
             } else {
                 kept.entry(child).or_default().insert(link);
@@ -280,7 +296,39 @@ impl Selection {
             rules: Rules::load(&root.state_dir)?,
             objects: excluded.objects,
             copies: excluded.copies,
+            unheld: excluded.unheld,
         })
+    }
+
+    fn is_unheld(&self, id: ObjectId, link: &Link) -> bool {
+        self.unheld
+            .iter()
+            .any(|u| u.object == id && &u.link == link)
+    }
+
+    /// Drop what no longer stands in the way: an entry the server has moved or removed, or one whose
+    /// twin here has gone. Returns whether any went.
+    pub fn recheck_unheld(&mut self, root: &Root, remote: &Tree) -> bool {
+        let before = self.unheld.len();
+        self.unheld.retain(|u| {
+            if !remote
+                .get_live(u.object)
+                .is_some_and(|n| n.links.contains(&u.link))
+            {
+                return false;
+            }
+            if !u.twin {
+                return true;
+            }
+            let Some(path) = remote.path_of_link(&u.link) else {
+                return true;
+            };
+            let Ok(dir) = root.dir.open_path(&path[..path.len() - 1]) else {
+                return true;
+            };
+            !matches!(dir.stat(u.link.name.as_bytes()), Err(e) if is_not_found(&e))
+        });
+        self.unheld.len() != before
     }
 
     /// A filter for scans: whether this entry is left out, and where the copies went.
@@ -397,6 +445,7 @@ impl Selection {
             &Excluded {
                 objects: self.objects.clone(),
                 copies: self.copies.clone(),
+                unheld: self.unheld.clone(),
             },
         )
     }
@@ -409,7 +458,7 @@ impl Selection {
         remote: &'a Tree,
         rows: &mut BTreeMap<ObjectId, Row>,
     ) -> View<'a> {
-        if self.rules.is_empty() && self.objects.is_empty() {
+        if self.rules.is_empty() && self.objects.is_empty() && self.unheld.is_empty() {
             return View {
                 base: Cow::Borrowed(base),
                 remote: Cow::Borrowed(remote),
@@ -418,12 +467,14 @@ impl Selection {
                 changed: Vec::new(),
             };
         }
-        let remote_view = visible(remote, &self.rules, &|id| self.objects.contains(&id));
+        let remote_view = visible(remote, &self.rules, &|id, link| {
+            self.objects.contains(&id) || self.is_unheld(id, link)
+        });
         // A folder excluded by identity while this device still holds it stays in the base, so that
         // it reads as gone from the server and the copy here goes the way anything deleted there
         // does: only if it has not changed. That is `cairn exclude --remove-local`.
-        let base_view = visible(base, &self.rules, &|id| {
-            self.objects.contains(&id) && !rows.contains_key(&id)
+        let base_view = visible(base, &self.rules, &|id, link| {
+            (self.objects.contains(&id) && !rows.contains_key(&id)) || self.is_unheld(id, link)
         });
 
         let moved_away: BTreeSet<ObjectId> = remote
@@ -928,6 +979,7 @@ mod tests {
             rules: Rules::parse(rules.as_bytes()).unwrap(),
             objects: objects.iter().copied().collect(),
             copies: Vec::new(),
+            unheld: Vec::new(),
         }
     }
 

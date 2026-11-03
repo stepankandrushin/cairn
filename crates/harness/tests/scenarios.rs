@@ -941,3 +941,158 @@ fn a_git_working_tree_comes_out_clean_on_the_other_side() {
         "no conflict copies inside .git: {copies:?}"
     );
 }
+
+/// Two machines commit to one repository before either has synced: git cannot take a copy of a ref
+/// under a name with spaces, so the copy must be a branch it can merge.
+#[test]
+fn commits_made_at_once_on_two_machines_become_two_branches() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git is not installed: skipped");
+        return;
+    }
+    let (_sb, _s, a, b) = pair("git-race");
+    let git = |root: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(root.join("repo"))
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    a.write("repo/one", "1\n");
+    a.write("repo/two", "2\n");
+    git(&a.root, &["init", "-q"]);
+    git(&a.root, &["add", "."]);
+    git(&a.root, &["commit", "-qm", "base"]);
+    a.synced();
+    b.synced();
+
+    a.write("repo/one", "1 from a\n");
+    git(&a.root, &["commit", "-qam", "from a"]);
+    b.write("repo/two", "2 from b\n");
+    git(&b.root, &["commit", "-qam", "from b"]);
+    a.synced();
+    b.synced();
+    a.synced();
+
+    let branch = git(&a.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = branch.trim();
+    for dev in [&a, &b] {
+        let all = git(&dev.root, &["log", "--all", "--format=%s"]);
+        for subject in ["base", "from a", "from b"] {
+            assert!(
+                all.lines().any(|l| l == subject),
+                "{subject} missing: {all}"
+            );
+        }
+        git(&dev.root, &["fsck", "--no-dangling"]);
+    }
+    let branches = git(&b.root, &["branch", "--format=%(refname:short)"]);
+    let copy = format!("{branch}.conflict-b-");
+    let theirs = branches
+        .lines()
+        .find(|l| l.starts_with(&copy))
+        .unwrap_or_else(|| panic!("no branch {copy}*: {branches}"))
+        .to_string();
+
+    // b's file is in the tree but not in the commit that won, and git says so; merging joins them.
+    git(&b.root, &["merge", "--autostash", "--no-edit", &theirs]);
+    git(&b.root, &["branch", "-d", &theirs]);
+    b.synced();
+    a.synced();
+    for dev in [&a, &b] {
+        assert_eq!(git(&dev.root, &["status", "--porcelain"]), "");
+        assert_eq!(dev.read("repo/one"), b"1 from a\n");
+        assert_eq!(dev.read("repo/two"), b"2 from b\n");
+        let log = git(&dev.root, &["log", "--format=%s"]);
+        assert!(log.contains("from a") && log.contains("from b"), "{log}");
+        git(&dev.root, &["fsck", "--no-dangling"]);
+        let spaced: Vec<String> = Picture::of(&dev.root.join("repo/.git"))
+            .names()
+            .into_iter()
+            .filter(|n| n.contains(' '))
+            .collect();
+        assert!(spaced.is_empty(), "{spaced:?}");
+    }
+}
+
+/// A program that empties a file to write it again leaves it empty for a moment, which reads as steady
+/// as any file, and on a busy machine for longer than the stable window. While the program still has it
+/// open, the empty file goes nowhere.
+#[test]
+fn a_file_emptied_by_a_program_still_writing_it_is_not_sent_empty() {
+    use std::io::Write;
+    let (_sb, _s, a, b) = pair("emptied");
+    a.write("doc", "the first version\n");
+    a.synced();
+    b.synced();
+    let mut saving = std::fs::File::create(a.path("doc")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let run = a.sync();
+    assert_eq!(run.code, Some(3), "{}", run.text());
+    assert!(run.text().contains("emptied"), "{}", run.text());
+    b.synced();
+    assert_eq!(b.read("doc"), b"the first version\n");
+    // However long the program takes: the kernel says it still has the file open.
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        let run = a.sync();
+        assert_eq!(run.code, Some(3), "{}", run.text());
+        b.synced();
+        assert_eq!(b.read("doc"), b"the first version\n");
+    }
+    saving.write_all(b"the second version\n").unwrap();
+    drop(saving);
+    a.synced();
+    b.synced();
+    assert_eq!(b.read("doc"), b"the second version\n");
+}
+
+/// What is emptied for good is sent empty: at once where the kernel can say nobody is writing it, a
+/// moment later where it cannot.
+#[test]
+fn a_file_emptied_and_closed_is_sent_empty() {
+    let (_sb, _s, a, b) = pair("emptied-closed");
+    a.write("log", "old lines\n");
+    a.synced();
+    b.synced();
+    std::fs::File::create(a.path("log")).unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        let run = a.sync();
+        if run.ok() {
+            break;
+        }
+        assert_eq!(run.code, Some(3), "{}", run.text());
+        assert!(start.elapsed().as_secs() < 5, "{}", run.text());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    b.synced();
+    assert_eq!(b.read("log"), b"");
+}
+
+/// A program that keeps a file open between writes, a log or a database, does not keep it from
+/// syncing once it has been still for a moment.
+#[test]
+fn a_file_an_idle_program_keeps_open_still_syncs() {
+    use std::io::Write;
+    let (_sb, _s, a, b) = pair("held-open");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(a.path("app.log"))
+        .unwrap();
+    log.write_all(b"started\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+    a.synced();
+    b.synced();
+    assert_eq!(b.read("app.log"), b"started\n");
+    drop(log);
+}

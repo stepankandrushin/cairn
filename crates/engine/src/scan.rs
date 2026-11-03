@@ -2,13 +2,14 @@
 //! could not observe is recorded as such, so it is never mistaken for a delete.
 
 use crate::chunker::manifest_of;
-use crate::fsops::{is_not_found, is_permission, Dir, Stat};
+use crate::fsops::{is_not_found, is_permission, open_for_writing, Dir, Stat};
 use crate::metadata::{capture, Accounts};
 use crate::root::aside_origin;
 use crate::state::{Fingerprint, Row};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
 use cairn_protocol::{Bytes, Content, Hash, Metadata, Name, Skip, SkipKind, Timestamp, STATE_DIR};
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::FileType;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +20,12 @@ const RACY_WINDOW_NS: i128 = 100_000_000;
 /// A file changed more recently than this may be in the middle of a save: a program that truncates
 /// and then writes leaves an empty file that reads as perfectly steady. It waits this long first.
 const STABLE_WINDOW_NS: i128 = 250_000_000;
+
+/// A file another program has open for writing, or one emptied a moment ago, is in the middle of being
+/// written until this long after its last change, however steady it reads: on a busy machine a writer
+/// can stall for longer than the stable window between emptying a file and filling it. An emptied file
+/// that is still open for writing waits for the writer however long it takes.
+const WRITER_WINDOW_NS: i128 = 2_000_000_000;
 
 /// How often a file that changed under a read is tried again within one scan.
 const READ_ATTEMPTS: u32 = 3;
@@ -394,6 +401,10 @@ impl Walk<'_> {
             if before.file_type != FileType::RegularFile || before.ctime != settling.ctime {
                 continue;
             }
+            if let Some(why) = self.being_written(&fd, &before) {
+                self.forget_link(&st);
+                return self.unobservable(path, SkipKind::KeepsChanging, Some(why.into()));
+            }
             hit("scan.file.reading");
             let manifest = match manifest_of(&fd, before.size) {
                 Ok(m) => m,
@@ -443,6 +454,28 @@ impl Walk<'_> {
         }
         self.forget_link(&st);
         self.unobservable(path, SkipKind::KeepsChanging, None);
+    }
+
+    /// Why this file, steady as it reads, may be halfway through a save. A program that truncates and
+    /// then writes leaves an empty file, and one that writes in pieces a part of one.
+    fn being_written(&self, fd: &OwnedFd, st: &Stat) -> Option<&'static str> {
+        let recent = now_ns() - ns(st.ctime) < WRITER_WINDOW_NS;
+        let emptied = st.size == 0
+            && self
+                .opts
+                .rows
+                .get(&(st.dev, st.ino))
+                .is_some_and(|row| row.fp.size > 0);
+        match open_for_writing(fd.as_fd()) {
+            Some(true) if emptied => {
+                Some("emptied, and another program still has it open to write")
+            }
+            Some(true) if recent => Some("another program has it open and is writing it"),
+            None if emptied && recent => {
+                Some("emptied a moment ago, as a program saving it does first")
+            }
+            _ => None,
+        }
     }
 
     fn forget_link(&mut self, st: &Stat) {

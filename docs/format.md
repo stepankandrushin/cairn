@@ -70,7 +70,7 @@ the root.
 
 | Table | Holds |
 |---|---|
-| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move |
+| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way |
 | `base` | The server's tree as of the cursor: the common ancestor for merging |
 | `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it |

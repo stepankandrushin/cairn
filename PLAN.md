@@ -111,12 +111,17 @@ universally force NFD. Each folder picks a policy:
 
 `File.txt` and `file.txt` both stay on the server; a case-insensitive destination shows a clear
 mapping or a conflict. A rename made for compatibility must not break a relative symlink that points
-at it.
+at it. Until those policies exist, a name the filesystem refuses, or one it holds as the same name as
+another here, is out of view on that device, as if excluded: reported on every sync, never retried, so it
+holds nothing else back, and it comes down once the server's entry is renamed or the twin here is gone.
 
 ## Sync
 
 **Committing a change.** Wait for a stable candidate (a file's ctime 250 ms old, for the daemon as for the
-one-shot CLI, since a watcher's close_write says nothing about a program that writes again) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
+one-shot CLI, since a watcher's close_write says nothing about a program that writes again; 2 s if another
+program has it open for writing, which Linux tells by refusing a read lease, or if it has just been emptied; and
+an emptied file still open for writing waits for its writer however long, since a program that truncates and
+then writes, stalled on a busy machine, leaves exactly that) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
 its base revision and a unique operation ID → durable acknowledgement. A retried operation ID returns
 the first result, so a lost response is harmless. Small files take a simpler batched path.
 
@@ -139,7 +144,7 @@ record yet; a removal of a just-arrived file can be undone by the server's copy,
 | Metadata on both, different fields | Merge field by field |
 | Metadata on both, same field | Server order wins; the loser is in the activity log |
 | Content on one, metadata or rename on the other | Apply both |
-| Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox |
+| Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox. Inside a git directory the copy is `name.conflict-hostname-2026-10-31`, a name git takes: a copy of a branch is a branch to merge, where a space in `refs/` breaks the repository |
 | Edit against delete | The edit survives, and it is reported. This includes each side removing a different hard link of a file someone edited |
 | Same new name, different objects | Identical content or two directories become one object; otherwise keep both under a conflict name |
 | Concurrent moves that would form a cycle | The server rejects the second; that client rebases |
@@ -155,7 +160,10 @@ of `GET /changes`, not a stream, since a plain response survives any proxy; when
 client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, and
 it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
 unmounted, but says nothing when only a bind mount goes away, or when anything is mounted back: the
-reconcile finds the first, and retrying while paused the second.
+reconcile finds the first, and retrying while paused the second. After a failure it backs off, up to a
+minute, and holds every change back until then. A file still being written is no failure: the daemon comes
+back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
+its close does.
 
 **Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
 `cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree

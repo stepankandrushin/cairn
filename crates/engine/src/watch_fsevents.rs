@@ -7,9 +7,11 @@
 //! before the first sync, so whatever was written before it is found by that sync.
 
 use crate::fsops::Dir;
+use crate::scan::display_path;
 use crate::selection::{Rules, IGNORE_FILE};
 use cairn_failpoint::hit;
 use cairn_protocol::{Name, STATE_DIR};
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +47,9 @@ const EVENT_KERNEL_DROPPED: u32 = 0x04;
 const EVENT_ROOT_CHANGED: u32 = 0x20;
 const EVENT_MOUNT: u32 = 0x40;
 const EVENT_UNMOUNT: u32 = 0x80;
+const EVENT_ITEM_CREATED: u32 = 0x100;
+const EVENT_ITEM_REMOVED: u32 = 0x200;
+const EVENT_ITEM_RENAMED: u32 = 0x800;
 const EVENT_IS_DIR: u32 = 0x0002_0000;
 
 /// Gathers a burst into one wake. The first event of a quiet spell is delivered at once (no defer).
@@ -105,6 +110,9 @@ struct Inner {
     root: PathBuf,
     rules: Rules,
     wake: Box<dyn Fn() + Send>,
+    /// Files the last sync found still being written, by their printable paths: their writes wake
+    /// nothing, as the daemon comes back for them anyway. FSEvents says nothing of a close.
+    in_motion: HashSet<String>,
 }
 
 fn load_rules(root: &Path) -> Rules {
@@ -146,8 +154,14 @@ impl Inner {
         let Ok(names) = names else {
             return true;
         };
+        let is_dir = flags & EVENT_IS_DIR != 0;
+        let only_written =
+            flags & (EVENT_ITEM_CREATED | EVENT_ITEM_REMOVED | EVENT_ITEM_RENAMED) == 0;
+        if only_written && !is_dir && self.in_motion.contains(&display_path(&names)) {
+            return false;
+        }
         // A busy log file that is ignored must not keep the daemon scanning.
-        names.is_empty() || !self.rules.excludes(&names, flags & EVENT_IS_DIR != 0)
+        names.is_empty() || !self.rules.excludes(&names, is_dir)
     }
 }
 
@@ -185,6 +199,7 @@ impl Watcher {
             rules: load_rules(&real),
             root: real.clone(),
             wake: Box::new(wake),
+            in_motion: HashSet::new(),
         }));
         let refused = || std::io::Error::other("FSEvents refused the stream");
         let bytes = real.as_os_str().as_bytes();
@@ -245,6 +260,14 @@ impl Watcher {
     pub fn walk_all(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.rules = load_rules(&inner.root);
+    }
+
+    /// The files the last sync found still being written, by their printable paths.
+    pub fn set_in_motion(&self, paths: HashSet<String>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_motion = paths;
     }
 
     pub fn counts(&self) -> WatchCounts {

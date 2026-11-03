@@ -7,6 +7,8 @@
 //! - `CAIRN_FP_CRASH=<n>`: SIGKILL this process on the n-th hit (1-based), or `<name>` on that name.
 //! - `CAIRN_FP_ENOSPC=<n>`: `check` returns ENOSPC from the n-th hit on, or `<name>` on that name.
 //! - `CAIRN_FP_PAUSE=<name>:<dir>`: on the hit, create `<dir>/reached` and wait for `<dir>/go`.
+//! - `CAIRN_FP_REFUSE_NAME=<name>`: `refuse_name` refuses that name as a filesystem refuses bytes it
+//!   cannot hold (EILSEQ), as APFS does a name that is not UTF-8.
 
 use std::io;
 
@@ -24,6 +26,18 @@ pub fn hit(name: &str) {
 pub fn check(name: &str) -> io::Result<()> {
     #[cfg(feature = "enabled")]
     return imp::check(name);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = name;
+        Ok(())
+    }
+}
+
+/// Before an entry is made under this name: may refuse it, as some filesystems refuse some names.
+#[inline]
+pub fn refuse_name(name: &[u8]) -> io::Result<()> {
+    #[cfg(feature = "enabled")]
+    return imp::refuse_name(name);
     #[cfg(not(feature = "enabled"))]
     {
         let _ = name;
@@ -103,5 +117,20 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    pub fn refuse_name(name: &[u8]) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        const EILSEQ: i32 = 92;
+        #[cfg(not(target_os = "macos"))]
+        const EILSEQ: i32 = 84;
+        match std::env::var_os("CAIRN_FP_REFUSE_NAME") {
+            Some(refused)
+                if std::os::unix::ffi::OsStrExt::as_bytes(refused.as_os_str()) == name =>
+            {
+                Err(io::Error::from_raw_os_error(EILSEQ))
+            }
+            _ => Ok(()),
+        }
     }
 }

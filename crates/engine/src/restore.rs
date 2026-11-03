@@ -3,7 +3,7 @@
 
 use crate::client::Client;
 use crate::export::tree_at;
-use crate::merge::conflict_name;
+use crate::merge::{conflict_name, in_git_dir};
 use crate::root::Root;
 use crate::scan::display_path;
 use crate::schedule::{schedule, Topo, TopoOp};
@@ -96,10 +96,16 @@ fn topo(tree: &Tree) -> Topo {
 }
 
 /// A free name for something restored over a name now in use.
-fn free_name(desired: &BTreeMap<Link, ObjectId>, link: &Link, seq: u64) -> Link {
+fn free_name(desired: &BTreeMap<Link, ObjectId>, link: &Link, seq: u64, in_git: bool) -> Link {
     let mut attempt = 0;
     loop {
-        let name = conflict_name(&link.name, "restored", &format!("seq {seq}"), attempt);
+        let name = conflict_name(
+            &link.name,
+            "restored",
+            &format!("seq {seq}"),
+            attempt,
+            in_git,
+        );
         let candidate = Link {
             parent: link.parent,
             name,
@@ -162,7 +168,10 @@ fn restore_ops(now: &Tree, then: &Tree, top: ObjectId, seq: u64) -> Result<Vec<O
         for l in &n.links {
             // The name is in use by something outside this restore: both stay.
             let placed = if desired.contains_key(l) {
-                free_name(&desired, l, seq)
+                let in_git = then
+                    .path_of_link(l)
+                    .is_some_and(|p| in_git_dir(&p[..p.len() - 1]));
+                free_name(&desired, l, seq, in_git)
             } else {
                 l.clone()
             };

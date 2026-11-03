@@ -128,6 +128,66 @@ pub fn is_exists(e: &io::Error) -> bool {
     e.raw_os_error() == Some(Errno::EXIST.raw_os_error())
 }
 
+/// Whether another program has this file open for writing: the kernel grants a read lease only when
+/// none has. `None` where that cannot be asked: a file of another user's, a filesystem whose leases
+/// mean something else (NFS refuses one for every file it holds no delegation for), or not Linux.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn open_for_writing(fd: BorrowedFd<'_>) -> Option<bool> {
+    use std::ffi::c_int;
+    extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+    const F_SETSIG: c_int = 10;
+    const F_SETLEASE: c_int = 1024;
+    const F_RDLCK: c_int = 0;
+    const F_UNLCK: c_int = 2;
+    // What a writer opening the file in the instant the lease is held sends instead of SIGIO, which
+    // would end the process: ignored unless handled, and nothing here handles it.
+    const SIGURG: c_int = 23;
+    // Local filesystems that use the kernel's own leases: ext2 to 4, XFS, Btrfs, tmpfs, F2FS,
+    // bcachefs, ZFS.
+    const GENERIC_LEASES: [i64; 7] = [
+        0xEF53,
+        0x5846_5342,
+        0x9123_683E,
+        0x0102_1994,
+        0xF2F5_2010,
+        0xCA45_1A4E,
+        0x2FC1_2FC1,
+    ];
+    // The width of `f_type` differs between architectures.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = fs::fstatfs(fd).ok()?.f_type as i64;
+    if !GENERIC_LEASES.contains(&kind) {
+        return None;
+    }
+    let raw = fd.as_raw_fd();
+    // SAFETY: the descriptor is open for these calls, and each takes an integer argument.
+    unsafe {
+        if fcntl(raw, F_SETSIG, SIGURG) == -1 {
+            return None;
+        }
+        if fcntl(raw, F_SETLEASE, F_RDLCK) == -1 {
+            let busy =
+                io::Error::last_os_error().raw_os_error() == Some(Errno::AGAIN.raw_os_error());
+            return busy.then_some(true);
+        }
+        fcntl(raw, F_SETLEASE, F_UNLCK);
+    }
+    Some(false)
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub fn open_for_writing(_: BorrowedFd<'_>) -> Option<bool> {
+    None
+}
+
 /// `F_PUNCHHOLE`, which rustix does not have. Both must be multiples of the filesystem's block.
 #[cfg(target_os = "macos")]
 pub fn punch_hole(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
@@ -547,4 +607,28 @@ pub fn write_all_at(fd: BorrowedFd<'_>, mut buf: &[u8], mut offset: u64) -> io::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_open_for_writing_says_so() {
+        let dir = std::env::temp_dir().join(format!("cairn-lease-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let read = std::fs::File::open(&path).unwrap();
+        let Some(idle) = open_for_writing(read.as_fd()) else {
+            eprintln!("this filesystem cannot say: skipped");
+            return;
+        };
+        assert!(!idle);
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(open_for_writing(read.as_fd()), Some(true));
+        drop(writer);
+        assert_eq!(open_for_writing(read.as_fd()), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -192,8 +192,24 @@ pub fn merge_metadata(b: &Metadata, l: &Metadata, r: &Metadata) -> (Metadata, Ve
     (out, notes)
 }
 
-/// `name (conflict host 2026-10-31).ext`, within the 255 bytes filesystems allow.
-pub fn conflict_name(name: &Name, host: &str, date: &str, attempt: u32) -> Name {
+/// Whether a folder is a git directory: `.git`, or a bare repository's `name.git`.
+pub fn is_git_dir(name: &Name) -> bool {
+    name.as_bytes().ends_with(b".git")
+}
+
+/// Whether something in this folder, given by its names from the root, is inside a git directory.
+pub fn in_git_dir(folder: &[Name]) -> bool {
+    folder.iter().any(is_git_dir)
+}
+
+/// `name (conflict host 2026-10-31).ext`, within the 255 bytes filesystems allow. Inside a git
+/// directory it is `name.conflict-host-2026-10-31`, a name git takes: a copy of a branch is a branch,
+/// and of its reflog that branch's reflog, so `git log --all` shows both commits and `git merge`
+/// joins them. A space in a name in `refs/` makes git fail on the whole repository.
+pub fn conflict_name(name: &Name, host: &str, date: &str, attempt: u32, in_git: bool) -> Name {
+    if in_git {
+        return git_conflict_name(name, host, date, attempt);
+    }
     let bytes = name.as_bytes();
     let split = bytes
         .iter()
@@ -222,6 +238,56 @@ pub fn conflict_name(name: &Name, host: &str, date: &str, attempt: u32) -> Name 
             .collect::<Vec<u8>>(),
     )
     .expect("a conflict name is built from a valid name")
+}
+
+/// The suffix keeps to what any ref name may hold, and is appended whole: an `.idx` or `.pack` that
+/// kept its extension would be taken for part of a pack.
+fn git_conflict_name(name: &Name, host: &str, date: &str, attempt: u32) -> Name {
+    let mut tag = format!("conflict-{host}-{date}");
+    if attempt > 0 {
+        tag.push_str(&format!("-{}", attempt + 1));
+    }
+    let mut tag: Vec<u8> = tag
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+                b
+            } else {
+                b'-'
+            }
+        })
+        .collect();
+    tag.insert(0, b'.');
+    let bytes = name.as_bytes();
+    let room = 255usize.saturating_sub(tag.len());
+    let mut out = bytes[..bytes.len().min(room)].to_vec();
+    out.extend_from_slice(&tag);
+    Name::new(out).expect("a conflict name is built from a valid name")
+}
+
+/// Whether a folder, by its object, is inside a git directory, going up by its first entry.
+fn folder_in_git(
+    mut at: ObjectId,
+    local: &BTreeMap<ObjectId, LNode>,
+    remote: &cairn_protocol::Tree,
+) -> bool {
+    for _ in 0..4096 {
+        if at == ObjectId::ROOT {
+            return false;
+        }
+        let up = local
+            .get(&at)
+            .and_then(|n| n.links.iter().next())
+            .or_else(|| remote.nodes.get(&at).and_then(|n| n.links.iter().next()));
+        let Some(up) = up else {
+            return false;
+        };
+        if is_git_dir(&up.name) {
+            return true;
+        }
+        at = up.parent;
+    }
+    false
 }
 
 /// What an adopted copy loses to the server's record: same-field conflicts have a log entry. Times
@@ -590,10 +656,11 @@ fn merge_both(
             .links
             .iter()
             .map(|old| {
+                let in_git = folder_in_git(old.parent, input.local, input.remote);
                 let free = (0u32..)
                     .map(|attempt| Link {
                         parent: old.parent,
-                        name: conflict_name(&old.name, input.host, input.date, attempt),
+                        name: conflict_name(&old.name, input.host, input.date, attempt, in_git),
                     })
                     .find(|c| !occupied.contains(c) && input.remote.entry_at(c).is_none())
                     .expect("the attempts are unbounded");
@@ -903,12 +970,13 @@ fn resolve_collisions(input: &MergeInput<'_>, plan: &mut Plan) {
             .iter()
             .min_by_key(|id| (rank(id), **id))
             .expect("at least two owners");
+        let in_git = folder_in_git(link.parent, input.local, input.remote);
         for loser in owners.into_iter().filter(|o| taken || *o != winner) {
             let mut attempt = 0;
             let renamed = loop {
                 let candidate = Link {
                     parent: link.parent,
-                    name: conflict_name(&link.name, input.host, input.date, attempt),
+                    name: conflict_name(&link.name, input.host, input.date, attempt, in_git),
                 };
                 if used.insert(candidate.clone()) {
                     break candidate;
@@ -1606,22 +1674,77 @@ mod tests {
     #[test]
     fn conflict_names_keep_the_extension_and_the_limit() {
         assert_eq!(
-            conflict_name(&name("a.tar.gz"), "h", "d", 0).to_string(),
+            conflict_name(&name("a.tar.gz"), "h", "d", 0, false).to_string(),
             "a.tar (conflict h d).gz"
         );
         assert_eq!(
-            conflict_name(&name(".bashrc"), "h", "d", 0).to_string(),
+            conflict_name(&name(".bashrc"), "h", "d", 0, false).to_string(),
             ".bashrc (conflict h d)"
         );
         assert_eq!(
-            conflict_name(&name("x"), "h", "d", 1).to_string(),
+            conflict_name(&name("x"), "h", "d", 1, false).to_string(),
             "x (conflict h d 2)"
         );
         let long = "n".repeat(255);
-        assert!(conflict_name(&name(&long), "h", "d", 0).as_bytes().len() <= 255);
+        assert!(
+            conflict_name(&name(&long), "h", "d", 0, false)
+                .as_bytes()
+                .len()
+                <= 255
+        );
         let long_ext = format!("x.{}", "e".repeat(253));
-        let named = conflict_name(&name(&long_ext), "h", "d", 0);
+        let named = conflict_name(&name(&long_ext), "h", "d", 0, false);
         assert!(named.as_bytes().len() <= 255, "{}", named.as_bytes().len());
         assert!(named.to_string().contains("(conflict h d)"));
+    }
+
+    /// git's check-ref-format, for what a conflict name can contain.
+    fn valid_ref_component(c: &str) -> bool {
+        !c.is_empty()
+            && !c.starts_with('.')
+            && !c.ends_with('.')
+            && !c.ends_with(".lock")
+            && !c.contains("..")
+            && !c.contains("@{")
+            && !c
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7f || b" ~^:?*[\\".contains(&b))
+    }
+
+    #[test]
+    fn conflict_names_in_a_git_directory_are_names_git_takes() {
+        assert_eq!(
+            conflict_name(&name("main"), "me", "2026-11-03", 0, true).to_string(),
+            "main.conflict-me-2026-11-03"
+        );
+        assert_eq!(
+            conflict_name(&name("main"), "me", "2026-11-03", 2, true).to_string(),
+            "main.conflict-me-2026-11-03-3"
+        );
+        // Kept whole, so git does not take it for one half of a pack.
+        assert_eq!(
+            conflict_name(&name("pack-1.idx"), "me", "d", 0, true).to_string(),
+            "pack-1.idx.conflict-me-d"
+        );
+        for (host, date) in [
+            ("my laptop", "seq 12"),
+            ("a~b^c:d", "x..y"),
+            ("h@{1}", "*[?]"),
+        ] {
+            for stem in ["main", "main.lock", "feature.v2"] {
+                let named = conflict_name(&name(stem), host, date, 0, true).to_string();
+                assert!(valid_ref_component(&named), "{named}");
+            }
+        }
+        let long = "n".repeat(255);
+        assert!(
+            conflict_name(&name(&long), "h", "d", 0, true)
+                .as_bytes()
+                .len()
+                <= 255
+        );
+        assert!(in_git_dir(&[name("repo"), name(".git"), name("refs")]));
+        assert!(in_git_dir(&[name("srv"), name("repo.git")]));
+        assert!(!in_git_dir(&[name("repo"), name("src")]));
     }
 }

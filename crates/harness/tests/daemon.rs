@@ -848,6 +848,56 @@ fn a_busy_file_that_is_ignored_does_not_wake_the_daemon() {
     assert_eq!(da.syncs(), before, "{}", da.log());
 }
 
+/// A program writing one file for a long time, a download say, holds back nothing else, however long
+/// it takes, and its file arrives whole once it is closed.
+#[test]
+fn a_file_being_written_holds_back_nothing_else() {
+    use std::io::Write;
+    let (_sb, _s, a, b) = pair("d-writing");
+    let da = Daemon::start(&a, &["--reconcile-secs", DAY, "--retry-secs", "60"]);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (path, stop) = (a.path("download.part"), stop.clone());
+        std::thread::spawn(move || {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let mut written = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let piece = vec![b'x'; 1024];
+                f.write_all(&piece).unwrap();
+                written.extend_from_slice(&piece);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            f.write_all(b"end").unwrap();
+            written.extend_from_slice(b"end");
+            written
+        })
+    };
+    // Long enough for a backoff to have grown to 16 seconds, if anything were backing off.
+    std::thread::sleep(Duration::from_secs(20));
+    for i in 0..3 {
+        // Apart, so that no one sync takes them all.
+        std::thread::sleep(Duration::from_secs(2));
+        let name = format!("note-{i}");
+        a.write(&name, "x");
+        let start = Instant::now();
+        wait_file(&db, b.path(&name), b"x");
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "{name} took {:?}: {}",
+            start.elapsed(),
+            da.log()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    assert!(!b.exists("download.part"), "a part of it went over");
+    stop.store(true, Ordering::SeqCst);
+    let whole = writer.join().unwrap();
+    wait_file(&db, b.path("download.part"), &whole);
+}
+
 /// Rules that cannot be used are said out loud, and nothing goes up until they are fixed.
 #[test]
 fn a_daemon_with_bad_rules_says_so_and_uploads_nothing() {

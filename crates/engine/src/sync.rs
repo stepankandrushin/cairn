@@ -99,6 +99,17 @@ impl SyncReport {
     }
 }
 
+fn unheld_skip(remote: &Tree, u: &crate::selection::Unheld) -> Skip {
+    Skip {
+        path: remote.path_of_link(&u.link).map_or_else(
+            || u.link.name.to_string(),
+            |p| crate::scan::display_path(&p),
+        ),
+        kind: cairn_protocol::SkipKind::CannotHoldName,
+        detail: Some(u.why.clone()),
+    }
+}
+
 /// Today's UTC date as `YYYY-MM-DD`, for conflict names.
 pub fn utc_date(epoch_secs: i64) -> String {
     let days = epoch_secs.div_euclid(86_400);
@@ -801,6 +812,9 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         fetch_changes(&client, &mut remote, &mut seq, &mut seen)?;
         report.head = seq;
 
+        if selection.recheck_unheld(&root, &remote) && !opts.dry_run {
+            selection.store(&root)?;
+        }
         // From here to the push, everything sees only what this device takes part in. `base` and
         // `remote` stay the real record, for the cursor and for the next round.
         let mut view = selection.view(&base, &remote, &mut rows);
@@ -847,6 +861,9 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         root.state.put_manifests(&scanned.new_manifests)?;
         let unstable = scanned.unstable;
         report.skips = scanned.skips.clone();
+        report
+            .skips
+            .extend(selection.unheld.iter().map(|u| unheld_skip(&remote, u)));
         retryable = report.skips.iter().any(|s| s.kind.retryable()) || unstable;
 
         let intents: Vec<CopyIntent> = root
@@ -997,6 +1014,16 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         .run(&plan)?;
         hit("sync.applied");
         report.steps_applied += outcome.applied_steps;
+        if !outcome.unholdable.is_empty() {
+            for (unheld, _) in &outcome.unholdable {
+                report.skips.push(unheld_skip(&remote, unheld));
+            }
+            selection
+                .unheld
+                .extend(outcome.unholdable.into_iter().map(|(u, _)| u));
+            // Out of view from the next round on, and for every later sync.
+            selection.store(&root)?;
+        }
         for w in outcome.warnings {
             if !report.warnings.contains(&w) {
                 report.warnings.push(w);

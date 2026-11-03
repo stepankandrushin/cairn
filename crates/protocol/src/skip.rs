@@ -14,6 +14,8 @@ pub enum SkipKind {
     KeepsChanging,
     VanishedDuringScan,
     CannotApply,
+    /// A name on the server this filesystem cannot hold. Not retried until something changes the names.
+    CannotHoldName,
     /// The server has something at a path where this device has something it excludes.
     ExcludedInTheWay,
     ReadError,
@@ -33,6 +35,12 @@ impl SkipKind {
         )
     }
 
+    /// Something still being written or moved, which its own next change or close announces: no
+    /// reason to hold back anything else.
+    pub fn in_motion(self) -> bool {
+        matches!(self, SkipKind::KeepsChanging | SkipKind::VanishedDuringScan)
+    }
+
     pub fn reason(self) -> &'static str {
         match self {
             SkipKind::Fifo => "named pipes are not synced",
@@ -46,6 +54,7 @@ impl SkipKind {
             SkipKind::KeepsChanging => "file keeps changing",
             SkipKind::VanishedDuringScan => "vanished while being scanned",
             SkipKind::CannotApply => "destination cannot represent this",
+            SkipKind::CannotHoldName => "this filesystem cannot hold this name",
             SkipKind::ExcludedInTheWay => "something this device excludes is at that name",
             SkipKind::ReadError => "could not be read",
         }
@@ -63,6 +72,9 @@ impl SkipKind {
             SkipKind::KeepsChanging => "sync again once it has stopped changing",
             SkipKind::VanishedDuringScan => "sync again",
             SkipKind::CannotApply => "the server keeps the data; read it with `cairn export`",
+            SkipKind::CannotHoldName => {
+                "the server and other devices keep it, and it comes here once renamed there or the name in its way here is gone; read it with `cairn export`"
+            }
             SkipKind::ExcludedInTheWay => {
                 "move what is here, or change the rule, and the server's will come"
             }

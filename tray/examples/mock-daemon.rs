@@ -1,6 +1,6 @@
 //! A stand-in daemon for trying the tray without one: it serves `cairn_protocol::local` for a scratch
-//! root, registers it in the registry, and makes up activity. Point HOME (macOS, Linux) or LOCALAPPDATA
-//! (Windows) at a scratch directory for it and the tray alike, so the real registry is not touched.
+//! root, registers it in the registry, and makes up activity. Point CAIRN_USER_DIR at a scratch
+//! directory for it and the tray alike, so the real registry and daemons are not touched.
 //!
 //!     cargo run --example mock-daemon -- /tmp/mock-root [--problems]
 
@@ -116,10 +116,13 @@ fn main() {
         loop {
             std::thread::sleep(Duration::from_secs(4));
             n += 1;
+            if s.status.lock().unwrap().1.paused_since.is_some() {
+                continue;
+            }
+            s.change(|st| st.syncing = true);
+            std::thread::sleep(Duration::from_secs(1));
             s.change(|st| {
-                if st.paused_since.is_some() {
-                    return;
-                }
+                st.syncing = false;
                 st.head += 1;
                 st.syncs += 1;
                 st.last_sync = now();

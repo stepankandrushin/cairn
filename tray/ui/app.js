@@ -53,7 +53,10 @@ function setTab(t) {
   draw(true);
 }
 
+// Each answer has the server replay its journal, so only when a person opens the tab or acts, and not
+// twice within a few seconds of clicking.
 async function askConflicts() {
+  if (Date.now() - conflictsAskedAt < 3000) return;
   conflictsAskedAt = Date.now();
   if (!state) return;
   for (const r of state.roots.filter((r) => r.up)) {
@@ -87,7 +90,6 @@ async function tick() {
     seenNotice = state.notice[0];
     if (state.notice[1]) notice(state.notice[1]);
   }
-  if (tab === 'conflicts' && Date.now() - conflictsAskedAt > 30000) askConflicts();
   draw(false);
 }
 
@@ -184,6 +186,7 @@ function conflictButtons(r, c) {
     draw(true);
     await call('conflict', { rootId: r.root_id, seq: c.seq, what: action });
     busy.delete(`${r.root_id}/${c.seq}`);
+    conflictsAskedAt = 0;
     askConflicts();
     draw(true);
   };

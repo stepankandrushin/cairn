@@ -32,9 +32,6 @@ impl Light {
     }
 }
 
-/// Activity this recent reads as a sync under way: the status says nothing of one running.
-const SYNCING_FOR: Secs = 5;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Problem {
     pub what: String,
@@ -60,7 +57,7 @@ pub fn when(secs: Secs) -> String {
     }
 }
 
-pub fn light(view: &RootView, now: Secs) -> Light {
+pub fn light(view: &RootView, _now: Secs) -> Light {
     let Link::Up(s) = &view.link else {
         return Light::NotRunning;
     };
@@ -70,7 +67,7 @@ pub fn light(view: &RootView, now: Secs) -> Light {
     if s.paused_since.is_some() {
         return Light::Paused;
     }
-    if s.state.is_empty() || s.recent.first().is_some_and(|a| now - a.time < SYNCING_FOR) {
+    if s.syncing || s.state.is_empty() {
         return Light::Syncing;
     }
     if s.state == "partial" || s.waiting.is_some() || s.unwatched > 0 {

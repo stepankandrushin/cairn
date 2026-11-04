@@ -28,18 +28,21 @@ macro_rules! say {
     };
 }
 
-const USAGE: &str = "usage: cairn-tray [--open TAB | --probe | --login on|off | --version]
+const USAGE: &str =
+    "usage: cairn-tray [--open TAB | --probe [--conflicts] | --login on|off | --version]
   (none)       the tray icon, its menu and window
   --open TAB   the same, with its window open at status, recent, problems or conflicts
   --probe      print, with no window, what the tray would show for each root; exit 2 if the
-               registry of roots cannot be read
+               registry of roots cannot be read. With --conflicts, the open conflicts too, which
+               has the server replay its journal
   --login on   start the tray at login (off: no longer)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
-        ["--probe"] => probe(),
+        ["--probe"] => probe(false),
+        ["--probe", "--conflicts"] => probe(true),
         ["--login", on @ ("on" | "off")] => match actions::login::set(*on == "on") {
             Ok(()) => {
                 println!("start at login: {on}");
@@ -139,7 +142,7 @@ pub fn log(line: &str) {
     }
 }
 
-fn probe() -> ExitCode {
+fn probe(with_conflicts: bool) -> ExitCode {
     let Some(path) = registry_path() else {
         say!("registry: no home directory to find it in");
         return ExitCode::from(2);
@@ -172,7 +175,7 @@ fn probe() -> ExitCode {
             },
             Err(why) => Link::Down { since: now, why },
         };
-        let conflicts = matches!(link, Link::Up(_)).then(|| {
+        let conflicts = (with_conflicts && matches!(link, Link::Up(_))).then(|| {
             match link::ask(&entry.root_id, Request::Conflicts, Duration::from_secs(60)) {
                 Ok(Reply::Conflicts { open }) => Ok(open),
                 Ok(Reply::Error { text }) => Err(text),

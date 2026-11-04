@@ -15,8 +15,6 @@ use std::time::Duration;
 const REGISTRY_EVERY: Duration = Duration::from_secs(3);
 /// The longest wait before trying a daemon that did not answer again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
-/// How old a root's conflict list may grow before it is asked for again.
-const CONFLICTS_EVERY: Secs = 300;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Link {
@@ -276,12 +274,12 @@ impl Hub {
         r
     }
 
-    /// Keeps each running daemon's conflict list fresh: every few minutes, and at once when its
-    /// activity shows a new conflict.
+    /// Asks a running daemon for its conflicts again when its activity shows a new one. Never on a
+    /// timer: the daemon has the server replay its whole journal to answer. Otherwise the window asks,
+    /// when its Conflicts tab is opened.
     fn poll_conflicts(self: Arc<Self>) {
         loop {
             let due: Vec<(String, Secs)> = {
-                let now = now_secs();
                 self.lock()
                     .roots
                     .iter()
@@ -294,12 +292,7 @@ impl Hub {
                             .map(|a| a.time)
                             .max()
                             .unwrap_or(0);
-                        let stale = match &r.conflicts {
-                            None => true,
-                            Some((at, _)) => now - at >= CONFLICTS_EVERY,
-                        };
-                        (stale || newest > r.conflicts_seen)
-                            .then(|| (r.entry.root_id.clone(), newest))
+                        (newest > r.conflicts_seen).then(|| (r.entry.root_id.clone(), newest))
                     })
                     .collect()
             };

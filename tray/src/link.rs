@@ -148,6 +148,18 @@ fn check_peer(stream: &Stream) -> Result<(), LinkError> {
     Ok(())
 }
 
+/// BUILTIN\Administrators, S-1-5-32-544, and LocalSystem, S-1-5-18, as SID bytes.
+#[cfg(windows)]
+const ADMINISTRATORS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+#[cfg(windows)]
+const SYSTEM: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+
+/// A pipe owned by this user, or by Administrators or SYSTEM, which a program of another user cannot
+/// make it, or else one served by a process of this user. The owner is read from the pipe itself,
+/// which needs nothing of the daemon's process: a daemon in session 0 under S4U lets a desktop session
+/// of the same user open its pipe but not its process, and its pipe's owner is Administrators, the
+/// default owner of that task's token. An administrator's program would pass, but an administrator can
+/// do anything here anyway.
 #[cfg(windows)]
 fn check_peer(pipe: &Stream) -> Result<(), LinkError> {
     use std::os::windows::io::AsRawHandle;
@@ -156,6 +168,12 @@ fn check_peer(pipe: &Stream) -> Result<(), LinkError> {
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    // SAFETY: a pseudo-handle, not to be closed.
+    let mine = token_user(unsafe { GetCurrentProcess() })
+        .map_err(|e| LinkError::Other(format!("cannot tell who this is: {e}")))?;
+    if pipe_owner(pipe).is_ok_and(|o| o == mine || o[..] == ADMINISTRATORS || o[..] == SYSTEM) {
+        return Ok(());
+    }
     let mut pid = 0u32;
     // SAFETY: a pipe handle this process holds, and an out-parameter.
     if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
@@ -176,15 +194,44 @@ fn check_peer(pipe: &Stream) -> Result<(), LinkError> {
     // SAFETY: the handle opened above.
     unsafe { CloseHandle(process) };
     let theirs = theirs.map_err(|e| LinkError::Refused(format!("cannot tell who answers: {e}")))?;
-    // SAFETY: a pseudo-handle, not to be closed.
-    let mine = token_user(unsafe { GetCurrentProcess() })
-        .map_err(|e| LinkError::Other(format!("cannot tell who this is: {e}")))?;
     if theirs != mine {
         return Err(LinkError::Refused(format!(
             "a program of another user (process {pid}) answers at the daemon's address"
         )));
     }
     Ok(())
+}
+
+/// The owner of the pipe's security descriptor, as SID bytes: the user whose program made it.
+#[cfg(windows)]
+fn pipe_owner(pipe: &Stream) -> std::io::Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION};
+    let mut owner = std::ptr::null_mut();
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: a handle this process holds, opened for reading, which includes READ_CONTROL; the
+    // descriptor is freed below, and `owner` points into it.
+    unsafe {
+        let r = GetSecurityInfo(
+            pipe.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if r != 0 {
+            return Err(std::io::Error::from_raw_os_error(r as i32));
+        }
+        let n = GetLengthSid(owner) as usize;
+        let bytes = std::slice::from_raw_parts(owner as *const u8, n).to_vec();
+        LocalFree(sd);
+        Ok(bytes)
+    }
 }
 
 /// The SID a process runs as, as bytes: two are the same user when the bytes are the same.

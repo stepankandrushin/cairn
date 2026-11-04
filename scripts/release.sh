@@ -6,6 +6,9 @@ cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 target=x86_64-unknown-linux-musl
 
+# The tray is a workspace of its own, which nothing here builds: give it this version, for the commit.
+python3 scripts/tray-version.py
+
 # The binaries are published, and panic messages carry source paths: keep the build machine's out.
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 rustup_home=${RUSTUP_HOME:-$HOME/.rustup}

@@ -1,6 +1,7 @@
 //! This user's roots on this device, for `cairn status --all` and the tray: the registry of
-//! `cairn_protocol::local`. `cairn init` and a starting daemon add to it. Nothing here removes an entry
-//! because its folder has gone: it reads as gone, so nobody is left thinking a root still syncs.
+//! `cairn_protocol::local`. `cairn init` and a starting daemon add to it. Nothing removes an entry
+//! because its folder has gone: it reads as gone, so nobody is left thinking a root still syncs, until a
+//! person takes it off with `cairn forget`.
 
 use anyhow::{anyhow, Context, Result};
 use cairn_protocol::local::{registry_path, Registry, RootEntry, RootView};
@@ -55,6 +56,61 @@ pub fn register(path: &Path, root_id: &str, server: &str) -> Result<()> {
     write(&file, &reg)
 }
 
+/// What [`forget`] took off the list.
+#[derive(Debug)]
+pub struct Forgotten {
+    pub entry: RootEntry,
+    /// It was still there: its folder held its ID.
+    pub present: bool,
+}
+
+/// Take a root off the list, by its path as listed or by its ID. One that is still there is taken off
+/// only when `even_if_present`: it syncs as before, and its daemon lists it again when it starts.
+pub fn forget(path_or_id: &Path, even_if_present: bool) -> Result<Forgotten> {
+    let file = file()?;
+    let listed = read(&file)?;
+    let absolute = std::path::absolute(path_or_id)?;
+    let by_path = listed
+        .roots
+        .iter()
+        .find(|e| e.path == absolute || e.path == path_or_id);
+    let by_id = || {
+        listed
+            .roots
+            .iter()
+            .find(|e| Path::new(&e.root_id) == path_or_id)
+    };
+    let Some(entry) = by_path.or_else(by_id).cloned() else {
+        return Err(anyhow!(
+            "no root is listed at {}: `cairn status --all` lists them",
+            path_or_id.display()
+        ));
+    };
+    // Asked before the lock: a folder on a mount that hangs must not hold up every other writer.
+    let present = is_present(&entry);
+    if present && !even_if_present {
+        return Err(anyhow!(
+            "{} is still there, root {}: it is taken off the list only with --even-if-present, and \
+             its daemon lists it again when it starts",
+            entry.path.display(),
+            entry.root_id
+        ));
+    }
+    let dir = file.parent().expect("a file in a directory");
+    let _lock = lock(dir)?;
+    let mut reg = read(&file)?;
+    let before = reg.roots.len();
+    reg.roots.retain(|e| *e != entry);
+    if reg.roots.len() == before {
+        return Err(anyhow!(
+            "{} changed in the list while this looked at it; nothing was taken off, so ask again",
+            entry.path.display()
+        ));
+    }
+    write(&file, &reg)?;
+    Ok(Forgotten { entry, present })
+}
+
 /// The registry as it is; empty if nothing was ever registered.
 pub fn load() -> Result<Registry> {
     read(&file()?)
@@ -65,8 +121,13 @@ pub fn views() -> Result<Vec<RootView>> {
     Ok(load()?.roots.into_iter().map(view).collect())
 }
 
+/// The folder still holds this root: its `.cairn/root-id` reads as the entry's ID.
+fn is_present(root: &RootEntry) -> bool {
+    crate::root::read_root_id(&root.path).is_ok_and(|id| id == root.root_id)
+}
+
 pub fn view(root: RootEntry) -> RootView {
-    let present = crate::root::read_root_id(&root.path).is_ok_and(|id| id == root.root_id);
+    let present = is_present(&root);
     let daemon = if present {
         crate::control::status_of(&root.path, &root.root_id)
     } else {

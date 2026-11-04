@@ -148,37 +148,53 @@ fn check_peer(stream: &Stream) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// BUILTIN\Administrators, S-1-5-32-544, and LocalSystem, S-1-5-18, as SID bytes.
-#[cfg(windows)]
-const ADMINISTRATORS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
-#[cfg(windows)]
-const SYSTEM: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-
-/// A pipe owned by this user, or by Administrators or SYSTEM, which a program of another user cannot
-/// make it, or else one served by a process of this user. The owner is read from the pipe itself,
-/// which needs nothing of the daemon's process: a daemon in session 0 under S4U lets a desktop session
-/// of the same user open its pipe but not its process, and its pipe's owner is Administrators, the
-/// default owner of that task's token. An administrator's program would pass, but an administrator can
-/// do anything here anyway.
+/// A pipe owned by this user, which no program of another user can have made, or else one served by a
+/// process of this user. The owner is read from the pipe itself, which needs nothing of the daemon's
+/// process: a daemon in session 0 under S4U lets a desktop session of the same user open its pipe but not
+/// its process, and owns its pipe as its user for that reason. An administrator's program could make
+/// either, but an administrator can do anything here anyway.
 #[cfg(windows)]
 fn check_peer(pipe: &Stream) -> Result<(), LinkError> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: a pseudo-handle, not to be closed.
     let mine = token_user(unsafe { GetCurrentProcess() })
         .map_err(|e| LinkError::Other(format!("cannot tell who this is: {e}")))?;
-    if pipe_owner(pipe).is_ok_and(|o| o == mine || o[..] == ADMINISTRATORS || o[..] == SYSTEM) {
+    trust(pipe_owner(pipe), &mine, || server_user(pipe))
+}
+
+/// Who answers, decided: the pipe's owner if that is this user, and otherwise the user the serving
+/// process runs as. A pipe owned by Administrators, as a daemon's was before it owned its pipe as its
+/// user, counts only by its process.
+#[cfg(any(windows, test))]
+fn trust(
+    owner: std::io::Result<Vec<u8>>,
+    mine: &[u8],
+    server_user: impl FnOnce() -> Result<(u32, Vec<u8>), LinkError>,
+) -> Result<(), LinkError> {
+    if owner.as_deref().is_ok_and(|o| o == mine) {
         return Ok(());
     }
+    let (pid, theirs) = server_user()?;
+    if theirs != mine {
+        return Err(LinkError::Refused(format!(
+            "a program of another user (process {pid}) answers at the daemon's address"
+        )));
+    }
+    Ok(())
+}
+
+/// The process that serves the pipe, and the user it runs as.
+#[cfg(windows)]
+fn server_user(pipe: &Stream) -> Result<(u32, Vec<u8>), LinkError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let mut pid = 0u32;
     // SAFETY: a pipe handle this process holds, and an out-parameter.
     if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
         return Err(LinkError::Refused(format!(
-            "cannot tell who answers: {}",
+            "the daemon's pipe is not owned by this user, and who serves it cannot be told: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -186,20 +202,18 @@ fn check_peer(pipe: &Stream) -> Result<(), LinkError> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
         return Err(LinkError::Refused(format!(
-            "cannot tell who answers, process {pid}: {}",
+            "the daemon's pipe is not owned by this user, and process {pid}, which serves it, cannot be \
+             opened to tell who it runs as ({}): a daemon older than this tray owns its pipe that way, \
+             and updating it puts this right",
             std::io::Error::last_os_error()
         )));
     }
     let theirs = token_user(process);
     // SAFETY: the handle opened above.
     unsafe { CloseHandle(process) };
-    let theirs = theirs.map_err(|e| LinkError::Refused(format!("cannot tell who answers: {e}")))?;
-    if theirs != mine {
-        return Err(LinkError::Refused(format!(
-            "a program of another user (process {pid}) answers at the daemon's address"
-        )));
-    }
-    Ok(())
+    theirs
+        .map(|t| (pid, t))
+        .map_err(|e| LinkError::Refused(format!("cannot tell who answers: {e}")))
 }
 
 /// The owner of the pipe's security descriptor, as SID bytes: the user whose program made it.
@@ -330,5 +344,63 @@ pub fn tell(root_id: &str, request: Request) -> Result<(), String> {
         Ok(Reply::Error { text }) => Err(text),
         Ok(other) => Err(format!("the daemon answered {other:?}")),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: &[u8] = &[1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 2, 3, 4];
+    const SOMEONE: &[u8] = &[1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 9, 9, 9, 9];
+    /// BUILTIN\Administrators, S-1-5-32-544, the owner of an S4U task's pipes by default.
+    const ADMINISTRATORS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+
+    fn unopenable() -> Result<(u32, Vec<u8>), LinkError> {
+        Err(LinkError::Refused("process 7 cannot be opened".into()))
+    }
+
+    #[test]
+    fn a_pipe_owned_by_this_user_is_trusted_without_its_process() {
+        let asked = std::cell::Cell::new(false);
+        let r = trust(Ok(ME.to_vec()), ME, || {
+            asked.set(true);
+            unopenable()
+        });
+        assert_eq!(r, Ok(()));
+        assert!(!asked.get());
+    }
+
+    /// As a daemon's was before it owned its pipe as its user: Administrators, which another user's
+    /// program running elevated could make it, so it proves nothing about who answers.
+    #[test]
+    fn a_pipe_owned_by_administrators_counts_only_by_its_process() {
+        assert!(matches!(
+            trust(Ok(ADMINISTRATORS.to_vec()), ME, unopenable),
+            Err(LinkError::Refused(_))
+        ));
+        assert_eq!(
+            trust(Ok(ADMINISTRATORS.to_vec()), ME, || Ok((7, ME.to_vec()))),
+            Ok(())
+        );
+        assert!(matches!(
+            trust(Ok(ADMINISTRATORS.to_vec()), ME, || Ok((
+                7,
+                SOMEONE.to_vec()
+            ))),
+            Err(LinkError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn another_users_pipe_is_refused_and_an_unread_owner_falls_back_to_the_process() {
+        assert!(matches!(
+            trust(Ok(SOMEONE.to_vec()), ME, || Ok((7, SOMEONE.to_vec()))),
+            Err(LinkError::Refused(_))
+        ));
+        let unread = Err(std::io::Error::other("no READ_CONTROL"));
+        assert_eq!(trust(unread, ME, || Ok((7, ME.to_vec()))), Ok(()));
+        let unread = Err(std::io::Error::other("no READ_CONTROL"));
+        assert!(trust(unread, ME, unopenable).is_err());
     }
 }

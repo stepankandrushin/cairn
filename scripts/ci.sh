@@ -9,6 +9,7 @@ TMPDIR=$(mktemp -d /var/tmp/cairn-ci.XXXXXX)
 export TMPDIR
 
 cargo fmt --all --check
+python3 scripts/tray-version.py --test
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 

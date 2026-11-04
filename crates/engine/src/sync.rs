@@ -928,8 +928,13 @@ fn down_activity(cur: &BTreeMap<ObjectId, CurNode>, plan: &Plan) -> Vec<Activity
                         Some(event_path(plan, *id)),
                     ));
                 }
+                // What the applier sets: the same test. A folder's own, as for one sent, is not listed.
                 if c.content != t.body.content {
                     out.push(entry(Change::Changed, event_path(plan, *id), None));
+                } else if c.apply_from != t.body.metadata
+                    && c.kind != cairn_protocol::ObjectKind::Dir
+                {
+                    out.push(entry(Change::Metadata, event_path(plan, *id), None));
                 }
             }
         }

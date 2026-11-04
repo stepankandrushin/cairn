@@ -1750,6 +1750,148 @@ fn roots_made_at_once_are_all_listed_and_one_gone_stays_listed() {
     );
 }
 
+/// A root that has gone stays listed until a person forgets it; one still there is forgotten only when
+/// asked, and its daemon lists it again when it starts.
+#[test]
+fn forget_takes_off_a_root_that_has_gone_and_one_still_there_only_when_asked() {
+    let sb = Sandbox::on_disk("d-forget");
+    let server = Server::start(sb.path("server"));
+    let user = UserDir::new();
+    let env = user.env();
+    let token = server.token_file.to_str().unwrap().to_string();
+    let gone = sb.path("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    let gone_str = gone.to_str().unwrap();
+    run(
+        &[
+            "init",
+            "--server",
+            &server.url,
+            "--token-file",
+            &token,
+            "--device-name",
+            "gone",
+            gone_str,
+        ],
+        &env,
+    )
+    .expect_ok();
+    let a = Device::new(&sb, &server, "a");
+    let a_str = a.root.to_str().unwrap();
+    let id = std::fs::read_to_string(a.path(".cairn/root-id")).unwrap();
+    let id = id.trim();
+    let mut da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    da.wait_state("synced");
+    let paths = || -> Vec<String> {
+        let all = json(&run(&["status", "--all", "--json"], &env).expect_ok());
+        let mut p: Vec<String> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["root"]["path"].as_str().unwrap().to_string())
+            .collect();
+        p.sort();
+        p
+    };
+    let both = {
+        let mut b = vec![a_str.to_string(), gone_str.to_string()];
+        b.sort();
+        b
+    };
+    assert_eq!(paths(), both);
+
+    // Still there: refused, and still listed.
+    for asked in [a_str, gone_str] {
+        let r = run(&["forget", asked], &env);
+        assert!(
+            !r.ok() && r.stderr.contains("still there") && r.stderr.contains("--even-if-present"),
+            "{}",
+            r.text()
+        );
+    }
+    assert_eq!(paths(), both);
+
+    // Gone: taken off, and said so. Asked again, it is not listed, which is said too.
+    std::fs::remove_dir_all(&gone).unwrap();
+    let r = run(&["forget", gone_str], &env).expect_ok();
+    assert!(r.stdout.contains("had gone"), "{}", r.text());
+    assert_eq!(paths(), vec![a_str.to_string()]);
+    let r = run(&["forget", gone_str], &env);
+    assert!(
+        !r.ok() && r.stderr.contains("no root is listed"),
+        "{}",
+        r.text()
+    );
+
+    // Still there, asked explicitly and by its ID: off the list, and the root goes on as it was.
+    let r = run(&["forget", "--even-if-present", id], &env).expect_ok();
+    assert!(r.stdout.contains("still a root"), "{}", r.text());
+    assert_eq!(paths(), Vec::<String>::new());
+    a.write("after", "1");
+    let log = da.log.clone();
+    wait_for("the daemon to send what is new", &log, || {
+        has_activity(&da.status(), "up", "added", "after")
+    });
+    da.kill();
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    wait_for("the daemon to list its root again", &da.log, || {
+        paths() == vec![a_str.to_string()]
+    });
+}
+
+/// The harness's own `cairn` keeps its list of roots, and on macOS and Windows its daemons' locks and
+/// sockets, out of the user's own directory, where test runs once left a lock file for each root made.
+#[test]
+fn the_harness_leaves_nothing_in_the_users_own_directory() {
+    let sb = Sandbox::on_disk("d-home");
+    let server = Server::start(sb.path("server"));
+    let home = sb.path("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+    let (state, local) = (format!("{h}/state"), format!("{h}/local"));
+    // Empty counts as unset, for the harness as for `cairn`.
+    let env = [
+        ("HOME", h),
+        ("XDG_STATE_HOME", state.as_str()),
+        ("LOCALAPPDATA", local.as_str()),
+        ("CAIRN_USER_DIR", ""),
+    ];
+    let d = Device {
+        root: sb.path("r"),
+        name: "r".into(),
+    };
+    std::fs::create_dir_all(&d.root).unwrap();
+    let token = server.token_file.to_str().unwrap().to_string();
+    let root = d.root.to_str().unwrap();
+    run(
+        &[
+            "init",
+            "--server",
+            &server.url,
+            "--token-file",
+            &token,
+            "--device-name",
+            "r",
+            root,
+        ],
+        &env,
+    )
+    .expect_ok();
+    let da = Daemon::start_env(&d, &["--reconcile-secs", DAY], &env);
+    da.wait_state("synced");
+    d.cairn_env(&["status"], &env).expect_ok();
+    // Listed, in the harness's own directory.
+    let id = std::fs::read_to_string(d.path(".cairn/root-id")).unwrap();
+    let listed = cairn_harness::user_dir().join("roots.json");
+    let reg = std::fs::read_to_string(&listed).unwrap_or_default();
+    assert!(reg.contains(id.trim()), "{}: {reg}", listed.display());
+    let left: Vec<_> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// The daemons on machines not yet given this version hold their lock and write their file, and
 /// answer nothing on it.
 #[cfg(target_os = "linux")]
@@ -1834,4 +1976,48 @@ fn a_subscriber_sees_each_sync_start_and_what_it_did() {
     }
     let _ = sub.kill();
     let _ = sub.wait();
+}
+
+/// A mode or a time changed elsewhere is listed where it arrives, as where it was made: as metadata,
+/// not as an edit, and not left out.
+#[test]
+fn a_change_of_metadata_alone_is_listed_where_it_arrives_too() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (_sb, _s, a, b) = pair("d-meta");
+    a.write("mode", "m");
+    a.write("time", "t");
+    a.sync().expect_ok();
+    b.sync().expect_ok();
+    let da = Daemon::events_only(&a);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+    chmod(&b.path("mode"), 0o751);
+    set_mtime(&b.path("time"), 1_000_000_000, 5);
+    let log = da.log.clone();
+    wait_for("the mode and the time to arrive", &log, || {
+        let mode = std::fs::metadata(a.path("mode")).map(|m| m.permissions().mode() & 0o7777);
+        let time = std::fs::metadata(a.path("time")).map(|m| (m.mtime(), m.mtime_nsec()));
+        mode.is_ok_and(|m| m == 0o751) && time.is_ok_and(|t| t == (1_000_000_000, 5))
+    });
+    da.wait_rest();
+    db.wait_rest();
+    let (here, there) = (da.status(), db.status());
+    for path in ["mode", "time"] {
+        assert!(
+            has_activity(&there, "up", "metadata", path),
+            "up {path}: {}",
+            there["recent"]
+        );
+        assert!(
+            has_activity(&here, "down", "metadata", path),
+            "down {path}: {}",
+            here["recent"]
+        );
+        assert!(
+            !has_activity(&here, "down", "changed", path),
+            "{path}: {}",
+            here["recent"]
+        );
+    }
 }

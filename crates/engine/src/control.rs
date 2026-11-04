@@ -600,9 +600,13 @@ mod pipe {
     }
 
     impl Security {
+        /// Owned by this user, who alone may open it, at a low label so that the same user's desktop
+        /// session reaches a daemon in session 0. Owned by the user, not by the token's default owner,
+        /// which is Administrators for an S4U task's: a client in the desktop session may not open the
+        /// daemon's process, so the pipe's owner is how it tells this user's daemon from another's.
         fn this_user_only() -> io::Result<Self> {
             let sid = user_sid()?;
-            let sddl = wide(&format!("D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
+            let sddl = wide(&format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
             let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: a terminated string, and a place for the descriptor.
             let ok = unsafe {
@@ -764,6 +768,51 @@ mod pipe {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+        /// The owner as a client reads it from its own end, as the tray does: this user, whether or not
+        /// this process runs elevated, whose token's default owner is then Administrators.
+        #[test]
+        fn the_pipe_is_owned_by_its_user() {
+            let root_id = format!("test-{:032x}", rand::random::<u128>());
+            let lock = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            let listener = listen(&lock, &root_id).unwrap();
+            let client = open(&listener.name).unwrap();
+            let mut owner = std::ptr::null_mut();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: a handle this test holds, opened for reading, which includes READ_CONTROL; the
+            // descriptor is freed below, and `owner` points into it.
+            let owner = unsafe {
+                let r = GetSecurityInfo(
+                    client.raw(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut sd,
+                );
+                assert_eq!(r, 0, "{}", io::Error::from_raw_os_error(r as i32));
+                let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+                assert_ne!(ConvertSidToStringSidW(owner, &mut text), 0, "{}", last());
+                let mut n = 0;
+                while *text.add(n) != 0 {
+                    n += 1;
+                }
+                let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+                LocalFree(text as _);
+                LocalFree(sd as _);
+                s
+            };
+            assert_eq!(owner, user_sid().unwrap());
         }
     }
 }

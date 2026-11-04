@@ -63,6 +63,7 @@ Beyond one machine, put a TLS-terminating reverse proxy in front, start the serv
 cairn daemon --root ~/Sync       # stays in the foreground; run one per root under your service manager
 cairn status                     # what it last said, and what a sync would do now
 cairn status --all               # every root of yours on this machine, and which have gone
+cairn forget ~/Old               # take one that has gone off that list (--even-if-present for one still there)
 cairn pause                      # no sync starts until `cairn resume`, through restarts too
 ```
 

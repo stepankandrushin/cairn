@@ -158,6 +158,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Take a root that has gone off this user's list of roots, which `cairn status --all` and the
+    /// tray show. Nothing in any root changes.
+    Forget {
+        /// The root's path as `cairn status --all` lists it, or its ID.
+        path: PathBuf,
+        /// Take it off even though it is still there. It syncs as before, and its daemon lists it
+        /// again when it starts.
+        #[arg(long)]
+        even_if_present: bool,
+    },
     /// Pause this root's daemon: it starts no sync until `cairn resume`, through restarts too. Changes
     /// here and on the server wait, and none is lost.
     Pause,
@@ -595,6 +605,19 @@ fn run_inner() -> Result<u8> {
                     outln!("");
                 }
                 print_view(v);
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Forget {
+            path,
+            even_if_present,
+        } => {
+            let gone = registry::forget(&path, even_if_present)?;
+            let (path, id) = (gone.entry.path.display(), &gone.entry.root_id);
+            if gone.present {
+                outln!("{path} (root {id}) is no longer listed, though it is still a root and syncs as before; its daemon lists it again when it starts");
+            } else {
+                outln!("{path} (root {id}) had gone, and is no longer listed");
             }
             Ok(EXIT_OK)
         }

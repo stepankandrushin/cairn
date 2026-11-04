@@ -19,7 +19,8 @@
   pushes its status, now with its last 100 changes, takes look now, pause and resume (`cairn pause`, `cairn
   resume`; a pause outlives a restart), and lists open conflicts with their paths here. `cairn status --all`
   shows every root of this user on this machine, from a list `cairn init` and each daemon add to, a root that
-  has gone included; `--json` gives either as JSON, and `cairn ask` sends one request.
+  has gone included, until `cairn forget` takes it off; `--json` gives either as JSON, and `cairn ask` sends
+  one request.
 
 **Fixed:**
 

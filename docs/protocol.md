@@ -126,14 +126,16 @@ line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out
 |---|---|---|
 | Linux | `cairn-daemon-<root-id>` in the abstract namespace: the daemon's lock, so an answer means it runs | the daemon's user, by `SO_PEERCRED`; a client checks the server the same way |
 | macOS | `<user dir>/<first 16 of root-id>.sock`, a path being at most 104 bytes | the socket 0600, the directory 0700, and the peer's uid |
-| Windows | `\\.\pipe\cairn-daemon-<root-id>`, first instance, no remote clients | a DACL naming the daemon's user only, in any session |
+| Windows | `\\.\pipe\cairn-daemon-<root-id>`, first instance, no remote clients | a DACL naming the daemon's user only, in any session; owned by that user, which the tray checks, or else the user of the process serving it, as a desktop session may not open a daemon's in session 0 |
 
 The user dir is `$XDG_STATE_HOME/cairn` or `~/.local/state/cairn` on Linux, `~/Library/Application
 Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`, for tests. It holds
 `roots.json`, the registry of this user's roots (`{ roots: [{ path, root_id, server, added }] }`), which
 `cairn init` and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
-whose folder no longer holds its ID is listed as gone, not dropped; a file that does not parse is an
-error, never written over.
+whose folder no longer holds its ID is listed as gone, not dropped, until `cairn forget` takes it off, by
+its path or ID, under the same lock: it refuses a root still there unless given `--even-if-present`, and
+that root's daemon lists it again when it starts. A file that does not parse is an error, never written
+over.
 
 | Request | Replies |
 |---|---|
@@ -145,7 +147,7 @@ error, never written over.
 
 A malformed request gets an `error { text }`. The status adds only fields with defaults, so a reader of
 an older file keeps working: `recent` lists the last 100 changes the daemon sent (`up`) or applied
-(`down`) as `added`, `changed`, `metadata` (sent only), `moved` with `to`, `removed` (a folder once) or
-`conflict`, newest first, and outlives a restart; `syncing` is true while a sync runs, on the socket only, as
+(`down`) as `added`, `changed`, `metadata` (a file's or a link's alone; a folder's goes unlisted), `moved`
+with `to`, `removed` (a folder once) or `conflict`, newest first, and outlives a restart; `syncing` is true while a sync runs, on the socket only, as
 the file is written after each sync. A daemon from before this API holds the Linux socket
 without answering, so `cairn status` waits 2 s for an answer and then reads its lock and file.

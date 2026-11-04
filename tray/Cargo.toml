@@ -1,0 +1,48 @@
+[package]
+name = "cairn-tray"
+description = "A tray for Cairn's daemons: what each is doing, and what a person deals with."
+license = "Apache-2.0"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+# Its own workspace: it needs a desktop's webview to build, which CI and the root workspace do not have.
+[workspace]
+
+[features]
+default = ["gui"]
+# Without it, only `--probe` and `--login`: what can be built and checked where no webview is.
+gui = ["dep:tauri", "dep:tauri-build"]
+
+[dependencies]
+cairn-protocol = { path = "../crates/protocol" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11", optional = true, features = ["tray-icon"] }
+trash = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

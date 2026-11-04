@@ -364,6 +364,9 @@ fn run_seed(seed: u64, with_rules: bool) {
         }
     }
 
+    // Beside the trees, for a failure below, whose message does not carry it.
+    std::fs::write(sb.path("steps.log"), log.join("\n") + "\n").unwrap();
+
     // Whatever was left out, all of it comes back in here.
     if with_rules {
         std::fs::write(&rules_file, "").unwrap();

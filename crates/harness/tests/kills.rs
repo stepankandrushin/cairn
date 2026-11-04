@@ -323,6 +323,27 @@ fn a_kill_while_a_folder_arrives_makes_no_false_note() {
     assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775);
 }
 
+/// A folder is made private until the last pass. Killed again before that pass, on a run that had
+/// already found it so and wrote into it, it is still a folder whose mode never arrived, not one this
+/// filesystem kept at 0700, or no later run gives it its mode.
+#[test]
+fn a_folder_killed_twice_while_arriving_still_gets_its_mode() {
+    let (_sb, _s, a, b) = pair("killed-twice-folder");
+    filler(&a);
+    a.synced();
+    b.synced();
+    a.write("d/f", "1");
+    chmod(&a.path("d"), 0o775);
+    a.synced();
+    killed_at(&b, "apply.mkdir.done");
+    // The folder's time moves with what this run puts in it.
+    killed_at(&b, "apply.create.renamed");
+    b.synced();
+    let p = converge(&[&a, &b]);
+    assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775);
+    assert_eq!(b.read("d/f"), b"1");
+}
+
 // --- A conflict copy and what comes after it ---
 
 #[test]

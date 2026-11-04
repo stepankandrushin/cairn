@@ -305,6 +305,12 @@ fn settled_row(
             .map(|s| s.applied.clone()),
         None => old.and_then(|o| o.applied.clone()),
     };
+    // A folder still private from a killed run: what is on disk is no pair of its record, whatever
+    // else arrived since, until the last pass has given it its metadata.
+    let still_unapplied = shared_body.is_some()
+        && old
+            .and_then(|o| o.synced.as_ref())
+            .is_some_and(|s| s.unapplied);
     let from_body = shared_body.or_else(|| known.map(|n| n.body.clone()));
     let is_held = |l: &Link| {
         now.contains(l)
@@ -344,10 +350,10 @@ fn settled_row(
                         metadata,
                     },
                     applied,
-                    false,
+                    still_unapplied,
                 )
             }
-            Some(baseline) => (from.clone(), baseline.clone(), false),
+            Some(baseline) => (from.clone(), baseline.clone(), still_unapplied),
             // Known, with no record of having matched it: the server's record stands, against the disk.
             None => (from.clone(), node.metadata.clone(), true),
         },

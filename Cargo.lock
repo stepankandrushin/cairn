@@ -186,6 +186,7 @@ dependencies = [
  "cairn-engine",
  "cairn-protocol",
  "clap",
+ "serde",
  "serde_json",
 ]
 
@@ -200,6 +201,7 @@ dependencies = [
  "fastcdc",
  "hex",
  "ignore",
+ "libc",
  "rand",
  "rusqlite",
  "rustix",

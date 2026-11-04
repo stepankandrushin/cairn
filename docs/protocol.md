@@ -115,3 +115,37 @@ A server that ignores `wait`, or a proxy that answers for it, only makes a clien
 when it gets no news without having waited. A reverse proxy's read timeout has to be longer than the wait
 to be of use; the daemon waits 25 seconds, under nginx's default 60, and when something cuts its requests off
 it waits for less from then on.
+
+## Local API
+
+Not on the wire to the server: what a device's daemons tell the programs that show them (`cairn status`,
+the tray), in `cairn_protocol::local`. Each daemon serves it on a socket of its own, one JSON object per
+line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out.
+
+| Platform | Address | Who may connect |
+|---|---|---|
+| Linux | `cairn-daemon-<root-id>` in the abstract namespace: the daemon's lock, so an answer means it runs | the daemon's user, by `SO_PEERCRED`; a client checks the server the same way |
+| macOS | `<user dir>/<first 16 of root-id>.sock`, a path being at most 104 bytes | the socket 0600, the directory 0700, and the peer's uid |
+| Windows | `\\.\pipe\cairn-daemon-<root-id>`, first instance, no remote clients | a DACL naming the daemon's user only, in any session |
+
+The user dir is `$XDG_STATE_HOME/cairn` or `~/.local/state/cairn` on Linux, `~/Library/Application
+Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`, for tests. It holds
+`roots.json`, the registry of this user's roots (`{ roots: [{ path, root_id, server, added }] }`), which
+`cairn init` and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
+whose folder no longer holds its ID is listed as gone, not dropped; a file that does not parse is an
+error, never written over.
+
+| Request | Replies |
+|---|---|
+| `status` | one `status`, the same object as `.cairn/daemon.json` |
+| `subscribe` | a `status` now, on every change, and every 30 s regardless, until the client closes. A client whose queue of 16 is full, or that takes more than 5 s over a write, is dropped, and the daemon's log says so |
+| `sync_now` | `done`: an event like the watcher's, so it brings the next sync forward; an `error` while paused |
+| `pause`, `resume` | `done` once kept in `.cairn/paused`, so a pause outlives a kill; while paused no sync starts, the state is `paused` and `paused_since` is set, and on resume a full sync runs at once |
+| `conflicts` | `conflicts { open }`, each with its copy and the version it competes with as paths on this device when they are here. It replays the journal, so it is asked when a person looks, not polled |
+
+A malformed request gets an `error { text }`. The status adds only fields with defaults, so a reader of
+an older file keeps working: `recent` lists the last 100 changes the daemon sent (`up`) or applied
+(`down`) as `added`, `changed`, `metadata` (sent only), `moved` with `to`, `removed` (a folder once) or
+`conflict`, newest first, and outlives a restart; `syncing` is true while a sync runs, on the socket only, as
+the file is written after each sync. A daemon from before this API holds the Linux socket
+without answering, so `cairn status` waits 2 s for an answer and then reads its lock and file.

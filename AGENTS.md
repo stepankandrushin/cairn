@@ -21,7 +21,7 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   with a failure test (crash, full disk, lost event, missing mount).
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
-  Windows are the exceptions, at the owner's asking, to test in milestone 3's run.
+  Windows, and the tray on them, are the exceptions, at the owner's asking, to test in milestone 3's run.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
 
@@ -34,5 +34,7 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.
 - crates/harness/tests/ — the failure tests. A failing seed reproduces with `CAIRN_SEED=n`, and its log
   and kept directory say what happened: trust the oracle until a trace proves it wrong.
+- tray/ — the tray, its own Cargo workspace outside CI, as it needs a desktop's webview; built on macOS
+  and Windows.
 - agents/maintainer.md — remotes, publishing and releases; before any of those. It and history/ exist only
   in the maintainer's checkout.

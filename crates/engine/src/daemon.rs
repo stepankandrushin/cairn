@@ -8,19 +8,24 @@
 //!   mounted again.
 //!
 //! A kill at any moment is the crash `sync()` already recovers from, so no signal is handled.
+//!
+//! It also serves the local API (control.rs) to `cairn status` and the tray: its status, and three
+//! requests that change no tree. Look now is an event like the watcher's; a pause stops it starting a
+//! sync until a resume, and outlives a restart, being kept in `.cairn`.
 
 use crate::client::Client;
+use crate::control::{Handler, Hub};
 use crate::fsops::Dir;
 use crate::root::{read_config, read_root_id, Busy};
-use crate::scan::STATE_FILE_DAEMON;
+use crate::scan::{display_path, STATE_FILE_DAEMON};
 use crate::sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 use crate::watch::{WatchCounts, Watcher};
 use anyhow::{bail, Result};
 use cairn_failpoint::hit;
+use cairn_protocol::local::{OpenConflict, Reply, Request, MAX_RECENT};
 use cairn_protocol::SkipKind;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
@@ -79,53 +84,16 @@ enum Wake {
     ServerBack,
     /// The feed cannot reach the server, which an idle daemon would otherwise not find out.
     FeedDown,
+    /// Something for the main loop from the local API: a pause, a resume, a line for the log.
+    Control,
 }
 
-/// What the daemon is up to, for `cairn status`: `.cairn/daemon.json`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Status {
-    pub pid: u32,
-    /// `synced`, `partial`, `paused` or `error`.
-    pub state: String,
-    pub detail: Option<String>,
-    pub last_sync: i64,
-    pub last_synced: i64,
-    pub head: u64,
-    pub syncs: u64,
-    pub watched: usize,
-    pub unwatched: usize,
-    pub watch_limit_reached: bool,
-    /// Why the change feed is down, if it is.
-    pub feed_down: Option<String>,
-    pub skips: Vec<String>,
-    /// Changes here or on the server that wait, until when and why.
-    pub waiting: Option<Waiting>,
-    /// Metadata the filesystem here refused, which the server keeps: each until a later sync applies
-    /// that path's in full, the path is gone, or the daemon restarts. A sync says so only once, since
-    /// after it nothing differs, so this is where it stays to be seen.
-    #[serde(default)]
-    pub not_applied: Vec<NotApplied>,
-    /// How many there are, of which `not_applied` holds the first [`MAX_NOT_APPLIED`].
-    #[serde(default)]
-    pub not_applied_count: usize,
-}
+/// What the daemon is up to, for `cairn status` and the tray: `.cairn/daemon.json`, and the local
+/// API's status. Defined in the protocol crate, so every reader has the same fields.
+pub use cairn_protocol::local::{DaemonStatus as Status, NotApplied, Waiting, MAX_NOT_APPLIED};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotApplied {
-    pub path: String,
-    pub text: String,
-    /// Seconds since the epoch.
-    pub since: i64,
-}
-
-pub const MAX_NOT_APPLIED: usize = 200;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Waiting {
-    /// Seconds since the epoch.
-    pub until: i64,
-    pub why: String,
-}
+/// Where a pause is kept: in the root's state, so that it outlives a kill and a restart.
+const PAUSED_FILE: &str = "paused";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -139,19 +107,22 @@ fn lock_address(root_id: &str) -> std::io::Result<SocketAddr> {
 }
 
 /// Held for the life of the daemon. A name in the abstract socket namespace rather than a file, which
-/// would be an open descriptor on the disk and keep it from being unmounted.
+/// would be an open descriptor on the disk and keep it from being unmounted. It is the local API's
+/// socket as well. Public for tests that play a daemon.
 #[cfg(target_os = "linux")]
-fn take_lock(root_id: &str) -> std::io::Result<UnixListener> {
+pub fn take_lock(root_id: &str) -> std::io::Result<UnixListener> {
     UnixListener::bind_addr(&lock_address(root_id)?)
 }
 
 /// macOS has no abstract sockets. A lock on a file in the user's library, not in the root, for the same
 /// reason; the kernel drops it when the process dies.
 #[cfg(target_os = "macos")]
-fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
-    let home = std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME is not set"))?;
-    let dir = Path::new(&home).join("Library/Application Support/Cairn");
+pub fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
+    let dir = cairn_protocol::local::user_dir()
+        .ok_or_else(|| std::io::Error::other("HOME is not set"))?;
     std::fs::create_dir_all(&dir)?;
+    // The local API's socket is here too.
+    crate::fsops::make_private_dir(&dir)?;
     let file = std::fs::File::create(dir.join(format!("daemon-{root_id}.lock")))?;
     match crate::fsops::try_lock(&file)? {
         true => Ok(file),
@@ -162,10 +133,9 @@ fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
 /// As on macOS: a lock on a file in the user's local application data, not in the root, which the
 /// kernel drops when the process dies.
 #[cfg(windows)]
-fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
-    let base = std::env::var_os("LOCALAPPDATA")
+pub fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
+    let dir = cairn_protocol::local::user_dir()
         .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
-    let dir = Path::new(&base).join("Cairn");
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -179,7 +149,8 @@ fn take_lock(root_id: &str) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// What the daemon of this root last said, if one is running.
+/// What the daemon of this root last wrote, if one is running: for a daemon that does not answer on the
+/// local API, as one from before it does not. [`crate::control::status_of`] asks first.
 pub fn running_status(path: &Path) -> Option<Status> {
     let root_id = read_root_id(path).ok()?;
     if take_lock(&root_id).is_ok() {
@@ -208,6 +179,149 @@ fn write_status(path: &Path, status: &Status) {
         Ok(())
     };
     let _ = write();
+}
+
+/// Written and shown: the file for whoever reads it, the local API for the rest.
+fn show(path: &Path, status: &Status, hub: &Hub) {
+    write_status(path, status);
+    hub.publish(status);
+}
+
+/// What a daemon said before it was restarted: the last changes it made are still the last ones.
+fn previous_recent(path: &Path) -> Vec<cairn_protocol::local::Activity> {
+    std::fs::read(state_file(path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Status>(&b).ok())
+        .map(|s| s.recent)
+        .unwrap_or_default()
+}
+
+const PAUSED_DETAIL: &str =
+    "paused by request: no sync starts until it is resumed, and changes here and on the server wait";
+
+/// A pause, as the local API sets it and the main loop obeys it.
+#[derive(Default)]
+struct Pause {
+    since: Mutex<Option<i64>>,
+}
+
+impl Pause {
+    fn get(&self) -> Option<i64> {
+        *self.since.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Kept in the root before it counts: a pause that a kill could undo would be one in name only.
+    fn set(&self, root: &Path, on: bool) -> Result<()> {
+        let mut since = self.since.lock().unwrap_or_else(|e| e.into_inner());
+        if on == since.is_some() {
+            return Ok(());
+        }
+        let state = Dir::open_root(root)?.open_dir(cairn_protocol::STATE_DIR)?;
+        if on {
+            let now = now_secs();
+            let tmp = format!("{PAUSED_FILE}.new");
+            let _ = state.unlink(tmp.as_bytes());
+            let mut file = std::fs::File::from(state.create_new(tmp.as_bytes(), 0o600)?);
+            file.write_all(now.to_string().as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            state.rename_over(tmp.as_bytes(), &state, PAUSED_FILE.as_bytes())?;
+            state.sync()?;
+            *since = Some(now);
+        } else {
+            match state.unlink(PAUSED_FILE.as_bytes()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            state.sync()?;
+            *since = None;
+        }
+        Ok(())
+    }
+
+    /// As kept in the root. A file that does not read as a time is still a pause.
+    fn load(&self, root: &Path) -> Result<()> {
+        let state = Dir::open_root(root)?.open_dir(cairn_protocol::STATE_DIR)?;
+        let since = match state.open_read(PAUSED_FILE.as_bytes()) {
+            Ok(fd) => {
+                let mut text = String::new();
+                std::fs::File::from(fd).read_to_string(&mut text)?;
+                Some(text.trim().parse::<i64>().unwrap_or_else(|_| now_secs()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        *self.since.lock().unwrap_or_else(|e| e.into_inner()) = since;
+        Ok(())
+    }
+}
+
+/// The open conflicts, with where their copies are on this device: a path only if something is there.
+fn open_conflicts(root: &Path) -> Result<Vec<OpenConflict>> {
+    let config = read_config(root)?;
+    let here = |names: Option<&[cairn_protocol::Name]>| {
+        let names = names?;
+        let mut at = root.to_path_buf();
+        for n in names {
+            at.push(crate::fsops::name_path(n.as_bytes()));
+        }
+        std::fs::symlink_metadata(&at).is_ok().then_some(at)
+    };
+    Ok(crate::restore::conflicts(&config)?
+        .into_iter()
+        .filter(|c| c.open)
+        .map(|c| OpenConflict {
+            seq: c.entry.seq,
+            time: c.entry.time,
+            device_name: c.entry.device_name.clone(),
+            copy: here(c.copy_now.as_deref()),
+            original: here(c.object_now.as_deref()),
+            copy_display: c
+                .copy_now
+                .as_deref()
+                .or(c.made_at.as_deref())
+                .map_or_else(|| format!("copy {}", c.entry.copy), display_path),
+            original_display: c.object_now.as_deref().map(display_path),
+        })
+        .collect())
+}
+
+/// What the local API may ask of this daemon beyond its status.
+fn handler(root: &Path, pause: &Arc<Pause>, wake: &Sender<Wake>) -> Arc<Handler> {
+    let (root, pause, wake) = (root.to_path_buf(), pause.clone(), wake.clone());
+    Arc::new(move |request: Request| match request {
+        Request::SyncNow => {
+            if pause.get().is_some() {
+                return Reply::Error {
+                    text: "this daemon is paused: resume it to sync".into(),
+                };
+            }
+            let _ = wake.send(Wake::Local);
+            Reply::Done
+        }
+        r @ (Request::Pause | Request::Resume) => {
+            let on = r == Request::Pause;
+            match pause.set(&root, on) {
+                Ok(()) => {
+                    let _ = wake.send(Wake::Control);
+                    Reply::Done
+                }
+                Err(e) => Reply::Error {
+                    text: format!("{}: {e:#}", if on { "not paused" } else { "still paused" }),
+                },
+            }
+        }
+        Request::Conflicts => match open_conflicts(&root) {
+            Ok(open) => Reply::Conflicts { open },
+            Err(e) => Reply::Error {
+                text: format!("{e:#}"),
+            },
+        },
+        Request::Status | Request::Subscribe => Reply::Error {
+            text: "not a request for the handler".into(),
+        },
+    })
 }
 
 /// Waits for the head to move, and wakes the daemon when it does.
@@ -362,7 +476,7 @@ impl Schedule {
                 self.retry_at = None;
                 self.remote = true;
             }
-            Wake::FeedDown => {}
+            Wake::FeedDown | Wake::Control => {}
         }
     }
 
@@ -447,6 +561,13 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let (wake_tx, wake_rx) = channel();
     let synced_head = Arc::new(AtomicU64::new(0));
     let feed_down = Arc::new(Mutex::new(None::<String>));
+    let pause = Arc::new(Pause::default());
+    let hub = {
+        let tx = wake_tx.clone();
+        Arc::new(Hub::new(&Status::default(), move || {
+            let _ = tx.send(Wake::Control);
+        }))
+    };
 
     let watcher = if opts.watch {
         let tx = wake_tx.clone();
@@ -489,8 +610,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     };
     let mut status = Status {
         pid: std::process::id(),
+        root: std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+        version: env!("CARGO_PKG_VERSION").into(),
+        recent: previous_recent(path),
         ..Status::default()
     };
+    let mut was_paused: Option<i64> = None;
     let mut said: BTreeSet<String> = BTreeSet::new();
     let mut said_counts = WatchCounts::default();
     let mut said_feed: Option<String> = None;
@@ -499,12 +624,46 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut walk_first = true;
 
     loop {
-        let wait = schedule.due().saturating_duration_since(Instant::now());
+        for note in hub.take_notes() {
+            log(&note);
+        }
+        let paused = pause.get();
+        if paused != was_paused {
+            match paused {
+                Some(_) => {
+                    log("paused by request: no sync starts until it is resumed");
+                    status.state = "paused".into();
+                    status.detail = Some(PAUSED_DETAIL.into());
+                    status.waiting = None;
+                }
+                None => {
+                    log("resumed: syncing what changed while it was paused");
+                    // Not in agreement until the sync that follows at once says so.
+                    status.state = "partial".into();
+                    status.detail =
+                        Some("resumed: syncing what changed while it was paused".into());
+                    // All of it, watched or not: the sync is state-based, so nothing has been lost.
+                    schedule.reconcile_at = Instant::now();
+                }
+            }
+            status.paused_since = paused;
+            show(path, &status, &hub);
+            was_paused = paused;
+        }
+        // Paused, only the local API can end the wait.
+        let wait = match paused {
+            Some(_) => Duration::from_secs(3600),
+            None => schedule.due().saturating_duration_since(Instant::now()),
+        };
         match wake_rx.recv_timeout(wait) {
             Ok(wake) => {
                 schedule.note(wake, synced_head.load(Ordering::SeqCst));
                 while let Ok(more) = wake_rx.try_recv() {
                     schedule.note(more, synced_head.load(Ordering::SeqCst));
+                }
+                // Paused, or just paused or resumed, which the top of the loop says first.
+                if pause.get().is_some() || pause.get() != was_paused {
+                    continue;
                 }
                 let now = Instant::now();
                 if now < schedule.due() {
@@ -526,10 +685,15 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         }
                     }
                     if changed {
-                        write_status(path, &status);
+                        show(path, &status, &hub);
                     }
                     continue;
                 }
+            }
+            Err(RecvTimeoutError::Timeout)
+                if pause.get().is_some() || pause.get() != was_paused =>
+            {
+                continue
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => bail!("the daemon's own channel closed"),
@@ -548,7 +712,41 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                     taken = take_lock(&id);
                 }
                 match taken {
-                    Ok(l) => lock = Some(l),
+                    Ok(l) => {
+                        status.root_id.clone_from(&id);
+                        if let Ok(config) = read_config(path) {
+                            status.server = config.server;
+                        }
+                        if let Err(e) = crate::registry::register(path, &id, &status.server) {
+                            log(&format!(
+                                "this root could not be added to the list of roots, so `cairn status --all` and the tray do not show it: {e:#}"
+                            ));
+                        }
+                        if let Err(e) = pause.load(path) {
+                            log(&format!(
+                                "cannot read whether this daemon was paused, so it is: {e:#}"
+                            ));
+                            *pause.since.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(now_secs());
+                        }
+                        match crate::control::listen(&l, &id) {
+                            Ok(listener) => {
+                                hub.publish(&status);
+                                crate::control::serve(
+                                    listener,
+                                    hub.clone(),
+                                    handler(path, &pause, &wake_tx),
+                                );
+                            }
+                            Err(e) => log(&format!(
+                                "cannot serve the local API, so `cairn status` reads this daemon's file and the tray does not see it: {e}"
+                            )),
+                        }
+                        lock = Some(l);
+                        if pause.get().is_some() {
+                            continue;
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                         bail!(
                             "another cairn daemon is already running for {}",
@@ -573,6 +771,10 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             }
         }
         status.waiting = None;
+        // To the local API only: writing the file twice a sync would be for nobody.
+        status.syncing = true;
+        hub.publish(&status);
+        status.syncing = false;
         hit("daemon.sync");
         let result = sync(path, &SyncOptions::default());
         hit("daemon.synced");
@@ -593,6 +795,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             Ok(report) => {
                 last_error = None;
                 walk_first = false;
+                if !report.activity.is_empty() {
+                    let mut recent: Vec<_> = report.activity.iter().rev().cloned().collect();
+                    recent.append(&mut status.recent);
+                    recent.truncate(MAX_RECENT);
+                    status.recent = recent;
+                }
                 status.head = report.head;
                 synced_head.store(report.head, Ordering::SeqCst);
                 lines = report_lines(&report);
@@ -686,7 +894,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
 
         say_feed(&feed_down, &mut said_feed, log);
         status.feed_down.clone_from(&said_feed);
-        write_status(path, &status);
+        show(path, &status, &hub);
 
         if reconcile {
             let degraded =

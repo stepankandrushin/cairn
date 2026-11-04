@@ -2,6 +2,7 @@
 //! strip a field it does not understand. See docs/protocol.md and docs/format.md.
 
 pub mod ids;
+pub mod local;
 pub mod manifest;
 pub mod metadata;
 pub mod name;

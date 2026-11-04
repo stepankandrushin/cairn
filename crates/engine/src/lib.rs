@@ -3,6 +3,7 @@
 pub mod apply;
 pub mod chunker;
 pub mod client;
+pub mod control;
 pub mod daemon;
 pub mod export;
 #[cfg_attr(windows, path = "fsops_windows.rs")]
@@ -10,6 +11,7 @@ pub mod fsops;
 pub mod identify;
 pub mod merge;
 pub mod metadata;
+pub mod registry;
 pub mod restore;
 pub mod root;
 pub mod scan;

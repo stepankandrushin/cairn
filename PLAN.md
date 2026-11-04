@@ -58,7 +58,7 @@ These outrank features and speed; each has failure tests.
 | Linux watcher | inotify as the baseline, fanotify with `FAN_REPORT_FID` when privileged | The daemon runs without root, and fanotify's mount and filesystem marks need `CAP_SYS_ADMIN` |
 | Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: events can be lost, the scan is the safety net |
 | Web UI | TypeScript + Svelte, static build embedded in the binary | Thin client of the same API; stays out of the server's hot path |
-| Desktop UI | Tauri tray and settings around the Rust daemon | Small; native integration only where needed |
+| Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed |
 | Mobile | Swift/SwiftUI and Kotlin, Rust core through uniffi | Native file-provider and background-task integration |
 | Deployment | One binary + storage (+ PostgreSQL at scale) | No fleet of supporting services |
 
@@ -165,7 +165,11 @@ minute, and holds every change back until then. A file still being written is no
 back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
 its close does. Between syncs it rests for twice the last one's scan, the part every sync repeats, so a tree
 that never rests keeps it scanning at most a third of the time; the length of a big download is no reason to
-wait, as the next sync does not repeat it. `cairn status` says when changes wait, until when, and why.
+wait, as the next sync does not repeat it. `cairn status` says when changes wait, until when, and why. It serves the local API
+(`cairn_protocol::local`) on a socket only its user can open: its status, pushed on each change, the open
+conflicts, and three requests that change no tree: look now, pause, resume. A pause outlives a restart
+and shows as `paused`. Each user's roots on a device are listed in a registry the CLI and the daemon add
+to, for `cairn status --all` and the tray.
 
 **Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
 `cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree
@@ -253,7 +257,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
-| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix |
+| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |
 | 9 | WebDAV gateway, Nextcloud importer (files, versions, trash), E2EE, LAN/P2P transfers | |
 

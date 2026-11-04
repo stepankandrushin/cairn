@@ -20,6 +20,7 @@ use crate::selection::Selection;
 use crate::state::{Row, Synced};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
+use cairn_protocol::local::{Activity, Change, Direction};
 use cairn_protocol::wire::{self, CommitRequest, CommitResponse, MAX_CHUNK_BATCH_BYTES};
 use cairn_protocol::{
     ChunkRef, Content, Hash, Link, Manifest, Name, ObjectId, Op, OpId, RevisionId, Skip, Tree,
@@ -79,6 +80,9 @@ pub struct SyncReport {
     pub not_synced_here: Vec<String>,
     /// How long the scans took: the part of a sync that every one repeats, whatever there is to do.
     pub scan_time: std::time::Duration,
+    /// What it sent and what it applied here, in order, for the daemon's list of recent changes.
+    /// Not metadata applied here alone, which a filesystem that cannot hold all of it would repeat.
+    pub activity: Vec<Activity>,
 }
 
 impl SyncReport {
@@ -101,6 +105,7 @@ impl SyncReport {
             excluded_here: Vec::new(),
             not_synced_here: Vec::new(),
             scan_time: std::time::Duration::ZERO,
+            activity: Vec::new(),
         }
     }
 }
@@ -875,6 +880,140 @@ fn event_path(plan: &Plan, id: ObjectId) -> String {
     parts.join("/")
 }
 
+/// A path on disk as the scan found it, by its first entry.
+fn cur_path(cur: &BTreeMap<ObjectId, CurNode>, id: ObjectId) -> String {
+    let mut parts = Vec::new();
+    let mut at = id;
+    while at != ObjectId::ROOT {
+        let Some(link) = cur.get(&at).and_then(|c| c.links.iter().next()) else {
+            break;
+        };
+        parts.push(link.name.to_string());
+        at = link.parent;
+        if parts.len() > 4096 {
+            break;
+        }
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+/// What applying this plan does to the disk here: from the tree as scanned to the target. A folder
+/// removed is one entry, not one for each thing in it.
+fn down_activity(cur: &BTreeMap<ObjectId, CurNode>, plan: &Plan) -> Vec<Activity> {
+    let time = now_secs();
+    let entry = |change, path: String, to: Option<String>| Activity {
+        time,
+        direction: Direction::Down,
+        change,
+        path,
+        to,
+    };
+    let copies: BTreeSet<ObjectId> = plan.copies.iter().map(|c| c.copy).collect();
+    let mut out = Vec::new();
+    for c in &plan.copies {
+        out.push(entry(Change::Conflict, event_path(plan, c.copy), None));
+    }
+    for (id, t) in &plan.target {
+        if *id == ObjectId::ROOT || copies.contains(id) {
+            continue;
+        }
+        match cur.get(id) {
+            None => out.push(entry(Change::Added, event_path(plan, *id), None)),
+            Some(c) => {
+                if c.links != t.links && !c.links.is_empty() {
+                    out.push(entry(
+                        Change::Moved,
+                        cur_path(cur, *id),
+                        Some(event_path(plan, *id)),
+                    ));
+                }
+                if c.content != t.body.content {
+                    out.push(entry(Change::Changed, event_path(plan, *id), None));
+                }
+            }
+        }
+    }
+    let removed = |id: &ObjectId| *id != ObjectId::ROOT && !plan.target.contains_key(id);
+    for (id, c) in cur {
+        let topmost = c.links.iter().all(|l| !removed(&l.parent));
+        if removed(id) && topmost {
+            out.push(entry(Change::Removed, cur_path(cur, *id), None));
+        }
+    }
+    out
+}
+
+/// What a commit sent, in its order. A folder deleted is one entry, not one for each thing in it.
+fn up_activity(remote: &Tree, plan: &Plan, ops: &[Op]) -> Vec<Activity> {
+    let time = now_secs();
+    let entry = |change, path: String, to: Option<String>| Activity {
+        time,
+        direction: Direction::Up,
+        change,
+        path,
+        to,
+    };
+    let was = |link: &Link| {
+        remote
+            .path_of_link(link)
+            .map_or_else(|| link.name.to_string(), |p| crate::scan::display_path(&p))
+    };
+    let unlinked: BTreeSet<ObjectId> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Unlink { object, .. } => Some(*object),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            Op::Create {
+                object,
+                conflict_of,
+                ..
+            } => out.push(entry(
+                if conflict_of.is_some() {
+                    Change::Conflict
+                } else {
+                    Change::Added
+                },
+                event_path(plan, *object),
+                None,
+            )),
+            Op::Link { link, .. } => {
+                let parent = event_path(plan, link.parent);
+                let path = if parent.is_empty() {
+                    link.name.to_string()
+                } else {
+                    format!("{parent}/{}", link.name)
+                };
+                out.push(entry(Change::Added, path, None));
+            }
+            Op::Unlink { link, .. } if !unlinked.contains(&link.parent) => {
+                out.push(entry(Change::Removed, was(link), None));
+            }
+            Op::Unlink { .. } => {}
+            Op::Move { object, from, .. } => out.push(entry(
+                Change::Moved,
+                was(from),
+                Some(event_path(plan, *object)),
+            )),
+            Op::Update { object, body, .. } => {
+                let before = remote.get_live(*object);
+                if before.is_some_and(|n| n.body.content != body.content) {
+                    out.push(entry(Change::Changed, event_path(plan, *object), None));
+                } else if body.content.kind() != cairn_protocol::ObjectKind::Dir {
+                    out.push(entry(Change::Metadata, event_path(plan, *object), None));
+                }
+            }
+            Op::Note { .. } => {}
+        }
+    }
+    out
+}
+
 fn describe_op(op: &Op) -> String {
     match op {
         Op::Create { link, .. } => format!("create {}", link.name),
@@ -1130,6 +1269,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &view.remote,
         )?;
         let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
+        let arriving = down_activity(&cur, &plan);
         let (outcome, cur) = Applier::new(
             &mut root,
             Some(&client),
@@ -1141,6 +1281,20 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         .run(&plan)?;
         hit("sync.applied");
         report.steps_applied += outcome.applied_steps;
+        // What did not get there is no change made, and comes again in a later round.
+        if !outcome.halted {
+            let missed: BTreeSet<&str> = outcome
+                .failed
+                .iter()
+                .chain(&outcome.changed)
+                .map(|s| s.path.as_str())
+                .collect();
+            report.activity.extend(
+                arriving
+                    .into_iter()
+                    .filter(|a| !missed.contains(a.path.as_str())),
+            );
+        }
         for line in gone_lines(&outcome.gone) {
             if seen_events.insert(line.clone()) {
                 report.events.push(line);
@@ -1253,6 +1407,9 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             CommitResponse::Committed { .. } => {
                 report.commits += 1;
                 report.ops_pushed += req.ops.len() as u64;
+                report
+                    .activity
+                    .extend(up_activity(&view.remote, &plan, &req.ops));
                 // A huge change is not a tree failing to settle, as long as it is getting through.
                 if truncated {
                     report.rounds -= 1;

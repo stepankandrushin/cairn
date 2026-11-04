@@ -62,13 +62,17 @@ Beyond one machine, put a TLS-terminating reverse proxy in front, start the serv
 ```sh
 cairn daemon --root ~/Sync       # stays in the foreground; run one per root under your service manager
 cairn status                     # what it last said, and what a sync would do now
+cairn status --all               # every root of yours on this machine, and which have gone
+cairn pause                      # no sync starts until `cairn resume`, through restarts too
 ```
 
 It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
 events can be lost. Its output says what it did and what it could not do, each thing once, and `cairn status`
 keeps what this filesystem refused (a mode on a file another user owns, say) until it is put right. A paused or
 failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log`, `history`, `export`
-and `conflicts` only ask the server, so they answer during a sync too. As a systemd user unit:
+and `conflicts` only ask the server, so they answer during a sync too. It answers `cairn status` and the
+tray on a local socket only your user can open (`--json` gives the same objects; docs/protocol.md). As a
+systemd user unit:
 
 ```ini
 [Service]

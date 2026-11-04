@@ -5,10 +5,11 @@ use cairn_engine::client::Client;
 use cairn_engine::daemon::DaemonOptions;
 use cairn_engine::root::{open_config, Busy, Paused};
 use cairn_engine::scan::display_path;
+use cairn_engine::{control, registry, restore, selection};
 use cairn_engine::{
     init_root, sync, ApplyPolicy, InitOptions, OwnerPolicy, Root, SyncOptions, SyncOutcome,
 };
-use cairn_engine::{restore, selection};
+use cairn_protocol::local::{Reply, Request, RootEntry, RootView};
 use cairn_protocol::{Name, RevisionId};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
@@ -147,8 +148,27 @@ enum Command {
         #[arg(long)]
         merge: bool,
     },
-    /// What a sync would do now.
-    Status,
+    /// What a sync would do now, and what this root's daemon says.
+    Status {
+        /// Every root of this user on this device, as listed when each was made or its daemon
+        /// started: what each daemon says, and which roots have gone.
+        #[arg(long)]
+        all: bool,
+        /// As JSON, the local API's types.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause this root's daemon: it starts no sync until `cairn resume`, through restarts too. Changes
+    /// here and on the server wait, and none is lost.
+    Pause,
+    /// Resume this root's daemon, which then syncs what changed while it was paused.
+    Resume,
+    /// Send one request of the local API to this root's daemon and print what it answers, one JSON
+    /// object per line: what the tray sees.
+    Ask {
+        /// status, subscribe, sync_now, pause, resume or conflicts.
+        request: String,
+    },
     /// The change journal, newest last.
     Log {
         /// Only the last N entries.
@@ -275,13 +295,65 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     }
 }
 
+/// This root as the local API shows it, whether or not it is in the list of roots.
+fn root_view(root_path: &Path) -> Result<RootView> {
+    let root_id = cairn_engine::root::read_root_id(root_path)
+        .with_context(|| format!("{} is not a sync root", root_path.display()))?;
+    let path = std::path::absolute(root_path)?;
+    let listed = registry::load()
+        .ok()
+        .and_then(|r| r.roots.into_iter().find(|e| e.root_id == root_id));
+    let entry = match listed {
+        Some(e) => e,
+        None => RootEntry {
+            path,
+            server: open_config(root_path).map(|c| c.server).unwrap_or_default(),
+            root_id,
+            added: 0,
+        },
+    };
+    let mut view = registry::view(entry);
+    // Listed somewhere else, but this is the folder asked about.
+    if !view.present {
+        view.root.path = root_path.to_path_buf();
+        view.present = true;
+        view.daemon = control::status_of(root_path, &view.root.root_id);
+    }
+    Ok(view)
+}
+
+fn print_view(v: &RootView) {
+    if !v.present {
+        outln!(
+            "{}: gone: no root with ID {} is there now{}",
+            v.root.path.display(),
+            v.root.root_id,
+            if v.root.added > 0 {
+                format!("; listed since {}", date_time(v.root.added))
+            } else {
+                String::new()
+            }
+        );
+        return;
+    }
+    outln!("{} (server {})", v.root.path.display(), v.root.server);
+    match &v.daemon {
+        Some(s) => print_daemon(s),
+        None => outln!("daemon: not running"),
+    }
+}
+
 fn print_daemon(s: &cairn_engine::daemon::Status) {
     outln!(
         "daemon: running as process {}, {}{}; last sync {}, last fully synced {}; {} folders watched",
         s.pid,
         if s.state.is_empty() { "starting" } else { &s.state },
         s.detail.as_ref().map_or(String::new(), |d| format!(" ({d})")),
-        date_time(s.last_sync),
+        if s.last_sync == 0 {
+            "none yet".to_string()
+        } else {
+            date_time(s.last_sync)
+        },
         if s.last_synced == 0 {
             "never".to_string()
         } else {
@@ -324,6 +396,29 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
             w.why
         );
     }
+    if let Some(since) = s.paused_since {
+        outln!(
+            "daemon: paused by request since {}: `cairn resume` resumes it",
+            date_time(since)
+        );
+    }
+}
+
+fn json_line(value: &impl serde::Serialize) -> Result<()> {
+    outln!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+/// One request to this root's daemon, its one answer.
+fn ask_daemon(root_path: &Path, request: &Request) -> Result<Reply> {
+    let root_id = cairn_engine::root::read_root_id(root_path)
+        .with_context(|| format!("{} is not a sync root", root_path.display()))?;
+    control::ask(&root_id, request, control::IO_WAIT).map_err(|e| {
+        anyhow!(
+            "no daemon answers for {}: {e}. A daemon from before the local API runs without answering",
+            root_path.display()
+        )
+    })
 }
 
 fn now() -> i64 {
@@ -405,6 +500,12 @@ fn run_inner() -> Result<u8> {
                 },
             )?;
             let root = Root::open(&dir)?;
+            let listed = cairn_engine::root::read_root_id(&dir)
+                .map_err(anyhow::Error::from)
+                .and_then(|id| registry::register(&dir, &id, &root.config.server));
+            if let Err(e) = listed {
+                errln!("cairn: this root could not be added to the list of roots, so `cairn status --all` does not show it until its daemon starts: {e:#}");
+            }
             let head = Client::new(&root.config)
                 .context("checking the server")?
                 .info()?
@@ -478,19 +579,55 @@ fn run_inner() -> Result<u8> {
             outln!("{} is synced here again", display_path(&names));
             run_sync(&root_path, SyncOptions::default())
         }
-        Command::Status => {
-            let root_path = find_root(cli.root)?;
-            match cairn_engine::daemon::running_status(&root_path) {
-                Some(s) => print_daemon(&s),
-                None => outln!("daemon: not running"),
+        Command::Status { all: true, json } => {
+            let views = registry::views()?;
+            if json {
+                json_line(&views)?;
+                return Ok(EXIT_OK);
             }
-            let report = match sync(
+            if views.is_empty() {
+                outln!(
+                    "no roots listed for this user: `cairn init` and a starting daemon list theirs"
+                );
+            }
+            for (i, v) in views.iter().enumerate() {
+                if i > 0 {
+                    outln!("");
+                }
+                print_view(v);
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Status { all: false, json } => {
+            let root_path = find_root(cli.root)?;
+            let view = root_view(&root_path)?;
+            if !json {
+                match &view.daemon {
+                    Some(s) => print_daemon(s),
+                    None => outln!("daemon: not running"),
+                }
+            }
+            let dry_run = sync(
                 &root_path,
                 &SyncOptions {
                     allow_mass_delete: true,
                     dry_run: true,
                 },
-            ) {
+            );
+            if json {
+                let mut out = serde_json::to_value(&view)?;
+                let busy = matches!(&dry_run, Err(e) if e.downcast_ref::<Busy>().is_some());
+                let report = if busy { None } else { Some(dry_run?) };
+                out["busy"] = busy.into();
+                out["planned"] = serde_json::to_value(report.as_ref().map(|r| &r.planned))?;
+                out["excluded_here"] =
+                    serde_json::to_value(report.as_ref().map(|r| &r.excluded_here))?;
+                out["not_synced_here"] =
+                    serde_json::to_value(report.as_ref().map(|r| &r.not_synced_here))?;
+                json_line(&out)?;
+                return Ok(report.as_ref().map_or(EXIT_OK, status_code));
+            }
+            let report = match dry_run {
                 Err(e) if e.downcast_ref::<Busy>().is_some() => {
                     outln!("a sync is running now, so what the next one would do is not known yet");
                     return Ok(EXIT_OK);
@@ -626,6 +763,51 @@ fn run_inner() -> Result<u8> {
             } else {
                 EXIT_PARTIAL
             })
+        }
+        Command::Pause | Command::Resume => {
+            let pause = matches!(cli.command, Command::Pause);
+            let root_path = find_root(cli.root)?;
+            let request = if pause {
+                Request::Pause
+            } else {
+                Request::Resume
+            };
+            match ask_daemon(&root_path, &request)? {
+                Reply::Done if pause => outln!(
+                    "paused: the daemon starts no sync until `cairn resume`; changes wait, and none is lost"
+                ),
+                Reply::Done => outln!("resumed: the daemon syncs what changed meanwhile"),
+                Reply::Error { text } => bail!("{text}"),
+                other => bail!("the daemon answered with {other:?}"),
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Ask { request } => {
+            let root_path = find_root(cli.root)?;
+            let request: Request =
+                serde_json::from_value(serde_json::json!({ "op": request.replace('-', "_") }))
+                    .map_err(|_| {
+                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume or conflicts")
+                    })?;
+            let root_id = cairn_engine::root::read_root_id(&root_path)
+                .with_context(|| format!("{} is not a sync root", root_path.display()))?;
+            let mut c = control::Client::connect(&root_id)
+                .with_context(|| format!("no daemon answers for {}", root_path.display()))?;
+            // A subscription lasts until the daemon or this program ends.
+            let wait = (request != Request::Subscribe).then_some(control::IO_WAIT);
+            c.set_wait(wait)?;
+            c.send(&request)?;
+            let mut code = EXIT_OK;
+            while let Some(reply) = c.next(wait)? {
+                if matches!(reply, Reply::Error { .. }) {
+                    code = EXIT_ERROR;
+                }
+                json_line(&reply)?;
+                if STDOUT_GONE.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            Ok(code)
         }
         Command::Conflicts { all } => {
             let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;

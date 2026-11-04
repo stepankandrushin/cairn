@@ -1452,3 +1452,386 @@ fn inner_real_unmount() {
     drop((da, db));
     sh("umount", &[mount_point.to_str().unwrap()]);
 }
+
+// --- The local API: status, pause and resume, look now, the list of roots ---
+
+/// A user directory of the test's own, for its list of roots and, on macOS and Windows, its daemons'
+/// locks and sockets. Every process of the test gets the same one. In the temp directory, as a macOS
+/// socket path holds at most 104 bytes.
+struct UserDir(PathBuf);
+
+impl UserDir {
+    fn new() -> Self {
+        let d = std::env::temp_dir().join(format!("cairn-u-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&d).unwrap();
+        Self(d)
+    }
+
+    fn env(&self) -> [(&str, &str); 1] {
+        [("CAIRN_USER_DIR", self.0.to_str().unwrap())]
+    }
+}
+
+impl Drop for UserDir {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn json(run: &Run) -> serde_json::Value {
+    serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", run.text()))
+}
+
+/// Whether the daemon's list of recent changes has one like this.
+fn has_activity(status: &serde_json::Value, direction: &str, change: &str, path: &str) -> bool {
+    status["recent"].as_array().is_some_and(|r| {
+        r.iter()
+            .any(|a| a["direction"] == direction && a["change"] == change && a["path"] == path)
+    })
+}
+
+#[test]
+fn a_pause_outlives_a_kill_and_a_restart() {
+    let (_sb, _s, a, b) = pair("d-pk");
+    let user = UserDir::new();
+    let env = user.env();
+    let mut da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+
+    let run = a.cairn_env(&["pause"], &env).expect_ok();
+    assert!(run.stdout.contains("paused"), "{}", run.text());
+    da.wait_state("paused");
+    assert!(da.status()["paused_since"].is_i64(), "{}", da.status());
+    let syncs = da.syncs();
+    a.write("while-paused", "1");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!b.exists("while-paused"));
+    assert_eq!(da.syncs(), syncs, "{}", da.log());
+
+    // Killed and started again, it is still paused, and syncs nothing.
+    let old = da.status()["pid"].clone();
+    da.kill();
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    let log = da.log.clone();
+    wait_for("the new daemon to say it is paused", &log, || {
+        let s = da.status();
+        s["pid"] != old && s["state"] == "paused"
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!b.exists("while-paused"));
+    assert_eq!(da.syncs(), 0, "{}", da.log());
+    let status = a.cairn_env(&["status"], &env).expect_ok();
+    assert!(
+        status.stdout.contains("paused by request since"),
+        "{}",
+        status.text()
+    );
+    // Listed by the daemon that started, and shown paused there too.
+    let all = json(
+        &a.cairn_env(&["status", "--all", "--json"], &env)
+            .expect_ok(),
+    );
+    let listed = all.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{all}");
+    assert_eq!(listed[0]["present"], true, "{all}");
+    assert_eq!(listed[0]["daemon"]["state"], "paused", "{all}");
+
+    a.cairn_env(&["resume"], &env).expect_ok();
+    wait_file(&db, b.path("while-paused"), b"1");
+    da.wait_state("synced");
+    assert!(da.status()["paused_since"].is_null(), "{}", da.status());
+    // A resumed daemon that is killed stays resumed.
+    drop(da);
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    da.wait_state("synced");
+    a.write("after", "2");
+    wait_file(&db, b.path("after"), b"2");
+}
+
+#[test]
+fn every_change_made_while_paused_arrives_after_resume() {
+    let (_sb, _s, a, b) = pair("d-pr");
+    let user = UserDir::new();
+    let env = user.env();
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+    a.write("edit", "0");
+    a.write("gone", "x");
+    a.write("old-name", "n");
+    a.write("both", "0");
+    wait_file(&db, b.path("both"), b"0");
+    db.wait_rest();
+    da.wait_rest();
+
+    a.cairn_env(&["pause"], &env).expect_ok();
+    da.wait_state("paused");
+    a.write("new", "1");
+    a.write("edit", "2");
+    std::fs::remove_file(a.path("gone")).unwrap();
+    std::fs::rename(a.path("old-name"), a.path("new-name")).unwrap();
+    a.write("dir/sub/f", "f");
+    a.write("both", "a");
+    // The other device goes on, and this one takes nothing of it while paused.
+    b.write("from-b", "b");
+    b.write("both", "b");
+    db.wait_rest();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!b.exists("new") && !a.exists("from-b"));
+    assert_eq!(b.read("edit"), b"0");
+    let run = a.cairn_env(&["ask", "sync_now"], &env);
+    assert!(!run.ok() && run.stdout.contains("paused"), "{}", run.text());
+
+    a.cairn_env(&["resume"], &env).expect_ok();
+    wait_file(&db, b.path("new"), b"1");
+    wait_file(&db, b.path("edit"), b"2");
+    wait_gone(&db, b.path("gone"));
+    wait_file(&db, b.path("new-name"), b"n");
+    wait_gone(&db, b.path("old-name"));
+    wait_file(&db, b.path("dir/sub/f"), b"f");
+    wait_file(&da, a.path("from-b"), b"b");
+    da.wait_state("synced");
+    da.wait_rest();
+
+    // Both edited `both`: one keeps the name, the other is a copy, in the conflict inbox.
+    let copies = a.conflict_copies("", "both");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let run = a.cairn_env(&["ask", "conflicts"], &env).expect_ok();
+    let reply = json(&run);
+    assert_eq!(reply["reply"], "conflicts", "{reply}");
+    let open = reply["open"].as_array().unwrap();
+    assert_eq!(open.len(), 1, "{reply}");
+    let copy = open[0]["copy"].as_str().expect("the copy is here");
+    assert!(
+        Path::new(copy).exists() && copy.ends_with(&copies[0]),
+        "{reply}"
+    );
+    assert!(
+        open[0]["original"].as_str().unwrap().ends_with("both"),
+        "{reply}"
+    );
+
+    // What went up and what came down, in the daemon's list of recent changes.
+    let s = da.status();
+    for (direction, change, path) in [
+        ("up", "added", "new"),
+        ("up", "changed", "edit"),
+        ("up", "removed", "gone"),
+        ("up", "moved", "old-name"),
+        ("up", "added", "dir"),
+        ("down", "added", "from-b"),
+    ] {
+        assert!(
+            has_activity(&s, direction, change, path),
+            "{direction} {change} {path}: {}",
+            s["recent"]
+        );
+    }
+}
+
+#[test]
+fn a_subscriber_that_never_reads_does_not_stall_syncs() {
+    let (_sb, _s, a, b) = pair("d-stuck");
+    let da = Daemon::events_only(&a);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+    // A program that subscribes and then stops reading: `cairn ask` with nobody reading its output,
+    // so that once its pipe is full it reads no more from the daemon.
+    let mut stuck = Command::new(CAIRN)
+        .arg("--root")
+        .arg(&a.root)
+        .args(["ask", "subscribe"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut round = 0;
+    while !da.log().contains("stopped reading its status") {
+        round += 1;
+        assert!(round <= 120, "never dropped: {}", da.log());
+        // Many at once, so each status is long.
+        for i in 0..40 {
+            a.write(&format!("r{round}/f{i}"), format!("{round}"));
+        }
+        wait_file(
+            &db,
+            b.path(&format!("r{round}/f39")),
+            round.to_string().as_bytes(),
+        );
+    }
+    // And it goes on as before.
+    a.write("after", "x");
+    wait_file(&db, b.path("after"), b"x");
+    let _ = stuck.kill();
+    let _ = stuck.wait();
+}
+
+#[test]
+fn sync_now_brings_a_change_no_event_announced() {
+    let (_sb, _s, a, b) = pair("d-now");
+    let da = Daemon::start(&a, &["--no-watch", "--reconcile-secs", DAY]);
+    let db = Daemon::events_only(&b);
+    da.wait_state("synced");
+    db.wait_state("synced");
+    da.wait_rest();
+    a.write("unannounced", "u");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!b.exists("unannounced"));
+    let run = a.cairn(&["ask", "sync_now"]).expect_ok();
+    assert!(run.stdout.contains(r#""reply":"done""#), "{}", run.text());
+    wait_file(&db, b.path("unannounced"), b"u");
+}
+
+#[test]
+fn roots_made_at_once_are_all_listed_and_one_gone_stays_listed() {
+    let sb = Sandbox::on_disk("d-reg");
+    let server = Server::start(sb.path("server"));
+    let user = UserDir::new();
+    let env = user.env();
+    let token = server.token_file.to_str().unwrap().to_string();
+    let roots: Vec<PathBuf> = (0..24).map(|i| sb.path(&format!("r{i}"))).collect();
+    std::thread::scope(|s| {
+        for (i, r) in roots.iter().enumerate() {
+            std::fs::create_dir_all(r).unwrap();
+            let (url, token, env) = (&server.url, &token, &env);
+            s.spawn(move || {
+                let name = format!("dev{i}");
+                let root = r.to_str().unwrap();
+                run(
+                    &[
+                        "init",
+                        "--server",
+                        url,
+                        "--token-file",
+                        token,
+                        "--device-name",
+                        &name,
+                        root,
+                    ],
+                    env,
+                )
+                .expect_ok();
+            });
+        }
+    });
+    let listed = |env: &[(&str, &str)]| {
+        let all = json(&run(&["status", "--all", "--json"], env).expect_ok());
+        all.as_array().unwrap().clone()
+    };
+    let all = listed(&env);
+    assert_eq!(all.len(), roots.len(), "{all:?}");
+    for r in &roots {
+        assert!(
+            all.iter()
+                .any(|v| v["root"]["path"] == r.to_str().unwrap() && v["present"] == true),
+            "{} is not listed: {all:?}",
+            r.display()
+        );
+    }
+
+    std::fs::remove_dir_all(&roots[0]).unwrap();
+    let all = listed(&env);
+    assert_eq!(all.len(), roots.len(), "{all:?}");
+    let gone: Vec<_> = all.iter().filter(|v| v["present"] == false).collect();
+    assert_eq!(gone.len(), 1, "{all:?}");
+    assert_eq!(gone[0]["root"]["path"], roots[0].to_str().unwrap());
+    let text = run(&["status", "--all"], &env).expect_ok();
+    assert!(
+        text.stdout.contains(": gone: no root with ID"),
+        "{}",
+        text.text()
+    );
+}
+
+/// The daemons on machines not yet given this version hold their lock and write their file, and
+/// answer nothing on it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_from_before_the_local_api_is_read_from_its_file() {
+    let (_sb, _s, a, _b) = pair("d-old");
+    let id = std::fs::read_to_string(a.path(".cairn/root-id")).unwrap();
+    let _held = cairn_engine::daemon::take_lock(id.trim()).unwrap();
+    std::fs::write(
+        a.path(".cairn/daemon.json"),
+        r#"{"pid":4242,"state":"synced","detail":null,"last_sync":1,"last_synced":1,"head":3,
+           "syncs":9,"watched":2,"unwatched":0,"watch_limit_reached":false,"feed_down":null,
+           "skips":[],"waiting":null,"not_applied":[],"not_applied_count":0}"#,
+    )
+    .unwrap();
+    let v = json(&a.cairn(&["status", "--json"]).expect_ok());
+    assert_eq!(v["daemon"]["pid"], 4242, "{v}");
+    assert_eq!(v["daemon"]["state"], "synced", "{v}");
+    assert_eq!(v["daemon"]["recent"], serde_json::json!([]), "{v}");
+    let text = a.cairn(&["status"]).expect_ok();
+    assert!(
+        text.stdout.contains("daemon: running as process 4242"),
+        "{}",
+        text.text()
+    );
+    // What it cannot answer is said, not waited for.
+    let run = a.cairn(&["pause"]);
+    assert!(
+        !run.ok() && run.stderr.contains("no daemon answers"),
+        "{}",
+        run.text()
+    );
+}
+
+#[test]
+fn a_subscriber_sees_each_sync_start_and_what_it_did() {
+    use std::io::BufRead;
+    let (_sb, _s, a, _b) = pair("d-sub");
+    let da = Daemon::events_only(&a);
+    da.wait_state("synced");
+    da.wait_rest();
+    let mut sub = Command::new(CAIRN)
+        .arg("--root")
+        .arg(&a.root)
+        .args(["ask", "subscribe"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = sub.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || -> serde_json::Value {
+        let line = rx
+            .recv_timeout(SOON)
+            .unwrap_or_else(|e| panic!("no status ({e}): {}", da.log()));
+        serde_json::from_str(&line).unwrap()
+    };
+    // The status as it is, first.
+    let first = next();
+    assert_eq!(
+        (&first["reply"], &first["state"], &first["syncing"]),
+        (&"status".into(), &"synced".into(), &false.into()),
+        "{first}"
+    );
+    a.write("x", "1");
+    let mut started = false;
+    loop {
+        let s = next();
+        if s["syncing"] == true {
+            started = true;
+        } else if has_activity(&s, "up", "added", "x") {
+            assert!(started, "no status said the sync had started: {s}");
+            assert_eq!(s["state"], "synced", "{s}");
+            break;
+        }
+    }
+    let _ = sub.kill();
+    let _ = sub.wait();
+}

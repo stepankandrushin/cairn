@@ -170,7 +170,7 @@ wait, as the next sync does not repeat it. `cairn status` says when changes wait
 conflicts, and three requests that change no tree: look now, pause, resume. A pause outlives a restart
 and shows as `paused`. Each user's roots on a device are listed in a registry the CLI and the daemon add
 to, for `cairn status --all` and the tray. A root that has gone stays listed as gone until a person takes it
-off with `cairn forget`, which takes off one still there only when asked.
+off with `cairn forget`, which takes off one still there only when asked, or with the tray's Forget, which never does.
 
 **Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
 `cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree

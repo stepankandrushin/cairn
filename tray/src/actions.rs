@@ -1,5 +1,6 @@
-//! What the tray does on the desktop: open a folder, a file or the server's page, and deal with a
-//! conflict by the ordinary file operations a person would make, which the daemon then syncs.
+//! What the tray does on the desktop: open a folder, a file or the server's page, deal with a conflict
+//! by the ordinary file operations a person would make, which the daemon then syncs, and take a root
+//! that has gone off the list.
 
 use crate::hub::Hub;
 use cairn_protocol::local::OpenConflict;
@@ -55,6 +56,23 @@ fn platform_open(target: &std::ffi::OsStr) -> Result<(), String> {
             r as usize
         ))
     }
+}
+
+/// Takes a root off this device's list of roots, as `cairn forget` does, if the tray shows it as gone:
+/// the window asked first.
+pub fn forget(hub: &Hub, root_id: &str) -> Result<String, String> {
+    let r = hub
+        .root(root_id)
+        .ok_or("that root is no longer in the registry")?;
+    if !crate::model::shown_gone(&r) {
+        return Err(format!(
+            "{} is not shown as gone, so it stays on the list; `cairn forget --even-if-present` takes off one still there",
+            r.entry.path.display()
+        ));
+    }
+    let file = cairn_protocol::local::registry_path()
+        .ok_or("no home directory to find the registry in")?;
+    crate::registry::forget(&file, &r.entry)
 }
 
 /// Shows the file selected in its folder.

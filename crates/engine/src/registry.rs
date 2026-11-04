@@ -176,7 +176,8 @@ fn write(file: &Path, reg: &Registry) -> Result<()> {
     result.with_context(|| format!("write {}", file.display()))
 }
 
-/// Writers take turns, so that two adding at once keep both.
+/// Writers take turns, so that two adding at once keep both. The tray's Forget takes this lock too, and
+/// writes the file as [`write`] does (tray/src/registry.rs): a change to either is a change to both.
 fn lock(dir: &Path) -> Result<std::fs::File> {
     let path = dir.join("roots.lock");
     let file = std::fs::OpenOptions::new()

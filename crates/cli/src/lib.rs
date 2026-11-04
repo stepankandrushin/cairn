@@ -423,12 +423,19 @@ fn json_line(value: &impl serde::Serialize) -> Result<()> {
 fn ask_daemon(root_path: &Path, request: &Request) -> Result<Reply> {
     let root_id = cairn_engine::root::read_root_id(root_path)
         .with_context(|| format!("{} is not a sync root", root_path.display()))?;
-    control::ask(&root_id, request, control::IO_WAIT).map_err(|e| {
+    control::ask(&root_id, request, control::IO_WAIT).map_err(|e| not_asked(root_path, &e))
+}
+
+/// Why the daemon of this root could not be asked: nothing answers, or what answers is refused.
+fn not_asked(root_path: &Path, e: &std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow!("the daemon of {} cannot be asked: {e}", root_path.display())
+    } else {
         anyhow!(
             "no daemon answers for {}: {e}. A daemon from before the local API runs without answering",
             root_path.display()
         )
-    })
+    }
 }
 
 fn now() -> i64 {
@@ -814,8 +821,8 @@ fn run_inner() -> Result<u8> {
                     })?;
             let root_id = cairn_engine::root::read_root_id(&root_path)
                 .with_context(|| format!("{} is not a sync root", root_path.display()))?;
-            let mut c = control::Client::connect(&root_id)
-                .with_context(|| format!("no daemon answers for {}", root_path.display()))?;
+            let mut c =
+                control::Client::connect(&root_id).map_err(|e| not_asked(&root_path, &e))?;
             // A subscription lasts until the daemon or this program ends.
             let wait = (request != Request::Subscribe).then_some(control::IO_WAIT);
             c.set_wait(wait)?;

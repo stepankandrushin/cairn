@@ -31,6 +31,7 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             act,
             refresh_conflicts,
             conflict,
+            forget,
             open_folder,
             open_server
         ])
@@ -388,6 +389,8 @@ struct UiRoot {
     light_word: &'static str,
     headline: String,
     up: bool,
+    /// Shown as gone, so Forget is offered.
+    gone: bool,
     paused_by_you: bool,
     version: String,
     problems: Vec<Problem>,
@@ -442,6 +445,7 @@ async fn snapshot() -> UiState {
                 light_word: l.word(),
                 headline: model::headline(r, now),
                 up,
+                gone: model::shown_gone(r),
                 paused_by_you,
                 version,
                 problems: model::problems(r),
@@ -525,6 +529,12 @@ async fn conflict(root_id: String, seq: u64, what: String) -> Result<String, Str
         actions::conflict(hub(), &root_id, seq, action)
     })
     .await
+}
+
+/// Takes a root shown as gone off the registry, as `cairn forget` does; the window asked first.
+#[tauri::command]
+async fn forget(root_id: String) -> Result<String, String> {
+    blocking(move || actions::forget(hub(), &root_id)).await
 }
 
 #[tauri::command]

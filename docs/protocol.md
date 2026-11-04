@@ -126,7 +126,7 @@ line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out
 |---|---|---|
 | Linux | `cairn-daemon-<root-id>` in the abstract namespace: the daemon's lock, so an answer means it runs | the daemon's user, by `SO_PEERCRED`; a client checks the server the same way |
 | macOS | `<user dir>/<first 16 of root-id>.sock`, a path being at most 104 bytes | the socket 0600, the directory 0700, and the peer's uid |
-| Windows | `\\.\pipe\cairn-daemon-<root-id>`, first instance, no remote clients | a DACL naming the daemon's user only, in any session; owned by that user, which the tray checks, or else the user of the process serving it, as a desktop session may not open a daemon's in session 0 |
+| Windows | `\\.\pipe\cairn-daemon-<root-id>`, first instance, no remote clients | a DACL naming the daemon's user only, in any session, and owned by that user; a client (the CLI, the tray) believes a pipe its user owns, or else one whose serving process runs as its user, since a desktop session may open a daemon's pipe in session 0 but not its process. A daemon older than that owner, whose pipe Administrators own, is refused where its process cannot be opened |
 
 The user dir is `$XDG_STATE_HOME/cairn` or `~/.local/state/cairn` on Linux, `~/Library/Application
 Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`, for tests. It holds
@@ -134,7 +134,8 @@ Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`,
 `cairn init` and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
 whose folder no longer holds its ID is listed as gone, not dropped, until `cairn forget` takes it off, by
 its path or ID, under the same lock: it refuses a root still there unless given `--even-if-present`, and
-that root's daemon lists it again when it starts. A file that does not parse is an error, never written
+that root's daemon lists it again when it starts. The tray's Forget, offered for a root it shows as gone, does
+the same without the flag, writing the file itself under the same lock. A file that does not parse is an error, never written
 over.
 
 | Request | Replies |

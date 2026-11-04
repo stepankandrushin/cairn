@@ -8,9 +8,9 @@ let tab = 'status';
 let seenTab = 0;
 let seenNotice = 0;
 let drawn = '';
-// Conflicts awaiting a confirmation: "rootId/seq/action".
+// Actions awaiting a confirmation: "rootId/seq/action" for a conflict, "rootId/forget" for a root.
 const confirming = new Set();
-// Conflicts with an action under way, so their buttons wait.
+// Conflicts and roots with an action under way, so their buttons wait.
 const busy = new Set();
 let conflictsAskedAt = 0;
 
@@ -146,7 +146,35 @@ function drawStatus() {
         ? el('button', { class: 'act', disabled: !r.up, onclick: () => call('act', { rootId: r.root_id, what: 'resume' }) }, 'Resume')
         : el('button', { class: 'act', disabled: !r.up, onclick: () => call('act', { rootId: r.root_id, what: 'pause' }) }, 'Pause'),
       el('button', { class: 'act', onclick: () => call('open_folder', { rootId: r.root_id }) }, 'Open folder'),
-      el('button', { class: 'act', disabled: !r.server, onclick: () => call('open_server', { rootId: r.root_id }) }, 'Open in browser'))));
+      el('button', { class: 'act', disabled: !r.server, onclick: () => call('open_server', { rootId: r.root_id }) }, 'Open in browser')),
+    forgetControls(r)));
+}
+
+// A root shown as gone: taken off this device's list once confirmed, as `cairn forget` does. Once done,
+// its buttons stay waiting until the registry, read again every few seconds, no longer lists it.
+function forgetControls(r) {
+  if (!r.gone) return [];
+  const k = `${r.root_id}/forget`;
+  const waiting = busy.has(k);
+  const run = async () => {
+    confirming.delete(k);
+    busy.add(k);
+    draw(true);
+    if (!(await call('forget', { rootId: r.root_id }))) busy.delete(k);
+    draw(true);
+  };
+  const ask = () => { confirming.clear(); confirming.add(k); draw(true); };
+  const cancel = () => { confirming.clear(); draw(true); };
+  const out = [el('div', { class: 'buttons' },
+    el('button', { class: 'act', disabled: waiting, onclick: ask }, 'Forget…'))];
+  if (confirming.has(k)) {
+    out.push(el('div', { class: 'confirm' },
+      el('div', {}, `${r.path} comes off this device's list of roots. Nothing in it or on the server changes, and should the root come back there, its daemon lists it again when it starts.`),
+      el('div', { class: 'buttons' },
+        el('button', { class: 'act danger', disabled: waiting, onclick: run }, 'Take it off the list'),
+        el('button', { class: 'act', onclick: cancel }, 'Cancel'))));
+  }
+  return out;
 }
 
 const CHANGE = {
@@ -174,7 +202,8 @@ function drawProblems() {
     title(r),
     r.problems.length === 0 ? el('div', { class: 'empty' }, 'No problems.')
       : el('ul', { class: 'list' }, r.problems.map((p) => el('li', {},
-        el('div', {}, p.what), p.todo && el('div', { class: 'todo' }, p.todo))))));
+        el('div', {}, p.what), p.todo && el('div', { class: 'todo' }, p.todo)))),
+    forgetControls(r)));
 }
 
 function conflictButtons(r, c) {

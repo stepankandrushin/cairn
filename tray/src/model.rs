@@ -163,7 +163,7 @@ pub fn problems(view: &RootView) -> Vec<Problem> {
                 ),
                 LinkError::Refused(w) => p(
                     format!("Its daemon's address is not to be trusted: {w}"),
-                    "Find what holds it: no daemon of this user can start while it does.",
+                    "Find what holds it: this user's daemon cannot answer there while it does.",
                 ),
                 LinkError::Other(w) => p(
                     format!("Its daemon cannot be reached: {w}"),
@@ -248,15 +248,19 @@ pub fn problems(view: &RootView) -> Vec<Problem> {
     out
 }
 
+/// Shown as gone, with Forget offered: no daemon answers, and the folder does not hold the root.
+pub fn shown_gone(view: &RootView) -> bool {
+    matches!(view.link, Link::Down { .. }) && gone(view).is_some()
+}
+
 /// Whether the root itself has gone from where the registry says it is: unmounted, or replaced.
 fn gone(view: &RootView) -> Option<Problem> {
-    let marker = view.entry.path.join(".cairn").join("root-id");
-    let todo = "If its disk is not mounted, mount it: a daemon pauses rather than taking a missing folder for deletes.";
-    match std::fs::read_to_string(&marker) {
-        Ok(id) if id.trim() == view.entry.root_id => None,
+    let todo = "If its disk is not mounted, mount it: a daemon pauses rather than taking a missing folder for deletes. If it is gone for good, Forget takes it off this list.";
+    match crate::registry::root_id_at(&view.entry.path) {
+        Ok(id) if id == view.entry.root_id => None,
         Ok(_) => Some(Problem {
             what: format!("Another root is at {} now", view.entry.path.display()),
-            todo: "This one may have moved: `cairn status` in the folder says which it is.".into(),
+            todo: "This one may have moved: `cairn status` in the folder says which it is. If it is gone for good, Forget takes it off this list.".into(),
         }),
         Err(_) => Some(Problem {
             what: format!(
@@ -295,6 +299,40 @@ mod tests {
         let s = format!("a/b: {}", SkipKind::CannotHoldName.reason());
         assert_eq!(skip_action(&s), SkipKind::CannotHoldName.action());
         assert_eq!(skip_action("a: something new"), "");
+    }
+
+    /// Forget is offered only where no daemon answers and the folder does not hold the root.
+    #[test]
+    fn only_a_root_without_its_daemon_or_its_folder_is_shown_gone() {
+        use cairn_protocol::local::RootEntry;
+        let dir = std::env::temp_dir().join(format!("cairn-tray-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("here/.cairn")).unwrap();
+        std::fs::write(dir.join("here/.cairn/root-id"), "id-here\n").unwrap();
+        let view = |name: &str, id: &str, link: Link| {
+            let entry = RootEntry {
+                path: dir.join(name),
+                root_id: id.into(),
+                server: String::new(),
+                added: 0,
+            };
+            RootView::detached(entry, link, None)
+        };
+        let down = || Link::Down {
+            since: 0,
+            why: LinkError::NotRunning("no daemon answers".into()),
+        };
+        assert!(shown_gone(&view("gone", "id-gone", down())));
+        // Another root is there now.
+        assert!(shown_gone(&view("here", "id-gone", down())));
+        assert!(!shown_gone(&view("here", "id-here", down())));
+        assert!(!shown_gone(&view("gone", "id-gone", Link::Connecting)));
+        assert!(!shown_gone(&view(
+            "gone",
+            "id-gone",
+            Link::Up(Box::default())
+        )));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

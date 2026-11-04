@@ -422,8 +422,61 @@ pub use pipe::Listener;
 #[cfg(windows)]
 fn connect(address: &LocalAddress) -> io::Result<Box<dyn ClientConn>> {
     match address {
-        LocalAddress::Pipe(name) => Ok(Box::new(pipe::open(name)?)),
+        LocalAddress::Pipe(name) => Ok(Box::new(pipe::open_trusted(name)?)),
         _ => Err(io::Error::other("not an address on this platform")),
+    }
+}
+
+/// Whether to believe whoever serves a Windows pipe, decided as the tray decides (tray/src/link.rs,
+/// `trust`): a pipe this user owns, which no program of another user can have made, or else one whose
+/// serving process runs as this user. A daemon owns its pipe as its user for that reason, since a desktop
+/// session may open the pipe of the same user's daemon in session 0 but not its process. A pipe owned by
+/// Administrators, as a daemon's was before it owned its pipe, counts only by its process. An
+/// administrator's program could make either, but an administrator can do anything here anyway.
+#[cfg(any(windows, test))]
+fn trust(
+    owner: io::Result<String>,
+    mine: &str,
+    server: impl FnOnce() -> io::Result<(u32, String)>,
+) -> io::Result<()> {
+    let (owner, by_administrators) = match owner {
+        Ok(o) if o == mine => return Ok(()),
+        Ok(o) => (
+            format!("owned by {}, not by this user ({mine})", sid_name(&o)),
+            o == ADMINISTRATORS,
+        ),
+        Err(e) => (format!("of an owner that cannot be read ({e})"), false),
+    };
+    let refused = |text: String| io::Error::new(io::ErrorKind::PermissionDenied, text);
+    match server() {
+        Ok((_, theirs)) if theirs == mine => Ok(()),
+        Ok((pid, theirs)) => Err(refused(format!(
+            "the pipe of this root's daemon is {owner}, and process {pid}, which serves it, runs as {}: \
+             a program of another user holds this root's address, where this user's daemon cannot \
+             answer while it does",
+            sid_name(&theirs)
+        ))),
+        Err(e) if by_administrators => Err(refused(format!(
+            "the pipe of this root's daemon is {owner}, and who serves it cannot be told: {e}. A daemon \
+             older than this client owns its pipe as Administrators: updating it puts this right, and \
+             meanwhile an elevated session can open its process and ask"
+        ))),
+        Err(e) => Err(refused(format!(
+            "the pipe of this root's daemon is {owner}, and who serves it cannot be told: {e}"
+        ))),
+    }
+}
+
+#[cfg(any(windows, test))]
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+/// The two owners a pipe of this user's may have that are not the user, by name.
+#[cfg(any(windows, test))]
+fn sid_name(sid: &str) -> String {
+    match sid {
+        ADMINISTRATORS => format!("Administrators ({sid})"),
+        "S-1-5-18" => format!("SYSTEM ({sid})"),
+        _ => sid.to_string(),
     }
 }
 
@@ -447,20 +500,23 @@ mod pipe {
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         SDDL_REVISION_1,
     };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-        TOKEN_USER,
+        GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
         PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
+        CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForSingleObject,
+        INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -606,7 +662,11 @@ mod pipe {
         /// daemon's process, so the pipe's owner is how it tells this user's daemon from another's.
         fn this_user_only() -> io::Result<Self> {
             let sid = user_sid()?;
-            let sddl = wide(&format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
+            Self::from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"))
+        }
+
+        fn from_sddl(sddl: &str) -> io::Result<Self> {
+            let sddl = wide(sddl);
             let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: a terminated string, and a place for the descriptor.
             let ok = unsafe {
@@ -634,11 +694,98 @@ mod pipe {
 
     /// This process's user, as `S-1-5-...`.
     fn user_sid() -> io::Result<String> {
+        // SAFETY: a pseudo-handle, not to be closed.
+        token_user(unsafe { GetCurrentProcess() })
+    }
+
+    /// A SID as `S-1-5-...`.
+    ///
+    /// # Safety
+    /// `sid` points to a valid SID.
+    unsafe fn sid_text(sid: PSID) -> io::Result<String> {
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a valid SID, as the caller says; the string is terminated, and freed with LocalFree.
+        unsafe {
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                return Err(last());
+            }
+            let mut n = 0;
+            while *text.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            LocalFree(text as _);
+            Ok(s)
+        }
+    }
+
+    /// The owner of the pipe at the other end, read from this end, which needs nothing of the process
+    /// that made it.
+    fn owner(pipe: &Pipe) -> io::Result<String> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a handle this holds, opened for reading, which includes READ_CONTROL; the descriptor
+        // is freed below, after the owner, which points into it, is read.
+        unsafe {
+            let r = GetSecurityInfo(
+                pipe.raw(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if r != 0 {
+                return Err(io::Error::from_raw_os_error(r as i32));
+            }
+            let s = sid_text(owner);
+            LocalFree(sd as _);
+            s
+        }
+    }
+
+    /// The process that serves the pipe at the other end, and the user it runs as.
+    fn server_user(pipe: &Pipe) -> io::Result<(u32, String)> {
+        let mut pid = 0u32;
+        // SAFETY: a pipe handle this holds, and an out-parameter.
+        if unsafe { GetNamedPipeServerProcessId(pipe.raw(), &mut pid) } == 0 {
+            let e = last();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("the process that serves it cannot be found ({e})"),
+            ));
+        }
+        // SAFETY: a plain call; the handle is owned from here on.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            let e = last();
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "process {pid}, which serves it, cannot be opened to tell who it runs as ({e})"
+                ),
+            ));
+        }
+        // SAFETY: just opened.
+        let process = unsafe { OwnedHandle::from_raw_handle(process as _) };
+        let user = token_user(process.as_raw_handle() as HANDLE).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("process {pid}, which serves it, does not say who it runs as ({e})"),
+            )
+        })?;
+        Ok((pid, user))
+    }
+
+    /// The user a process runs as, as `S-1-5-...`.
+    fn token_user(process: HANDLE) -> io::Result<String> {
         // SAFETY: the token is closed by its OwnedHandle; the buffer is sized by the first call and
-        // holds a TOKEN_USER whose SID points into it; the string is freed with LocalFree.
+        // holds a TOKEN_USER whose SID points into it.
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return Err(last());
             }
             let token = OwnedHandle::from_raw_handle(token as _);
@@ -662,17 +809,7 @@ mod pipe {
                 return Err(last());
             }
             let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
-                return Err(last());
-            }
-            let mut n = 0;
-            while *text.add(n) != 0 {
-                n += 1;
-            }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
-            LocalFree(text as _);
-            Ok(sid)
+            sid_text(user.User.Sid)
         }
     }
 
@@ -744,8 +881,17 @@ mod pipe {
         }
     }
 
-    /// The client's end. Identification only: the daemon learns who asks, and cannot act as them.
-    pub fn open(name: &str) -> io::Result<Pipe> {
+    /// The client's end, once whoever serves it is believed to be this user's daemon, by
+    /// [`super::trust`]: before a word is sent or read.
+    pub fn open_trusted(name: &str) -> io::Result<Pipe> {
+        let pipe = open(name)?;
+        super::trust(owner(&pipe), &user_sid()?, || server_user(&pipe))?;
+        Ok(pipe)
+    }
+
+    /// The client's end, unchecked. Identification only: the daemon learns who asks, and cannot act as
+    /// them.
+    fn open(name: &str) -> io::Result<Pipe> {
         let mut tries = 0;
         loop {
             match std::fs::OpenOptions::new()
@@ -774,8 +920,6 @@ mod pipe {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
 
         /// The owner as a client reads it from its own end, as the tray does: this user, whether or not
         /// this process runs elevated, whose token's default owner is then Administrators.
@@ -785,34 +929,108 @@ mod pipe {
             let lock = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
             let listener = listen(&lock, &root_id).unwrap();
             let client = open(&listener.name).unwrap();
-            let mut owner = std::ptr::null_mut();
-            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            // SAFETY: a handle this test holds, opened for reading, which includes READ_CONTROL; the
-            // descriptor is freed below, and `owner` points into it.
-            let owner = unsafe {
-                let r = GetSecurityInfo(
-                    client.raw(),
-                    SE_FILE_OBJECT,
-                    OWNER_SECURITY_INFORMATION,
-                    &mut owner,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut sd,
-                );
-                assert_eq!(r, 0, "{}", io::Error::from_raw_os_error(r as i32));
-                let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
-                assert_ne!(ConvertSidToStringSidW(owner, &mut text), 0, "{}", last());
-                let mut n = 0;
-                while *text.add(n) != 0 {
-                    n += 1;
-                }
-                let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
-                LocalFree(text as _);
-                LocalFree(sd as _);
-                s
-            };
-            assert_eq!(owner, user_sid().unwrap());
+            assert_eq!(owner(&client).unwrap(), user_sid().unwrap());
         }
+
+        /// What `Client::connect` opens: this user's daemon, by its pipe's owner; a daemon's pipe as one
+        /// older than this made it, by its process, which is this one; and not a pipe another user
+        /// serves. lsass's, on every Windows, owned by Administrators and served as SYSTEM, stands in for
+        /// a program of another user that took a root's address.
+        #[test]
+        fn a_client_believes_its_users_daemon_and_refuses_another_users_pipe() {
+            let connect = |name: &str| super::super::connect(&LocalAddress::Pipe(name.into()));
+            let root_id = format!("test-{:032x}", rand::random::<u128>());
+            let lock = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            let listener = listen(&lock, &root_id).unwrap();
+            connect(&listener.name).unwrap();
+
+            // Owned by the token's default owner: Administrators when this runs elevated, as from SSH.
+            let sid = user_sid().unwrap();
+            let old = Security::from_sddl(&format!("D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)")).unwrap();
+            let old_name = format!("{}-old", listener.name);
+            let _old = instance(&old_name, &old, true).unwrap();
+            connect(&old_name).unwrap();
+
+            let lsass = r"\\.\pipe\lsass";
+            let raw = open(lsass).expect("lsass's pipe opens, for reading and writing");
+            assert_ne!(owner(&raw).unwrap(), sid);
+            drop(raw);
+            let e = connect(lsass)
+                .err()
+                .expect("a pipe another user serves is refused");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                e.to_string()
+                    .starts_with("the pipe of this root's daemon is owned by"),
+                "{e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THIS_USER: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
+    /// Windows' decision, on every platform: the pipe's owner first, then the serving process's user.
+    #[test]
+    fn a_windows_pipe_is_believed_by_its_owner_or_else_by_its_serving_process() {
+        let never = || -> io::Result<(u32, String)> {
+            panic!("a pipe this user owns needs nothing of its process")
+        };
+        trust(Ok(THIS_USER.into()), THIS_USER, never).unwrap();
+
+        // A daemon older than its pipe's owner: Administrators own it, so its process decides.
+        trust(Ok(ADMINISTRATORS.into()), THIS_USER, || {
+            Ok((7, THIS_USER.into()))
+        })
+        .unwrap();
+        let e = trust(Ok(ADMINISTRATORS.into()), THIS_USER, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process 7, which serves it, cannot be opened to tell who it runs as",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let text = e.to_string();
+        assert!(
+            text.contains("owned by Administrators (S-1-5-32-544), not by this user")
+                && text.contains("process 7, which serves it, cannot be opened")
+                && text.contains("updating it puts this right"),
+            "{text}"
+        );
+
+        let e = trust(Ok(OTHER.into()), THIS_USER, || Ok((9, OTHER.into()))).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            e.to_string()
+                .contains("process 9, which serves it, runs as"),
+            "{e}"
+        );
+        trust(Ok(ADMINISTRATORS.into()), THIS_USER, || {
+            Ok((9, "S-1-5-18".into()))
+        })
+        .unwrap_err();
+        // Only a pipe Administrators own is taken for a daemon from before, which updating puts right.
+        let e = trust(Ok(OTHER.into()), THIS_USER, || {
+            Err(io::Error::other("no process"))
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!e.to_string().contains("older"), "{e}");
+
+        // An owner that cannot be read counts for nothing either way.
+        trust(Err(io::Error::other("unreadable")), THIS_USER, || {
+            Ok((7, THIS_USER.into()))
+        })
+        .unwrap();
+        trust(Err(io::Error::other("unreadable")), THIS_USER, || {
+            Ok((9, OTHER.into()))
+        })
+        .unwrap_err();
     }
 }

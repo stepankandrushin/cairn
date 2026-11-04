@@ -11,6 +11,7 @@ mod hub;
 mod icon;
 mod link;
 mod model;
+mod registry;
 
 use cairn_protocol::local::{registry_path, user_dir, Direction, Reply, Request};
 use hub::{Link, RootView};

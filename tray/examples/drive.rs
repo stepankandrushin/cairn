@@ -3,6 +3,7 @@
 //!
 //!     drive <root_id> tell sync_now|pause|resume
 //!     drive <root_id> conflict <seq> show|open_both|keep_original|keep_copy
+//!     drive <root_id> forget
 #![allow(dead_code)]
 
 #[path = "../src/actions.rs"]
@@ -13,6 +14,8 @@ mod hub;
 mod link;
 #[path = "../src/model.rs"]
 mod model;
+#[path = "../src/registry.rs"]
+mod registry;
 
 use cairn_protocol::local::Request;
 use std::process::ExitCode;
@@ -43,6 +46,19 @@ fn main() -> ExitCode {
             }
             actions::conflict(&hub, root, seq, action)
         }
+        // As the window's Forget, once the hub has tried the root's daemon.
+        [root, "forget"] => {
+            let hub = hub::Hub::start();
+            let start = Instant::now();
+            while hub
+                .root(root)
+                .is_none_or(|r| matches!(r.link, hub::Link::Connecting))
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            actions::forget(&hub, root)
+        }
         _ => return usage(),
     };
     match r {
@@ -59,7 +75,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: drive ROOT_ID tell sync_now|pause|resume | drive ROOT_ID conflict SEQ ACTION"
+        "usage: drive ROOT_ID tell sync_now|pause|resume | drive ROOT_ID conflict SEQ ACTION | drive ROOT_ID forget"
     );
     ExitCode::from(64)
 }

@@ -1876,12 +1876,14 @@ fn mark_synced(
         let Some(row) = rows.get_mut(&id) else {
             continue;
         };
-        let on_disk = cur.get(&id).is_some_and(|c| {
-            c.fp.is_some()
-                && c.content == state.body.content
-                && c.apply_from == state.body.metadata
-                && state.links.is_subset(&c.links)
-        });
+        // What could not be read fully is no pair of what went up.
+        let on_disk = !row.incomplete
+            && cur.get(&id).is_some_and(|c| {
+                c.fp.is_some()
+                    && c.content == state.body.content
+                    && c.apply_from == state.body.metadata
+                    && state.links.is_subset(&c.links)
+            });
         if on_disk {
             row.synced = Some(Synced {
                 body: state.body.clone(),

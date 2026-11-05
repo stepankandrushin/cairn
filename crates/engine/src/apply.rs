@@ -1643,7 +1643,13 @@ impl<'a> Applier<'a> {
                 .fp
                 .as_ref()
                 .is_some_and(|fp| (fp.ino, fp.size, fp.mtime) == (st.ino, st.size, st.mtime));
-        let in_step = in_step.filter(|_| untouched);
+        // A folder still private from a killed run, which this round's scan could not read in full, stays
+        // so: this pass went by what it did not know, and what is on disk is no pair of the record.
+        let still_private = self
+            .rows
+            .get(&id)
+            .is_some_and(|o| o.incomplete && o.synced.as_ref().is_some_and(|s| s.unapplied));
+        let in_step = in_step.filter(|_| untouched && !still_private);
         let synced = in_step.map(|(t, _)| Synced {
             body: t.body.clone(),
             links: t.links.clone(),
@@ -1778,14 +1784,18 @@ impl<'a> Applier<'a> {
             if let Some(held) = row.held.as_mut() {
                 held.extend(t.links.iter().cloned());
             }
-            row.synced = Some(Synced {
-                body: t.body.clone(),
-                links: t.links.clone(),
-                applied: row.scan.clone(),
-                commit: None,
-                unapplied: false,
-                folder_time: None,
-            });
+            // What could not be read fully is no pair of the record: a folder still private from a killed
+            // run, unreadable now, would lose its mark and keep 0700 as a mode this device holds.
+            if !row.incomplete {
+                row.synced = Some(Synced {
+                    body: t.body.clone(),
+                    links: t.links.clone(),
+                    applied: row.scan.clone(),
+                    commit: None,
+                    unapplied: false,
+                    folder_time: None,
+                });
+            }
             changed.push(*id);
         }
         let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &self.rows[id])).collect();

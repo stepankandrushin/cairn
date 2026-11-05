@@ -523,6 +523,63 @@ fn a_folder_removed_here_that_comes_back_killed_still_gets_its_mode() {
     }
 }
 
+/// A folder still private from a killed run, unreadable here when it next changes: renamed on another device
+/// or here after a sync has seen it, or written into elsewhere. What could not be read is no pair of its
+/// record, or the 0700 it has until its last pass stays, read as a mode this device keeps.
+#[test]
+fn a_private_folder_unreadable_when_it_next_changes_still_gets_its_mode() {
+    for point in ["apply.dirs.synced", "apply.dir.meta"] {
+        for case in [
+            "renamed elsewhere",
+            "renamed here",
+            "written into elsewhere",
+        ] {
+            let (_sb, _s, a, b) = pair("private-unreadable");
+            filler(&a);
+            a.synced();
+            b.synced();
+            a.write("d/f", "1");
+            chmod(&a.path("d"), 0o775);
+            a.synced();
+            killed_at(&b, point);
+            let context = format!("{point}, {case}");
+            assert_eq!(mode_of(&b.path("d")) & 0o777, 0o700, "{context}");
+            chmod(&b.path("d"), 0o000);
+            let name = if case.starts_with("renamed") {
+                "d2"
+            } else {
+                "d"
+            };
+            match case {
+                "renamed here" => {
+                    // Seen once as it is, then moved here, still unreadable.
+                    let run = b.sync();
+                    assert!(run.ok() || run.code == Some(3), "{context}: {}", run.text());
+                    fs::rename(b.path("d"), b.path("d2")).unwrap();
+                }
+                "renamed elsewhere" => {
+                    fs::rename(a.path("d"), a.path("d2")).unwrap();
+                    a.synced();
+                }
+                _ => {
+                    a.write("d/g", "2");
+                    a.synced();
+                }
+            }
+            let run = b.sync();
+            assert!(run.ok() || run.code == Some(3), "{context}: {}", run.text());
+            chmod(&b.path(name), 0o700);
+            let p = converge(&[&a, &b]);
+            let entry = p.entries[name.as_bytes()].clone();
+            assert_eq!(entry.mode & 0o777, 0o775, "{context}");
+            assert_eq!(b.read(&format!("{name}/f")), b"1", "{context}");
+            if name == "d2" {
+                assert!(!p.entries.contains_key(b"d".as_slice()), "{context}");
+            }
+        }
+    }
+}
+
 // --- A conflict copy and what comes after it ---
 
 #[test]

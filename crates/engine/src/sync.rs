@@ -1065,6 +1065,10 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let date = utc_date(now_secs());
     let mut seen_events: BTreeSet<String> = report.events.iter().cloned().collect();
     let mut retryable = false;
+    // Losers of metadata conflicts not yet in a commit the server took. Nothing else says them again:
+    // the next round finds the conflict settled.
+    let mut notes: Vec<(ObjectId, String)> = Vec::new();
+    let mut noted: HashSet<(ObjectId, String)> = HashSet::new();
 
     let mut seen = Seen {
         last: cursor_op,
@@ -1082,7 +1086,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         fetch_changes(&client, &mut remote, &mut seq, &mut seen)?;
         report.head = seq;
 
-        if selection.recheck_unheld(&root, &remote) && !opts.dry_run {
+        if selection.recheck_unheld(&root.dir, &remote) && !opts.dry_run {
             selection.store(&root)?;
         }
         // From here to the push, everything sees only what this device takes part in. `base` and
@@ -1201,6 +1205,14 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             }
         }
 
+        // A name the server has in another form goes up as a second name, unless it waits here.
+        report.skips.extend(crate::twins::hold_back_twins(
+            &root,
+            &mut identified,
+            &base,
+            &remote,
+        ));
+
         let host = root.config.device_name.clone();
         let plan = merge(MergeInput {
             base: &view.base,
@@ -1213,7 +1225,13 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             fresh_id: &mut ObjectId::random,
         });
         for r in &plan.reports {
-            if r.kind == ReportKind::ConflictCopy {
+            // A new object kept beside the server's at a name both took is a conflict copy too.
+            let beside = r.kind == ReportKind::SameNameKeptBoth
+                && plan
+                    .target
+                    .get(&r.object)
+                    .is_some_and(|t| t.conflict_of.is_some());
+            if r.kind == ReportKind::ConflictCopy || beside {
                 report.conflicts += 1;
             }
             let line = format!("{}: {}", event_path(&plan, r.object), r.detail);
@@ -1348,13 +1366,17 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         // The loser of a metadata conflict goes in the log even when nothing else is to be pushed.
         // Unless applying failed: the conflict stands, and would be logged on every run.
         if !failed || !ops.is_empty() {
-            for (object, text) in &plan.notes {
-                ops.push(Op::Note {
-                    object: *object,
-                    text: text.clone(),
-                });
+            for note in &plan.notes {
+                if noted.insert(note.clone()) {
+                    notes.push(note.clone());
+                }
             }
         }
+        let first_note = ops.len();
+        ops.extend(notes.iter().map(|(object, text)| Op::Note {
+            object: *object,
+            text: text.clone(),
+        }));
         if ops.is_empty() {
             if failed {
                 break SyncOutcome::Partial;
@@ -1374,8 +1396,10 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                 SyncOutcome::Synced
             };
         }
-        // A huge change goes in several commits, the next round picking up where this one ended.
+        // A huge change goes in several commits, the next round picking up where this one ended, and
+        // the notes left out with it.
         let truncated = truncate_ops(&mut ops);
+        let notes_sent = ops.len().saturating_sub(first_note);
 
         match upload(&client, &root, &cur, &ops)? {
             Upload::FileChanged => {
@@ -1411,6 +1435,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         hit("sync.dequeued");
         match resp {
             CommitResponse::Committed { .. } => {
+                notes.drain(..notes_sent);
                 report.commits += 1;
                 report.ops_pushed += req.ops.len() as u64;
                 report

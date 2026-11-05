@@ -22,6 +22,9 @@ pub enum SkipKind {
     /// A kind of entry this device does not sync: on Windows a symlink, junction or mount point, made
     /// here. Like a FIFO it is no failure: trying again changes nothing.
     Unsupported,
+    /// Something new here at a name the server has in another form, which this filesystem takes for
+    /// the same name. Held back until renamed here, or it would go up as a second name.
+    SameNameOnServer,
 }
 
 impl SkipKind {
@@ -61,6 +64,9 @@ impl SkipKind {
             SkipKind::ExcludedInTheWay => "something this device excludes is at that name",
             SkipKind::ReadError => "could not be read",
             SkipKind::Unsupported => "this kind of entry is not synced here",
+            SkipKind::SameNameOnServer => {
+                "the server has this name in another form, which this filesystem takes for the same name"
+            }
         }
     }
 
@@ -85,6 +91,9 @@ impl SkipKind {
                 "move what is here, or change the rule, and the server's will come"
             }
             SkipKind::ReadError => "check the disk, then sync again",
+            SkipKind::SameNameOnServer => {
+                "rename it here to the server's form, and the two merge; until then it does not go up, nor the server's come down"
+            }
         }
     }
 }

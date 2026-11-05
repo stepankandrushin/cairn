@@ -19,7 +19,7 @@ use cairn_protocol::{Link, Name, ObjectId, ObjectKind, Timestamp, Tree};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -307,9 +307,11 @@ impl Selection {
     }
 
     /// Drop what no longer stands in the way: an entry the server has moved or removed, or one whose
-    /// twin here has gone. Returns whether any went.
-    pub fn recheck_unheld(&mut self, root: &Root, remote: &Tree) -> bool {
+    /// twin here has gone, or has been renamed to the server's very name, which then merges with it as
+    /// anything new does. Returns whether any went.
+    pub fn recheck_unheld(&mut self, root: &Dir, remote: &Tree) -> bool {
         let before = self.unheld.len();
+        let mut listed: HashMap<Vec<Name>, Vec<Vec<u8>>> = HashMap::new();
         self.unheld.retain(|u| {
             if !remote
                 .get_live(u.object)
@@ -323,10 +325,17 @@ impl Selection {
             let Some(path) = remote.path_of_link(&u.link) else {
                 return true;
             };
-            let Ok(dir) = root.dir.open_path(&path[..path.len() - 1]) else {
+            let folder = &path[..path.len() - 1];
+            let Ok(dir) = root.open_path(folder) else {
                 return true;
             };
-            !matches!(dir.stat(u.link.name.as_bytes()), Err(e) if is_not_found(&e))
+            if matches!(dir.stat(u.link.name.as_bytes()), Err(e) if is_not_found(&e)) {
+                return false;
+            }
+            let names = listed
+                .entry(folder.to_vec())
+                .or_insert_with(|| dir.list().unwrap_or_default());
+            !names.iter().any(|n| n == u.link.name.as_bytes())
         });
         self.unheld.len() != before
     }
@@ -757,6 +766,47 @@ pub fn excluded_paths(root: &Root) -> Result<ExcludedPaths> {
 mod tests {
     use super::*;
     use cairn_protocol::{Content, Metadata, Node, RevisionBody, RevisionId};
+
+    /// Where names are bytes nothing is ever a twin, so the twin is made up: the server's `Readme`
+    /// held out for a `README` here, which a person then renames to the server's very name.
+    #[test]
+    fn a_twin_renamed_to_the_servers_name_comes_back_into_view() {
+        let path = std::env::temp_dir().join(format!("cairn-twin-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&path).unwrap();
+        let mut remote = Tree::new();
+        let object = ObjectId::random();
+        let link = Link {
+            parent: ObjectId::ROOT,
+            name: Name::new(*b"Readme").unwrap(),
+        };
+        remote
+            .apply(&cairn_protocol::Op::Create {
+                object,
+                revision: RevisionId::random(),
+                body: RevisionBody {
+                    content: Content::Dir,
+                    metadata: Metadata::default(),
+                },
+                link: link.clone(),
+                conflict_of: None,
+            })
+            .unwrap();
+        let mut selection = Selection {
+            unheld: vec![Unheld {
+                object,
+                link,
+                why: "`README` here is the same name to this filesystem".into(),
+                twin: true,
+            }],
+            ..Selection::default()
+        };
+        let root = Dir::open_root(&path).unwrap();
+        std::fs::create_dir(path.join("README")).unwrap();
+        std::fs::rename(path.join("README"), path.join("Readme")).unwrap();
+        assert!(selection.recheck_unheld(&root, &remote));
+        assert!(selection.unheld.is_empty());
+        std::fs::remove_dir_all(&path).unwrap();
+    }
 
     fn names(path: &str) -> Vec<Name> {
         path.split('/')

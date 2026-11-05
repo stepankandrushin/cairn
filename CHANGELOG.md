@@ -52,6 +52,19 @@
 - On a filesystem that cannot swap two names in one step, a replacement renamed the new version over the old one,
   and took an edit made in the moment since its last look. The old file is now held under a third name, a hard
   link, and looked at there.
+- A device joining a tree the server already had, with the same bytes and metadata of its own, lost the xattrs the
+  server lacked: they were removed from its disk and never sent (on a Mac, Finder tags and FinderInfo). What only
+  one side has now stays, sent up from here or applied here. Where both have a value, the server's stands and the
+  other is in the log, as for any conflict over one field. A join with more such notes than one commit holds lost
+  the rest; they now go in the next.
+- A device joining with separate equal copies of a file the server holds under several names made a conflict copy
+  of each extra name, for everyone. They are now links of the one file here.
+- A conflict copy made because a new file here had a name the server already used, as happens at a join, was missing
+  from `cairn conflicts`. It is listed now, like any other.
+- On a filesystem that takes one name for another (APFS: a decomposed name and its composed form, or two cases),
+  something new at a name the server had in the other form went up as a second name, a folder with everything in
+  it, and every device that keeps names as bytes then held both. It now waits, reported with both names, until it
+  is renamed here to the server's form, and then the two merge.
 
 ## 0.1.1
 

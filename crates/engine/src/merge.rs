@@ -84,6 +84,8 @@ pub enum ReportKind {
     MoveConflict,
     CycleRefused,
     KeptForChild,
+    /// A separate copy here of a file the server holds under several names, linked to it.
+    Linked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -290,34 +292,50 @@ fn folder_in_git(
     false
 }
 
-/// What an adopted copy loses to the server's record: same-field conflicts have a log entry. Times
-/// and owners differ between any two copies and say nothing.
-fn adoption_notes(l: &Metadata, r: &Metadata) -> Vec<String> {
+/// A copy with no history and the server's record of the same thing, together. Nothing says who
+/// changed what, so it is the merge field by field with each side's fields its own: a record (an xattr)
+/// only one side has stays, and where both have a value and they differ the server's stands and the
+/// other goes in the activity log, value and all, as the loser of a same-field conflict does. Times and
+/// owners differ between any two copies and say nothing of anyone's intent: the server's stand, unlogged.
+pub fn join_metadata(server: &Metadata, here: &Metadata, whose: &str) -> (Metadata, Vec<String>) {
+    let mut out = server.clone();
     let mut notes = Vec::new();
-    if l.mode != r.mode {
+    if here.mode != server.mode {
         notes.push(format!(
-            "mode: kept {:o} from the server; this device had {:o}",
-            r.mode, l.mode
+            "mode: kept {:o} from the server; {whose} had {:o}",
+            server.mode, here.mode
         ));
     }
-    let keys: BTreeSet<_> = l.records.keys().chain(r.records.keys()).collect();
-    for key in keys {
-        if l.records.get(key) != r.records.get(key) {
-            // The value itself: this copy's is about to go, and it was never stored anywhere.
-            let had = l.records.get(key).map_or("nothing".to_string(), |v| {
-                cairn_protocol::name::display_bytes(&v.0)
-            });
-            notes.push(format!(
-                "record {} {}: kept the server's value; this device had {had}",
+    for (key, value) in &here.records {
+        match server.records.get(key) {
+            None => {
+                out.records.insert(key.clone(), value.clone());
+            }
+            Some(theirs) if theirs != value => notes.push(format!(
+                "record {} {}: kept the server's value; {whose} had {}",
                 key.ns,
-                cairn_protocol::name::display_bytes(&key.name.0)
-            ));
+                cairn_protocol::name::display_bytes(&key.name.0),
+                cairn_protocol::name::display_bytes(&value.0)
+            )),
+            Some(_) => {}
         }
     }
-    notes
+    (out, notes)
 }
 
-fn adopt(input: &MergeInput<'_>) -> (BTreeMap<ObjectId, LNode>, BTreeMap<ObjectId, ObjectId>) {
+/// New local objects recognised as the server's: same name and content, or two directories.
+struct Adoption {
+    /// The local tree with adoptions applied.
+    local: BTreeMap<ObjectId, LNode>,
+    adopted: BTreeMap<ObjectId, ObjectId>,
+    /// Separate copies here of a file the server holds under several names, each at one of them: they
+    /// become links of it here.
+    linked: BTreeMap<ObjectId, ObjectId>,
+    /// What this device's copies lose to the server's record.
+    notes: Vec<(ObjectId, String)>,
+}
+
+fn adopt(input: &MergeInput<'_>) -> Adoption {
     let mut by_parent: HashMap<ObjectId, Vec<(Name, ObjectId)>> = HashMap::new();
     for (id, n) in input.local {
         for l in &n.links {
@@ -329,6 +347,9 @@ fn adopt(input: &MergeInput<'_>) -> (BTreeMap<ObjectId, LNode>, BTreeMap<ObjectI
     }
     let mut adopted: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
     let mut taken: BTreeSet<ObjectId> = BTreeSet::new();
+    // Files once every folder is seen: one the server holds under several names can have a copy at
+    // each here, and which of them adopts it is a choice.
+    let mut files: BTreeMap<ObjectId, Vec<(Name, ObjectId)>> = BTreeMap::new();
     // Local directory, its counterpart on the server.
     let mut queue = vec![(ObjectId::ROOT, ObjectId::ROOT)];
     while let Some((ldir, rdir)) = queue.pop() {
@@ -355,17 +376,52 @@ fn adopt(input: &MergeInput<'_>) -> (BTreeMap<ObjectId, LNode>, BTreeMap<ObjectI
                 && !taken.contains(&y);
             let same = r.kind() == node.kind()
                 && (node.kind() == ObjectKind::Dir || r.body.content == node.content);
-            if free && same {
+            if !(free && same) {
+                continue;
+            }
+            if node.kind() == ObjectKind::Dir {
                 taken.insert(y);
                 adopted.insert(*x, y);
-                if node.kind() == ObjectKind::Dir {
-                    queue.push((*x, y));
-                }
+                queue.push((*x, y));
+            } else {
+                files.entry(y).or_default().push((name.clone(), *x));
+            }
+        }
+    }
+    // The copy with most of its own adopts the file, since what it has stays on its inode. Another
+    // folds into it, as a link, only if it has nothing that neither that inode nor the server's record
+    // holds: it is removed before anything is written to the inode that stays, so that would be lost
+    // to a kill in between. Such a copy stays itself, new, and so a conflict copy.
+    let mut linked: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
+    for (y, mut copies) in files {
+        copies.retain(|(_, x)| !adopted.contains_key(x) && !linked.contains_key(x));
+        copies.sort_by(|a, b| {
+            let own = |x: &ObjectId| input.local[x].stored.records.len();
+            own(&b.1).cmp(&own(&a.1)).then_with(|| a.cmp(b))
+        });
+        let mut once = BTreeSet::new();
+        copies.retain(|(_, x)| once.insert(*x));
+        let Some((_, first)) = copies.first().cloned() else {
+            continue;
+        };
+        adopted.insert(first, y);
+        let stays = &input.local[&first].stored.records;
+        let server = &input.remote.nodes[&y].body.metadata.records;
+        for (_, x) in &copies[1..] {
+            let n = &input.local[x];
+            let brings = n
+                .stored
+                .records
+                .iter()
+                .any(|(k, v)| server.get(k) != Some(v) && stays.get(k) != Some(v));
+            if n.links.len() == 1 && !brings {
+                linked.insert(*x, y);
             }
         }
     }
     let map = |o: ObjectId| adopted.get(&o).copied().unwrap_or(o);
-    let local = input
+    let mut notes = Vec::new();
+    let local: BTreeMap<ObjectId, LNode> = input
         .local
         .iter()
         .map(|(id, n)| {
@@ -379,15 +435,33 @@ fn adopt(input: &MergeInput<'_>) -> (BTreeMap<ObjectId, LNode>, BTreeMap<ObjectI
                 })
                 .collect();
             if let Some(y) = adopted.get(id) {
-                // Same content, but this copy's metadata has no history: the server's stands, and
-                // is applied here.
+                // Same content, and this copy's metadata has no history: it joins the server's
+                // record, and what that holds and this copy lacks is applied here.
+                let (joined, lost) = join_metadata(
+                    &input.remote.nodes[y].body.metadata,
+                    &n.stored,
+                    "this device",
+                );
+                notes.extend(lost.into_iter().map(|t| (*y, t)));
                 n.apply_from = n.stored.clone();
-                n.stored = input.remote.nodes[y].body.metadata.clone();
+                n.stored = joined;
             }
             (map(*id), n)
         })
         .collect();
-    (local, adopted)
+    for (x, y) in &linked {
+        let n = &input.local[x];
+        let at = n.links.iter().next().map(|l| l.name.to_string());
+        let whose = format!("this device's copy at {}", at.unwrap_or_default());
+        let (_, lost) = join_metadata(&local[y].stored, &n.stored, &whose);
+        notes.extend(lost.into_iter().map(|t| (*y, t)));
+    }
+    Adoption {
+        local,
+        adopted,
+        linked,
+        notes,
+    }
 }
 
 /// The common ancestor of an object, if it had one: the newer shared state where known.
@@ -442,21 +516,34 @@ fn merge_links(
 
 /// Merge the three trees into a plan.
 pub fn merge(mut input: MergeInput<'_>) -> Plan {
-    let (local, adopted) = adopt(&input);
+    let Adoption {
+        local,
+        adopted,
+        linked,
+        notes,
+    } = adopt(&input);
     let mut plan = Plan {
         adopted,
         ..Plan::default()
     };
-    for (x, y) in &plan.adopted.clone() {
-        let notes = adoption_notes(&input.local[x].stored, &input.remote.nodes[y].body.metadata);
-        for note in notes {
-            plan.reports.push(Report {
-                kind: ReportKind::MetadataConflict,
-                object: *y,
-                detail: note.clone(),
-            });
-            plan.notes.push((*y, note));
-        }
+    for (y, note) in notes {
+        plan.reports.push(Report {
+            kind: ReportKind::MetadataConflict,
+            object: y,
+            detail: note.clone(),
+        });
+        plan.notes.push((y, note));
+    }
+    for (x, y) in &linked {
+        let name = local[x].links.iter().next().map(|l| l.name.to_string());
+        plan.reports.push(Report {
+            kind: ReportKind::Linked,
+            object: *y,
+            detail: format!(
+                "`{}` here was a separate copy with the same bytes, and the server holds both names as one file: now it is a link of it here too",
+                name.unwrap_or_default()
+            ),
+        });
     }
 
     let ids: BTreeSet<ObjectId> = local
@@ -474,6 +561,10 @@ pub fn merge(mut input: MergeInput<'_>) -> Plan {
         .collect();
 
     for id in ids {
+        // Goes, its name taken by a link of the file it is a copy of.
+        if linked.contains_key(&id) {
+            continue;
+        }
         let l = local.get(&id);
         let r = input.remote.get_live(id);
         // What this scan could not see says nothing, so it can never push: the server's state
@@ -989,6 +1080,14 @@ fn resolve_collisions(input: &MergeInput<'_>, plan: &mut Plan) {
                 .expect("an owner is in the target");
             t.links.remove(&link);
             t.links.insert(renamed.clone());
+            // New beside what the server has at that name, and other than it: a conflict copy like
+            // any other, in the inbox until a person deals with it.
+            if t.conflict_of.is_none() && input.remote.entry_at(&link) == Some(winner) {
+                t.conflict_of = Some(ConflictOf {
+                    object: winner,
+                    competing_revision: input.remote.nodes[&winner].rev,
+                });
+            }
             for copy in plan.copies.iter_mut().filter(|c| c.copy == loser) {
                 for m in copy.moves.iter_mut().filter(|m| m.1 == link) {
                     m.1 = renamed.clone();
@@ -1360,6 +1459,195 @@ mod tests {
         assert_eq!(p.target[&y].body.metadata.mode, 0o644);
         assert_eq!(p.notes.len(), 1);
         assert!(p.notes[0].1.contains("750"), "{:?}", p.notes);
+    }
+
+    fn with(mode: u32, records: &[(&str, &str)]) -> Metadata {
+        let mut m = meta(mode);
+        for (k, v) in records {
+            m.records.insert(
+                RecordKey {
+                    ns: NS_LINUX_XATTR.into(),
+                    name: Bytes(k.as_bytes().to_vec()),
+                },
+                Bytes(v.as_bytes().to_vec()),
+            );
+        }
+        m
+    }
+
+    fn record<'a>(m: &'a Metadata, k: &str) -> Option<&'a [u8]> {
+        m.records
+            .get(&RecordKey {
+                ns: NS_LINUX_XATTR.into(),
+                name: Bytes(k.as_bytes().to_vec()),
+            })
+            .map(|v| v.0.as_slice())
+    }
+
+    /// A joining device's copy: what only it has stays, and goes to the server; where both have a
+    /// value the server's stands, and this device's is in the log.
+    #[test]
+    fn an_adopted_copy_keeps_what_the_server_lacks_and_logs_what_it_loses() {
+        let mut t = T::new();
+        let x = ObjectId::random();
+        let here = with(0o644, &[("user.mine", "2"), ("user.both", "mine")]);
+        t.local
+            .insert(x, lnode(at("f"), file("same"), here.clone()));
+        let y = t.remote_add(
+            at("f"),
+            file("same"),
+            with(0o664, &[("user.server", "1"), ("user.both", "server's")]),
+        );
+        let p = t.run();
+        assert_eq!(p.adopted[&x], y);
+        let m = &p.target[&y].body.metadata;
+        assert_eq!(m.mode, 0o664);
+        assert_eq!(record(m, "user.mine"), Some(b"2".as_slice()));
+        assert_eq!(record(m, "user.server"), Some(b"1".as_slice()));
+        assert_eq!(record(m, "user.both"), Some(b"server's".as_slice()));
+        assert_eq!(p.local[&y].apply_from, here, "against what is on disk");
+        let notes: Vec<&str> = p.notes.iter().map(|n| n.1.as_str()).collect();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("this device had 644")));
+        assert!(notes.iter().any(|n| n.contains("this device had mine")));
+    }
+
+    fn linked_on_the_server(t: &mut T, names: &[&str], content: Content) -> ObjectId {
+        let y = t.remote_add(at(names[0]), content, meta(0o644));
+        for n in &names[1..] {
+            t.remote
+                .apply(&Op::Link {
+                    object: y,
+                    link: at(n),
+                })
+                .unwrap();
+        }
+        y
+    }
+
+    #[test]
+    fn separate_equal_copies_of_a_file_with_several_names_become_its_links() {
+        let mut t = T::new();
+        let y = linked_on_the_server(&mut t, &["one", "two"], file("shared"));
+        let x1 = ObjectId::random();
+        let x2 = ObjectId::random();
+        t.local
+            .insert(x1, lnode(at("one"), file("shared"), meta(0o644)));
+        t.local
+            .insert(x2, lnode(at("two"), file("shared"), meta(0o600)));
+        let p = t.run();
+        assert_eq!(p.adopted.values().collect::<Vec<_>>(), vec![&y]);
+        assert_eq!(p.target[&y].links, [at("one"), at("two")].into());
+        let objects = |p: &Plan| p.target.keys().filter(|id| **id != ObjectId::ROOT).count();
+        assert_eq!(objects(&p), 1, "no copy of its own: {:?}", p.target);
+        assert_eq!(only(&p, ReportKind::SameNameKeptBoth), 0);
+        assert_eq!(only(&p, ReportKind::Linked), 1);
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.1.contains("this device's copy at two had 600")),
+            "{:?}",
+            p.notes
+        );
+    }
+
+    /// The copy that stays is the one whose inode holds what the others have.
+    #[test]
+    fn the_copy_with_records_of_its_own_is_the_one_that_stays() {
+        let mut t = T::new();
+        let y = linked_on_the_server(&mut t, &["one", "two"], file("shared"));
+        let plain = ObjectId::random();
+        let tagged = ObjectId::random();
+        t.local
+            .insert(plain, lnode(at("one"), file("shared"), meta(0o644)));
+        t.local.insert(
+            tagged,
+            lnode(
+                at("two"),
+                file("shared"),
+                with(0o644, &[("user.tag", "red")]),
+            ),
+        );
+        let p = t.run();
+        assert_eq!(p.adopted.get(&tagged), Some(&y));
+        assert!(!p.target.contains_key(&plain));
+        assert_eq!(
+            record(&p.target[&y].body.metadata, "user.tag"),
+            Some(b"red".as_slice())
+        );
+    }
+
+    /// Folding it away would take a name only it has.
+    #[test]
+    fn a_copy_with_a_name_the_file_lacks_is_not_folded_away() {
+        let mut t = T::new();
+        linked_on_the_server(&mut t, &["one", "two"], file("shared"));
+        let first = ObjectId::random();
+        let other = ObjectId::random();
+        t.local
+            .insert(first, lnode(at("one"), file("shared"), meta(0o644)));
+        let mut n = lnode(at("two"), file("shared"), meta(0o644));
+        n.links.insert(at("mine"));
+        t.local.insert(other, n);
+        let p = t.run();
+        let (kept, adopter) = if p.adopted.contains_key(&first) {
+            (other, first)
+        } else {
+            (first, other)
+        };
+        assert!(p.target.contains_key(&kept), "{:?}", p.target);
+        assert!(!p.target.contains_key(&adopter));
+    }
+
+    /// Folding it in would remove what it alone holds before the file here holds it too.
+    #[test]
+    fn a_copy_with_something_the_file_here_would_not_hold_stays_a_listed_conflict_copy() {
+        let mut t = T::new();
+        let y = linked_on_the_server(&mut t, &["one", "two"], file("shared"));
+        let a = ObjectId::random();
+        let b = ObjectId::random();
+        t.local.insert(
+            a,
+            lnode(at("one"), file("shared"), with(0o644, &[("user.a", "1")])),
+        );
+        t.local.insert(
+            b,
+            lnode(at("two"), file("shared"), with(0o644, &[("user.b", "2")])),
+        );
+        let p = t.run();
+        let (kept, lost_name) = if p.adopted.contains_key(&a) {
+            (b, "two")
+        } else {
+            (a, "one")
+        };
+        let copy = &p.target[&kept];
+        assert_ne!(copy.links, [at(lost_name)].into());
+        assert_eq!(
+            copy.conflict_of,
+            Some(ConflictOf {
+                object: y,
+                competing_revision: t.remote.nodes[&y].rev,
+            })
+        );
+    }
+
+    /// Found by review: the same new name with other bytes was kept beside, but in no inbox.
+    #[test]
+    fn a_new_name_the_server_has_with_other_bytes_is_a_listed_conflict() {
+        let mut t = T::new();
+        let x = ObjectId::random();
+        t.local
+            .insert(x, lnode(at("new"), file("mine"), meta(0o644)));
+        let y = t.remote_add(at("new"), file("theirs"), meta(0o644));
+        let p = t.run();
+        assert_eq!(
+            p.target[&x].conflict_of,
+            Some(ConflictOf {
+                object: y,
+                competing_revision: t.remote.nodes[&y].rev,
+            })
+        );
+        assert!(p.target[&y].conflict_of.is_none());
     }
 
     /// Found by review: a file unobservable after this device pushed it stood for the older base,

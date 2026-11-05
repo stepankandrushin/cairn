@@ -509,9 +509,13 @@ fn stored_terms(
             &node.metadata,
         )),
         (Some(k), _) if node.metadata_incomplete => same(k.body.metadata.clone()),
-        // Known to the server, but this client has no record of having matched it: the server's
-        // record stands, and is applied here against what is really on disk.
-        (Some(k), _) => (k.body.metadata.clone(), node.metadata.clone()),
+        // Known to the server, but this client has no record of having matched it, as after joining:
+        // the two records join as a copy and the server's do at adoption, and what that gives is
+        // applied here against what is really on disk.
+        (Some(k), _) => (
+            crate::merge::join_metadata(&k.body.metadata, &node.metadata, "this device").0,
+            node.metadata.clone(),
+        ),
         (None, _) => same(node.metadata.clone()),
     }
 }

@@ -113,7 +113,11 @@ universally force NFD. Each folder picks a policy:
 mapping or a conflict. A rename made for compatibility must not break a relative symlink that points
 at it. Until those policies exist, a name the filesystem refuses, or one it holds as the same name as
 another here, is out of view on that device, as if excluded: reported on every sync, never retried, so it
-holds nothing else back, and it comes down once the server's entry is renamed or the twin here is gone.
+holds nothing else back, and it comes down once the server's entry is renamed or the twin here is gone, or
+renamed to it. The other way round, something new here at a name the server has in that folder in
+another form this filesystem takes for the same (decomposed on APFS, or in another case where case
+folds) waits, reported with both names, until it is renamed to the server's form: it would go up as a
+second name, folders whole, for every device that keeps names as bytes to hold both.
 
 ## Sync
 
@@ -146,7 +150,7 @@ record yet; a removal of a just-arrived file can be undone by the server's copy,
 | Content on one, metadata or rename on the other | Apply both |
 | Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox, open until the copy is deleted, renamed or moved, which is how a person deals with one. Inside a git directory the copy is `name.conflict-hostname-2026-10-31`, a name git takes: a copy of a branch is a branch to merge, where a space in `refs/` breaks the repository |
 | Edit against delete | The edit survives, and it is reported. This includes each side removing a different hard link of a file someone edited |
-| Same new name, different objects | Identical content or two directories become one object; otherwise keep both under a conflict name |
+| Same new name, different objects | Identical content or two directories become one object. With no base its metadata still merges field by field, each side's own: what only one has stays, and where both have a value the server's stands and the other is in the activity log (times and owners, which differ between any two copies, without an entry). A file the server holds under several names takes separate equal copies at them as its links, the copy with the most of its own staying, unless another has something the file would not hold. Otherwise keep both under a conflict name, in the conflict inbox like any other |
 | Concurrent moves that would form a cycle | The server rejects the second; that client rebases |
 
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh

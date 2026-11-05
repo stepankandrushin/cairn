@@ -925,6 +925,26 @@ impl<'a> Applier<'a> {
 
     /// Move local files aside as conflict copies, durably marked as the new objects they now are.
     fn make_copies(&mut self, plan: &Plan) -> Result<()> {
+        // Something new kept beside the server's at a name both took is a conflict copy too, and must
+        // say so in whichever later run it goes up: the same mark a copy made below has.
+        let mut join_copies = Vec::new();
+        for (id, t) in &plan.target {
+            let (Some(of), Some(cur)) = (&t.conflict_of, self.cur.get(id)) else {
+                continue;
+            };
+            let Some(fp) = &cur.fp else {
+                continue;
+            };
+            let intent = CopyIntent {
+                copy: *id,
+                dev: fp.dev,
+                ino: fp.ino,
+                is: Some((cur.kind, fp.btime)),
+                conflict_of: of.clone(),
+            };
+            join_copies.push((format!("{INTENT_COPY}{id}"), intent));
+        }
+        self.root.state.put_intents(&join_copies)?;
         for copy in &plan.copies {
             let display = copy
                 .moves
@@ -1370,7 +1390,7 @@ impl<'a> Applier<'a> {
                 let here = c.content == t.body.content
                     && c.apply_from == t.body.metadata
                     && c.links == t.links;
-                if here || c.fp.is_none() {
+                if here || c.fp.is_none() || (c.content == t.body.content && self.unmatched(*id)) {
                     continue;
                 }
             }
@@ -1419,7 +1439,8 @@ impl<'a> Applier<'a> {
             ) else {
                 continue;
             };
-            if r.rev == cairn_protocol::RevisionId::ZERO || c.fp.is_none() {
+            if r.rev == cairn_protocol::RevisionId::ZERO || c.fp.is_none() || self.unmatched(parent)
+            {
                 continue;
             }
             at.insert(parent, marks.len());
@@ -1434,6 +1455,15 @@ impl<'a> Applier<'a> {
                 },
             ));
         }
+    }
+
+    /// Here before this run, as a joining device's files are, with no record of ever having matched
+    /// the server's: its next scan joins the two records again, whatever got there, so there is nothing
+    /// for a mark to tell apart, and one would make the server's whole record look arrived.
+    fn unmatched(&self, id: ObjectId) -> bool {
+        self.rows
+            .get(&id)
+            .is_some_and(|r| r.applied.is_none() && r.synced.is_none())
     }
 
     /// What is recorded and in step with the server needs no mark any more. What the target only shares

@@ -20,7 +20,13 @@ cairn-cli = { workspace = true, features = ["failpoints"] }
 cairn-server = { workspace = true, features = ["failpoints"] }
 cairn-engine = { workspace = true, features = ["failpoints"] }
 cairn-protocol.workspace = true
+cairn-failpoint.workspace = true
 anyhow.workspace = true
 rand.workspace = true
-rustix.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

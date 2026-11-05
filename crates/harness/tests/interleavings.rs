@@ -3,7 +3,6 @@
 
 mod common;
 use common::*;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
@@ -16,11 +15,30 @@ fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
 
 /// Run a sync on a thread, paused at a failpoint; `during` acts in the gap.
 fn sync_with_gap(sb: &Sandbox, d: &Device, point: &str, during: impl FnOnce()) -> Run {
+    sync_with_gap_env(sb, d, point, &[], during)
+}
+
+fn sync_with_gap_env(
+    sb: &Sandbox,
+    d: &Device,
+    point: &str,
+    env: &[(&str, &str)],
+    during: impl FnOnce(),
+) -> Run {
     let gate: PathBuf = sb.path(&format!("gate-{:x}", rand::random::<u32>()));
     std::fs::create_dir(&gate).unwrap();
     let pause = format!("{point}:{}", gate.display());
     let device = d.clone();
-    let worker = std::thread::spawn(move || device.sync_env(&[("CAIRN_FP_PAUSE", &pause)]));
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let worker = std::thread::spawn(move || {
+        let mut all: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        all.push(("CAIRN_FP_PAUSE", &pause));
+        device.sync_env(&all)
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !gate.join("reached").exists() {
         assert!(
@@ -237,16 +255,6 @@ fn a_tree_pushed_and_emptied_before_finishing_still_pauses() {
     assert!(b.exists("d/30"));
 }
 
-fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-    let status = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(from)
-        .arg(to)
-        .status()
-        .unwrap();
-    assert!(status.success());
-}
-
 #[test]
 fn a_server_restored_from_backup_is_noticed_and_rejoining_loses_nothing() {
     let (sb, mut server, a, b) = pair("rollback");
@@ -334,9 +342,8 @@ fn a_crash_while_updating_hard_links_does_not_split_them() {
     let p = converge(&[&a, &b]);
     assert_eq!(p.entries[&b"two".to_vec()].content, b"from b");
     for d in [&a, &b] {
-        let m = std::fs::metadata(d.path("one")).unwrap();
-        assert_eq!(m.nlink(), 3, "the links split on {}", d.name);
-        assert_eq!(m.ino(), std::fs::metadata(d.path("three")).unwrap().ino());
+        assert_eq!(nlink(&d.path("one")), 3, "the links split on {}", d.name);
+        assert_eq!(inode(&d.path("one")), inode(&d.path("three")));
     }
 }
 
@@ -367,18 +374,27 @@ fn a_rejoining_copy_with_other_metadata_leaves_a_log_entry() {
     let c = sb.path("c");
     std::fs::create_dir(&c).unwrap();
     std::fs::write(c.join("f"), "same").unwrap();
-    chmod(&c.join("f"), 0o750);
+    // On Windows a file holds its write bits alone.
+    let mode = if cfg!(windows) { 0o444 } else { 0o750 };
+    chmod(&c.join("f"), mode);
     let d = Device {
         root: c,
         name: "c".into(),
     };
     run_init(&s, &d);
     let run = d.synced();
-    assert!(run.stdout.contains("this device had 750"), "{}", run.text());
+    assert!(
+        run.stdout.contains(&format!("this device had {mode:o}")),
+        "{}",
+        run.text()
+    );
     let log = d.cairn(&["log"]).expect_ok();
     assert!(log.stdout.contains("note: mode"), "{}", log.text());
 }
 
+/// Not on Windows: a clash takes two changes of one field from a third value, and of a mode a Windows
+/// file holds two, writable or read-only.
+#[cfg(unix)]
 #[test]
 fn the_loser_of_a_metadata_conflict_is_in_the_log_with_nothing_else_to_push() {
     let (_sb, _s, a, b) = pair("note");
@@ -524,6 +540,8 @@ fn children_of_a_pushed_directory_that_cannot_be_read_are_not_deleted() {
     converge(&[&a, &b]);
 }
 
+/// Not on Windows, where a folder holds no write bits.
+#[cfg(unix)]
 #[test]
 fn a_crash_while_updating_a_hard_link_in_a_read_only_directory_does_not_split_it() {
     if is_root() {
@@ -544,15 +562,11 @@ fn a_crash_while_updating_a_hard_link_in_a_read_only_directory_does_not_split_it
     let p = converge(&[&a, &b]);
     assert_eq!(p.entries[&b"ro/two".to_vec()].content, b"from b");
     for d in [&a, &b] {
-        let one = std::fs::metadata(d.path("one")).unwrap();
-        let two = std::fs::metadata(d.path("ro/two")).unwrap();
-        assert_eq!(one.ino(), two.ino(), "the link split on {}", d.name);
-        assert_eq!(two.nlink(), 2);
+        let (one, two) = (d.path("one"), d.path("ro/two"));
+        assert_eq!(inode(&one), inode(&two), "the link split on {}", d.name);
+        assert_eq!(nlink(&two), 2);
     }
-    assert_eq!(
-        std::fs::metadata(a.path("ro")).unwrap().mode() & 0o777,
-        0o555
-    );
+    assert_eq!(mode_of(&a.path("ro")) & 0o777, 0o555);
 }
 
 #[test]
@@ -628,18 +642,14 @@ fn hard_links_across_commits_of_a_big_change_all_stay() {
     for d in [&a, &b] {
         for i in 0..7_000 {
             let name = format!("d{}/{i}", i / 500);
-            assert_eq!(
-                std::fs::metadata(d.path(&name)).unwrap().nlink(),
-                3,
-                "{name} on {}",
-                d.name
-            );
+            assert_eq!(nlink(&d.path(&name)), 3, "{name} on {}", d.name);
         }
     }
     converge(&[&a, &b]);
 }
 
-/// Swapped after the scan and before apply opens anything: the open itself must refuse the link.
+/// Swapped after the scan and before apply opens anything: the open itself must refuse the link. On
+/// Windows the link is a junction.
 #[test]
 fn a_parent_swapped_for_a_symlink_before_apply_opens_it_does_not_redirect_it() {
     let (sb, _s, a, b) = pair("symlink-before-open");
@@ -659,7 +669,7 @@ fn a_parent_swapped_for_a_symlink_before_apply_opens_it_does_not_redirect_it() {
     let moved = sb.path("moved-away");
     let _ = sync_with_gap(&sb, &a, "apply.prefetched", || {
         std::fs::rename(a.path("d"), &moved).unwrap();
-        std::os::unix::fs::symlink(&outside, a.path("d")).unwrap();
+        dir_link(&outside, &a.path("d"));
     });
     assert_eq!(
         std::fs::read_dir(&outside).unwrap().count(),
@@ -667,7 +677,7 @@ fn a_parent_swapped_for_a_symlink_before_apply_opens_it_does_not_redirect_it() {
         "something arrived outside the root"
     );
 
-    std::fs::remove_file(a.path("d")).unwrap();
+    remove_dir_link(&a.path("d"));
     std::fs::rename(&moved, a.path("d")).unwrap();
     let p = converge(&[&a, &b]);
     has_version(&p, b"from remote");
@@ -725,6 +735,16 @@ fn the_base_does_not_move_past_what_could_not_be_read_with_an_edit_too() {
 
 #[test]
 fn an_edit_between_the_last_look_and_the_replacement_survives() {
+    edit_between_the_last_look_and_the_replacement(&[]);
+}
+
+/// Where the filesystem cannot swap two names, as NTFS cannot: a rename over the name took the edit.
+#[test]
+fn an_edit_between_the_last_look_and_the_replacement_survives_without_a_swap() {
+    edit_between_the_last_look_and_the_replacement(&[("CAIRN_FP_UNSUPPORTED", "fs.exchange")]);
+}
+
+fn edit_between_the_last_look_and_the_replacement(env: &[(&str, &str)]) {
     let (sb, _s, a, b) = pair("gap-replace");
     a.write("f", "base");
     a.write("keep", "k");
@@ -732,7 +752,7 @@ fn an_edit_between_the_last_look_and_the_replacement_survives() {
     b.synced();
     b.write("f", "from b");
     b.synced();
-    let _ = sync_with_gap(&sb, &a, "apply.replace.before_rename", || {
+    let _ = sync_with_gap_env(&sb, &a, "apply.replace.before_rename", env, || {
         std::fs::write(a.path("f"), "typed in the gap").unwrap();
     });
     let p = converge(&[&a, &b]);
@@ -768,9 +788,9 @@ fn a_same_size_same_mtime_edit_survives_relink_recovery() {
     b.synced();
     let run = a.cairn_env(&["sync"], &[("CAIRN_FP_CRASH", "apply.replace.relink")]);
     assert!(run.was_killed(), "{}", run.text());
-    let meta = std::fs::symlink_metadata(a.path("two")).unwrap();
+    let (sec, nsec) = mtime_of(&a.path("two"));
     std::fs::write(a.path("two"), "BASE").unwrap();
-    set_mtime(&a.path("two"), meta.mtime(), meta.mtime_nsec());
+    set_mtime(&a.path("two"), sec, nsec);
     a.synced();
     let p = converge(&[&a, &b]);
     has_version(&p, b"BASE");
@@ -796,6 +816,8 @@ fn a_directory_moved_on_both_sides_before_finishing_does_not_jam_pushes() {
     has_version(&p, b"x");
 }
 
+/// Not on Windows, which makes no FIFOs in a folder.
+#[cfg(unix)]
 #[test]
 fn a_fifo_in_the_way_does_not_hold_back_everything_else() {
     let (_sb, _s, a, b) = pair("fifo-blocks");
@@ -899,7 +921,8 @@ fn many_small_files_go_up_in_several_requests() {
 
 /// A conflict copy's mark lives until the next finished sync. Here the copy is gone by then, deleted on
 /// both sides, and a symlink has its inode number: under the copy's identity the server refuses that
-/// symlink on every round, and the sync never finishes.
+/// symlink on every round, and the sync never finishes. Not on Windows, which holds no symlinks yet.
+#[cfg(unix)]
 #[test]
 fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
     let (_sb, _s, a, b) = pair("copy-ino");
@@ -918,14 +941,14 @@ fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
     b.synced();
 
     let copy = a.path(&copies[0]);
-    let ino = std::fs::metadata(&copy).unwrap().ino();
+    let ino = inode(&copy);
     std::fs::remove_file(&copy).unwrap();
     let mut made = Vec::new();
     let mut reused = false;
     for i in 0..2000 {
         let path = a.path(&format!("try-{i}"));
         std::os::unix::fs::symlink("f", &path).unwrap();
-        if std::fs::symlink_metadata(&path).unwrap().ino() == ino {
+        if inode(&path) == ino {
             std::fs::rename(&path, a.path("link")).unwrap();
             reused = true;
             break;

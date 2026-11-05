@@ -33,7 +33,9 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   a bug; about 30 minutes with GitHub's `CAIRN_SEEDS=200`. scripts/release.sh — a release.
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.
 - crates/harness/tests/ — the failure tests. A failing seed reproduces with `CAIRN_SEED=n`, and its log
-  and kept directory say what happened: trust the oracle until a trace proves it wrong.
+  and kept directory say what happened: trust the oracle until a trace proves it wrong. They run on
+  Windows too, outside CI, by `cargo test -p cairn-harness`; what Windows does not hold is split out with
+  `#[cfg(unix)]`, each with its reason.
 - tray/ — the tray, its own Cargo workspace outside CI, as it needs a desktop's webview; built on macOS
   and Windows.
 - agents/maintainer.md — remotes, publishing and releases; before any of those. It and history/ exist only

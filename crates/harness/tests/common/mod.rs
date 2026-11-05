@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -45,10 +47,24 @@ impl Drop for Sandbox {
             eprintln!("kept for inspection: {}", self.dir.display());
         } else {
             // Trees under test may hold read-only directories.
+            #[cfg(unix)]
             let _ = Command::new("chmod")
                 .args(["-R", "u+rwx"])
                 .arg(&self.dir)
                 .output();
+            // And on Windows read-only files, and what `chmod` made unreadable.
+            #[cfg(windows)]
+            if std::fs::remove_dir_all(&self.dir).is_err() {
+                let _ = Command::new("icacls")
+                    .arg(&self.dir)
+                    .args(["/reset", "/T", "/C", "/Q"])
+                    .output();
+                let _ = Command::new("attrib")
+                    .arg("-R")
+                    .arg(self.dir.join("*"))
+                    .args(["/S", "/D"])
+                    .output();
+            }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -73,8 +89,13 @@ impl Run {
         self.code == Some(0)
     }
 
+    /// Killed by a signal, or on Windows by a failpoint, which says so by its exit code.
     pub fn was_killed(&self) -> bool {
-        self.code.is_none()
+        if cfg!(windows) {
+            self.code == Some(cairn_failpoint::KILLED_EXIT_CODE)
+        } else {
+            self.code.is_none()
+        }
     }
 
     pub fn text(&self) -> String {
@@ -193,6 +214,7 @@ impl Server {
     }
 
     /// SIGTERM, returning how long the server took to go.
+    #[cfg(unix)]
     pub fn stop_gently(&mut self) -> std::time::Duration {
         let start = std::time::Instant::now();
         if let Some(mut c) = self.child.take() {
@@ -433,6 +455,7 @@ fn brief(e: &Entry) -> String {
     )
 }
 
+#[cfg(unix)]
 fn list_xattrs(path: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut buf = vec![0u8; 1 << 16];
@@ -454,6 +477,163 @@ fn list_xattrs(path: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
     out
 }
 
+/// Windows holds none: a record from elsewhere stays stored, never applied.
+#[cfg(windows)]
+fn list_xattrs(_: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    BTreeMap::new()
+}
+
+/// A name's bytes as the server holds them: on Windows UTF-8, or WTF-8 for a lone surrogate.
+pub fn name_bytes(name: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    return name.as_bytes().to_vec();
+    #[cfg(windows)]
+    return cairn_engine::fsops::os_name_bytes(name).unwrap();
+}
+
+/// What one `lstat` says, in the picture's terms. On Windows that is what Windows holds: a file's write
+/// bits as its read-only attribute, which is all the engine reads of a mode there, no owner, and times
+/// to NTFS's 100 ns.
+struct Lstat {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: (i64, i64),
+    nlink: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn lstat(path: &Path, m: &std::fs::Metadata) -> Lstat {
+    let _ = path;
+    Lstat {
+        mode: m.mode() & 0o7777,
+        uid: m.uid(),
+        gid: m.gid(),
+        mtime: (m.mtime(), m.mtime_nsec()),
+        nlink: m.nlink(),
+        ino: m.ino(),
+    }
+}
+
+#[cfg(windows)]
+fn lstat(path: &Path, m: &std::fs::Metadata) -> Lstat {
+    use std::os::windows::fs::MetadataExt;
+    let ft = m.file_type();
+    let mode = if ft.is_symlink() {
+        0o777
+    } else if ft.is_dir() {
+        0o755
+    } else if m.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    };
+    // FILETIME counts 100 ns from 1601.
+    let ns = (i128::from(m.last_write_time()) - 116_444_736_000_000_000) * 100;
+    let (nlink, ino) = file_links(path);
+    Lstat {
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: (
+            ns.div_euclid(1_000_000_000) as i64,
+            ns.rem_euclid(1_000_000_000) as i64,
+        ),
+        nlink,
+        ino,
+    }
+}
+
+/// The link count and file ID of an entry, which std does not give on Windows yet. A link is opened as
+/// itself, never followed.
+#[cfg(windows)]
+fn file_links(path: &Path) -> (u64, u64) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let f = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    // SAFETY: the handle is open for the call, and the struct is what it fills.
+    let info = unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        assert_ne!(
+            GetFileInformationByHandle(f.as_raw_handle(), &mut info),
+            0,
+            "{}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        info
+    };
+    (
+        u64::from(info.nNumberOfLinks),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )
+}
+
+/// A file's mode other than 0644, for a change of metadata alone: this one, or on Windows, which holds
+/// a file's write bits alone, read-only.
+pub fn other_mode(unix: u32) -> u32 {
+    if cfg!(windows) {
+        0o444
+    } else {
+        unix
+    }
+}
+
+/// A folder's mode as this platform holds it: on Windows always the same.
+pub fn dir_mode(unix: u32) -> u32 {
+    if cfg!(windows) {
+        0o755
+    } else {
+        unix
+    }
+}
+
+/// An entry's mode as the picture has it: on Windows a file's write bits alone.
+pub fn mode_of(path: &Path) -> u32 {
+    lstat(path, &std::fs::symlink_metadata(path).unwrap()).mode
+}
+
+/// An entry's modification time as the picture has it: on Windows to 100 ns.
+pub fn mtime_of(path: &Path) -> (i64, i64) {
+    lstat(path, &std::fs::symlink_metadata(path).unwrap()).mtime
+}
+
+/// How many names a file has.
+pub fn nlink(path: &Path) -> u64 {
+    lstat(path, &std::fs::symlink_metadata(path).unwrap()).nlink
+}
+
+/// A file's inode number, or on Windows its file ID.
+pub fn inode(path: &Path) -> u64 {
+    lstat(path, &std::fs::symlink_metadata(path).unwrap()).ino
+}
+
+/// One positional read of exactly this much.
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], offset: u64) {
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, offset).unwrap();
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            let n =
+                std::os::windows::fs::FileExt::seek_read(f, &mut buf[done..], offset + done as u64)
+                    .unwrap();
+            assert!(n > 0, "the file ended early");
+            done += n;
+        }
+    }
+}
+
 fn walk(
     dir: &Path,
     prefix: Vec<u8>,
@@ -464,14 +644,15 @@ fn walk(
     // The root's own record, under the empty name.
     if top {
         let m = std::fs::symlink_metadata(dir).unwrap();
+        let st = lstat(dir, &m);
         p.entries.insert(
             Vec::new(),
             Entry {
                 kind: 'd',
-                mode: m.mode() & 0o7777,
-                uid: m.uid(),
-                gid: m.gid(),
-                mtime: (m.mtime(), m.mtime_nsec()),
+                mode: st.mode,
+                uid: st.uid,
+                gid: st.gid,
+                mtime: st.mtime,
                 size: 0,
                 content: Vec::new(),
                 target: Vec::new(),
@@ -481,29 +662,33 @@ fn walk(
             },
         );
     }
-    let mut names: Vec<OsString> = std::fs::read_dir(dir)
+    let mut names: Vec<(Vec<u8>, OsString)> = std::fs::read_dir(dir)
         .unwrap()
-        .map(|e| e.unwrap().file_name())
+        .map(|e| {
+            let name = e.unwrap().file_name();
+            (name_bytes(&name), name)
+        })
         .collect();
     names.sort();
-    for name in names {
+    for (bytes, name) in names {
         if top && name == ".cairn" {
             continue;
         }
         let path = dir.join(&name);
         let m = std::fs::symlink_metadata(&path).unwrap();
+        let st = lstat(&path, &m);
         let mut rel = prefix.clone();
         if !rel.is_empty() {
             rel.push(b'/');
         }
-        rel.extend_from_slice(&name.clone().into_vec());
+        rel.extend_from_slice(&bytes);
         let ft = m.file_type();
         let mut e = Entry {
             kind: '?',
-            mode: m.mode() & 0o7777,
-            uid: m.uid(),
-            gid: m.gid(),
-            mtime: (m.mtime(), m.mtime_nsec()),
+            mode: st.mode,
+            uid: st.uid,
+            gid: st.gid,
+            mtime: st.mtime,
             size: 0,
             content: Vec::new(),
             target: Vec::new(),
@@ -515,28 +700,28 @@ fn walk(
             e.kind = 'd';
         } else if ft.is_symlink() {
             e.kind = 'l';
-            e.target = std::fs::read_link(&path)
-                .unwrap()
-                .into_os_string()
-                .into_vec();
+            e.target = name_bytes(std::fs::read_link(&path).unwrap().as_os_str());
         } else if ft.is_file() {
             e.kind = 'f';
-            e.size = m.size();
+            e.size = m.len();
             let f = std::fs::File::open(&path).unwrap();
-            e.data_runs =
-                cairn_engine::chunker::data_runs(rustix::fd::AsFd::as_fd(&f), m.size()).unwrap();
+            #[cfg(unix)]
+            let fd = rustix::fd::AsFd::as_fd(&f);
+            #[cfg(windows)]
+            let fd = std::os::windows::io::AsHandle::as_handle(&f);
+            e.data_runs = cairn_engine::chunker::data_runs(fd, m.len()).unwrap();
             // Data only: reading a huge hole as zeros would take hours.
             for (offset, len) in &e.data_runs {
                 let mut buf = vec![0u8; *len as usize];
-                std::os::unix::fs::FileExt::read_exact_at(&f, &mut buf, *offset).unwrap();
+                read_exact_at(&f, &mut buf, *offset);
                 e.content.extend_from_slice(&buf);
             }
         } else {
             e.kind = 's';
         }
-        if !ft.is_dir() && m.nlink() > 1 {
+        if !ft.is_dir() && st.nlink > 1 {
             let next = inodes.len();
-            e.link_group = Some(*inodes.entry(m.ino()).or_insert(next));
+            e.link_group = Some(*inodes.entry(st.ino).or_insert(next));
         }
         let is_dir = ft.is_dir();
         p.entries.insert(rel.clone(), e);
@@ -546,15 +731,145 @@ fn walk(
     }
 }
 
+/// A link to a folder: a symlink, or on Windows a junction, which needs no privilege to make and which
+/// sync must not follow either.
+pub fn dir_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let out = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "mklink {}: {}{}",
+            link.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `cp -a`: a copy of a tree with its metadata. On Windows each file is copied by `CopyFileExW`, which
+/// keeps its times and attributes.
+pub fn copy_tree(from: &Path, to: &Path) {
+    #[cfg(unix)]
+    {
+        let status = Command::new("cp")
+            .arg("-a")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    #[cfg(windows)]
+    {
+        let m = std::fs::symlink_metadata(from).unwrap();
+        if m.is_dir() {
+            std::fs::create_dir(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                copy_tree(&e.path(), &to.join(e.file_name()));
+            }
+        } else {
+            std::fs::copy(from, to).unwrap();
+        }
+    }
+}
+
+/// Remove what `dir_link` made: on Windows a junction is a folder.
+pub fn remove_dir_link(link: &Path) {
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
+}
+
+/// Make a file writable before a person writes to it: on Windows a read-only one refuses a write, a
+/// replacing rename and a delete, and editors ask to clear it first. Nothing to do on Unix, where the
+/// modes used here all let their owner write.
+// On Windows `set_readonly(false)` clears the attribute and nothing else.
+#[allow(clippy::permissions_set_readonly_false)]
+pub fn make_writable(path: &Path) {
+    #[cfg(windows)]
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        let mut perms = m.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    let _ = path;
+}
+
+/// Remove a file as a person would: on Windows a read-only one too, as `del /f` does, since a plain
+/// delete refuses it there.
+pub fn remove_file(path: &Path) {
+    make_writable(path);
+    std::fs::remove_file(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+#[cfg(unix)]
 pub fn set_xattr(path: &Path, name: &str, value: &[u8]) {
     rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty()).unwrap();
 }
 
+#[cfg(unix)]
 pub fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
 }
 
+/// A mode, as far as Windows holds one: a file's write bits as its read-only attribute, as the engine
+/// reads them, and no read bits as reading denied by the ACL, which is how a file or folder is made
+/// unreadable there. A folder's write bits mean nothing to Windows.
+#[cfg(windows)]
+pub fn chmod(path: &Path, mode: u32) {
+    let m = std::fs::symlink_metadata(path).unwrap();
+    if m.is_file() {
+        let mut perms = m.permissions();
+        perms.set_readonly(mode & 0o222 == 0);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+    // What this process denied, by file ID, which follows a file through a rename. A probe cannot say:
+    // opened for backup, as a folder has to be, an elevated session reads it anyway.
+    static DENIED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let id = inode(path);
+    let mut denied = DENIED.lock().unwrap();
+    let deny = mode & 0o444 == 0;
+    if deny == denied.contains(&id) {
+        return;
+    }
+    // Everyone, which includes this user.
+    let mut cmd = Command::new("icacls");
+    cmd.arg(path);
+    if deny {
+        cmd.args(["/deny", "*S-1-1-0:(RD)"]);
+    } else {
+        cmd.args(["/remove:d", "*S-1-1-0"]);
+    }
+    let out = cmd.arg("/Q").output().unwrap();
+    assert!(
+        out.status.success(),
+        "icacls {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    if deny {
+        denied.insert(id);
+    } else {
+        denied.remove(&id);
+    }
+}
+
 /// A specific modification time, to the nanosecond.
+#[cfg(unix)]
 pub fn set_mtime(path: &Path, sec: i64, nsec: i64) {
     let t = rustix::fs::Timestamps {
         last_access: rustix::fs::Timespec {
@@ -575,8 +890,37 @@ pub fn set_mtime(path: &Path, sec: i64, nsec: i64) {
     .unwrap();
 }
 
+/// A specific modification time, to NTFS's 100 ns. A link is set itself, never followed.
+#[cfg(windows)]
+pub fn set_mtime(path: &Path, sec: i64, nsec: i64) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+    };
+    let t = if sec >= 0 {
+        UNIX_EPOCH + Duration::new(sec as u64, nsec as u32)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(sec.unsigned_abs()) + Duration::from_nanos(nsec as u64)
+    };
+    let f = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+        .unwrap();
+}
+
+#[cfg(unix)]
 pub fn is_root() -> bool {
     rustix::process::geteuid().is_root()
+}
+
+/// No Windows account passes every check the way root does.
+#[cfg(windows)]
+pub fn is_root() -> bool {
+    false
 }
 
 /// Self-checking file content: a half-written file cannot pass for a whole one, and each version is

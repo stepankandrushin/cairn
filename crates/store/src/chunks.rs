@@ -25,10 +25,29 @@ pub struct FsChunkStore {
     root: PathBuf,
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
+/// Make a directory's entries durable.
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
+    open_dir(path)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("fsync directory {}", path.display()))
+}
+
+#[cfg(unix)]
+fn open_dir(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+/// Windows opens a directory only with backup semantics, and flushes it only through a handle that may
+/// add to it.
+#[cfg(windows)]
+fn open_dir(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_ADD_FILE: u32 = 0x2;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .access_mode(FILE_ADD_FILE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 impl FsChunkStore {

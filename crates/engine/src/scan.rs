@@ -3,8 +3,8 @@
 
 use crate::chunker::manifest_of;
 use crate::fsops::{
-    is_busy, is_invalid, is_not_found, is_permission, open_for_writing, AsFd, Dir, FileType,
-    OwnedFd, Stat,
+    birth_mark, is_busy, is_invalid, is_not_found, is_permission, open_for_writing, AsFd, Dir,
+    FileType, OwnedFd, Stat,
 };
 use crate::metadata::{capture, Accounts};
 use crate::root::aside_origin;
@@ -96,7 +96,7 @@ pub fn fingerprint(st: &Stat) -> Fingerprint {
         size: st.size,
         mtime: st.mtime,
         ctime: st.ctime,
-        btime: st.btime,
+        btime: birth_mark(st.btime),
     }
 }
 
@@ -178,7 +178,7 @@ pub fn aside_holds_edit(dir: &Dir, temp: &[u8], opts: &ScanOptions) -> Option<Fi
     let same_inode = opts
         .rows
         .get(&(st.dev, st.ino))
-        .filter(|row| row.fp.btime == st.btime);
+        .filter(|row| birth_mark(row.fp.btime) == birth_mark(st.btime));
     let on_record = same_inode.is_some_and(|row| Some(&row.content) == content.as_ref());
     let on_its_way = opts.arriving.iter().any(|(on_its_way, names)| {
         Some(on_its_way) == content.as_ref()
@@ -304,7 +304,7 @@ impl Walk<'_> {
             FileType::BlockDevice => self.skip(path, SkipKind::BlockDevice, None),
             FileType::Unknown => self.skip(
                 path,
-                SkipKind::ReadError,
+                SkipKind::Unsupported,
                 Some(crate::fsops::UNKNOWN_TYPE.into()),
             ),
         }
@@ -357,7 +357,7 @@ impl Walk<'_> {
         let raw = path.last().expect("an entry has a name").as_bytes();
         let fp = fingerprint(&st);
         if let Some(row) = self.opts.rows.get(&(st.dev, st.ino)) {
-            if row.fp == fp
+            if row.fp.current() == fp
                 && !row.racy
                 && !row.incomplete
                 && matches!(row.content, Content::File { .. })

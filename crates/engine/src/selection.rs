@@ -11,7 +11,7 @@
 //! changed while it was excluded merges as new, keeping both versions if they differ.
 
 use crate::client::Client;
-use crate::fsops::{is_not_found, Dir, FileType, Stat};
+use crate::fsops::{birth_mark, is_not_found, Dir, FileType, Stat};
 use crate::root::Root;
 use crate::state::Row;
 use anyhow::{anyhow, bail, Context, Result};
@@ -124,11 +124,13 @@ pub struct KeptCopy {
 impl KeptCopy {
     fn is(&self, st: &Stat) -> bool {
         // Zero: nothing was here when it was excluded, so only the path says anything.
-        self.ino != 0 && (self.dev, self.ino, self.btime) == (st.dev, st.ino, st.btime)
+        self.ino != 0
+            && (self.dev, self.ino, birth_mark(self.btime))
+                == (st.dev, st.ino, birth_mark(st.btime))
     }
 
     fn follow(&mut self, path: &[Name], st: &Stat) {
-        (self.dev, self.ino, self.btime) = (st.dev, st.ino, st.btime);
+        (self.dev, self.ino, self.btime) = (st.dev, st.ino, birth_mark(st.btime));
         self.path = path.to_vec();
     }
 }
@@ -282,8 +284,9 @@ fn held_only(base: &Tree, rows: &BTreeMap<ObjectId, Row>) -> Option<Tree> {
 /// Whether this inode is an object this device has a record of. A birth time that differs proves the
 /// number was reused.
 fn is_known(rows: &BTreeMap<ObjectId, Row>, st: &Stat) -> bool {
-    rows.values()
-        .any(|r| (r.fp.dev, r.fp.ino, r.fp.btime) == (st.dev, st.ino, st.btime))
+    rows.values().any(|r| {
+        (r.fp.dev, r.fp.ino, birth_mark(r.fp.btime)) == (st.dev, st.ino, birth_mark(st.btime))
+    })
 }
 
 impl Selection {
@@ -594,7 +597,7 @@ fn holds_any(dir: &Dir, inodes: &HashSet<(u64, u64, Option<Timestamp>)>) -> Resu
         let Some(st) = dir.try_stat(&name)? else {
             continue;
         };
-        if inodes.contains(&(st.dev, st.ino, st.btime))
+        if inodes.contains(&(st.dev, st.ino, birth_mark(st.btime)))
             || (st.file_type == FileType::Directory && holds_any(&dir.open_dir(&name)?, inodes)?)
         {
             return Ok(true);
@@ -643,7 +646,7 @@ pub fn exclude(root: &mut Root, path: &[Name], remove_local: bool) -> Result<()>
             let outside: HashSet<_> = rows
                 .iter()
                 .filter(|(id, _)| !subtree.contains(id))
-                .map(|(_, r)| (r.fp.dev, r.fp.ino, r.fp.btime))
+                .map(|(_, r)| (r.fp.dev, r.fp.ino, birth_mark(r.fp.btime)))
                 .collect();
             holds_any(&dir, &outside)?
         }
@@ -1094,7 +1097,9 @@ mod tests {
         assert!(rules.excludes(&names("secret.key"), false));
     }
 
-    /// The same number on a different birth time is a reused inode: nothing this device knows.
+    /// The same number on a different birth time is a reused inode: nothing this device knows. Not on
+    /// Windows, where a file ID is never reused.
+    #[cfg(unix)]
     #[test]
     fn a_reused_inode_number_is_not_known() {
         let mut st = Dir::open_root(std::path::Path::new("/"))

@@ -362,7 +362,9 @@ pub fn rebase_local_changes(stored: &Metadata, applied: &Metadata, scanned: &Met
         out.mtime = scanned.mtime;
         out.time_precision_ns = scanned.time_precision_ns;
     }
-    if applied.btime != scanned.btime {
+    // Where a birth time is not to be counted on, a new one is no change here: NTFS gives a file renamed
+    // where another has just gone that one's creation time, the engine's own renames included.
+    if crate::fsops::birth_mark(applied.btime) != crate::fsops::birth_mark(scanned.btime) {
         out.btime = scanned.btime;
     }
 

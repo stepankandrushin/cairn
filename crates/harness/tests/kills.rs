@@ -143,7 +143,7 @@ fn metadata_received_and_killed_does_not_undo_a_chmod_elsewhere() {
     chmod(&a.path("x"), 0o644);
     a.synced();
     b.synced();
-    chmod(&a.path("x"), 0o600);
+    chmod(&a.path("x"), other_mode(0o600));
     a.synced();
     killed_at(&b, "apply.meta.done");
     chmod(&a.path("x"), 0o644);
@@ -164,11 +164,13 @@ fn a_chmod_here_after_a_killed_update_still_goes_up() {
     set_mtime(&a.path("x"), 1_000_000, 0);
     a.synced();
     killed_at(&b, "apply.meta.done");
-    chmod(&b.path("x"), 0o640);
+    chmod(&b.path("x"), other_mode(0o640));
     converge(&[&a, &b]);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(a.path("x")).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o640, "the chmod here was lost");
+    assert_eq!(
+        mode_of(&a.path("x")) & 0o777,
+        other_mode(0o640),
+        "the chmod here was lost"
+    );
 }
 
 // --- What arrived, and went elsewhere before this device had finished ---
@@ -320,7 +322,7 @@ fn a_kill_while_a_folder_arrives_makes_no_false_note() {
     let run = b.synced();
     assert!(!run.text().contains("kept"), "{}", run.text());
     let p = converge(&[&a, &b]);
-    assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775);
+    assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, dir_mode(0o775));
 }
 
 /// A folder is made private until the last pass. Killed again before that pass, on a run that had
@@ -340,7 +342,7 @@ fn a_folder_killed_twice_while_arriving_still_gets_its_mode() {
     killed_at(&b, "apply.create.renamed");
     b.synced();
     let p = converge(&[&a, &b]);
-    assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775);
+    assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, dir_mode(0o775));
     assert_eq!(b.read("d/f"), b"1");
 }
 
@@ -824,7 +826,14 @@ fn a_revert_elsewhere_stands_while_the_tree_keeps_moving() {
 /// New content came with its metadata, and a person then changed that: the same as with no kill.
 #[test]
 fn metadata_changed_after_new_content_was_killed_goes_up() {
-    for what in ["mode", "xattr", "mtime", "new file"] {
+    // Windows holds no xattrs.
+    for what in [
+        "mode",
+        #[cfg(unix)]
+        "xattr",
+        "mtime",
+        "new file",
+    ] {
         let (_sb, _s, a, b) = pair("killed-then-metadata");
         filler(&a);
         if what != "new file" {
@@ -845,16 +854,17 @@ fn metadata_changed_after_new_content_was_killed_goes_up() {
             },
         );
         match what {
+            #[cfg(unix)]
             "xattr" => set_xattr(&b.path("x"), "user.mine", b"here"),
             "mtime" => set_mtime(&b.path("x"), 981_000_000, 0),
-            _ => chmod(&b.path("x"), 0o600),
+            _ => chmod(&b.path("x"), other_mode(0o600)),
         }
         let p = converge(&[&a, &b]);
         let x = &p.entries[b"x".as_slice()];
         match what {
             "xattr" => assert_eq!(x.xattrs[b"user.mine".as_slice()], b"here"),
             "mtime" => assert_eq!(x.mtime, (981_000_000, 0)),
-            _ => assert_eq!(x.mode & 0o777, 0o600, "{what}"),
+            _ => assert_eq!(x.mode & 0o777, other_mode(0o600), "{what}"),
         }
     }
 }
@@ -863,7 +873,6 @@ fn metadata_changed_after_new_content_was_killed_goes_up() {
 /// nobody's change. Going by what differs would take it off everyone else's disk.
 #[test]
 fn what_this_device_does_not_hold_is_no_change_after_a_kill() {
-    use std::os::unix::fs::PermissionsExt;
     let commits = |d: &Device| d.cairn(&["log"]).stdout.lines().count();
     for point in ["apply.replace.renamed", "apply.create.renamed"] {
         let sb = Sandbox::on_disk("killed-no-mode");
@@ -877,21 +886,26 @@ fn what_this_device_does_not_hold_is_no_change_after_a_kill() {
         a.synced();
         b.synced();
         a.write("x", "v2");
-        chmod(&a.path("x"), 0o640);
+        chmod(&a.path("x"), other_mode(0o640));
         a.synced();
         let before = commits(&a);
         killed_at(&b, point);
         for d in [&b, &a, &b] {
             d.synced();
         }
-        let mode = fs::metadata(a.path("x")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o640, "{point}: taken off the other device");
+        assert_eq!(
+            mode_of(&a.path("x")) & 0o777,
+            other_mode(0o640),
+            "{point}: taken off the other device"
+        );
         assert_eq!(commits(&a), before, "{point}: a commit nobody made");
     }
 }
 
 /// The same with what a filesystem cannot take: a big xattr or a time past ext4's end. Where the disk
-/// under test can take them this shows nothing, and passes.
+/// under test can take them this shows nothing, and passes. Not on Windows, which holds no xattrs and
+/// has no tmpfs to set beside its disk.
+#[cfg(unix)]
 #[test]
 fn what_this_filesystem_does_not_hold_is_no_change_after_a_kill() {
     let shm = std::path::Path::new("/dev/shm");
@@ -929,7 +943,9 @@ fn what_this_filesystem_does_not_hold_is_no_change_after_a_kill() {
 }
 
 /// Two temporaries on one inode, the first in a folder the scan cannot remove from: when the second is
-/// gone, the first is the only copy, and is looked at again before it goes the same way.
+/// gone, the first is the only copy, and is looked at again before it goes the same way. Not on
+/// Windows, where a folder holds no write bits.
+#[cfg(unix)]
 #[test]
 fn an_edit_on_two_temporaries_one_read_only_is_kept() {
     if is_root() {
@@ -1139,7 +1155,7 @@ const SCENARIOS: &[Scenario] = &[
             a.write("x", "v1");
             chmod(&a.path("x"), 0o644);
         },
-        elsewhere: |a| chmod(&a.path("x"), 0o600),
+        elsewhere: |a| chmod(&a.path("x"), other_mode(0o600)),
         here: nothing,
         after: |a| chmod(&a.path("x"), 0o644),
     },
@@ -1149,7 +1165,7 @@ const SCENARIOS: &[Scenario] = &[
             a.write("x", "v1");
             chmod(&a.path("x"), 0o644);
         },
-        elsewhere: |a| chmod(&a.path("x"), 0o600),
+        elsewhere: |a| chmod(&a.path("x"), other_mode(0o600)),
         here: nothing,
         after: nothing,
     },
@@ -1160,7 +1176,7 @@ const SCENARIOS: &[Scenario] = &[
             chmod(&a.path("x"), 0o644);
         },
         elsewhere: |a| a.write("x", "v2"),
-        here: |b| chmod(&b.path("x"), 0o600),
+        here: |b| chmod(&b.path("x"), other_mode(0o600)),
         after: |a| a.write("x", "v1"),
     },
     Scenario {

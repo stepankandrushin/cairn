@@ -13,10 +13,12 @@ cairn-failpoint.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
-rustix.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rand.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [features]
 failpoints = ["cairn-failpoint/enabled"]

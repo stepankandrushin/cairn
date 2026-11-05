@@ -124,7 +124,7 @@ pub fn headline(view: &RootView, now: Secs) -> String {
 
 /// The action a skip's text calls for, found by its reason.
 fn skip_action(text: &str) -> &'static str {
-    const KINDS: [SkipKind; 12] = [
+    const KINDS: [SkipKind; 13] = [
         SkipKind::Fifo,
         SkipKind::Socket,
         SkipKind::CharDevice,
@@ -137,6 +137,7 @@ fn skip_action(text: &str) -> &'static str {
         SkipKind::CannotHoldName,
         SkipKind::ExcludedInTheWay,
         SkipKind::ReadError,
+        SkipKind::Unsupported,
     ];
     KINDS
         .iter()

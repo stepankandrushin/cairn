@@ -3,6 +3,10 @@
 //!
 //! Unprivileged, this covers what an unprivileged user can set. Run as root (`scripts/ci.sh` does) it
 //! also covers owners, setuid, capabilities, `trusted.*` and device nodes.
+//!
+//! Not on Windows: the tree is Unix's metadata, which Windows does not hold. What it does not hold
+//! staying stored is in scenarios.rs, and its sparse files are in the engine's own tests there.
+#![cfg(unix)]
 
 mod common;
 use common::*;

@@ -229,19 +229,17 @@ fn every_kind_of_change_reaches_the_other_device_by_itself() {
     a.write("renamed/w/z/newest/f", "and again");
     wait_file(&db, b.path("renamed/w/z/newest/f"), b"and again");
 
-    // Metadata alone.
-    chmod(&a.path("new.txt"), 0o640);
+    // Metadata alone: on Windows, all a file holds of a mode is its write bits.
+    let mode = if cfg!(windows) { 0o444 } else { 0o640 };
+    chmod(&a.path("new.txt"), mode);
     let log = db.log.clone();
     wait_for("the mode to arrive", &log, || {
-        std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(b.path("new.txt")).unwrap().permissions(),
-        ) & 0o777
-            == 0o640
+        mode_of(&b.path("new.txt")) == mode
     });
 
     // A delete.
     db.wait_rest();
-    std::fs::remove_file(b.path("new.txt")).unwrap();
+    remove_file(&b.path("new.txt"));
     wait_gone(&da, a.path("new.txt"));
     std::fs::remove_dir_all(a.path("came")).unwrap();
     wait_gone(&db, b.path("came"));
@@ -261,6 +259,8 @@ fn a_git_working_tree_stays_clean_with_daemons_running() {
         let out = Command::new("git")
             .current_dir(root)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+            // Git for Windows turns line ends into CRLF on checkout by default.
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .output()
             .unwrap();
@@ -273,8 +273,12 @@ fn a_git_working_tree_stays_clean_with_daemons_running() {
     };
     git(&a.root, &["init", "-q"]);
     a.write("src/main.sh", "#!/bin/sh\necho hello\n");
-    chmod(&a.path("src/main.sh"), 0o755);
-    std::os::unix::fs::symlink("src/main.sh", a.path("run")).unwrap();
+    // What Windows does not hold, git there does not record either.
+    #[cfg(unix)]
+    {
+        chmod(&a.path("src/main.sh"), 0o755);
+        std::os::unix::fs::symlink("src/main.sh", a.path("run")).unwrap();
+    }
     a.write("node_modules/dep/index.js", "module.exports = 1;\n");
     a.write(".venv/bin/python", "#!/fake\n");
     a.write(".gitignore", ".cairn\nnode_modules\n.venv\n");
@@ -534,14 +538,7 @@ fn a_server_behind_this_device_is_noticed_without_a_reconcile() {
     a.synced();
     let backup = sb.path("backup");
     server.kill();
-    sh(
-        "cp",
-        &[
-            "-a",
-            server.data.to_str().unwrap(),
-            backup.to_str().unwrap(),
-        ],
-    );
+    copy_tree(&server.data, &backup);
     server.restart();
     a.write("second", "2");
     a.synced();
@@ -550,15 +547,8 @@ fn a_server_behind_this_device_is_noticed_without_a_reconcile() {
     da.wait_state("synced");
     std::thread::sleep(Duration::from_secs(2));
     server.kill();
-    sh("rm", &["-rf", server.data.to_str().unwrap()]);
-    sh(
-        "cp",
-        &[
-            "-a",
-            backup.to_str().unwrap(),
-            server.data.to_str().unwrap(),
-        ],
-    );
+    std::fs::remove_dir_all(&server.data).unwrap();
+    copy_tree(&backup, &server.data);
     server.restart();
     let log = da.log.clone();
     wait_for("the daemon to pause", &log, || da.log().contains("paused"));
@@ -677,7 +667,7 @@ fn metadata_refused_here_stays_in_the_status() {
             .is_some_and(|v| v.iter().any(|n| n["path"] == path))
     };
     a.write("script", "x");
-    chmod(&a.path("script"), 0o755);
+    chmod(&a.path("script"), if cfg!(windows) { 0o444 } else { 0o755 });
     wait_file(&db, b.path("script"), b"x");
     let log = db.log.clone();
     wait_for("the refusal in the status", &log, || held("script"));
@@ -698,7 +688,7 @@ fn metadata_refused_here_stays_in_the_status() {
         status.text()
     );
     // Gone with the file.
-    std::fs::remove_file(a.path("script")).unwrap();
+    remove_file(&a.path("script"));
     wait_gone(&db, b.path("script"));
     wait_for("the refusal to go", &log, || !held("script"));
 }
@@ -774,7 +764,7 @@ fn the_status_report_does_not_follow_a_symlinked_state_directory() {
     let target = sb.path("elsewhere");
     std::fs::create_dir(&target).unwrap();
     std::fs::rename(a.path(".cairn"), &held).unwrap();
-    std::os::unix::fs::symlink(&target, a.path(".cairn")).unwrap();
+    dir_link(&target, &a.path(".cairn"));
     a.write("wake", "up");
     std::thread::sleep(Duration::from_secs(3));
     assert!(
@@ -797,7 +787,9 @@ fn moving_the_rules_away_takes_effect_too() {
     wait_file(&db, b.path("held"), b"h");
 }
 
-/// A waiting request must not hold a stopping server up for its whole wait.
+/// A waiting request must not hold a stopping server up for its whole wait. Not on Windows, which has
+/// no SIGTERM: a server there stops on a console's Ctrl-C, or is killed.
+#[cfg(unix)]
 #[test]
 fn a_server_stops_at_once_with_requests_waiting() {
     let (_sb, mut server, a, b) = pair("d-stop");
@@ -812,19 +804,25 @@ fn a_server_stops_at_once_with_requests_waiting() {
 }
 
 /// The root marker gone, as when a mount has gone: it stops, says why, and carries on when it is back.
+/// On Windows the reconcile is what notices: a folder being watched there says nothing when it is
+/// itself renamed, and the watch goes with it.
 #[test]
 fn a_root_that_goes_away_pauses_deletes_nothing_and_resumes() {
     let (sb, _s, a, b) = pair("d-gone");
     for i in 0..20 {
         a.write(&format!("f{i}"), "x");
     }
-    let da = Daemon::events_only(&a);
+    let da = if cfg!(windows) {
+        Daemon::start(&a, &["--reconcile-secs", "5"])
+    } else {
+        Daemon::events_only(&a)
+    };
     let db = Daemon::events_only(&b);
     wait_file(&db, b.path("f19"), b"x");
     da.wait_rest();
     db.wait_rest();
 
-    // With everything at rest, so that only the watcher can be what notices.
+    // With everything at rest, so that only the watcher, or on Windows the reconcile, can notice.
     let held = sb.path("held-away");
     std::fs::rename(&a.root, &held).unwrap();
     std::fs::create_dir(&a.root).unwrap();
@@ -1252,8 +1250,12 @@ impl StrippingProxy {
 }
 
 // --- With real mounts ---
+//
+// Not on Windows: these need a Linux user and mount namespace. A root that goes away is tested there by
+// its marker going, above.
 
 /// Run one `inner_` test below in a private user and mount namespace.
+#[cfg(unix)]
 fn in_namespace(test: &str) {
     let probe = Command::new("unshare").args(["-Urm", "true"]).output();
     if !probe.is_ok_and(|o| o.status.success()) {
@@ -1279,6 +1281,7 @@ fn in_namespace(test: &str) {
     );
 }
 
+#[cfg(unix)]
 #[track_caller]
 fn sh(program: &str, args: &[&str]) {
     let out = Command::new(program).args(args).output().unwrap();
@@ -1289,6 +1292,7 @@ fn sh(program: &str, args: &[&str]) {
     );
 }
 
+#[cfg(unix)]
 fn device_at(server: &Server, root: &Path, name: &str) -> Device {
     let token = server.token_file.to_str().unwrap().to_string();
     let r = root.to_str().unwrap().to_string();
@@ -1315,11 +1319,13 @@ fn device_at(server: &Server, root: &Path, name: &str) -> Device {
 /// Taking a bind mount away leaves its filesystem alive, so inotify says nothing at all: this is a case
 /// only the reconcile can find. The daemon must not hold the mount busy either: a tool that keeps a
 /// disk from being unmounted gets killed by the person who wanted to.
+#[cfg(unix)]
 #[test]
 fn a_bind_mount_going_away_is_found_by_the_reconcile_and_coming_back_resumes() {
     in_namespace("inner_bind_mount");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "runs inside the namespace, through the test above"]
 fn inner_bind_mount() {
@@ -1381,11 +1387,13 @@ fn inner_bind_mount() {
 
 /// A filesystem really unmounted: the event says so at once, with the reconcile far off. Then a disk
 /// mounted with the same files on it: nothing announces that, and the watches have to follow.
+#[cfg(unix)]
 #[test]
 fn a_filesystem_unmounted_pauses_at_once_and_a_remount_resumes_with_watches() {
     in_namespace("inner_real_unmount");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "runs inside the namespace, through the test above"]
 fn inner_real_unmount() {
@@ -1982,7 +1990,6 @@ fn a_subscriber_sees_each_sync_start_and_what_it_did() {
 /// not as an edit, and not left out.
 #[test]
 fn a_change_of_metadata_alone_is_listed_where_it_arrives_too() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let (_sb, _s, a, b) = pair("d-meta");
     a.write("mode", "m");
     a.write("time", "t");
@@ -1992,13 +1999,20 @@ fn a_change_of_metadata_alone_is_listed_where_it_arrives_too() {
     let db = Daemon::events_only(&b);
     da.wait_state("synced");
     db.wait_state("synced");
-    chmod(&b.path("mode"), 0o751);
-    set_mtime(&b.path("time"), 1_000_000_000, 5);
+    // Windows holds a file's write bits alone, and times to 100 ns.
+    let (mode, nsec) = if cfg!(windows) {
+        (0o444, 500)
+    } else {
+        (0o751, 5)
+    };
+    chmod(&b.path("mode"), mode);
+    set_mtime(&b.path("time"), 1_000_000_000, nsec);
     let log = da.log.clone();
     wait_for("the mode and the time to arrive", &log, || {
-        let mode = std::fs::metadata(a.path("mode")).map(|m| m.permissions().mode() & 0o7777);
-        let time = std::fs::metadata(a.path("time")).map(|m| (m.mtime(), m.mtime_nsec()));
-        mode.is_ok_and(|m| m == 0o751) && time.is_ok_and(|t| t == (1_000_000_000, 5))
+        a.exists("mode")
+            && mode_of(&a.path("mode")) == mode
+            && a.exists("time")
+            && mtime_of(&a.path("time")) == (1_000_000_000, nsec)
     });
     da.wait_rest();
     db.wait_rest();

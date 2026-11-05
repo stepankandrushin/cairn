@@ -19,6 +19,9 @@ pub enum SkipKind {
     /// The server has something at a path where this device has something it excludes.
     ExcludedInTheWay,
     ReadError,
+    /// A kind of entry this device does not sync: on Windows a symlink, junction or mount point, made
+    /// here. Like a FIFO it is no failure: trying again changes nothing.
+    Unsupported,
 }
 
 impl SkipKind {
@@ -57,14 +60,17 @@ impl SkipKind {
             SkipKind::CannotHoldName => "this filesystem cannot hold this name",
             SkipKind::ExcludedInTheWay => "something this device excludes is at that name",
             SkipKind::ReadError => "could not be read",
+            SkipKind::Unsupported => "this kind of entry is not synced here",
         }
     }
 
     pub fn action(self) -> &'static str {
         match self {
-            SkipKind::Fifo | SkipKind::Socket | SkipKind::CharDevice | SkipKind::BlockDevice => {
-                "move it out of the sync root to stop this report"
-            }
+            SkipKind::Fifo
+            | SkipKind::Socket
+            | SkipKind::CharDevice
+            | SkipKind::BlockDevice
+            | SkipKind::Unsupported => "move it out of the sync root to stop this report",
             SkipKind::MountPoint => "sync that filesystem as its own root",
             SkipKind::PermissionDenied => {
                 "grant read access, or run with access to it, and sync again"

@@ -74,10 +74,6 @@ fn token_of(path: &Path) -> Option<u64> {
     token::parse(&std::fs::read(path).ok()?)
 }
 
-fn nlink(path: &Path) -> u64 {
-    std::os::unix::fs::MetadataExt::nlink(&std::fs::symlink_metadata(path).unwrap())
-}
-
 /// Everything a device's user might do, recording which versions they knowingly replaced.
 fn mutate(
     rng: &mut StdRng,
@@ -119,6 +115,7 @@ fn mutate(
             }
             let size = pick_size(rng);
             let (id, data) = fresh(size);
+            make_writable(path);
             std::fs::write(path, data).unwrap();
             live.insert(id);
             log.push(format!("{} edit {} {old:?} -> {id}", d.name, rel(path)));
@@ -141,6 +138,7 @@ fn mutate(
             let size = pick_size(rng);
             let (id, data) = fresh(size);
             std::fs::write(&tmp, data).unwrap();
+            make_writable(path);
             std::fs::rename(&tmp, path).unwrap();
             live.insert(id);
             log.push(format!("{} save {} {old:?} -> {id}", d.name, rel(path)));
@@ -157,7 +155,7 @@ fn mutate(
                     named_away.insert(old);
                 }
             }
-            std::fs::remove_file(path).unwrap();
+            remove_file(path);
             log.push(format!(
                 "{} rm {} {old:?} (nlink {links})",
                 d.name,
@@ -191,14 +189,11 @@ fn mutate(
             let mut inside: std::collections::BTreeMap<u64, u64> =
                 std::collections::BTreeMap::new();
             for f in &inner {
-                let ino =
-                    std::os::unix::fs::MetadataExt::ino(&std::fs::symlink_metadata(f).unwrap());
-                *inside.entry(ino).or_default() += 1;
+                *inside.entry(inode(f)).or_default() += 1;
             }
             let mut gone = Vec::new();
             for f in &inner {
-                let ino =
-                    std::os::unix::fs::MetadataExt::ino(&std::fs::symlink_metadata(f).unwrap());
+                let ino = inode(f);
                 if let Some(old) = token_of(f) {
                     if inside[&ino] == nlink(f) {
                         live.remove(&old);
@@ -207,15 +202,25 @@ fn mutate(
                         named_away.insert(old);
                     }
                 }
+                make_writable(f);
             }
             std::fs::remove_dir_all(dir).unwrap();
             log.push(format!("{} rm -r {} {gone:?}", d.name, rel(dir)));
         }
-        // chmod, xattr.
+        // chmod, xattr. Windows holds a file's write bits alone, and no xattrs.
         90..=93 if !files.is_empty() => {
             let path = &files[rng.random_range(0..files.len())];
-            chmod(path, [0o644, 0o600, 0o755, 0o640][rng.random_range(0..4)]);
+            let mode = [0o644, 0o600, 0o755, 0o640][rng.random_range(0..4)];
+            chmod(
+                path,
+                if mode == 0o644 {
+                    mode
+                } else {
+                    other_mode(mode)
+                },
+            );
         }
+        #[cfg(unix)]
         94..=95 if !files.is_empty() => {
             let path = &files[rng.random_range(0..files.len())];
             set_xattr(
@@ -233,7 +238,8 @@ fn mutate(
                 log.push(format!("{} ln {} {}", d.name, rel(from), rel(&to)));
             }
         }
-        // A symlink, sometimes dangling, sometimes leaving the tree.
+        // A symlink, sometimes dangling, sometimes leaving the tree. Windows holds none yet.
+        #[cfg(unix)]
         98..=99 => {
             let to = some_dir(rng).join(format!("{name}-sym"));
             if std::fs::symlink_metadata(&to).is_err() {
@@ -290,17 +296,15 @@ fn run_seed(seed: u64, with_rules: bool) {
                     continue;
                 }
                 let target = all[rng.random_range(0..all.len())];
-                let meta = std::fs::symlink_metadata(target).unwrap();
-                let mode = std::os::unix::fs::MetadataExt::mode(&meta) & 0o7777;
-                let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+                let (mode, ino) = (mode_of(target), inode(target));
                 chmod(target, 0o000);
                 let run = d.cairn(&["sync", "--allow-mass-delete"]);
                 // Another device may have moved it meanwhile: a rename needs no access to what moves.
                 let (files, dirs) = entries(&d.root);
-                let now = files.iter().chain(dirs.iter()).find(|p| {
-                    std::fs::symlink_metadata(p)
-                        .is_ok_and(|m| std::os::unix::fs::MetadataExt::ino(&m) == ino)
-                });
+                let now = files
+                    .iter()
+                    .chain(dirs.iter())
+                    .find(|p| std::fs::symlink_metadata(p).is_ok() && inode(p) == ino);
                 if let Some(now) = now {
                     chmod(now, mode);
                 }

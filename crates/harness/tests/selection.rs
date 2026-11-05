@@ -478,10 +478,14 @@ fn rules_that_cannot_be_used_stop_the_sync_and_upload_nothing() {
     assert!(run.stderr.contains(".cairn/ignore"), "{}", run.text());
     std::fs::write(a.path(".cairn/ignore"), b"*.key\n\xff\xfe\n").unwrap();
     assert_eq!(a.sync().code, Some(1));
-    // A symlink is not followed, and is an error too, not an absence.
-    std::fs::remove_file(a.path(".cairn/ignore")).unwrap();
-    std::os::unix::fs::symlink("/etc/hostname", a.path(".cairn/ignore")).unwrap();
-    assert_eq!(a.sync().code, Some(1));
+    // A symlink is not followed, and is an error too, not an absence. A file symlink on Windows needs a
+    // privilege or developer mode.
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(a.path(".cairn/ignore")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", a.path(".cairn/ignore")).unwrap();
+        assert_eq!(a.sync().code, Some(1));
+    }
     assert!(on_server(&sb, &server, "probe").is_empty());
 }
 
@@ -887,6 +891,8 @@ fn a_kill_between_giving_up_and_removing_does_not_undo_a_delete_from_elsewhere()
 }
 
 /// A delete from elsewhere, undone, while a sync here has not finished: a restore must hold.
+/// Not on Windows, which makes no FIFOs in a folder.
+#[cfg(unix)]
 #[test]
 fn a_restore_holds_while_another_device_cannot_finish_its_sync() {
     let (_sb, _s, a, b) = pair("sel-restore-stuck");
@@ -1093,13 +1099,7 @@ fn a_kept_copy_stays_out_when_the_root_is_restored_from_a_backup() {
     a.write("d/private", "private");
     a.synced();
     let held = sb.path("backup");
-    let copied = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(&a.root)
-        .arg(&held)
-        .status()
-        .unwrap();
-    assert!(copied.success());
+    copy_tree(&a.root, &held);
     std::fs::remove_dir_all(&a.root).unwrap();
     std::fs::rename(&held, &a.root).unwrap();
     let run = a.synced();
@@ -1298,7 +1298,9 @@ fn excluding_a_path_something_else_was_moved_to_is_refused() {
 }
 
 /// A file regenerated at an excluded path, on an inode number just freed by something this device
-/// knows: a reused number is not that thing, so it stays out.
+/// knows: a reused number is not that thing, so it stays out. Not on Windows: an NTFS file ID carries a
+/// sequence number, so a freed one never comes back.
+#[cfg(unix)]
 #[test]
 fn a_regenerated_copy_on_a_reused_inode_stays_out() {
     let (sb, server, a, b) = pair("sel-reuse");
@@ -1310,7 +1312,7 @@ fn a_regenerated_copy_on_a_reused_inode_stays_out() {
     b.synced();
     a.synced();
     a.cairn(&["exclude", "conf.local"]).expect_ok();
-    let old = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(a.path("old.txt")).unwrap());
+    let old = inode(&a.path("old.txt"));
     std::fs::remove_file(a.path("old.txt")).unwrap();
     std::fs::remove_file(a.path("conf.local")).unwrap();
     // Until the number comes back, as it soon does on ext4.
@@ -1318,7 +1320,7 @@ fn a_regenerated_copy_on_a_reused_inode_stays_out() {
     for i in 0..2000 {
         let tmp = a.path(&format!("tmp{i}"));
         std::fs::write(&tmp, "API_KEY=secret").unwrap();
-        if std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&tmp).unwrap()) == old {
+        if inode(&tmp) == old {
             std::fs::rename(&tmp, a.path("conf.local")).unwrap();
             reused = true;
             break;
@@ -1909,10 +1911,6 @@ fn an_edit_elsewhere_while_one_name_of_a_hard_link_is_hidden_is_not_rewound() {
     assert_eq!(b.read("outside"), b"v2", "{}", run.text());
 }
 
-fn nlink(path: &std::path::Path) -> u64 {
-    std::os::unix::fs::MetadataExt::nlink(&std::fs::metadata(path).unwrap())
-}
-
 #[test]
 fn a_rule_file_that_cannot_be_read_stops_the_sync() {
     if is_root() {
@@ -1928,6 +1926,8 @@ fn a_rule_file_that_cannot_be_read_stops_the_sync() {
     assert!(on_server(&sb, &server, "probe").is_empty());
 }
 
+/// Not on Windows, which makes no FIFOs in a folder.
+#[cfg(unix)]
 #[test]
 fn a_rule_file_that_is_a_fifo_stops_the_sync_rather_than_reading_as_no_rules() {
     let (sb, server, a, _b) = pair("sel-fifo");

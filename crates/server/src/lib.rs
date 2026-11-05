@@ -16,7 +16,6 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
@@ -295,11 +294,12 @@ fn init(data: &FsPath) -> Result<()> {
     }
     Repo::open(data)?;
     let token = hex::encode(rand::random::<[u8; 32]>());
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&token_path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // Windows has no mode: who reads the token is up to the data directory's ACL.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&token_path)?;
     f.write_all(token.as_bytes())?;
     f.sync_all()?;
     println!("initialized {}", data.display());
@@ -308,12 +308,18 @@ fn init(data: &FsPath) -> Result<()> {
 }
 
 async fn shutdown_signal(app: Arc<App>) {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
     }
+    // Windows has no SIGTERM: a console's Ctrl-C or Ctrl-Break, or a kill.
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
     app.closing.send_replace(true);
 }
 

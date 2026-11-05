@@ -7,7 +7,8 @@
 mod common;
 use common::*;
 use std::collections::BTreeSet;
-use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -22,7 +23,8 @@ struct World {
 
 /// Device `a` holds unsynced edits of every kind, and the server holds changes it has not seen, so
 /// one `a` sync exercises every path: conflict copies, moves through the stage, a read-only
-/// directory, deletes, new content, hard links, metadata, uploads.
+/// directory, deletes, new content, hard links, metadata, uploads. On Windows, what it holds of those:
+/// no symlinks or xattrs, a file's write bits alone, and no folder that refuses a write.
 fn world(server_env: Vec<(String, String)>) -> World {
     let sb = Sandbox::fast("matrix");
     let server = Server::start_with(sb.path("server"), server_env);
@@ -62,6 +64,7 @@ fn world(server_env: Vec<(String, String)>) -> World {
     base("keep1", 10, &mut live);
     base("keep2", 10, &mut live);
     std::fs::hard_link(a.path("hard/first"), a.path("hard/second")).unwrap();
+    #[cfg(unix)]
     symlink("keep1", a.path("a-link")).unwrap();
     a.synced();
     chmod(&a.path("read-only"), 0o555);
@@ -87,7 +90,7 @@ fn world(server_env: Vec<(String, String)>) -> World {
     std::fs::rename(b.path("swap-remote/one"), b.path("swap-remote/tmp")).unwrap();
     std::fs::rename(b.path("swap-remote/two"), b.path("swap-remote/one")).unwrap();
     std::fs::rename(b.path("swap-remote/tmp"), b.path("swap-remote/two")).unwrap();
-    chmod(&b.path("meta-remote"), 0o600);
+    chmod(&b.path("meta-remote"), other_mode(0o600));
     let (i, d) = tok(160);
     b.write("hard/first", d);
     live.insert(i);
@@ -105,6 +108,7 @@ fn world(server_env: Vec<(String, String)>) -> World {
     b.write("read-only/from-remote", d);
     live.insert(i);
     chmod(&b.path("read-only"), 0o555);
+    #[cfg(unix)]
     symlink("keep2", b.path("b-link")).unwrap();
     b.synced();
 
@@ -133,9 +137,12 @@ fn world(server_env: Vec<(String, String)>) -> World {
     let (i, d) = tok(40);
     a.write("new-local/small", d);
     live.insert(i);
-    chmod(&a.path("keep1"), 0o640);
-    set_xattr(&a.path("keep2"), "user.tag", b"v");
-    symlink("/somewhere", a.path("new-link")).unwrap();
+    chmod(&a.path("keep1"), other_mode(0o640));
+    #[cfg(unix)]
+    {
+        set_xattr(&a.path("keep2"), "user.tag", b"v");
+        symlink("/somewhere", a.path("new-link")).unwrap();
+    }
     std::fs::remove_dir_all(a.path("tree-to-delete")).unwrap();
     live.remove(&tree_to_delete);
     World {
@@ -173,13 +180,9 @@ fn check_settled(w: &mut World, context: &str) {
     let stage = std::fs::read_dir(w.a.path(".cairn/stage")).unwrap().count();
     assert_eq!(stage, 0, "{context}: entries left in the stage");
     // The read-only directory is read-only again, whatever was relaxed.
-    let mode = std::fs::metadata(w.a.path("read-only"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
     assert_eq!(
-        mode, 0o555,
+        mode_of(&w.a.path("read-only")) & 0o777,
+        dir_mode(0o555),
         "{context}: a relaxed directory kept its relaxed mode"
     );
     let report = w.server.fsck();
@@ -192,11 +195,9 @@ fn check_settled(w: &mut World, context: &str) {
     );
     // New content reached every name of the hard-linked file, and they are still one file.
     for d in [&w.a, &w.b] {
-        let one = std::fs::metadata(d.path("hard/first")).unwrap();
-        let two = std::fs::metadata(d.path("hard/second")).unwrap();
         assert_eq!(
-            std::os::unix::fs::MetadataExt::ino(&one),
-            std::os::unix::fs::MetadataExt::ino(&two),
+            inode(&d.path("hard/first")),
+            inode(&d.path("hard/second")),
             "{context}: a hard link was split on {}",
             d.name
         );
@@ -270,6 +271,8 @@ const REQUIRED_CLIENT_STEPS: &[&str] = &[
     "apply.meta.done",
     "apply.mkdir.done",
     "apply.move.done",
+    // Windows has no folder that refuses a write, to relax.
+    #[cfg(unix)]
     "apply.relax.done",
     "apply.replace.before_rename",
     "apply.replace.renamed",

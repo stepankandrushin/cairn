@@ -1,7 +1,7 @@
 //! A server's data directory: chunks plus metadata, and the rule tying them together. A commit is
 //! accepted only if every chunk it names is already durable (invariant 1).
 
-use crate::chunks::{ChunkStore, FsChunkStore};
+use crate::chunks::{sync_dir, ChunkStore, FsChunkStore};
 use crate::meta::{CommitOutcome, MetaStore};
 use crate::sqlite::SqliteStore;
 use anyhow::{Context, Result};
@@ -23,21 +23,41 @@ pub struct Repo {
     _lock: File,
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
+/// The data directory's lock, held exclusively until the process ends however it ends.
+#[cfg(unix)]
+fn lock(root: &Path) -> Result<File> {
+    let lock = File::create(root.join("lock")).context("create the data directory's lock file")?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| anyhow::anyhow!("another cairn-server holds {}", root.display()))?;
+    Ok(lock)
+}
+
+/// On Windows the lock is the file open and shared with no one.
+#[cfg(windows)]
+fn lock(root: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(root.join("lock"))
+        .or_else(|e| {
+            if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+                anyhow::bail!("another cairn-server holds {}", root.display());
+            }
+            Err(e).context("create the data directory's lock file")
+        })
 }
 
 impl Repo {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(root.join("ns"))?;
-        let lock =
-            File::create(root.join("lock")).context("create the data directory's lock file")?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(|_| anyhow::anyhow!("another cairn-server holds {}", root.display()))?;
+        let lock = lock(&root)?;
         let meta = SqliteStore::open(&root.join("meta.sqlite"))?;
-        sync_parent(&root)?;
+        sync_dir(&root)?;
         Ok(Self {
             root,
             meta: Mutex::new(Box::new(meta)),
@@ -70,7 +90,7 @@ impl Repo {
         let store = std::sync::Arc::new(FsChunkStore::open(
             self.root.join("ns").join(hex::encode(ns)),
         )?);
-        sync_parent(&self.root.join("ns"))?;
+        sync_dir(&self.root.join("ns"))?;
         map.insert(ns.to_string(), store.clone());
         Ok(store)
     }

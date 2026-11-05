@@ -155,6 +155,11 @@ pub fn exists_error() -> io::Error {
 }
 
 /// Whether this process passes every permission check.
+/// A birth time, where it tells a reused inode number from the file that had it: on Unix always.
+pub fn birth_mark(btime: Option<Timestamp>) -> Option<Timestamp> {
+    btime
+}
+
 pub fn is_superuser() -> bool {
     rustix::process::geteuid().is_root()
 }
@@ -577,6 +582,9 @@ impl Dir {
 
     /// Atomically swap two entries. `Ok(false)` where this filesystem cannot.
     pub fn exchange(&self, a: &[u8], b: &[u8]) -> io::Result<bool> {
+        if cairn_failpoint::unsupported("fs.exchange") {
+            return Ok(false);
+        }
         match fs::renameat_with(&self.0, os(a), &self.0, os(b), RenameFlags::EXCHANGE) {
             Ok(()) => Ok(true),
             Err(Errno::INVAL | Errno::NOSYS) => Ok(false),

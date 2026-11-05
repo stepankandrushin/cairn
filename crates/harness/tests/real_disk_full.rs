@@ -1,5 +1,7 @@
 //! A real full disk, not an injected one: a size-limited tmpfs in a private user and mount namespace.
-//! Skipped where unprivileged namespaces are forbidden; the injected matrix still runs there.
+//! Skipped where unprivileged namespaces are forbidden; the injected matrix still runs there. Not
+//! built on Windows, which has neither.
+#![cfg(unix)]
 
 mod common;
 use common::*;

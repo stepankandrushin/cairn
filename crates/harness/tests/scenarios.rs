@@ -2,7 +2,8 @@
 
 mod common;
 use common::*;
-use std::os::unix::fs::{symlink, MetadataExt};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::process::Command;
 
 fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
@@ -49,13 +50,47 @@ fn renaming_a_big_tree_moves_no_data() {
     assert_eq!(b.read("renamed/sub/7"), b"file 7");
 }
 
+/// Two names swapped elsewhere arrive as moves, and are nobody's change here. On NTFS a file renamed
+/// where another has just gone takes that one's creation time (tunneling), so the engine's own renames
+/// moved birth times: read as a reused file ID, each name became a new file, and read as a change, each
+/// a revision from the device that received them.
+#[test]
+fn a_swap_of_two_names_arrives_as_moves_and_makes_no_revision() {
+    let (_sb, _s, a, b) = pair("swap-arrives");
+    a.write("x", "was x");
+    a.write("y", "was y");
+    a.synced();
+    b.synced();
+    std::fs::rename(a.path("x"), a.path("t")).unwrap();
+    std::fs::rename(a.path("y"), a.path("x")).unwrap();
+    std::fs::rename(a.path("t"), a.path("y")).unwrap();
+    let run = a.synced();
+    assert!(
+        run.stdout.contains("0 chunks (0 bytes) uploaded"),
+        "{}",
+        run.text()
+    );
+    for _ in 0..2 {
+        let run = b.synced();
+        assert!(run.stdout.contains(" 0 commits"), "{}", run.text());
+    }
+    assert_eq!(b.read("x"), b"was y");
+    assert_eq!(b.read("y"), b"was x");
+    let run = a.synced();
+    assert!(
+        run.stdout.contains(" 0 steps applied here, 0 commits"),
+        "{}",
+        run.text()
+    );
+}
+
 #[test]
 fn chmod_is_a_metadata_revision_with_nothing_uploaded() {
     let (_sb, _s, a, b) = pair("chmod");
     a.write("script.sh", "#!/bin/sh\n");
     a.synced();
     b.synced();
-    chmod(&a.path("script.sh"), 0o755);
+    chmod(&a.path("script.sh"), other_mode(0o755));
     let run = a.synced();
     assert!(
         run.stdout.contains("0 chunks (0 bytes) uploaded"),
@@ -63,10 +98,7 @@ fn chmod_is_a_metadata_revision_with_nothing_uploaded() {
         run.text()
     );
     b.synced();
-    assert_eq!(
-        std::fs::metadata(b.path("script.sh")).unwrap().mode() & 0o7777,
-        0o755
-    );
+    assert_eq!(mode_of(&b.path("script.sh")), other_mode(0o755));
 }
 
 #[test]
@@ -291,16 +323,26 @@ fn metadata_on_both_merges_field_by_field() {
     a.write("f", "x");
     a.synced();
     b.synced();
-    chmod(&a.path("f"), 0o600);
+    chmod(&a.path("f"), other_mode(0o600));
+    // Windows holds no xattrs: the other field there is the time.
+    #[cfg(unix)]
     set_xattr(&b.path("f"), "user.from-b", b"1");
+    #[cfg(windows)]
+    set_mtime(&b.path("f"), 1_000_000_000, 0);
     a.synced();
     b.synced();
     let p = converge(&[&a, &b]);
     let e = &p.entries[&b"f".to_vec()];
-    assert_eq!(e.mode, 0o600);
+    assert_eq!(e.mode, other_mode(0o600));
+    #[cfg(unix)]
     assert_eq!(e.xattrs[&b"user.from-b".to_vec()], b"1");
+    #[cfg(windows)]
+    assert_eq!(e.mtime, (1_000_000_000, 0));
 }
 
+/// Not on Windows: a clash takes two changes of one field from a third value, and of a mode a Windows
+/// file holds two, writable or read-only. Times clash silently, as any two copies' differ.
+#[cfg(unix)]
 #[test]
 fn metadata_on_both_same_field_the_loser_is_in_the_log() {
     let (_sb, _s, a, b) = pair("metaclash");
@@ -323,7 +365,7 @@ fn hard_links_stay_linked_through_an_edit_and_a_break() {
     std::fs::hard_link(a.path("one"), a.path("two")).unwrap();
     a.synced();
     b.synced();
-    assert_eq!(std::fs::metadata(b.path("one")).unwrap().nlink(), 2);
+    assert_eq!(nlink(&b.path("one")), 2);
 
     // An edit through one name is an edit to the object: the link survives elsewhere.
     std::fs::OpenOptions::new()
@@ -334,10 +376,7 @@ fn hard_links_stay_linked_through_an_edit_and_a_break() {
     a.synced();
     b.synced();
     assert_eq!(b.read("one"), b"changed in place");
-    assert_eq!(
-        std::fs::metadata(b.path("one")).unwrap().ino(),
-        std::fs::metadata(b.path("two")).unwrap().ino()
-    );
+    assert_eq!(inode(&b.path("one")), inode(&b.path("two")));
 
     // A save by replacing breaks the link here, and that is what the other side gets.
     std::fs::write(a.path("tmp"), "replaced").unwrap();
@@ -346,17 +385,14 @@ fn hard_links_stay_linked_through_an_edit_and_a_break() {
     b.synced();
     assert_eq!(b.read("one"), b"changed in place");
     assert_eq!(b.read("two"), b"replaced");
-    assert_ne!(
-        std::fs::metadata(b.path("one")).unwrap().ino(),
-        std::fs::metadata(b.path("two")).unwrap().ino()
-    );
+    assert_ne!(inode(&b.path("one")), inode(&b.path("two")));
     converge(&[&a, &b]);
 }
 
 // --- Invariant 2: stored and applied are separate ---
 
 /// The plan's sentence: Linux uploads script.sh at 0755, a client that cannot hold the bit edits it,
-/// the new revision keeps 0755, Linux receives the edit at 0755.
+/// the new revision keeps 0755, Linux receives the edit at 0755. On Windows the bit is read-only.
 #[test]
 fn a_client_that_cannot_hold_a_mode_does_not_erase_it() {
     let sb = Sandbox::on_disk("inv2");
@@ -365,12 +401,17 @@ fn a_client_that_cannot_hold_a_mode_does_not_erase_it() {
     let other = Device::with_flags(&sb, &server, "other", &["--no-mode"]);
 
     linux.write("script.sh", "#!/bin/sh\necho 1\n");
-    chmod(&linux.path("script.sh"), 0o755);
+    chmod(&linux.path("script.sh"), other_mode(0o755));
     linux.synced();
     other.synced();
+    let applied = mode_of(&other.path("script.sh"));
     assert_eq!(
-        std::fs::metadata(other.path("script.sh")).unwrap().mode() & 0o7777 & 0o111,
-        0,
+        if cfg!(windows) {
+            applied & 0o222
+        } else {
+            applied & 0o111
+        },
+        if cfg!(windows) { 0o200 } else { 0 },
         "this client does not apply modes"
     );
     assert!(
@@ -385,12 +426,127 @@ fn a_client_that_cannot_hold_a_mode_does_not_erase_it() {
     other.synced();
     linux.synced();
     assert_eq!(linux.read("script.sh"), b"#!/bin/sh\necho 2\n");
+    assert_eq!(mode_of(&linux.path("script.sh")), other_mode(0o755));
+}
+
+/// What Windows does not hold stays stored: the rest of a mode, an owner, another platform's xattrs.
+/// Put there by a Linux device, here by a commit of the test's own, they arrive as no change, and an
+/// edit on Windows, or read-only set there, keeps them.
+#[cfg(windows)]
+#[test]
+fn what_windows_does_not_hold_stays_stored() {
+    use cairn_protocol::wire::{CommitRequest, CommitResponse};
+    use cairn_protocol::{
+        Bytes, DeviceId, ObjectId, Op, OpId, Owner, RecordKey, RevisionBody, RevisionId,
+        NS_LINUX_XATTR,
+    };
+    let (_sb, _s, a, b) = pair("windows-holds");
+    a.write("f", "made on windows");
+    a.synced();
+    b.synced();
+    let config = cairn_engine::root::open_config(&a.root).unwrap();
+    let client = cairn_engine::client::Client::new(&config).unwrap();
+    // The newest revision of what was made at `f`.
+    let latest = || -> (ObjectId, RevisionId, RevisionBody) {
+        let mut found: Option<(ObjectId, RevisionId, RevisionBody)> = None;
+        for change in client.changes(0).unwrap().changes {
+            for op in change.ops {
+                match op {
+                    Op::Create {
+                        object,
+                        revision,
+                        body,
+                        link,
+                        ..
+                    } if link.name.as_bytes() == b"f" => found = Some((object, revision, body)),
+                    Op::Update {
+                        object,
+                        revision,
+                        body,
+                        ..
+                    } if found.as_ref().is_some_and(|f| f.0 == object) => {
+                        found = Some((object, revision, body))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found.expect("f is on the server")
+    };
+
+    let (object, base, mut body) = latest();
+    body.metadata.mode = 0o755;
+    body.metadata.owner = Some(Owner {
+        uid: 4242,
+        gid: 4343,
+        user: Some(Bytes(b"ann".to_vec())),
+        group: Some(Bytes(b"staff".to_vec())),
+    });
+    body.metadata.records.insert(
+        RecordKey {
+            ns: NS_LINUX_XATTR.into(),
+            name: Bytes(b"user.from-linux".to_vec()),
+        },
+        Bytes(b"kept".to_vec()),
+    );
+    let linux = body.metadata.clone();
+    let answer = client
+        .commit(&CommitRequest {
+            op_id: OpId::random(),
+            device: DeviceId::random(),
+            device_name: "linux".into(),
+            ops: vec![Op::Update {
+                object,
+                base,
+                revision: RevisionId::random(),
+                body,
+                restored_from: None,
+            }],
+        })
+        .unwrap();
+    assert!(
+        matches!(answer, CommitResponse::Committed { .. }),
+        "{answer:?}"
+    );
+
+    // Arriving, it is no change of anyone's.
+    for d in [&a, &b] {
+        let run = d.synced();
+        assert!(run.stdout.contains(" 0 commits"), "{}", run.text());
+        assert_eq!(mode_of(&d.path("f")), 0o644);
+    }
+    assert_eq!(latest().2.metadata, linux);
+
+    // An edit on Windows keeps all of it.
+    a.write("f", "edited on windows");
+    a.synced();
+    let kept = latest().2.metadata;
     assert_eq!(
-        std::fs::metadata(linux.path("script.sh")).unwrap().mode() & 0o7777,
-        0o755
+        (kept.mode, &kept.owner, &kept.records),
+        (0o755, &linux.owner, &linux.records)
+    );
+
+    // Read-only, which Windows holds, changes the write bits alone.
+    chmod(&a.path("f"), 0o444);
+    a.synced();
+    let kept = latest().2.metadata;
+    assert_eq!(
+        (kept.mode, &kept.owner, &kept.records),
+        (0o555, &linux.owner, &linux.records)
+    );
+    b.synced();
+    assert_eq!(b.read("f"), b"edited on windows");
+    assert_eq!(mode_of(&b.path("f")), 0o444);
+    let run = b.synced();
+    assert!(
+        run.stdout.contains(" 0 steps applied here, 0 commits"),
+        "{}",
+        run.text()
     );
 }
 
+/// Not on Windows, which holds no setgid bit to set.
+#[cfg(unix)]
 #[test]
 fn setuid_and_foreign_xattrs_stay_stored_when_not_applied() {
     let sb = Sandbox::on_disk("inv2-setid");
@@ -401,21 +557,14 @@ fn setuid_and_foreign_xattrs_stay_stored_when_not_applied() {
     chmod(&a.path("tool"), 0o2755);
     a.synced();
     b.synced();
-    assert_eq!(
-        std::fs::metadata(b.path("tool")).unwrap().mode() & 0o7777,
-        0o755,
-        "setgid needs a policy"
-    );
+    assert_eq!(mode_of(&b.path("tool")), 0o755, "setgid needs a policy");
     // b changes a permission and the content; setgid is not b's to lose.
     chmod(&b.path("tool"), 0o775);
     b.write("tool", "y");
     b.synced();
     a.synced();
     assert_eq!(a.read("tool"), b"y");
-    assert_eq!(
-        std::fs::metadata(a.path("tool")).unwrap().mode() & 0o7777,
-        0o2775
-    );
+    assert_eq!(mode_of(&a.path("tool")), 0o2775);
 }
 
 // --- Invariant 5: a missing mount ---
@@ -492,12 +641,31 @@ fn sync_never_traverses_a_symlink() {
     let outside = sb.path("outside");
     std::fs::create_dir(&outside).unwrap();
     std::fs::write(outside.join("secret"), "not yours").unwrap();
-    symlink(&outside, a.path("escape")).unwrap();
-    symlink(outside.join("secret"), a.path("escape-file")).unwrap();
-    a.synced();
+    #[cfg(unix)]
+    {
+        symlink(&outside, a.path("escape")).unwrap();
+        symlink(outside.join("secret"), a.path("escape-file")).unwrap();
+    }
+    // Windows syncs no links yet: a junction made there is reported and stays here, and holds nothing
+    // else back.
+    #[cfg(windows)]
+    dir_link(&outside, &a.path("escape"));
+    let run = a.synced();
     b.synced();
     // It synced as a link with its target verbatim, and nothing behind it travelled.
+    #[cfg(unix)]
     assert_eq!(std::fs::read_link(b.path("escape")).unwrap(), outside);
+    #[cfg(windows)]
+    {
+        assert!(
+            run.stdout
+                .contains("skipped: escape: this kind of entry is not synced here"),
+            "{}",
+            run.text()
+        );
+        assert!(!b.exists("escape"));
+    }
+    let _ = run;
     let p = Picture::of(&a.root);
     assert_eq!(p.entries[&b"escape".to_vec()].kind, 'l');
     assert!(!p.entries.contains_key(b"escape/secret".as_slice()));
@@ -513,6 +681,7 @@ fn sync_never_traverses_a_symlink() {
     );
 }
 
+/// On Windows the link is a junction, as below.
 #[test]
 fn a_directory_replaced_by_a_symlink_does_not_redirect_writes() {
     let (sb, _s, a, b) = pair("symlink-swap");
@@ -526,7 +695,7 @@ fn a_directory_replaced_by_a_symlink_does_not_redirect_writes() {
     b.write("d/f", "changed remotely");
     b.synced();
     std::fs::rename(a.path("d"), sb.path("d-gone")).unwrap();
-    symlink(&outside, a.path("d")).unwrap();
+    dir_link(&outside, &a.path("d"));
 
     let _ = a.sync();
     assert_eq!(
@@ -534,6 +703,9 @@ fn a_directory_replaced_by_a_symlink_does_not_redirect_writes() {
         0,
         "nothing arrived outside the root"
     );
+    // Windows syncs no links yet: the junction stays out of view, and in the way, until it goes.
+    #[cfg(windows)]
+    remove_dir_link(&a.path("d"));
     converge(&[&a, &b]);
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
@@ -559,8 +731,12 @@ fn a_parent_swapped_for_a_symlink_during_apply_does_not_redirect_it() {
     while !gate.join("reached").exists() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    std::fs::rename(a.path("d"), sb.path("moved-away")).unwrap();
-    symlink(&outside, a.path("d")).unwrap();
+    // Windows refuses to move a folder while a file in it is open: there the race cannot happen.
+    match std::fs::rename(a.path("d"), sb.path("moved-away")) {
+        Ok(()) => dir_link(&outside, &a.path("d")),
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => panic!("{e}"),
+    }
     std::fs::write(gate.join("go"), b"").unwrap();
     let _ = worker.join().unwrap();
 
@@ -976,6 +1152,8 @@ fn a_git_working_tree_comes_out_clean_on_the_other_side() {
         let out = Command::new("git")
             .current_dir(root)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+            // Git for Windows turns line ends into CRLF on checkout by default.
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .output()
             .unwrap();
@@ -988,8 +1166,12 @@ fn a_git_working_tree_comes_out_clean_on_the_other_side() {
     };
     git(&a.root, &["init", "-q"]);
     a.write("src/main.sh", "#!/bin/sh\necho hello\n");
-    chmod(&a.path("src/main.sh"), 0o755);
-    symlink("src/main.sh", a.path("run")).unwrap();
+    // What Windows does not hold, git there does not record either.
+    #[cfg(unix)]
+    {
+        chmod(&a.path("src/main.sh"), 0o755);
+        symlink("src/main.sh", a.path("run")).unwrap();
+    }
     a.write("node_modules/dep/index.js", "module.exports = 1;\n");
     a.write(".venv/bin/python", "#!/fake\n");
     a.write(".gitignore", ".cairn\nnode_modules\n.venv\n");
@@ -1004,10 +1186,8 @@ fn a_git_working_tree_comes_out_clean_on_the_other_side() {
         "git status is not clean"
     );
     assert_eq!(git(&b.root, &["log", "--format=%s"]).trim(), "first");
-    assert_eq!(
-        std::fs::metadata(b.path("src/main.sh")).unwrap().mode() & 0o777,
-        0o755
-    );
+    #[cfg(unix)]
+    assert_eq!(mode_of(&b.path("src/main.sh")) & 0o777, 0o755);
     assert!(b.exists("node_modules/dep/index.js") && b.exists(".venv/bin/python"));
 
     // Work continues on the other machine, one at a time.
@@ -1041,6 +1221,8 @@ fn commits_made_at_once_on_two_machines_become_two_branches() {
         let out = Command::new("git")
             .current_dir(root.join("repo"))
             .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+            // Git for Windows turns line ends into CRLF on checkout by default.
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .output()
             .unwrap();
@@ -1126,7 +1308,7 @@ fn a_file_emptied_by_a_program_still_writing_it_is_not_sent_empty() {
     b.synced();
     assert_eq!(b.read("doc"), b"the first version\n");
     // However long the program takes: the kernel says it still has the file open.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         std::thread::sleep(std::time::Duration::from_millis(2200));
         let run = a.sync();

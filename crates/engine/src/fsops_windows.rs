@@ -788,6 +788,13 @@ pub fn exists_error() -> io::Error {
     error(ERROR_ALREADY_EXISTS)
 }
 
+/// A birth time, where it tells a reused inode number from the file that had it: never on NTFS. A file
+/// ID carries a sequence number, so it is never reused, and a creation time moves between files: one
+/// renamed or made where another has just gone takes that one's (tunneling), as a swap of two names does.
+pub fn birth_mark(_: Option<Timestamp>) -> Option<Timestamp> {
+    None
+}
+
 /// No Windows account passes every check the way root does.
 pub fn is_superuser() -> bool {
     false

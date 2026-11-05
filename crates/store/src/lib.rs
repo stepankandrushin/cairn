@@ -12,11 +12,20 @@ pub use meta::{CommitOutcome, MetaStore};
 pub use repo::Repo;
 pub use sqlite::SqliteStore;
 
+/// ENOSPC and EDQUOT, whose numbers differ between Unixes.
+#[cfg(target_os = "macos")]
+const DISK_FULL: &[i32] = &[28, 69];
+#[cfg(all(unix, not(target_os = "macos")))]
+const DISK_FULL: &[i32] = &[28, 122];
+/// ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL and ERROR_DISK_QUOTA_EXCEEDED.
+#[cfg(windows)]
+const DISK_FULL: &[i32] = &[112, 39, 1295];
+
 /// True when an error chain ends in a full disk or quota, so callers can report it as such.
 pub fn is_disk_full(err: &anyhow::Error) -> bool {
     err.chain().any(|e| {
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            return matches!(io.raw_os_error(), Some(28) | Some(122));
+            return io.raw_os_error().is_some_and(|c| DISK_FULL.contains(&c));
         }
         if let Some(rusqlite::Error::SqliteFailure(f, _)) = e.downcast_ref::<rusqlite::Error>() {
             return f.code == rusqlite::ErrorCode::DiskFull;

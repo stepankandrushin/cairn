@@ -32,6 +32,17 @@ pub struct Fingerprint {
     pub btime: Option<Timestamp>,
 }
 
+impl Fingerprint {
+    /// As this build records one: a birth time this platform does not count on is left out, so that a
+    /// row written before still matches.
+    pub fn current(&self) -> Fingerprint {
+        Fingerprint {
+            btime: crate::fsops::birth_mark(self.btime),
+            ..self.clone()
+        }
+    }
+}
+
 /// State this client shares with the server, ahead of the base tree: it pushed it or applied it. The
 /// common ancestor once it is known to have reached the server, or while the head equals it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

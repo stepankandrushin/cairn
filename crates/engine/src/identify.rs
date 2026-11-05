@@ -1,6 +1,7 @@
 //! Giving each scanned inode its object identity. Inodes are only hints: they get reused, and editors
 //! save by replacing the file, so a name match fills in where an inode says nothing.
 
+use crate::fsops::birth_mark;
 use crate::merge::{LNode, Shared};
 use crate::metadata::rebase_local_changes;
 use crate::scan::{ScanResult, Scanned};
@@ -28,9 +29,9 @@ pub struct CopyIntent {
 
 impl CopyIntent {
     fn marks(&self, node: &Scanned) -> bool {
-        self.is
-            .as_ref()
-            .is_none_or(|(kind, btime)| *kind == node.content.kind() && *btime == node.fp.btime)
+        self.is.as_ref().is_none_or(|(kind, btime)| {
+            *kind == node.content.kind() && birth_mark(*btime) == birth_mark(node.fp.btime)
+        })
     }
 }
 
@@ -116,10 +117,10 @@ pub fn identify(
             .filter(|id| {
                 let row = &rows[*id];
                 row.content.kind() == node.content.kind()
-                    && row.fp.btime == node.fp.btime
+                    && birth_mark(row.fp.btime) == birth_mark(node.fp.btime)
                     && !claimed.contains(*id)
             })
-            .max_by_key(|id| rows[*id].fp == node.fp);
+            .max_by_key(|id| rows[*id].fp.current() == node.fp.current());
         if let Some(id) = found {
             claimed.insert(*id);
             ids[i] = Some(*id);
@@ -757,6 +758,8 @@ mod tests {
         found_under_its_own_row(fp(7, 10, None), fp(7, 20, None));
     }
 
+    /// Not on Windows, where a file ID is never reused, and so is identity enough.
+    #[cfg(unix)]
     #[test]
     fn a_reused_inode_alone_is_no_identity() {
         let id = ObjectId::random();
@@ -799,13 +802,29 @@ mod tests {
         let at = |btime| fp(7, 10, Some(btime));
         let mark = Some((ObjectKind::File, Some(STALE_BTIME)));
         assert!(copy_found(mark, scanned(path(), at(STALE_BTIME), file())));
-        assert!(!copy_found(mark, scanned(path(), at(LIVE_BTIME), file())));
+        // On Windows a file ID is never reused, and a creation time moves between files.
+        assert_eq!(
+            copy_found(mark, scanned(path(), at(LIVE_BTIME), file())),
+            cfg!(windows)
+        );
         let link = Content::Symlink {
             target: cairn_protocol::Bytes(b"a".to_vec()),
         };
         assert!(!copy_found(mark, scanned(path(), at(STALE_BTIME), link)));
         // A mark an older version left says only the number.
         assert!(copy_found(None, scanned(path(), at(LIVE_BTIME), file())));
+    }
+
+    /// A swap of two names on NTFS swaps their creation times too (tunneling): read as a birth time,
+    /// that made each file a new one where it was, and a swap two edits.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_whose_creation_time_ntfs_moved_is_still_found_by_its_id() {
+        let id = ObjectId::random();
+        let rows = BTreeMap::from([(id, row(fp(7, 10, Some(STALE_BTIME))))]);
+        let path = vec![vec![Name::new(b"moved".to_vec()).unwrap()]];
+        let scan = scan_of(vec![scanned(path, fp(7, 20, Some(LIVE_BTIME)), file())]);
+        assert_eq!(run(&scan, &rows), vec![id]);
     }
 
     /// Missing from the carried set, the unreadable file would read as deleted.

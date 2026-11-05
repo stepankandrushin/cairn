@@ -247,9 +247,10 @@ fn scan_stable(
             }
         }
         for (path, name, fp) in &result.rescued_temps {
-            let found = rows
-                .iter()
-                .find(|(_, r)| (r.fp.dev, r.fp.ino, r.fp.btime) == (fp.dev, fp.ino, fp.btime));
+            let found = rows.iter().find(|(_, r)| {
+                (r.fp.dev, r.fp.ino, crate::fsops::birth_mark(r.fp.btime))
+                    == (fp.dev, fp.ino, fp.btime)
+            });
             let original = name
                 .strip_prefix(prefix.as_bytes())
                 .and_then(crate::root::aside_origin)

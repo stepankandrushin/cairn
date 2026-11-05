@@ -49,6 +49,9 @@
   the replacement, and that text was lost. The version here now stays.
 - A sync interrupted after making a conflict copy could stop finishing for a while, ending in "the tree kept changing
   for 12 rounds", if the copy was then deleted and a symlink or folder took its inode number. Nothing was lost.
+- On a filesystem that cannot swap two names in one step, a replacement renamed the new version over the old one,
+  and took an edit made in the moment since its last look. The old file is now held under a third name, a hard
+  link, and looked at there.
 
 ## 0.1.1
 

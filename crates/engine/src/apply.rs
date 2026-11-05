@@ -335,8 +335,13 @@ impl<'a> Applier<'a> {
         if let (Some(n), Ok(st)) = (self.cur.get_mut(&o), dir.stat(name)) {
             let now = fingerprint(&st);
             if let Some(fp) = n.fp.as_mut() {
-                if (fp.dev, fp.ino, fp.size, fp.mtime, fp.btime)
-                    == (now.dev, now.ino, now.size, now.mtime, now.btime)
+                if (
+                    fp.dev,
+                    fp.ino,
+                    fp.size,
+                    fp.mtime,
+                    fsops::birth_mark(fp.btime),
+                ) == (now.dev, now.ino, now.size, now.mtime, now.btime)
                 {
                     fp.ctime = now.ctime;
                 }
@@ -831,10 +836,10 @@ impl<'a> Applier<'a> {
         // Nothing can be at a random name, and not every filesystem can promise that.
         dir.rename_over(&tmp, &dir, &aside)?;
         hit("apply.replace.aside");
-        if dir.exchange(&aside, &name)? {
+        if swap(self.root, &dir, &aside, &name)? {
             hit("apply.replace.swapped");
             if !self.still_as_scanned(id, &dir, &aside) {
-                dir.exchange(&aside, &name)?;
+                swap(self.root, &dir, &aside, &name)?;
                 let _ = dir.unlink(&aside);
                 let _ = self.root.state.drop_intent(&relink_key);
                 return Err(StepError::Changed(
@@ -856,11 +861,11 @@ impl<'a> Applier<'a> {
             let otmp = self.root.aside_name(&oname);
             dir.hard_link(&name, &odir, &otmp)?;
             hit("apply.replace.relink");
-            if odir.exchange(&otmp, &oname)? {
+            if swap(self.root, &odir, &otmp, &oname)? {
                 hit("apply.replace.relink.swapped");
                 let was = odir.stat(&otmp)?;
                 if Some((was.dev, was.ino, was.size, was.mtime)) != replaced {
-                    odir.exchange(&otmp, &oname)?;
+                    swap(self.root, &odir, &otmp, &oname)?;
                     edited_name = true;
                 }
                 odir.unlink(&otmp)?;
@@ -1615,6 +1620,29 @@ pub fn recover(root: &mut Root) -> Result<Vec<String>> {
     Ok(notes)
 }
 
+/// Swap what two names in `dir` hold, `a` one of this run's temporaries: in one step where the filesystem
+/// can, and otherwise in three, as on NTFS. There a third name, another temporary, holds what is at `b`
+/// meanwhile, so that whenever a kill comes each file is under a name, and whatever is under a temporary
+/// is looked at by the next scan, kept if it holds an edit. A plain rename over `b` would take an edit
+/// made in the moment since the last look. False where neither works, as without hard links.
+fn swap(root: &Root, dir: &Dir, a: &[u8], b: &[u8]) -> std::io::Result<bool> {
+    if dir.exchange(a, b)? {
+        return Ok(true);
+    }
+    let held = root.aside_name(b);
+    if dir.hard_link(b, dir, &held).is_err() {
+        return Ok(false);
+    }
+    hit("apply.swap.held");
+    if let Err(e) = dir.rename_over(a, dir, b) {
+        let _ = dir.unlink(&held);
+        return Err(e);
+    }
+    hit("apply.swap.renamed");
+    dir.rename_over(&held, dir, a)?;
+    Ok(true)
+}
+
 /// Point the remaining names at the new inode, if the rename to it happened, and only where a name
 /// still holds the old file untouched: an edit made since stays where it is.
 fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
@@ -1651,13 +1679,13 @@ fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
             first_dir.hard_link(first_name.as_bytes(), &dir, &tmp)?;
             hit("recover.relink.linked");
             // Swapped, as in `replace_content`: an edit since that look is not overwritten.
-            if dir.exchange(&tmp, name.as_bytes())? {
+            if swap(root, &dir, &tmp, name.as_bytes())? {
                 hit("recover.relink.swapped");
                 let was = dir.stat(&tmp)?;
                 if (was.ino, was.size, was.mtime)
                     != (intent.old.ino, intent.old.size, intent.old.mtime)
                 {
-                    dir.exchange(&tmp, name.as_bytes())?;
+                    swap(root, &dir, &tmp, name.as_bytes())?;
                 }
                 dir.unlink(&tmp)?;
             } else {

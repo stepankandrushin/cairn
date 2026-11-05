@@ -223,11 +223,13 @@ dependencies = [
  "anyhow",
  "cairn-cli",
  "cairn-engine",
+ "cairn-failpoint",
  "cairn-protocol",
  "cairn-server",
  "rand",
  "rustix",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -255,7 +257,6 @@ dependencies = [
  "clap",
  "hex",
  "rand",
- "rustix",
  "serde",
  "serde_json",
  "tokio",

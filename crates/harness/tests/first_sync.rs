@@ -207,7 +207,11 @@ fn a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks() 
         upload_tree(&a);
         let run = a.sync();
         let context = format!("server killed at step {n} ({})", steps[n - 1]);
-        assert!(run.ok() || !server.alive(), "{context}: {}", run.text());
+        assert!(
+            run.ok() || !server.alive_after_a_kill(),
+            "{context}: {}",
+            run.text()
+        );
         // As the kill left it, before a restart tidies anything: every chunk at its final path is
         // whole, and every commit names only chunks that are there.
         let report = server.fsck();

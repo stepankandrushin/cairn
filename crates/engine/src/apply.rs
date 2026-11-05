@@ -2183,11 +2183,12 @@ fn finish_copy_move(root: &Root, intent: &CopyIntent, from: &[Name], to: &[Name]
         fsops::FileType::Symlink => ObjectKind::Symlink,
         _ => ObjectKind::File,
     };
+    // Told as the scan tells it: on NTFS a creation time moves between files, the mark holds none, and
+    // the raw one never matches it, which left every name of the copy where the kill found it.
     let same = (st.dev, st.ino) == (intent.dev, intent.ino)
-        && intent
-            .is
-            .as_ref()
-            .is_none_or(|(k, btime)| *k == kind && *btime == st.btime);
+        && intent.is.as_ref().is_none_or(|(k, btime)| {
+            *k == kind && fsops::birth_mark(*btime) == fsops::birth_mark(st.btime)
+        });
     if !same {
         return Ok(());
     }

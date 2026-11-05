@@ -450,8 +450,10 @@ fn a_policy_changed_after_a_kill_takes_nothing_from_the_record() {
 }
 
 /// The loser of a same-field conflict goes in the log once, however the run that applied the winner
-/// ends: once the winner is on disk, nothing there says there was a conflict.
+/// ends: once the winner is on disk, nothing there says there was a conflict. Not on Windows, which
+/// holds a file's write bits alone: two devices there cannot change a mode two ways.
 #[test]
+#[cfg(unix)]
 fn the_losing_chmod_is_logged_once_after_a_kill() {
     for point in [
         "apply.noted",
@@ -518,15 +520,21 @@ fn a_folder_removed_here_that_comes_back_killed_still_gets_its_mode() {
         fs::remove_dir_all(b.path("d")).unwrap();
         killed_at(&b, point);
         let p = converge(&[&a, &b]);
-        assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775, "{point}");
+        assert_eq!(
+            p.entries[b"d".as_slice()].mode & 0o777,
+            dir_mode(0o775),
+            "{point}"
+        );
         assert_eq!(b.read("d/f"), b"1, edited", "{point}");
     }
 }
 
 /// A folder still private from a killed run, unreadable here when it next changes: renamed on another device
 /// or here after a sync has seen it, or written into elsewhere. What could not be read is no pair of its
-/// record, or the 0700 it has until its last pass stays, read as a mode this device keeps.
+/// record, or the 0700 it has until its last pass stays, read as a mode this device keeps. Not on Windows,
+/// which holds no folder mode, private or not.
 #[test]
+#[cfg(unix)]
 fn a_private_folder_unreadable_when_it_next_changes_still_gets_its_mode() {
     for point in ["apply.dirs.synced", "apply.dir.meta"] {
         for case in [

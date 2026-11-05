@@ -234,6 +234,20 @@ impl Server {
             .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
+    /// Whether the process is still up once a kill, if there was one, has had time to end it. Windows
+    /// says a process has ended only after its handles are closed, its sockets among them, so a
+    /// client can see the connection reset while the process still reads as running.
+    pub fn alive_after_a_kill(&mut self) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            if !self.alive() {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        true
+    }
+
     /// `fsck` on the data directory. The server is stopped for it, since it holds the lock.
     #[track_caller]
     pub fn fsck(&mut self) -> String {

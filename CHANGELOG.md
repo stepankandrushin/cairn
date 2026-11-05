@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- On Windows, a conflict on a hard-linked file, killed while its conflict copy was taking its names, brought back a
+  name deleted on another device, holding this device's version: the next sync never finished moving the copy's
+  names, as NTFS gives no file a creation time that marks it. Linux and macOS were not affected.
+
 ## 0.1.3
 
 **Fixed:**

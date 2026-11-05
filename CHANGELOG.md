@@ -42,6 +42,18 @@
   it was going.
 - A false "mode kept" note in everyone's log after a kill while a new folder arrived, and an unchanged file brought
   back after a kill while its folder was being detached from one that moved out of view.
+- A conflict on a hard-linked file, killed before its copy had all its names: a name deleted on another device came
+  back holding this device's version, and the others could read as deleted here. The copy now takes every name.
+- An edit caught by a killed sync replacing a hard-linked file split it in two: a name went on holding the edit as a
+  separate file, for everyone, and a second kill could add a copy of the other device's version and a false
+  "deleted here". The names now stay one file, with the edit kept once beside them.
+- A kept edit was said only in the output of the sync that kept it, which a kill could cut short. It is now a conflict
+  copy of the file that caught it, listed by `cairn conflicts` on every device and counted in the sync's conflicts.
+- A rule made between a kill and the next sync could hide an edit under a temporary name until the rule went, or
+  have a download left by the kill taken for an edit and copied once it went. Both are looked at before the rule
+  hides them.
+- The losing side of a same-field metadata conflict was missing from the log when the sync that applied the winner
+  was killed. It is noted before anything is applied, and logged once.
 
 - A file deleted on one device and restored before another had finished applying the delete could be deleted again
   by that other device, which had never deleted it. History kept it.

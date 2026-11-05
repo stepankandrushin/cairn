@@ -289,14 +289,26 @@ impl State {
         Ok(out)
     }
 
-    /// Queue a commit durably, with the state it will leave, before the first attempt to send it.
-    pub fn enqueue(&mut self, req: &CommitRequest, rows: &[(ObjectId, &Row)]) -> Result<()> {
+    /// Queue a commit durably, with the state it will leave, before the first attempt to send it, and
+    /// drop the marks it carries out.
+    pub fn enqueue(
+        &mut self,
+        req: &CommitRequest,
+        rows: &[(ObjectId, &Row)],
+        marks: &[String],
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO outbox (op_id, request) VALUES (?1, ?2)",
             params![req.op_id.0, serde_json::to_string(req)?],
         )?;
         put_rows(&tx, rows, &[])?;
+        {
+            let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
+            for key in marks {
+                del.execute([key])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -339,6 +351,23 @@ impl State {
                 put.execute(params![key, serde_json::to_string(value)?])?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A mark and the rows it goes with, in one transaction, so that no kill leaves one without the other.
+    pub fn put_intent_with_rows<T: Serialize>(
+        &mut self,
+        key: &str,
+        value: &T,
+        changed: &[(ObjectId, &Row)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        put_rows(&tx, changed, &[])?;
+        tx.execute(
+            "INSERT INTO intents (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, serde_json::to_string(value)?],
+        )?;
         tx.commit()?;
         Ok(())
     }

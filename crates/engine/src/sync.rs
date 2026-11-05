@@ -6,8 +6,8 @@
 //! special path beyond undoing half-made moves.
 
 use crate::apply::{
-    self, cur_from_identified, read_for_upload, recover, Applier, CurNode, INTENT_ARRIVING,
-    INTENT_COPY,
+    self, cur_from_identified, read_for_upload, recover, Applier, CurNode, NoteIntent,
+    INTENT_ARRIVING, INTENT_COPY, INTENT_NOTE,
 };
 use crate::client::Client;
 use crate::identify::{identify, settle_arriving, Arriving, CopyIntent, Identified};
@@ -23,7 +23,8 @@ use cairn_failpoint::{check, hit};
 use cairn_protocol::local::{Activity, Change, Direction};
 use cairn_protocol::wire::{self, CommitRequest, CommitResponse, MAX_CHUNK_BATCH_BYTES};
 use cairn_protocol::{
-    ChunkRef, Content, Hash, Link, Manifest, Name, ObjectId, Op, OpId, RevisionId, Skip, Tree,
+    ChunkRef, ConflictOf, Content, Hash, Link, Manifest, Name, ObjectId, ObjectKind, Op, OpId,
+    RevisionId, Skip, Tree,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -212,6 +213,8 @@ fn scan_stable(
     excluded: &dyn Fn(&[cairn_protocol::Name], &crate::fsops::Stat) -> bool,
     date: &str,
     events: &mut Vec<String>,
+    trees: (&Tree, &Tree),
+    kept_edits: &mut u64,
 ) -> Result<ScanResult> {
     let by_inode: HashMap<(u64, u64), &Row> =
         rows.values().map(|r| ((r.fp.dev, r.fp.ino), r)).collect();
@@ -235,6 +238,17 @@ fn scan_stable(
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
     let mut rescued = Vec::new();
+    // A rule made since a kill can hide the folder its leftovers are in from the scan: looked for in the
+    // folders of what was on its way, so that an edit caught there is kept under a name and said, not left
+    // under a temporary one until the rule goes.
+    let hidden = if remove_temps {
+        leftovers_out_of_view(root, trees, &result.excluded)?
+    } else {
+        Vec::new()
+    };
+    for (path, name) in hidden {
+        result.stale_temps.push((path, name));
+    }
     if !result.stale_temps.is_empty() || !result.rescued_temps.is_empty() {
         // Looked at again now that the scan has removed what it could: a name that was another's when
         // the scan got there may be the last.
@@ -257,17 +271,35 @@ fn scan_stable(
                 .and_then(|origin| Name::new(origin.to_vec()).ok())
                 .unwrap_or_else(|| Name::new(b"recovered".to_vec()).expect("a valid name"));
             // That inode becomes a new file under its new name, no longer the object it was, and the
-            // record says so first: a kill between the two leaves the file to be found again.
-            if let Some((id, row)) = found {
+            // record says so first: a kill between the two leaves the file to be found again. It goes up
+            // as a conflict copy of what it was caught by, so the conflict inbox lists it on every device
+            // however the run that kept it ends.
+            let mark = rescue_mark(root, path, name, fp, found.map(|(id, _)| *id), trees)?;
+            let row = found.map(|(id, row)| {
                 let mut row = row.clone();
                 row.fp.dev = 0;
                 row.fp.ino = 0;
-                root.state.store_rows(&[(*id, &row)], &[])?;
-                rescued.push(*id);
+                (*id, row)
+            });
+            let rows_noted: Vec<(ObjectId, &Row)> = row.iter().map(|(id, r)| (*id, r)).collect();
+            match &mark {
+                Some((key, intent)) => root.state.put_intent_with_rows(key, intent, &rows_noted)?,
+                None => root.state.store_rows(&rows_noted, &[])?,
+            }
+            if let Some((id, _)) = row {
+                rescued.push(id);
+            }
+            if mark.is_some() || !rows_noted.is_empty() {
                 hit("clean.rescue.noted");
             }
-            let kept = apply::keep_rescued_temp(root, path, name, &original, date)
+            *kept_edits += 1;
+            let mut kept = apply::keep_rescued_temp(root, path, name, &original, date)
                 .context("keeping an edit from a leftover temporary file")?;
+            if result.excluded.iter().any(|e| path.starts_with(e)) {
+                kept.push_str(
+                    ", in a folder this device leaves out, so it is not synced while it does",
+                );
+            }
             events.push(kept);
         }
         result = scan(&root.dir, &opts).context("scanning the root")?;
@@ -281,6 +313,114 @@ fn scan_stable(
     result.rescued = rescued;
     keep_what_only_moved_holes(root, &by_inode, &mut result);
     Ok(result)
+}
+
+/// This device's leftovers in folders the scan left out, where what was on its way was going.
+fn leftovers_out_of_view(
+    root: &Root,
+    (base, remote): (&Tree, &Tree),
+    excluded: &[Vec<Name>],
+) -> Result<Vec<(Vec<Name>, Vec<u8>)>> {
+    if excluded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut folders: BTreeSet<Vec<Name>> = BTreeSet::new();
+    for (_, a) in root.state.intents::<Arriving>(INTENT_ARRIVING)? {
+        for link in a.links.iter().chain(&a.names) {
+            let Some(mut path) = remote
+                .path_of_link(link)
+                .or_else(|| base.path_of_link(link))
+            else {
+                continue;
+            };
+            path.pop();
+            if excluded.iter().any(|e| path.starts_with(e)) {
+                folders.insert(path);
+            }
+        }
+    }
+    let prefix = root.temp_prefix();
+    let mut out = Vec::new();
+    for path in folders {
+        let Ok(dir) = root.dir.open_path(path.iter()) else {
+            continue;
+        };
+        let Ok(names) = dir.list() else {
+            continue;
+        };
+        for name in names {
+            let Some(rest) = name.strip_prefix(prefix.as_bytes()) else {
+                continue;
+            };
+            // What a scan would remove or keep: a folder only if it was moved aside.
+            let folder = dir
+                .stat(&name)
+                .is_ok_and(|st| st.file_type == crate::fsops::FileType::Directory);
+            if !folder || crate::root::aside_origin(rest).is_some() {
+                out.push((path.clone(), name));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The conflict copy a kept edit becomes: of the object it was, by its record or else by the name it was
+/// moved aside from, against the server's revision of that, which is what was arriving or being removed.
+/// The same mark again if a kill came before the edit got its name. None if no object can be named.
+fn rescue_mark(
+    root: &Root,
+    path: &[Name],
+    temp: &[u8],
+    fp: &crate::state::Fingerprint,
+    known: Option<ObjectId>,
+    (base, remote): (&Tree, &Tree),
+) -> Result<Option<(String, CopyIntent)>> {
+    let kind = match root.dir.open_path(path.iter())?.stat(temp)?.file_type {
+        crate::fsops::FileType::Directory => ObjectKind::Dir,
+        crate::fsops::FileType::Symlink => ObjectKind::Symlink,
+        _ => ObjectKind::File,
+    };
+    let is = Some((kind, fp.btime));
+    if let Some((key, intent)) = root
+        .state
+        .intents::<CopyIntent>(INTENT_COPY)?
+        .into_iter()
+        .find(|(_, i)| (i.dev, i.ino) == (fp.dev, fp.ino) && i.is == is)
+    {
+        return Ok(Some((key, intent)));
+    }
+    let origin = temp
+        .strip_prefix(root.temp_prefix().as_bytes())
+        .and_then(crate::root::aside_origin)
+        .unwrap_or_default();
+    // A long name was cut to fit: the one name in the folder it begins.
+    let by_name = || {
+        let parent = base.resolve(path)?;
+        let mut found = base
+            .children(parent)
+            .filter(|(n, _)| n.as_bytes().starts_with(origin) && !origin.is_empty());
+        let (name, id) = found.next()?;
+        (name.as_bytes() == origin || found.next().is_none()).then_some(id)
+    };
+    let Some(object) = known.or_else(by_name) else {
+        return Ok(None);
+    };
+    let Some(node) = remote.nodes.get(&object) else {
+        return Ok(None);
+    };
+    let copy = ObjectId::random();
+    let intent = CopyIntent {
+        copy,
+        dev: fp.dev,
+        ino: fp.ino,
+        is,
+        conflict_of: ConflictOf {
+            object,
+            competing_revision: node.rev,
+        },
+        moves: Vec::new(),
+    };
+    Ok(Some((format!("{INTENT_COPY}{copy}"), intent)))
 }
 
 /// What arrived and was removed here before it was recorded, said once for each topmost path.
@@ -670,6 +810,7 @@ fn replay_outbox(root: &mut Root, client: &Client, report: &mut SyncReport) -> R
         if matches!(resp, CommitResponse::Committed { .. }) {
             report.commits += 1;
         } else {
+            notes_back(root, &req)?;
             let mut rows = root.state.load_rows()?;
             let changed = take_back_refused(&req, &mut rows);
             let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
@@ -823,6 +964,10 @@ fn finalize(
     *base = remote.clone();
 
     for (key, _) in root.state.intents::<CopyIntent>(INTENT_COPY)? {
+        root.state.drop_intent(&key)?;
+    }
+    // Only notes on what the server never had are left by now.
+    for (key, _) in root.state.intents::<NoteIntent>(INTENT_NOTE)? {
         root.state.drop_intent(&key)?;
     }
     let mut keep: BTreeSet<Hash> = BTreeSet::new();
@@ -1117,6 +1262,8 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &|path, st| selection.leaves_out(path, st, &view, &rows, &mut moved.borrow_mut()),
             &date,
             &mut report.events,
+            (&base, &remote),
+            &mut report.conflicts,
         )?;
         report.scan_time += scan_started.elapsed();
         for id in &scanned.rescued {
@@ -1364,11 +1511,18 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
 
         let mut ops = remote_ops(&view.remote, &plan)?;
         // The loser of a metadata conflict goes in the log even when nothing else is to be pushed.
-        // Unless applying failed: the conflict stands, and would be logged on every run.
+        // Unless applying failed: the conflict stands, and would be logged on every run. A run killed
+        // after applying the winner left its notes noted, and they go now.
         if !failed || !ops.is_empty() {
             for note in &plan.notes {
                 if noted.insert(note.clone()) {
                     notes.push(note.clone());
+                }
+            }
+            for (_, n) in root.state.intents::<NoteIntent>(INTENT_NOTE)? {
+                let pair = (n.object, n.text);
+                if remote.nodes.contains_key(&pair.0) && noted.insert(pair.clone()) {
+                    notes.push(pair);
                 }
             }
         }
@@ -1421,12 +1575,28 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         };
         let pushed = mark_synced(&mut rows, &view.remote, &cur, &req);
         let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
-        root.state.enqueue(&req, &list)?;
+        // The queue delivers the notes in it from here on.
+        let delivered: Vec<String> = req
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Note { object, text } => Some(
+                    NoteIntent {
+                        object: *object,
+                        text: text.clone(),
+                    }
+                    .key(),
+                ),
+                _ => None,
+            })
+            .collect();
+        root.state.enqueue(&req, &list, &delivered)?;
         hit("sync.enqueued");
         let resp = client.commit(&req)?;
         hit("sync.committed");
         // Before the commit leaves the queue, so that dying here costs nothing.
         if matches!(resp, CommitResponse::Rejected { .. }) {
+            notes_back(&mut root, &req)?;
             let changed = take_back_refused(&req, &mut rows);
             let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
             root.state.store_rows(&list, &[])?;
@@ -1533,6 +1703,25 @@ fn mark_synced(
 }
 
 /// A refused commit said nothing: what its deletes gave up is still this device's to delete.
+/// The notes of a refused commit, noted again: the queue no longer carries them.
+fn notes_back(root: &mut Root, req: &CommitRequest) -> Result<()> {
+    let notes: Vec<(String, NoteIntent)> = req
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Note { object, text } => {
+                let note = NoteIntent {
+                    object: *object,
+                    text: text.clone(),
+                };
+                Some((note.key(), note))
+            }
+            _ => None,
+        })
+        .collect();
+    root.state.put_intents(&notes)
+}
+
 fn take_back_refused(req: &CommitRequest, rows: &mut BTreeMap<ObjectId, Row>) -> Vec<ObjectId> {
     let mut changed = BTreeSet::new();
     for op in &req.ops {

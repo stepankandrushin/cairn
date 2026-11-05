@@ -22,6 +22,26 @@ use cairn_protocol::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+/// The losing side of a same-field metadata conflict, for the activity log: noted before the first
+/// step, since once the winner is applied nothing on disk says there was a conflict, and gone once the
+/// commit that carries it is queued.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NoteIntent {
+    pub object: ObjectId,
+    pub text: String,
+}
+
+impl NoteIntent {
+    pub fn key(&self) -> String {
+        let digest = blake3::hash(self.text.as_bytes());
+        format!(
+            "{INTENT_NOTE}{}/{}",
+            self.object,
+            hex::encode(&digest.as_bytes()[..8])
+        )
+    }
+}
+
 /// A staged entry and where it came from, so that a crash can put it back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StageIntent {
@@ -46,6 +66,7 @@ pub const INTENT_MODE: &str = "mode/";
 pub const INTENT_COPY: &str = "copy/";
 pub const INTENT_RELINK: &str = "relink/";
 pub const INTENT_ARRIVING: &str = "arriving/";
+pub const INTENT_NOTE: &str = "note/";
 
 /// New content on its way to every hard link of a file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -941,6 +962,7 @@ impl<'a> Applier<'a> {
                 ino: fp.ino,
                 is: Some((cur.kind, fp.btime)),
                 conflict_of: of.clone(),
+                moves: Vec::new(),
             };
             join_copies.push((format!("{INTENT_COPY}{id}"), intent));
         }
@@ -976,25 +998,34 @@ impl<'a> Applier<'a> {
                 .conflict_of
                 .clone()
                 .expect("a copy has its origin"),
+            moves: copy
+                .moves
+                .iter()
+                .map(|(from, to)| (step_path(&self.cur, from), step_path(&self.cur, to)))
+                .collect(),
         };
         for (from, _) in &copy.moves {
             let (dir, name) = self.locate(from)?;
             self.check_fp(copy.object, &dir, &name)?;
         }
-        self.root
-            .state
-            .put_intent(&format!("{INTENT_COPY}{}", copy.copy), &intent)?;
-        hit("apply.copy.intent");
         // Names of the copy from here on, so that one the original does not get back before a kill
-        // comes down again, and does not read as deleted here. A scan takes back what it still finds.
+        // comes down again, and does not read as deleted here. In the mark's transaction: a kill
+        // between the two would leave the original's names to read as removed here.
+        let key = format!("{INTENT_COPY}{}", copy.copy);
         if let Some(row) = self.rows.get_mut(&copy.object) {
             let names = copy.moves.iter().map(|m| &m.0);
             let held = row.held.get_or_insert_with(|| original.links.clone());
             for name in names {
                 held.remove(name);
             }
-            self.root.state.store_rows(&[(copy.object, &*row)], &[])?;
+            self.root
+                .state
+                .put_intent_with_rows(&key, &intent, &[(copy.object, &*row)])?;
+            hit("apply.copy.intent");
             hit("apply.copy.given_up");
+        } else {
+            self.root.state.put_intent(&key, &intent)?;
+            hit("apply.copy.intent");
         }
         let mut links = BTreeSet::new();
         for (from, to) in &copy.moves {
@@ -1490,6 +1521,18 @@ impl<'a> Applier<'a> {
             return Ok((self.outcome, self.cur));
         }
         hit("apply.prefetched");
+        let notes: Vec<(String, NoteIntent)> = plan
+            .notes
+            .iter()
+            .map(|(object, text)| {
+                let note = NoteIntent {
+                    object: *object,
+                    text: text.clone(),
+                };
+                (note.key(), note)
+            })
+            .collect();
+        self.root.state.put_intents(&notes)?;
         let marks = self.note_arriving(plan);
         self.root.state.put_intents(&marks)?;
         hit("apply.noted");
@@ -1618,6 +1661,21 @@ pub fn recover(root: &mut Root) -> Result<Vec<String>> {
         restore_staged(root, &stage, &name, &[label], None, &mut notes)?;
     }
 
+    // A conflict copy moved aside under some of its names takes the rest of them, or the names it still
+    // has would read as the copy's own once the original's come down, and one removed elsewhere would
+    // come back holding this device's version. The mark stays until the next finished sync.
+    for (_, intent) in root.state.intents::<CopyIntent>(INTENT_COPY)? {
+        hit("recover.copy");
+        for (from, to) in &intent.moves {
+            if let Err(e) = finish_copy_move(root, &intent, from, to) {
+                notes.push(format!(
+                    "{}: could not finish moving it aside as a conflict copy after an interrupted sync: {e}",
+                    show(from)
+                ));
+            }
+        }
+    }
+
     // New content that reached only some names of a file reaches the rest.
     for (key, intent) in root.state.intents::<RelinkIntent>(INTENT_RELINK)? {
         hit("recover.relink");
@@ -1673,8 +1731,52 @@ fn swap(root: &Root, dir: &Dir, a: &[u8], b: &[u8]) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Point the remaining names at the new inode, if the rename to it happened, and only where a name
-/// still holds the old file untouched: an edit made since stays where it is.
+/// One name of a conflict copy to the name the plan gave it, if that name still holds the copy and
+/// nothing has taken the new one.
+fn finish_copy_move(root: &Root, intent: &CopyIntent, from: &[Name], to: &[Name]) -> Result<()> {
+    let (Some((from_name, from_parents)), Some((to_name, to_parents))) =
+        (from.split_last(), to.split_last())
+    else {
+        return Ok(());
+    };
+    let Ok(dir) = root.dir.open_path(from_parents.iter()) else {
+        return Ok(());
+    };
+    let Some(st) = dir.try_stat(from_name.as_bytes())? else {
+        return Ok(());
+    };
+    let kind = match st.file_type {
+        fsops::FileType::Directory => ObjectKind::Dir,
+        fsops::FileType::Symlink => ObjectKind::Symlink,
+        _ => ObjectKind::File,
+    };
+    let same = (st.dev, st.ino) == (intent.dev, intent.ino)
+        && intent
+            .is
+            .as_ref()
+            .is_none_or(|(k, btime)| *k == kind && *btime == st.btime);
+    if !same {
+        return Ok(());
+    }
+    let Ok(to_dir) = root.dir.open_path(to_parents.iter()) else {
+        return Ok(());
+    };
+    relaxed_for_a_moment(root, &dir, from_parents, || {
+        match dir.rename_new(from_name.as_bytes(), &to_dir, to_name.as_bytes()) {
+            Ok(()) => hit("recover.copy.renamed"),
+            // Something took the name meanwhile: the copy keeps this one, and the merge finds it.
+            Err(e) if is_exists(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    })
+}
+
+/// Point the remaining names at the new inode, if the rename to it happened. A name that no longer holds
+/// the old file untouched has someone's edit in it, made in the moment before the kill or since: it gets
+/// the new inode too, and the edit is left under an aside name for the scan that follows to keep under a
+/// conflict name. Left where it is, it would split the file in two, the edit taking that name from the
+/// server's version for every device.
 fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
     let Some((first_name, first_parents)) = intent.first.split_last() else {
         return Ok(());
@@ -1686,6 +1788,7 @@ fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
     if st.ino != intent.new_ino {
         return Ok(());
     }
+    let old = (intent.old.ino, intent.old.size, intent.old.mtime);
     for other in &intent.others {
         let Some((name, parents)) = other.split_last() else {
             continue;
@@ -1694,15 +1797,15 @@ fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
         let Some(now) = dir.try_stat(name.as_bytes())? else {
             continue;
         };
-        if (now.ino, now.size, now.mtime) != (intent.old.ino, intent.old.size, intent.old.mtime) {
+        // Already done, or a folder a person put there, which no file takes the place of.
+        if now.ino == intent.new_ino || now.file_type == fsops::FileType::Directory {
             continue;
         }
+        let mut untouched = (now.ino, now.size, now.mtime) == old;
         // The timestamps can be set back: only the content says the old file is untouched.
-        if let Some(want) = intent.old_manifest {
+        if let (true, Some(want)) = (untouched, intent.old_manifest) {
             let fd = dir.open_read(name.as_bytes())?;
-            if crate::chunker::manifest_of(&fd, now.size)?.hash() != want {
-                continue;
-            }
+            untouched = crate::chunker::manifest_of(&fd, now.size)?.hash() == want;
         }
         relaxed_for_a_moment(root, &dir, parents, || {
             let tmp = root.aside_name(name.as_bytes());
@@ -1712,14 +1815,16 @@ fn finish_relink(root: &Root, intent: &RelinkIntent) -> Result<()> {
             if swap(root, &dir, &tmp, name.as_bytes())? {
                 hit("recover.relink.swapped");
                 let was = dir.stat(&tmp)?;
-                if (was.ino, was.size, was.mtime)
-                    != (intent.old.ino, intent.old.size, intent.old.mtime)
-                {
-                    swap(root, &dir, &tmp, name.as_bytes())?;
+                // What was there: the old file untouched, or an edit that another name still holds,
+                // the aside a killed swap left for one, or else only this one, which stays.
+                if (untouched && (was.ino, was.size, was.mtime) == old) || was.nlink > 1 {
+                    dir.unlink(&tmp)?;
                 }
-                dir.unlink(&tmp)?;
-            } else {
+            } else if untouched {
                 dir.rename_over(&tmp, &dir, name.as_bytes())?;
+            } else {
+                // No swap on this filesystem: the edit stays at its name rather than risk it.
+                dir.unlink(&tmp)?;
             }
             Ok(())
         })?;

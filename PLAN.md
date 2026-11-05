@@ -138,9 +138,18 @@ on its way is noted before the first step, in one transaction however much it is
 next scan compares it with the disk, field by field and name by name, and what got there counts as shared
 with the server. New content arrived whole, and what its fields should read is asked of the filesystem, on a
 scratch entry, so that what it cannot hold is no change of anyone's. So what a device received does not read
-as its own change, kill or full disk, and a later change from elsewhere stands as it would have. One limit: a person who acts on a file in the moment between
-the kill and the next scan acts on something the scan cannot tell from what arrived, as a new inode has no
-record yet; a removal of a just-arrived file can be undone by the server's copy, and a rename can leave both.
+as its own change, kill or full disk, and a later change from elsewhere stands as it would have. With no room
+left to ask, what is there stands and goes up for no one. An edit caught in the moment before a file is
+replaced or removed is kept under a conflict name, as a conflict copy in the inbox, also when the name was a
+hard link's still to follow, whose names stay one file. The limits: a person who acts on a file in the moment
+between the kill and the next scan acts on something the scan cannot tell from what arrived, as a new inode has
+no record yet, and telling them apart would cost a durable write for each file before its rename. So a removal
+of a just-arrived file can be undone by the server's copy, a rename can leave both, an edit makes a conflict
+copy, a rename of what the run had just moved loses to the server's move, reported, and a folder's chmod or
+time set then goes back. A folder a rule hides from the next scan while it is still private to the run that
+made it logs "this device had 700" once the rule goes. And with no kill: an edit to another name of a
+hard-linked file, in the moment a sync moves that name to the new version, stays at its name, which splits the
+file in two for everyone, that name a new file holding the edit, with no conflict copy.
 
 | Changes | Result |
 |---|---|

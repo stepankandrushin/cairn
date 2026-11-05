@@ -25,6 +25,10 @@ pub struct CopyIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is: Option<(ObjectKind, Option<Timestamp>)>,
     pub conflict_of: ConflictOf,
+    /// Each name the copy moves from and to, as paths, so that a kill partway through finishes the
+    /// moves rather than leaving the copy at the original's names. Empty in a mark an older version left.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<(Vec<Name>, Vec<Name>)>,
 }
 
 impl CopyIntent {
@@ -784,6 +788,7 @@ mod tests {
                 object: ObjectId::random(),
                 competing_revision: RevisionId::random(),
             },
+            moves: Vec::new(),
         };
         identify(
             &scan_of(vec![node]),

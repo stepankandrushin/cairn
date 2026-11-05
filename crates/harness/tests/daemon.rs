@@ -504,6 +504,42 @@ fn a_daemon_killed_at_any_step_loses_nothing() {
     drop(sb);
 }
 
+/// Killed while taking on an update, and started again after a revert elsewhere: what it had received is
+/// not its own edit, so the revert stands, as it does for a one-shot sync (kills.rs).
+#[test]
+fn a_daemon_killed_while_receiving_does_not_undo_a_revert_elsewhere() {
+    for point in [
+        "apply.replace.swapped",
+        "apply.replace.renamed",
+        "sync.applied",
+    ] {
+        let (_sb, _server, a, b) = pair("d-kill-arriving");
+        for i in 0..14 {
+            a.write(&format!("fill/{i}"), format!("{i}"));
+        }
+        a.write("x", "v1");
+        a.synced();
+        b.synced();
+        a.write("x", "v2");
+        a.synced();
+        let mut d = Daemon::start_env(&b, &["--reconcile-secs", DAY], &[("CAIRN_FP_CRASH", point)]);
+        let log = d.log.clone();
+        wait_for(&format!("the daemon to die at {point}"), &log, || {
+            d.exited()
+        });
+        drop(d);
+        a.write("x", "v1");
+        a.synced();
+        let db = Daemon::events_only(&b);
+        wait_file(&db, b.path("x"), b"v1");
+        db.wait_rest();
+        drop(db);
+        a.synced();
+        assert_eq!(a.read("x"), b"v1", "{point}: the revert was undone");
+        assert!(leftover_temps(&b.root).is_empty(), "{point}");
+    }
+}
+
 /// The server goes away, with long polls in flight and edits waiting, and comes back.
 #[test]
 fn a_server_going_away_and_coming_back_loses_nothing_and_needs_no_reconcile() {

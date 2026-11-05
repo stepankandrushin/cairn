@@ -9,9 +9,14 @@ use std::process::Command;
 
 /// Re-run this test binary inside a namespace with `dir` mounted as a small tmpfs.
 fn in_namespace(test: &str, dir: &std::path::Path, megabytes: u32) -> Option<bool> {
+    in_namespace_with(test, dir, &format!("size={megabytes}m"))
+}
+
+/// The same, with the tmpfs's own options.
+fn in_namespace_with(test: &str, dir: &std::path::Path, options: &str) -> Option<bool> {
     let exe = std::env::current_exe().unwrap();
     let inner = format!(
-        "mount -t tmpfs -o size={megabytes}m tmpfs '{}' && CAIRN_INNER='{}' exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
+        "mount -t tmpfs -o {options} tmpfs '{}' && CAIRN_INNER='{}' exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
         dir.display(),
         dir.display(),
         exe.display(),
@@ -180,4 +185,94 @@ fn inner_server_disk() {
     assert_eq!(b.read("too-big"), token::make(2, 64 * 1024 * 1024));
     let report = server.fsck();
     assert!(report.contains("clean"), "{report}");
+}
+
+#[test]
+fn a_disk_with_no_room_to_ask_what_arrived_pushes_nothing_and_does_not_crash() {
+    let sb = Sandbox::on_disk("full-probe");
+    let dir = sb.path("small");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = in_namespace_with("inner_no_room_to_ask", &dir, "size=64m,nr_inodes=400") {
+        assert!(ok, "see the output above");
+    }
+}
+
+/// After a kill, what arrived whole with something else on disk than its record is asked of the
+/// filesystem on a scratch entry. With no inode left for one, what is there stands: nothing goes up for
+/// anyone, and the sync goes on.
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_no_room_to_ask() {
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-probe-outer");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b_root = small.join("b");
+    std::fs::create_dir(&b_root).unwrap();
+    let token = server.token_file.to_str().unwrap().to_string();
+    run(
+        &[
+            "init",
+            "--server",
+            &server.url,
+            "--device-name",
+            "b",
+            "--token-file",
+            &token,
+            b_root.to_str().unwrap(),
+        ],
+        &[],
+    )
+    .expect_ok();
+    let b = Device {
+        root: b_root,
+        name: "b".into(),
+    };
+    for i in 0..14 {
+        a.write(&format!("fill/{i}"), format!("{i}"));
+    }
+    a.write("x", "v1");
+    chmod(&a.path("x"), 0o644);
+    a.synced();
+    b.synced();
+    a.write("x", "v2");
+    a.synced();
+    // Killed with the new version in place and the run unfinished, then a chmod here in that moment.
+    let killed = b.sync_env(&[("CAIRN_FP_CRASH", "apply.replace.renamed")]);
+    assert!(killed.was_killed(), "{}", killed.text());
+    chmod(&b.path("x"), 0o600);
+
+    // The next sync's scan is done when the last inode goes.
+    let gate = sb.path("gate");
+    std::fs::create_dir(&gate).unwrap();
+    let pause = format!("sync.scanned:{}", gate.display());
+    let ballast = small.join("ballast");
+    let run = std::thread::scope(|s| {
+        let syncing = s.spawn(|| b.sync_env(&[("CAIRN_FP_PAUSE", &pause)]));
+        let start = std::time::Instant::now();
+        while !gate.join("reached").exists() {
+            assert!(start.elapsed().as_secs() < 60, "never reached sync.scanned");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::create_dir(&ballast).unwrap();
+        let mut made = 0;
+        while std::fs::File::create(ballast.join(made.to_string())).is_ok() {
+            made += 1;
+        }
+        assert!(made > 0);
+        assert!(std::fs::File::create(b.path(".cairn/arriving-probe")).is_err());
+        std::fs::write(gate.join("go"), "").unwrap();
+        syncing.join().unwrap()
+    });
+    assert_ne!(run.code, Some(101), "it crashed: {}", run.text());
+    assert!(!run.was_killed(), "{}", run.text());
+
+    std::fs::remove_dir_all(&ballast).unwrap();
+    b.synced();
+    a.synced();
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |d: &Device| std::fs::metadata(d.path("x")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(a.read("x"), b"v2");
+    assert_eq!(mode(&a), 0o644, "something went up for everyone");
+    assert_eq!(b.read("x"), b"v2");
 }

@@ -325,6 +325,36 @@ fn a_kill_while_a_folder_arrives_makes_no_false_note() {
     assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, dir_mode(0o775));
 }
 
+/// The loser of a same-field conflict goes in the log once, however the run that applied the winner
+/// ends: once the winner is on disk, nothing there says there was a conflict.
+#[test]
+fn the_losing_chmod_is_logged_once_after_a_kill() {
+    for point in [
+        "apply.noted",
+        "apply.meta.done",
+        "sync.applied",
+        "sync.enqueued",
+    ] {
+        let (_sb, _s, a, b) = pair("killed-losing-note");
+        filler(&a);
+        a.write("x", "v1");
+        chmod(&a.path("x"), 0o644);
+        a.synced();
+        b.synced();
+        chmod(&a.path("x"), 0o640);
+        a.synced();
+        chmod(&b.path("x"), 0o600);
+        killed_at(&b, point);
+        let p = converge(&[&a, &b]);
+        assert_eq!(p.entries[b"x".as_slice()].mode & 0o777, 0o640, "{point}");
+        let log = a.cairn(&["log"]).expect_ok();
+        let notes = log
+            .stdout
+            .matches("kept 640 from the server; this device had 600");
+        assert_eq!(notes.count(), 1, "{point}: {}", log.text());
+    }
+}
+
 /// A folder is made private until the last pass. Killed again before that pass, on a run that had
 /// already found it so and wrote into it, it is still a folder whose mode never arrived, not one this
 /// filesystem kept at 0700, or no later run gives it its mode.
@@ -369,6 +399,49 @@ fn a_conflict_on_a_hard_link_killed_keeps_every_name() {
         assert_eq!(a.read("x"), b"a-edit", "{point}");
         assert_eq!(a.read("y"), b"a-edit", "{point}: the second name went");
         has_version(&p, b"b-edit");
+    }
+}
+
+/// Killed before the copy had all its names: the rest follow, so a name removed elsewhere stays removed
+/// and is not the copy's, and nothing here reads as deleted.
+#[test]
+fn a_conflict_copy_killed_partway_takes_every_name() {
+    for point in [
+        "apply.copy.intent",
+        "apply.copy.given_up",
+        "apply.copy.renamed",
+    ] {
+        let (_sb, _s, a, b) = pair("killed-copy-names");
+        filler(&a);
+        a.write("d/x", "base");
+        fs::hard_link(a.path("d/x"), a.path("y")).unwrap();
+        fs::hard_link(a.path("d/x"), a.path("z")).unwrap();
+        a.synced();
+        b.synced();
+        a.write("d/x", "a-edit");
+        a.synced();
+        b.write("d/x", "b-edit");
+        killed_at(&b, point);
+        fs::remove_file(a.path("z")).unwrap();
+        a.synced();
+        let run = b.synced();
+        assert!(
+            !run.text().contains("deleted here"),
+            "{point}: {}",
+            run.text()
+        );
+        let p = converge(&[&a, &b]);
+        assert!(!a.exists("z"), "{point}: z came back: {:?}", p.names());
+        assert_eq!(a.read("d/x"), b"a-edit", "{point}");
+        assert_eq!(a.read("y"), b"a-edit", "{point}");
+        assert_eq!(
+            a.conflict_copies("", "z").len(),
+            1,
+            "{point}: {:?}",
+            p.names()
+        );
+        let copies = p.entries.iter().filter(|(_, e)| e.content == b"b-edit");
+        assert_eq!(copies.count(), 3, "{point}: {:?}", p.names());
     }
 }
 
@@ -468,9 +541,11 @@ fn an_edit_caught_by_a_killed_removal_is_kept() {
     assert_eq!(leftover_temps(&b.root), Vec::<String>::new());
 }
 
-/// The old file is still there under its other name, with the edit in it: nothing needs saving.
+/// The old file is still there under its other name, with the edit in it. That name takes the new
+/// version with the rest, and the edit is kept once, beside them: left where it was, it would split the
+/// file in two, and take that name from the other device's version for everyone.
 #[test]
-fn an_edit_through_another_name_after_a_killed_swap_makes_no_extra_copy() {
+fn an_edit_through_another_name_after_a_killed_swap_keeps_the_names_one_file() {
     let (_sb, _s, a, b) = pair("killed-swap-link");
     filler(&a);
     a.write("x", "base");
@@ -488,14 +563,35 @@ fn an_edit_through_another_name_after_a_killed_swap_makes_no_extra_copy() {
     f.write_all(b" and typed").unwrap();
     drop(f);
     let p = converge(&[&a, &b]);
-    has_version(&p, b"base and typed");
-    assert_eq!(a.read("x"), b"from a");
-    let names = p.names();
+    one_file_from_a(&p, &[&a, &b]);
+    let kept = p
+        .entries
+        .values()
+        .filter(|e| e.content == b"base and typed");
+    assert_eq!(kept.count(), 1, "{:?}", p.names());
+}
+
+/// `x` and `y` hold the other device's version as one file, on every device.
+#[track_caller]
+fn one_file_from_a(p: &Picture, devices: &[&Device]) {
+    let (x, y) = (&p.entries[b"x".as_slice()], &p.entries[b"y".as_slice()]);
     assert_eq!(
-        a.conflict_copies("", "x (conflict"),
-        Vec::<String>::new(),
-        "{names:?}"
+        (&x.content[..], &y.content[..]),
+        (&b"from a"[..], &b"from a"[..])
     );
+    assert!(
+        x.link_group.is_some() && x.link_group == y.link_group,
+        "{:?}",
+        p.names()
+    );
+    #[cfg(unix)]
+    for d in devices {
+        use std::os::unix::fs::MetadataExt;
+        let ino = |n: &str| fs::metadata(d.path(n)).unwrap().ino();
+        assert_eq!(ino("x"), ino("y"), "the names split on {}", d.name);
+    }
+    #[cfg(not(unix))]
+    let _ = devices;
 }
 
 #[test]
@@ -685,6 +781,68 @@ fn an_edit_while_an_interrupted_sync_is_finished_is_kept() {
     }
 }
 
+/// A rule made after the kill hides the folder the edit was caught in: it is kept under a name and said
+/// at once, not left under a temporary name until the rule goes.
+#[test]
+fn an_edit_caught_in_a_folder_a_rule_then_hides_is_kept_at_once() {
+    let (sb, _s, a, b) = pair("killed-swap-rule");
+    filler(&a);
+    a.write("d/f", "base");
+    a.write("d/g", "other");
+    a.synced();
+    b.synced();
+    a.write("d/f", "from a");
+    a.synced();
+    sync_killed_with_edit_in_the_gap(
+        &sb,
+        &b,
+        "apply.replace.before_rename",
+        "apply.replace.swapped",
+        "d/f",
+    );
+    b.write(".cairn/ignore", "d/\n");
+    let run = b.synced();
+    assert!(
+        run.text().contains("kept under this name"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(leftover_temps(&b.root), Vec::<String>::new());
+    assert_eq!(b.conflict_copies("d", "f").len(), 1);
+    fs::remove_file(b.path(".cairn/ignore")).unwrap();
+    let p = converge(&[&a, &b]);
+    has_version(&p, b"base and typed in place");
+    assert_eq!(b.conflict_copies("d", "f").len(), 1, "{:?}", p.names());
+}
+
+/// Killed with the download beside the file it was to replace, then a rule hides the folder: the download
+/// is looked at while its mark is there to say what it is, and is no one's edit once the rule goes.
+#[test]
+fn a_download_left_in_a_folder_a_rule_then_hides_is_no_edit() {
+    let (_sb, _s, a, b) = pair("killed-aside-rule");
+    filler(&a);
+    a.write("d/f", "base");
+    a.write("d/g", "other");
+    a.synced();
+    b.synced();
+    a.write("d/f", "from a");
+    a.synced();
+    killed_at(&b, "apply.replace.aside");
+    b.write(".cairn/ignore", "d/\n");
+    b.synced();
+    fs::remove_file(b.path(".cairn/ignore")).unwrap();
+    let run = b.synced();
+    assert!(
+        !run.text().contains("kept under this name"),
+        "{}",
+        run.text()
+    );
+    let p = converge(&[&a, &b]);
+    let from_a = p.entries.values().filter(|e| e.content == b"from a");
+    assert_eq!(from_a.count(), 1, "{:?}", p.names());
+    assert_eq!(leftover_temps(&b.root), Vec::<String>::new());
+}
+
 /// The record goes first: a second kill finds the file as what it now is, and does not take it for the
 /// object it was.
 #[test]
@@ -715,6 +873,58 @@ fn a_kill_while_keeping_an_edit_keeps_one_copy() {
             p.names()
         );
         assert_eq!(leftover_temps(&b.root), Vec::<String>::new());
+    }
+}
+
+/// A kept edit is a conflict copy of what caught it, in the inbox on every device, whether or not the run
+/// that kept it got to say so: found by its record, or by its name for an editor's save.
+#[test]
+fn a_kept_edit_is_in_the_conflict_inbox_however_its_sync_ends() {
+    for (how, point) in [
+        ("typed", "never"),
+        ("typed", "clean.rescue.noted"),
+        ("typed", "clean.rescued"),
+        ("typed", "sync.scanned"),
+        ("saved", "sync.scanned"),
+    ] {
+        let (sb, _s, a, b) = pair("killed-rescue-inbox");
+        filler(&a);
+        a.write("f", "base");
+        a.synced();
+        b.synced();
+        a.write("f", "from a");
+        a.synced();
+        let run = sync_with_a_gap(
+            &sb,
+            &b,
+            "apply.replace.before_rename",
+            "apply.replace.swapped",
+            || match how {
+                "typed" => type_in_place(&b.path("f")),
+                _ => save_as_an_editor_does(&b, "f", "base and typed in place"),
+            },
+        );
+        assert!(run.was_killed(), "{}", run.text());
+        let run = b.sync_env(&[("CAIRN_FP_CRASH", point)]);
+        assert_eq!(
+            run.was_killed(),
+            point != "never",
+            "{how} {point}: {}",
+            run.text()
+        );
+        converge(&[&a, &b]);
+        let copies = b.conflict_copies("", "f");
+        assert_eq!(copies.len(), 1, "{how} {point}: {copies:?}");
+        assert_eq!(b.read(&copies[0]), b"base and typed in place");
+        for d in [&a, &b] {
+            let inbox = d.cairn(&["conflicts"]).expect_ok();
+            let line = format!("{}: the competing version of f", copies[0]);
+            assert!(
+                inbox.stdout.contains(&line),
+                "{how} {point}: {}",
+                inbox.text()
+            );
+        }
     }
 }
 
@@ -939,6 +1149,50 @@ fn what_this_filesystem_does_not_hold_is_no_change_after_a_kill() {
         let x = &p.entries[b"x".as_slice()];
         assert_eq!(x.xattrs[b"user.k".as_slice()], big, "{point}: xattr");
         assert_eq!(x.mtime, far, "{point}: time");
+    }
+}
+
+/// An edit typed into a hard-linked file in the moment before its swap, and a kill: the old inode holds
+/// the edit under the other name and the swap's leftover. The names stay one file, the edit is kept once,
+/// and a second kill, where a conflict copy would have been made of it, adds nothing.
+#[test]
+fn an_edit_caught_by_a_killed_swap_on_a_hard_link_keeps_the_names_one_file() {
+    for second in ["never", "apply.copy.intent"] {
+        let (sb, _s, a, b) = pair("killed-swap-hard");
+        filler(&a);
+        a.write("x", "base");
+        fs::hard_link(a.path("x"), a.path("y")).unwrap();
+        a.synced();
+        b.synced();
+        a.write("x", "from a");
+        a.synced();
+        sync_killed_with_edit_in_the_gap(
+            &sb,
+            &b,
+            "apply.replace.before_rename",
+            "apply.replace.swapped",
+            "x",
+        );
+        let mut text = b.sync_env(&[("CAIRN_FP_CRASH", second)]).text();
+        text += &b.synced().text();
+        assert!(!text.contains("deleted here"), "{second}: {text}");
+        let p = converge(&[&a, &b]);
+        one_file_from_a(&p, &[&a, &b]);
+        let kept = p
+            .entries
+            .values()
+            .filter(|e| e.content == b"base and typed in place");
+        assert_eq!(kept.count(), 1, "{second}: {:?}", p.names());
+        let others = p.entries.iter().filter(|(n, e)| {
+            n.as_slice() != b"x" && n.as_slice() != b"y" && e.content == b"from a"
+        });
+        assert_eq!(
+            others.count(),
+            0,
+            "{second}: an extra copy: {:?}",
+            p.names()
+        );
+        assert_eq!(leftover_temps(&b.root), Vec::<String>::new());
     }
 }
 
@@ -1238,14 +1492,15 @@ const SCENARIOS: &[Scenario] = &[
         after: |a| a.write("y", "v3"),
     },
     Scenario {
-        name: "conflict on a hard link",
+        name: "conflict on a hard link, then a name gone",
         base: |a, _| {
-            write_many(a, &[("x", "base"), ("k", "k")]);
-            fs::hard_link(a.path("x"), a.path("y")).unwrap();
+            write_many(a, &[("d/x", "base"), ("k", "k")]);
+            fs::hard_link(a.path("d/x"), a.path("y")).unwrap();
+            fs::hard_link(a.path("d/x"), a.path("z")).unwrap();
         },
-        elsewhere: |a| a.write("x", "a-edit"),
-        here: |b| b.write("x", "b-edit"),
-        after: nothing,
+        elsewhere: |a| a.write("d/x", "a-edit"),
+        here: |b| b.write("d/x", "b-edit"),
+        after: |a| fs::remove_file(a.path("z")).unwrap(),
     },
     Scenario {
         name: "moved out of view while edited here",

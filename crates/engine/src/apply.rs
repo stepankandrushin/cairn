@@ -4,7 +4,7 @@
 //! synced paths (invariant 4).
 
 use crate::client::Client;
-use crate::fsops::{self, is_exists, is_not_found, AsFd, Dir};
+use crate::fsops::{self, is_exists, is_not_found, is_permission, AsFd, Dir};
 use crate::identify::{Arriving, CopyIntent};
 use crate::merge::{ConflictCopy, Plan, TNode};
 use crate::metadata::{self, Accounts};
@@ -215,6 +215,8 @@ pub struct Applier<'a> {
     /// Objects that only got or lost an entry in this run.
     moved: BTreeSet<ObjectId>,
     superuser: bool,
+    /// Which mount the root is on, or 0 where that cannot be told.
+    root_mnt: u64,
     outcome: ApplyOutcome,
 }
 
@@ -245,6 +247,7 @@ impl<'a> Applier<'a> {
         rows: &'a mut BTreeMap<ObjectId, Row>,
         remote: &'a Tree,
     ) -> Self {
+        let root_mnt = root.dir.stat_self().map_or(0, |st| st.mnt_id);
         Self {
             root,
             client,
@@ -257,6 +260,7 @@ impl<'a> Applier<'a> {
             placed: BTreeSet::new(),
             moved: BTreeSet::new(),
             superuser: fsops::is_superuser(),
+            root_mnt,
             outcome: ApplyOutcome::default(),
         }
     }
@@ -285,7 +289,15 @@ impl<'a> Applier<'a> {
             .ok_or_else(|| StepError::Changed(format!("directory {o} is not there")))?
             .clone();
         let (dir, name) = self.locate(&link)?;
-        Ok(dir.open_dir(&name)?)
+        let opened = dir.open_dir(&name)?;
+        // As the scan does not cross into another filesystem mounted in the tree, nothing is put there.
+        let mnt = opened.stat_self()?.mnt_id;
+        if self.root_mnt != 0 && mnt != 0 && mnt != self.root_mnt {
+            return Err(StepError::Failed(
+                "another filesystem is mounted here; sync does not cross mounts".into(),
+            ));
+        }
+        Ok(opened)
     }
 
     /// Make a directory writable for a moment if its mode forbids this user, remembering durably to
@@ -561,13 +573,14 @@ impl<'a> Applier<'a> {
                 hit("apply.temp.written");
                 fsops::sync_fd(fd.as_fd())?;
                 hit("apply.temp.synced");
-                self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display);
+                // Short of room for a field, the temporary is no whole arrival: it goes, and so does the run.
+                self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display)?;
                 fsops::sync_fd(fd.as_fd())?;
                 hit("apply.temp.meta");
                 return Ok(());
             }
         }
-        self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display);
+        self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display)?;
         hit("apply.temp.meta");
         Ok(())
     }
@@ -598,8 +611,8 @@ impl<'a> Applier<'a> {
         want: &Metadata,
         current: Option<&Metadata>,
         display: &[Name],
-    ) {
-        let problems = metadata::apply(
+    ) -> Result<(), StepError> {
+        let problems = metadata::apply_unless_full(
             dir,
             name,
             kind,
@@ -607,7 +620,8 @@ impl<'a> Applier<'a> {
             current,
             &self.root.config.policy,
             self.accounts,
-        );
+        )
+        .map_err(StepError::DiskFull)?;
         if problems.is_empty() {
             self.outcome.meta_applied.push(show(display));
         }
@@ -618,6 +632,7 @@ impl<'a> Applier<'a> {
                 detail: Some(p),
             });
         }
+        Ok(())
     }
 
     /// Make a new object appear at its first link.
@@ -873,8 +888,8 @@ impl<'a> Applier<'a> {
         }
         hit("apply.replace.renamed");
         self.touched_dirs.insert(first.parent);
-        // The other hard links follow, each atomically. Swapped, as above: a name that no longer holds
-        // what was scanned has someone's edit in it, and stays, and the others still go together.
+        // The other hard links follow, each atomically. Swapped, as above: what comes out of a name that
+        // no longer held what was scanned is someone's edit, kept beside the names, which stay one file.
         let mut edited_name = false;
         for other in links.iter().skip(1) {
             let (odir, oname) = self.locate(other)?;
@@ -885,11 +900,18 @@ impl<'a> Applier<'a> {
             if swap(self.root, &odir, &otmp, &oname)? {
                 hit("apply.replace.relink.swapped");
                 let was = odir.stat(&otmp)?;
-                if Some((was.dev, was.ino, was.size, was.mtime)) != replaced {
-                    swap(self.root, &odir, &otmp, &oname)?;
+                if Some((was.dev, was.ino, was.size, was.mtime)) == replaced {
+                    odir.unlink(&otmp)?;
+                } else {
+                    // Someone's edit since the scan. This name takes the new version with the rest, or
+                    // the file would split in two for everyone, and the edit stays under the aside
+                    // name, for the next look to keep as a conflict copy, unless a name still to follow
+                    // holds it too.
                     edited_name = true;
+                    if was.nlink > 1 {
+                        odir.unlink(&otmp)?;
+                    }
                 }
-                odir.unlink(&otmp)?;
             } else {
                 odir.rename_over(&otmp, &odir, &oname)?;
             }
@@ -1097,7 +1119,7 @@ impl<'a> Applier<'a> {
                         &t.body.metadata,
                         Some(&cur.apply_from),
                         &display,
-                    );
+                    )?;
                     hit("apply.meta.done");
                     self.reset_fp(*id, &dir, &name);
                     Ok(())
@@ -1181,7 +1203,7 @@ impl<'a> Applier<'a> {
                     &t.body.metadata,
                     (!is_new).then_some(&current),
                     &display,
-                );
+                )?;
                 hit("apply.dir.meta.done");
                 self.reset_fp(id, &dir, &name);
                 if let Some(child) = opened {
@@ -1433,6 +1455,7 @@ impl<'a> Applier<'a> {
                     links: r.links.clone(),
                     names: t.links.clone(),
                     folder_touched: false,
+                    policy: Some(self.root.config.policy.clone()),
                 },
             ));
         }
@@ -1483,6 +1506,7 @@ impl<'a> Applier<'a> {
                     links: r.links.clone(),
                     names: t.links.clone(),
                     folder_touched: true,
+                    policy: Some(self.root.config.policy.clone()),
                 },
             ));
         }
@@ -1654,6 +1678,13 @@ pub fn recover(root: &mut Root) -> Result<Vec<String>> {
         }
         root.state.drop_intent(&key)?;
     }
+    // A scratch entry a killed run left in the state directory, which held nothing.
+    for name in root.state_dir.list()? {
+        if name.starts_with(SCRATCH_PREFIX.as_bytes()) {
+            let _ = root.state_dir.unlink(&name);
+        }
+    }
+
     // Anything in the stage with no intent is kept too, not dropped.
     for name in stage.list()? {
         let label =
@@ -1885,38 +1916,89 @@ pub fn remove_stale_temp(root: &Root, path: &[Name], name: &[u8]) -> Result<()> 
 }
 
 /// What this filesystem makes of `want` on something new, which is how new content arrives: asked of it
-/// on a scratch entry under the state directory, on the same filesystem as all of the tree. What a file
-/// holds that differs from this was changed since, and what `want` asks for and this does not hold is
-/// no one's doing. `None` if it cannot be asked, on a full disk for one.
+/// on a scratch entry, under the policy the run that placed the file applied. The entry is made beside
+/// the file, in `folder`, so that what a folder gives what is made in it, an inherited ACL or a
+/// set-group-ID folder's group, is in it too, and the folder's time is put back after. Without a folder,
+/// for a dry run, or where the folder cannot be written to, it is made in the state directory instead,
+/// which writes nothing in the tree. What a file holds that differs from this was changed since, and what
+/// `want` asks for and this does not hold is no one's doing. `None` for a folder, which is not asked; an
+/// error if it cannot be asked, a disk too full for one more entry say, since what is there would then
+/// stand for what arrived, and a change made here would never go up.
 pub fn what_arrives(
     root: &Root,
     accounts: &Accounts,
     content: &Content,
     want: &Metadata,
-) -> Option<Metadata> {
-    const SCRATCH: &[u8] = b"arriving-probe";
-    let state = root.dir.open_dir(cairn_protocol::STATE_DIR).ok()?;
-    let _ = state.unlink(SCRATCH);
-    match content {
-        Content::File { .. } => drop(state.create_new(SCRATCH, 0o600).ok()?),
-        Content::Symlink { target } => state.symlink(&target.0, SCRATCH).ok()?,
-        Content::Dir => return None,
+    policy: &metadata::ApplyPolicy,
+    folder: Option<&[Name]>,
+) -> Result<Option<Metadata>> {
+    if *content == Content::Dir {
+        return Ok(None);
     }
-    let _ = metadata::apply(
-        &state,
-        SCRATCH,
-        content.kind(),
-        want,
-        None,
-        &root.config.policy,
+    // Windows keeps no record of what a folder gives a new file.
+    let folder = folder.filter(|_| cfg!(unix));
+    let beside = match folder {
+        Some(path) => {
+            let dir = root.dir.open_path(path.iter())?;
+            let before = dir.stat_self()?;
+            let name = root.temp_name();
+            match scratch(root, accounts, &dir, &name, content, want, policy) {
+                Err(e) if is_permission(&e) => None,
+                done => {
+                    let now = dir.stat_self()?;
+                    if now.mtime != before.mtime {
+                        dir.set_mtime(b".", before.mtime)?;
+                    }
+                    Some(done?)
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(held) = beside {
+        return Ok(Some(held));
+    }
+    let state = root.dir.open_dir(cairn_protocol::STATE_DIR)?;
+    let name = format!("{SCRATCH_PREFIX}{}", hex::encode(rand::random::<[u8; 8]>()));
+    Ok(Some(scratch(
+        root,
         accounts,
-    );
-    let held = state.stat(SCRATCH).ok().map(|st| {
+        &state,
+        name.as_bytes(),
+        content,
+        want,
+        policy,
+    )?))
+}
+
+/// The name of a scratch entry in the state directory, which a killed run can leave.
+pub const SCRATCH_PREFIX: &str = "arriving-probe";
+
+fn scratch(
+    root: &Root,
+    accounts: &Accounts,
+    dir: &Dir,
+    name: &[u8],
+    content: &Content,
+    want: &Metadata,
+    policy: &metadata::ApplyPolicy,
+) -> std::io::Result<Metadata> {
+    match content {
+        Content::File { .. } => drop(dir.create_new(name, 0o600)?),
+        Content::Symlink { target } => dir.symlink(&target.0, name)?,
+        Content::Dir => return Err(std::io::Error::other("a folder is not asked")),
+    }
+    // Short of room, it would hold less than the file did, and the difference would read as a change.
+    let applied =
+        metadata::apply_unless_full(dir, name, content.kind(), want, None, policy, accounts);
+    let held = applied.and_then(|_| dir.stat(name)).map(|st| {
         let precision = root.dir.fstype_precision_ns();
-        metadata::capture(&state, SCRATCH, &st, accounts, precision, &mut Vec::new())
+        metadata::capture(dir, name, &st, accounts, precision, &mut Vec::new())
     });
-    let _ = state.unlink(SCRATCH);
-    held
+    let gone = dir.unlink(name);
+    let held = held?;
+    gone?;
+    Ok(held)
 }
 
 /// A killed run's temporary that is a file it was replacing or removing, and no longer holds what was
@@ -1958,7 +2040,7 @@ pub fn keep_rescued_temp(
         show(&full)
     });
     Ok(format!(
-        "{at}: an edit caught by an interrupted sync, which was replacing or removing this file; it is kept under this name"
+        "{at}: an edit made while a sync was replacing or removing this file; it is kept under this name"
     ))
 }
 

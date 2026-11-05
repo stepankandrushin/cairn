@@ -1516,9 +1516,10 @@ fn a_save_made_while_a_file_is_being_removed_is_reported_as_surviving_the_delete
     assert_eq!(a.read("f"), b"saved");
 }
 
-/// Three names, one saved over in the last moment: the other two stay one file.
+/// Three names, one saved over in the last moment: all three stay one file, with the other device's
+/// version, and the save is a conflict copy beside them.
 #[test]
-fn a_save_to_one_name_of_three_keeps_the_others_linked() {
+fn a_save_to_one_name_of_three_keeps_all_three_one_file() {
     let (sb, _s, a, b) = pair("sel-hl-three");
     a.write("x", "base");
     std::fs::hard_link(a.path("x"), a.path("y")).unwrap();
@@ -1546,14 +1547,20 @@ fn a_save_to_one_name_of_three_keeps_the_others_linked() {
     let _ = b.sync();
     a.synced();
     b.synced();
-    assert_eq!(b.read("y"), b"typed on b");
-    assert_eq!(b.read("x"), b"edit from a");
-    assert_eq!(b.read("z"), b"edit from a");
-    assert_eq!(nlink(&b.path("x")), 2);
-    assert_eq!(nlink(&a.path("x")), 2);
+    for d in [&a, &b] {
+        for n in ["x", "y", "z"] {
+            assert_eq!(d.read(n), b"edit from a", "{n} on {}", d.name);
+        }
+        assert_eq!(nlink(&d.path("x")), 3, "the names split on {}", d.name);
+        let copies = d.conflict_copies("", "y");
+        assert_eq!(copies.len(), 1, "on {}: {copies:?}", d.name);
+        assert_eq!(d.read(&copies[0]), b"typed on b");
+    }
 }
 
-/// An edit in place to the second name, after the first has been replaced.
+/// An edit in place to the second name, after the first has been replaced: the names stay one file, with
+/// the other device's version, and the edit is a conflict copy beside them, in everyone's inbox. Left at
+/// its name, it would split the file in two, and that name would take the edit for everyone.
 #[test]
 fn an_edit_in_place_of_the_second_name_in_the_last_moment_is_kept() {
     let (sb, _s, a, b) = pair("sel-hl-inplace");
@@ -1576,12 +1583,23 @@ fn an_edit_in_place_of_the_second_name_in_the_last_moment_is_kept() {
         }
         std::fs::write(b.path("y"), "typed on b, longer than it was").unwrap();
         std::fs::write(gate.join("go"), "").unwrap();
-        let _ = syncing.join();
+        let run = syncing.join().unwrap();
+        assert!(run.stdout.contains(" 1 conflict(s)"), "{}", run.text());
     });
-    let _ = b.sync();
     a.synced();
     b.synced();
-    assert_eq!(b.read("y"), b"typed on b, longer than it was");
+    for d in [&a, &b] {
+        assert_eq!(d.read("x"), b"edit from a", "on {}", d.name);
+        assert_eq!(d.read("y"), b"edit from a", "on {}", d.name);
+        assert_eq!(nlink(&d.path("x")), 2, "the names split on {}", d.name);
+        let copies = d.conflict_copies("", "y");
+        assert_eq!(copies.len(), 1, "on {}: {copies:?}", d.name);
+        assert_eq!(d.read(&copies[0]), b"typed on b, longer than it was");
+        let inbox = d.cairn(&["conflicts"]).expect_ok();
+        // Named by the file's first name, which is the other.
+        let line = format!("{}: the competing version of x", copies[0]);
+        assert!(inbox.stdout.contains(&line), "{}", inbox.text());
+    }
 }
 
 /// A rename that arrived, while the edit that came with it did not, because a file here changed in the

@@ -75,7 +75,7 @@ the root.
 | `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
-| `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here and whether it is a folder only something inside changes, which the next scan compares with the disk to tell what arrived from what this device did |
+| `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here, the policy it applied by, and whether it is a folder only something inside changes, which the next scan compares with the disk to tell what arrived from what this device did |
 
 `rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field
@@ -98,5 +98,6 @@ which a half-written file never is. If a killed run leaves one that holds neithe
 nor what was on its way, and no other name has it, someone edited or saved in the moment before: it stays, under a
 conflict name of that name, reported, and goes up as a conflict copy of the file it was caught by, so the conflict
 inbox lists it. One in a folder a rule made since the kill leaves out is looked for there, in the folders of what
-was on its way. `.cairn/arriving-probe` is a scratch entry, there only for a moment after a
-killed run, on which the filesystem is asked what it makes of a record.
+was on its way. After a killed run, the filesystem is asked what it makes of a record on a scratch entry made for
+a moment beside the file, under that temporary prefix, or as `.cairn/arriving-probe-<random>` in a folder this
+device cannot write to and for a dry run; a run killed in that moment leaves one, which the next removes.

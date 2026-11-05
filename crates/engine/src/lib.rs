@@ -28,9 +28,12 @@ pub use metadata::{ApplyPolicy, OwnerPolicy};
 pub use root::{init_root, InitOptions, Root};
 pub use sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 
-/// A full disk or quota, anywhere in an error chain.
+/// A full disk or quota, anywhere in an error chain, the state database's own included.
 pub fn is_disk_full(err: &anyhow::Error) -> bool {
     err.chain().any(|e| {
+        if let Some(rusqlite::Error::SqliteFailure(f, _)) = e.downcast_ref::<rusqlite::Error>() {
+            return f.code == rusqlite::ErrorCode::DiskFull;
+        }
         e.downcast_ref::<std::io::Error>()
             .is_some_and(fsops::is_disk_full)
     })

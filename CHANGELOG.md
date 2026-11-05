@@ -54,11 +54,25 @@
   hides them.
 - The losing side of a same-field metadata conflict was missing from the log when the sync that applied the winner
   was killed. It is noted before anything is applied, and logged once.
+- A disk that filled while a file arrived could leave it in place without an xattr, and the next sync then removed
+  that xattr for everyone, the device it came from included. A field that does not fit for want of room now stops
+  the run before the file is placed, and a full disk is said as such wherever it shows, SQLite's own error included.
+- After a kill, what a folder gives a new file (an access ACL from a default ACL, a set-group-ID folder's group)
+  went up as a change, for everyone, and a policy changed before the next sync, `setid` turned on, took a setuid bit
+  off the server's record. The filesystem is now asked beside the file, under the policy the run applied by.
+- After a kill, a chmod made in that moment never went up if the disk had no room for one more entry, and a dry run,
+  so `cairn status`, said there was nothing to do. The sync now stops and says the disk is full, and the dry run
+  asks as the sync does.
+- An edit to another name of a hard-linked file, in the moment a sync moved that name to the new version, split
+  the file in two for everyone: that name became a new file holding the edit, with no conflict copy. The names now
+  stay one file, and the edit is a conflict copy in the inbox.
+- A file arriving in a folder where another filesystem is mounted inside the tree was written onto that
+  filesystem, which the scan does not cross, and every sync after stopped at it. It now waits, reported.
 
 - A file deleted on one device and restored before another had finished applying the delete could be deleted again
   by that other device, which had never deleted it. History kept it.
 - A hard-linked file being replaced by a sync could overwrite a save made to its second name in the moment before
-  the replacement, and that text was lost. The version here now stays.
+  the replacement, and that text was lost. The version here now stays, as a conflict copy.
 - A sync interrupted after making a conflict copy could stop finishing for a while, ending in "the tree kept changing
   for 12 rounds", if the copy was then deleted and a symlink or folder took its inode number. Nothing was lost.
 - On a filesystem that cannot swap two names in one step, a replacement renamed the new version over the old one,

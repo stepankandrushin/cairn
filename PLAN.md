@@ -137,19 +137,21 @@ disk and what the journal says, so a crash only means the next run finds some of
 on its way is noted before the first step, in one transaction however much it is, and claims nothing: the
 next scan compares it with the disk, field by field and name by name, and what got there counts as shared
 with the server. New content arrived whole, and what its fields should read is asked of the filesystem, on a
-scratch entry, so that what it cannot hold is no change of anyone's. So what a device received does not read
-as its own change, kill or full disk, and a later change from elsewhere stands as it would have. With no room
-left to ask, what is there stands and goes up for no one. An edit caught in the moment before a file is
-replaced or removed is kept under a conflict name, as a conflict copy in the inbox, also when the name was a
-hard link's still to follow, whose names stay one file. The limits: a person who acts on a file in the moment
+scratch entry beside it and under the policy the run applied by, so that what it cannot hold, and what its
+folder gives a new file (an inherited ACL, a set-group-ID folder's group), is no change of anyone's. A field
+that did not fit for want of room is a full disk, not a limit: the file is not placed. So what a device
+received does not read as its own change, kill or full disk, and a later change from elsewhere stands as it
+would have. With no room left to ask, the sync stops and says the disk is full. An edit caught in the moment
+before a file is replaced or removed, or in another name of a hard-linked file as it moves to the new version,
+is kept under a conflict name, as a conflict copy in the inbox, and the names stay one file. The limits: in a
+folder this device cannot write to, the scratch entry is made in `.cairn`, as it is for a dry run, so there
+what the folder gives a new file reads as a change made here. A person who acts on a file in the moment
 between the kill and the next scan acts on something the scan cannot tell from what arrived, as a new inode has
 no record yet, and telling them apart would cost a durable write for each file before its rename. So a removal
 of a just-arrived file can be undone by the server's copy, a rename can leave both, an edit makes a conflict
 copy, a rename of what the run had just moved loses to the server's move, reported, and a folder's chmod or
 time set then goes back. A folder a rule hides from the next scan while it is still private to the run that
-made it logs "this device had 700" once the rule goes. And with no kill: an edit to another name of a
-hard-linked file, in the moment a sync moves that name to the new version, stays at its name, which splits the
-file in two for everyone, that name a new file holding the edit, with no conflict copy.
+made it logs "this device had 700" once the rule goes.
 
 | Changes | Result |
 |---|---|

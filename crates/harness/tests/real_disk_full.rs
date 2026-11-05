@@ -188,7 +188,7 @@ fn inner_server_disk() {
 }
 
 #[test]
-fn a_disk_with_no_room_to_ask_what_arrived_pushes_nothing_and_does_not_crash() {
+fn a_disk_with_no_room_to_ask_what_arrived_stops_and_then_pushes_the_change() {
     let sb = Sandbox::on_disk("full-probe");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
@@ -197,18 +197,9 @@ fn a_disk_with_no_room_to_ask_what_arrived_pushes_nothing_and_does_not_crash() {
     }
 }
 
-/// After a kill, what arrived whole with something else on disk than its record is asked of the
-/// filesystem on a scratch entry. With no inode left for one, what is there stands: nothing goes up for
-/// anyone, and the sync goes on.
-#[test]
-#[ignore = "runs inside the namespace, through the test above"]
-fn inner_no_room_to_ask() {
-    let small = inner_dir();
-    let sb = Sandbox::fast("full-probe-outer");
-    let server = Server::start(sb.path("server"));
-    let a = Device::new(&sb, &server, "a");
-    let b_root = small.join("b");
-    std::fs::create_dir(&b_root).unwrap();
+/// A device whose root is on the small disk.
+fn device_on(server: &Server, root: std::path::PathBuf, name: &str) -> Device {
+    std::fs::create_dir(&root).unwrap();
     let token = server.token_file.to_str().unwrap().to_string();
     run(
         &[
@@ -216,18 +207,60 @@ fn inner_no_room_to_ask() {
             "--server",
             &server.url,
             "--device-name",
-            "b",
+            name,
             "--token-file",
             &token,
-            b_root.to_str().unwrap(),
+            root.to_str().unwrap(),
         ],
         &[],
     )
     .expect_ok();
-    let b = Device {
-        root: b_root,
-        name: "b".into(),
-    };
+    Device {
+        root,
+        name: name.into(),
+    }
+}
+
+/// A sync of `d` paused at `point` while `fill` takes what room is left, then let go.
+fn sync_while_filling(sb: &Sandbox, d: &Device, point: &str, fill: impl FnOnce()) -> Run {
+    let gate = sb.path("gate");
+    std::fs::create_dir(&gate).unwrap();
+    let pause = format!("{point}:{}", gate.display());
+    std::thread::scope(|s| {
+        let syncing = s.spawn(|| d.sync_env(&[("CAIRN_FP_PAUSE", &pause)]));
+        let start = std::time::Instant::now();
+        while !gate.join("reached").exists() {
+            assert!(start.elapsed().as_secs() < 60, "never reached {point}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fill();
+        std::fs::write(gate.join("go"), "").unwrap();
+        syncing.join().unwrap()
+    })
+}
+
+/// Empty files in `dir` until no inode is left.
+fn take_every_inode(dir: &std::path::Path) {
+    std::fs::create_dir(dir).unwrap();
+    let mut made = 0;
+    while std::fs::File::create(dir.join(made.to_string())).is_ok() {
+        made += 1;
+    }
+    assert!(made > 0);
+}
+
+/// After a kill, what arrived whole with something else on disk than its record is asked of the
+/// filesystem on a scratch entry. With no inode left for one, the sync stops and says the disk is full:
+/// what is there standing for what arrived would keep a change made here off the server for good. Once
+/// there is room, the change goes up.
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_no_room_to_ask() {
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-probe-outer");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = device_on(&server, small.join("b"), "b");
     for i in 0..14 {
         a.write(&format!("fill/{i}"), format!("{i}"));
     }
@@ -243,29 +276,10 @@ fn inner_no_room_to_ask() {
     chmod(&b.path("x"), 0o600);
 
     // The next sync's scan is done when the last inode goes.
-    let gate = sb.path("gate");
-    std::fs::create_dir(&gate).unwrap();
-    let pause = format!("sync.scanned:{}", gate.display());
     let ballast = small.join("ballast");
-    let run = std::thread::scope(|s| {
-        let syncing = s.spawn(|| b.sync_env(&[("CAIRN_FP_PAUSE", &pause)]));
-        let start = std::time::Instant::now();
-        while !gate.join("reached").exists() {
-            assert!(start.elapsed().as_secs() < 60, "never reached sync.scanned");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        std::fs::create_dir(&ballast).unwrap();
-        let mut made = 0;
-        while std::fs::File::create(ballast.join(made.to_string())).is_ok() {
-            made += 1;
-        }
-        assert!(made > 0);
-        assert!(std::fs::File::create(b.path(".cairn/arriving-probe")).is_err());
-        std::fs::write(gate.join("go"), "").unwrap();
-        syncing.join().unwrap()
-    });
-    assert_ne!(run.code, Some(101), "it crashed: {}", run.text());
-    assert!(!run.was_killed(), "{}", run.text());
+    let run = sync_while_filling(&sb, &b, "sync.scanned", || take_every_inode(&ballast));
+    assert_eq!(run.code, Some(1), "{}", run.text());
+    assert!(run.stderr.contains("this disk is full"), "{}", run.text());
 
     std::fs::remove_dir_all(&ballast).unwrap();
     b.synced();
@@ -273,6 +287,148 @@ fn inner_no_room_to_ask() {
     use std::os::unix::fs::PermissionsExt;
     let mode = |d: &Device| std::fs::metadata(d.path("x")).unwrap().permissions().mode() & 0o777;
     assert_eq!(a.read("x"), b"v2");
-    assert_eq!(mode(&a), 0o644, "something went up for everyone");
+    assert_eq!(mode(&a), 0o600, "the chmod here never went up");
+}
+
+#[test]
+fn an_xattr_the_disk_has_no_room_for_stays_on_every_device() {
+    let sb = Sandbox::on_disk("full-xattr");
+    let dir = sb.path("small");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = in_namespace_with(
+        "inner_xattr_on_a_full_disk",
+        &dir,
+        "size=24m,nr_inodes=3000",
+    ) {
+        assert!(ok, "see the output above");
+    }
+}
+
+/// The disk fills while a file with an xattr is on its way: the temporary has its content and not the
+/// xattr, which is no limit of this filesystem but a full disk. The file is not placed, the sync says the
+/// disk is full, and once there is room the file arrives with its xattr; the device it came from keeps it.
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_xattr_on_a_full_disk() {
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-xattr-outer");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = device_on(&server, small.join("b"), "b");
+    for i in 0..14 {
+        a.write(&format!("fill/{i}"), format!("{i}"));
+    }
+    a.write("x", "v1");
+    set_xattr(&a.path("x"), "user.k", b"vvvvvvvvvv");
+    a.synced();
+    b.synced();
+    let xattrs = |d: &Device| Picture::of(&d.root).entries[b"x".as_slice()].xattrs.clone();
+    if xattrs(&b).is_empty() {
+        eprintln!("no user xattrs on this tmpfs: skipped");
+        return;
+    }
+    a.write("x", "v2");
+    a.synced();
+
+    // Data, then inodes, then what is left of tmpfs's room for xattrs, which inodes share.
+    let ballast = small.join("ballast");
+    let run = sync_while_filling(&sb, &b, "apply.temp.synced", || {
+        std::fs::create_dir(&ballast).unwrap();
+        let mut big = std::fs::File::create(ballast.join("big")).unwrap();
+        for size in [1 << 20, 4096, 512] {
+            use std::io::Write;
+            while big.write_all(&vec![0u8; size]).is_ok() {}
+        }
+        let mut made = 0;
+        while std::fs::File::create(ballast.join(made.to_string())).is_ok() {
+            made += 1;
+        }
+        let first = ballast.join("0");
+        let mut k = 0;
+        for size in [512, 64, 8, 1] {
+            while rustix::fs::setxattr(
+                &first,
+                format!("user.p{k}").as_str(),
+                &vec![b'p'; size],
+                rustix::fs::XattrFlags::empty(),
+            )
+            .is_ok()
+            {
+                k += 1;
+            }
+        }
+    });
+    assert_eq!(run.code, Some(1), "{}", run.text());
+    assert!(run.stderr.contains("this disk is full"), "{}", run.text());
+
+    std::fs::remove_dir_all(&ballast).unwrap();
+    b.synced();
+    a.synced();
+    b.synced();
     assert_eq!(b.read("x"), b"v2");
+    assert_eq!(xattrs(&b).get(b"user.k".as_slice()).map(Vec::len), Some(10));
+    assert_eq!(
+        xattrs(&a).get(b"user.k".as_slice()).map(Vec::len),
+        Some(10),
+        "a lost its xattr"
+    );
+}
+
+#[test]
+fn nothing_is_written_into_a_filesystem_mounted_in_the_tree() {
+    let sb = Sandbox::on_disk("mount-in-tree");
+    let dir = sb.path("unused");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = in_namespace_with("inner_mount_in_the_tree", &dir, "size=1m") {
+        assert!(ok, "see the output above");
+    }
+}
+
+#[track_caller]
+fn sh(program: &str, args: &[&str]) {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The scan does not cross into another filesystem mounted in the tree, so the apply does not either:
+/// written there, a file would be one no scan could see, and every sync would stop at it. It waits,
+/// reported, and arrives once the mount is gone.
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_mount_in_the_tree() {
+    let sb = Sandbox::fast("mount-in-tree-outer");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..14 {
+        a.write(&format!("fill/{i}"), format!("{i}"));
+    }
+    a.write("m/k", "k");
+    a.synced();
+    b.synced();
+    // A person mounts another filesystem on the folder.
+    let m = b.path("m");
+    let m = m.to_str().unwrap();
+    sh("mount", &["-t", "tmpfs", "-o", "size=8m", "tmpfs", m]);
+    let run = b.sync();
+    assert!(
+        run.text().contains("sync does not cross mounts"),
+        "{}",
+        run.text()
+    );
+    a.write("m/x", "into the mount");
+    a.synced();
+    let run = b.sync();
+    assert!(!b.exists("m/x"), "written into the mount: {}", run.text());
+    sh("umount", &[m]);
+    b.synced();
+    assert_eq!(b.read("m/x"), b"into the mount");
+    assert_eq!(b.read("m/k"), b"k");
 }

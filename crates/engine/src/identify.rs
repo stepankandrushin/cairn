@@ -53,6 +53,10 @@ pub struct Arriving {
     /// A folder something happens in, whose timestamp moves until the last pass puts it back.
     #[serde(default)]
     pub folder_touched: bool,
+    /// What the run applied by, which the next scan asks the filesystem under: a policy changed since
+    /// would read what it left unapplied as a change. Absent in a mark an older version left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::metadata::ApplyPolicy>,
 }
 
 #[derive(Debug, Default)]

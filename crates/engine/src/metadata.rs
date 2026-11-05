@@ -400,8 +400,34 @@ pub fn apply(
     policy: &ApplyPolicy,
     accounts: &Accounts,
 ) -> Vec<String> {
+    match apply_unless_full(dir, name, kind, want, current, policy, accounts) {
+        Ok(problems) => problems,
+        Err(e) => vec![format!("{e}")],
+    }
+}
+
+/// The same, failing on a full disk: what a field could not get only for want of room is no limit of
+/// this filesystem, and an entry missing it must not stand for the record, or the next look reads the
+/// gap as a change made here. A field too large for this filesystem is a limit, reported as any other.
+/// The rest is applied all the same.
+pub fn apply_unless_full(
+    dir: &Dir,
+    name: &[u8],
+    kind: ObjectKind,
+    want: &Metadata,
+    current: Option<&Metadata>,
+    policy: &ApplyPolicy,
+    accounts: &Accounts,
+) -> io::Result<Vec<String>> {
     let mut problems = Vec::new();
-    let mut note = |what: &str, e: io::Error| problems.push(format!("{what}: {e}"));
+    let mut full: Option<io::Error> = None;
+    let mut note = |what: &str, e: io::Error| {
+        if crate::fsops::is_out_of_room(dir, &e) {
+            full.get_or_insert(e);
+        } else {
+            problems.push(format!("{what}: {e}"));
+        }
+    };
 
     // chown clears setuid, setgid and capabilities, so they are set after it, and a chown forces them.
     let owner_differs = current.is_none_or(|c| c.owner != want.owner);
@@ -484,7 +510,10 @@ pub fn apply(
             note("mtime", e);
         }
     }
-    problems
+    match full {
+        Some(e) => Err(e),
+        None => Ok(problems),
+    }
 }
 
 #[cfg(test)]

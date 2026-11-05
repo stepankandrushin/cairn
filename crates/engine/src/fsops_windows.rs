@@ -752,6 +752,11 @@ pub fn is_not_empty(e: &io::Error) -> bool {
     has_code(e, &[ERROR_DIR_NOT_EMPTY])
 }
 
+/// A full disk or quota met by an entry in `dir`. Windows has no limit on a field that it reports so.
+pub fn is_out_of_room(_dir: &Dir, e: &io::Error) -> bool {
+    is_disk_full(e)
+}
+
 pub fn is_disk_full(e: &io::Error) -> bool {
     has_code(
         e,

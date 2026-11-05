@@ -126,6 +126,22 @@ pub fn is_disk_full(e: &io::Error) -> bool {
     is_errno(e, Errno::NOSPC) || is_errno(e, Errno::DQUOT)
 }
 
+/// A full disk or quota met by an entry in `dir`, as opposed to a field this filesystem cannot hold at
+/// all: ext4 refuses an xattr too large for its block with ENOSPC, room or not. Out of room is no block or
+/// no inode left for this user.
+pub fn is_out_of_room(dir: &Dir, e: &io::Error) -> bool {
+    if is_errno(e, Errno::DQUOT) {
+        return true;
+    }
+    if !is_errno(e, Errno::NOSPC) {
+        return false;
+    }
+    match rustix::fs::fstatvfs(dir.fd()) {
+        Ok(st) => st.f_bavail == 0 || (st.f_files > 0 && st.f_favail == 0),
+        Err(_) => true,
+    }
+}
+
 /// A name whose bytes this filesystem refuses.
 pub fn is_bad_name(e: &io::Error) -> bool {
     is_errno(e, Errno::ILSEQ)

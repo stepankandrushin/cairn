@@ -325,6 +325,130 @@ fn a_kill_while_a_folder_arrives_makes_no_false_note() {
     assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, dir_mode(0o775));
 }
 
+// --- What the filesystem is asked after a kill ---
+
+/// A default ACL on a folder, as `setfacl -d -m u:65534:rx` makes it.
+#[cfg(target_os = "linux")]
+fn give_a_default_acl(dir: &std::path::Path) {
+    let undefined = u32::MAX;
+    let entries: [(u16, u16, u32); 5] = [
+        (1, 7, undefined),
+        (2, 5, 65534),
+        (4, 5, undefined),
+        (16, 5, undefined),
+        (32, 5, undefined),
+    ];
+    let mut value = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        value.extend(tag.to_le_bytes());
+        value.extend(perm.to_le_bytes());
+        value.extend(id.to_le_bytes());
+    }
+    rustix::fs::setxattr(
+        dir,
+        "system.posix_acl_default",
+        &value,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn has_access_acl(path: &std::path::Path) -> bool {
+    let mut buf = [0u8; 256];
+    rustix::fs::getxattr(path, "system.posix_acl_access", &mut buf[..]).is_ok()
+}
+
+/// What a folder gives what is made in it, here an access ACL from its default ACL, is the folder's doing,
+/// not a change made here: after a kill the filesystem is asked beside the file, and nothing goes up.
+#[test]
+#[cfg(target_os = "linux")]
+fn what_a_folder_gives_a_new_file_is_no_change_after_a_kill() {
+    for (rel, point) in [
+        ("d/x", "apply.replace.renamed"),
+        ("d/y", "apply.create.renamed"),
+    ] {
+        let (_sb, _s, a, b) = pair("killed-acl-folder");
+        filler(&a);
+        a.write("d/x", "v1");
+        a.synced();
+        b.synced();
+        give_a_default_acl(&b.path("d"));
+        b.synced();
+        a.synced();
+        a.write(rel, "v2");
+        if has_access_acl(&a.path(rel)) {
+            rustix::fs::removexattr(a.path(rel), "system.posix_acl_access").unwrap();
+        }
+        a.synced();
+        killed_at(&b, point);
+        assert!(
+            has_access_acl(&b.path(rel)),
+            "{rel}: the folder gave it none"
+        );
+        let run = b.synced();
+        assert!(run.stdout.contains(" 0 commits"), "{rel}: {}", run.text());
+        a.synced();
+        assert!(
+            !has_access_acl(&a.path(rel)),
+            "{rel}: b's folder's ACL went up"
+        );
+        // The scratch entry came and went in the folder, whose time stays what it was.
+        let time = |d: &Device| Picture::of(&d.root).entries[b"d".as_slice()].mtime;
+        assert_eq!(time(&b), time(&a), "{rel}: the folder's time moved");
+    }
+}
+
+/// After a kill, a dry run, and so `cairn status`, asks the filesystem as a sync does: a chmod made here in
+/// that moment shows as about to go up.
+#[test]
+#[cfg(unix)]
+fn a_dry_run_after_a_kill_shows_a_change_made_here() {
+    let (_sb, _s, a, b) = pair("killed-dry-run");
+    filler(&a);
+    a.write("x", "v1");
+    chmod(&a.path("x"), 0o644);
+    a.synced();
+    b.synced();
+    a.write("x", "v2");
+    a.synced();
+    killed_at(&b, "apply.replace.renamed");
+    chmod(&b.path("x"), 0o600);
+    let dry = b.cairn(&["sync", "--dry-run"]).expect_ok();
+    assert!(dry.stdout.contains("server: update"), "{}", dry.text());
+    let run = b.synced();
+    assert!(run.stdout.contains(" 1 commits"), "{}", run.text());
+    a.synced();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(a.path("x")).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// A policy changed between the kill and the next sync: what the run left unapplied under the old one, a
+/// setuid bit here, is no change made here, and the server's record keeps it.
+#[test]
+#[cfg(unix)]
+fn a_policy_changed_after_a_kill_takes_nothing_from_the_record() {
+    let (_sb, _s, a, b) = pair("killed-policy");
+    filler(&a);
+    a.write("x", "v1");
+    chmod(&a.path("x"), 0o4755);
+    a.synced();
+    b.synced();
+    a.write("x", "v2");
+    chmod(&a.path("x"), 0o4755);
+    a.synced();
+    killed_at(&b, "apply.replace.renamed");
+    let config = b.path(".cairn/config.json");
+    let mut c: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    c["policy"]["setid"] = true.into();
+    fs::write(&config, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+    let run = b.synced();
+    assert!(run.stdout.contains(" 0 commits"), "{}", run.text());
+}
+
 /// The loser of a same-field conflict goes in the log once, however the run that applied the winner
 /// ends: once the winner is on disk, nothing there says there was a conflict.
 #[test]

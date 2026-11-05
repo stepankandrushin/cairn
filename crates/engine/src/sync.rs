@@ -542,30 +542,44 @@ fn still_holds(root: &Root, node: &crate::scan::Scanned, m: &Manifest) -> bool {
 }
 
 /// For what has arrived whole with something else than its record on disk: what this filesystem would
-/// have made of that record. Without it, on a dry run or a disk too full to ask, what is there stands.
+/// have made of that record, beside it and under the policy the run applied by. An error if that cannot be
+/// asked: what is there would otherwise stand for what arrived, and a change made here would never go up.
 fn what_arrives_here(
     root: &Root,
     accounts: &Accounts,
     arriving: &BTreeMap<ObjectId, Arriving>,
     identified: &Identified,
     dry_run: bool,
-) -> BTreeMap<ObjectId, cairn_protocol::Metadata> {
-    if dry_run {
-        return BTreeMap::new();
+) -> Result<BTreeMap<ObjectId, cairn_protocol::Metadata>> {
+    let mut out = BTreeMap::new();
+    for a in arriving.values() {
+        let Some(node) = identified.scanned.get(&a.object) else {
+            continue;
+        };
+        let mut want = a.body.metadata.clone();
+        want.btime = node.metadata.btime;
+        if node.content != a.body.content || node.metadata == want {
+            continue;
+        }
+        let policy = a.policy.as_ref().unwrap_or(&root.config.policy);
+        let folder = node
+            .paths
+            .first()
+            .and_then(|p| p.split_last())
+            .map(|(_, parent)| parent)
+            .filter(|_| !dry_run);
+        let held = apply::what_arrives(root, accounts, &node.content, &a.body.metadata, policy, folder)
+            .with_context(|| {
+                format!(
+                    "{}: asking this filesystem what it makes of what arrived before an interrupted sync",
+                    crate::scan::display_path(&node.paths[0])
+                )
+            })?;
+        if let Some(held) = held {
+            out.insert(a.object, held);
+        }
     }
-    arriving
-        .values()
-        .filter_map(|a| {
-            let node = identified.scanned.get(&a.object)?;
-            let mut want = a.body.metadata.clone();
-            want.btime = node.metadata.btime;
-            if node.content != a.body.content || node.metadata == want {
-                return None;
-            }
-            let held = apply::what_arrives(root, accounts, &node.content, &a.body.metadata)?;
-            Some((a.object, held))
-        })
-        .collect()
+    Ok(out)
 }
 
 /// An empty or largely vanished tree is not a mass delete until a person says so (invariant 5).
@@ -1176,8 +1190,18 @@ fn describe_op(op: &Op) -> String {
     }
 }
 
-/// Sync one root once.
+/// Sync one root once. A full disk is said as such, wherever it shows.
 pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
+    sync_once(path, opts).map_err(|e| {
+        if crate::is_disk_full(&e) && !format!("{e:#}").contains("this disk is full") {
+            e.context("this disk is full: free space and sync again")
+        } else {
+            e
+        }
+    })
+}
+
+fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let mut report = SyncReport::new();
     let mut root = match Root::open(path) {
         Ok(r) => r,
@@ -1312,7 +1336,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         );
         // In a tree still moving, what was seen was seen, and only what was not is asked again.
         if !arriving.is_empty() {
-            let holds = what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run);
+            let holds = what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run)?;
             let (changed, answered) =
                 settle_arriving(&identified, &arriving, &holds, &view.base, &mut rows);
             if !opts.dry_run {

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 **Fixed:**
 
@@ -8,6 +8,9 @@
   before its last pass, by a kill or a full disk, it stayed private (mode 0700) there for good, with no change
   shown: that device took 0700 for a mode it keeps. The server and the other devices had the right mode. It now
   gets it on the next sync.
+- A folder that arrived and was stopped before its last pass, by a kill or a full disk, also stayed at 0700 for
+  good if it could not be read when it next moved, renamed on another device or here: what could not be read was
+  taken for what the folder held. Only what was read in full is now recorded as what a folder holds.
 - `cairn init` with a server it could not reach, or one that refused its token, still made the folder a root and
   listed it, so the same init run again called it a root already. The server is now asked first, and an init it
   does not take leaves the folder as it was and lists nothing.
@@ -53,6 +56,15 @@
 - A new device read the whole journal in one answer of `GET /changes`, hundreds of megabytes and twice that of the
   server's memory. An answer now stops at about 16 MiB, always with one entry; every client asks again from where
   it ended.
+
+**Known limits:**
+
+- A sync that carries a change still loads, merges and schedules the whole tree: at about 840,000 entries, about a
+  minute of one core and 8.5 GB, twice for each device a change reaches, so a change takes one to two and a half
+  minutes to arrive. An idle tree is cheap: 8 seconds and under 1 GB. The next release works on a sync that costs
+  what changed.
+- A first sync of such a tree still takes hours per device over a slow path, most of it placing files one at a
+  time, each with its fsyncs. Off Linux every placed file is still read back once.
 
 ## 0.1.2
 

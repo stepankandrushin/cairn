@@ -32,10 +32,18 @@ pub trait MetaStore: Send {
     fn create_namespace(&mut self, ns: &str) -> Result<()>;
     /// All or nothing. Durable when this returns `Committed`.
     fn commit(&mut self, ns: &str, req: &CommitRequest, time: i64) -> Result<CommitOutcome>;
-    fn changes(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>>;
+    /// Up to `limit` entries after `after`, in order, and no more once their operations, as stored,
+    /// pass `max_bytes`: always at least one.
+    fn changes(
+        &mut self,
+        ns: &str,
+        after: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Change>>;
     /// As `changes`, without the operations: which entry is where, for a client checking its cursor.
     fn changes_without_ops(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>> {
-        let mut out = self.changes(ns, after, limit)?;
+        let mut out = self.changes(ns, after, limit, usize::MAX)?;
         for c in &mut out {
             c.ops.clear();
         }
@@ -161,14 +169,17 @@ pub mod suite {
         ));
 
         // The journal gives the changes after a cursor, in order.
-        let changes = s.changes("n", 1, 100).unwrap();
+        let changes = s.changes("n", 1, 100, usize::MAX).unwrap();
         assert_eq!(changes.iter().map(|c| c.seq).collect::<Vec<_>>(), [2]);
-        assert_eq!(s.changes("n", 0, 1).unwrap().len(), 1);
+        assert_eq!(s.changes("n", 0, 1, usize::MAX).unwrap().len(), 1);
+        // A byte budget stops the answer after the entry that passes it, never before the first.
+        assert_eq!(s.changes("n", 0, 100, 1).unwrap().len(), 1);
+        assert_eq!(s.changes("n", 1, 100, 1).unwrap()[0].seq, 2);
 
         // Namespaces do not see each other.
         s.create_namespace("m").unwrap();
         assert_eq!(s.head("m").unwrap(), 0);
-        assert!(s.changes("m", 0, 100).unwrap().is_empty());
+        assert!(s.changes("m", 0, 100, usize::MAX).unwrap().is_empty());
         assert_eq!(s.namespaces().unwrap(), ["default", "m", "n"]);
     }
 }

@@ -360,7 +360,13 @@ impl MetaStore for SqliteStore {
         })
     }
 
-    fn changes(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>> {
+    fn changes(
+        &mut self,
+        ns: &str,
+        after: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Change>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
             "SELECT seq, op_id, device, device_name, time, ops FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
@@ -376,8 +382,13 @@ impl MetaStore for SqliteStore {
             ))
         })?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for row in rows {
+            if bytes >= max_bytes {
+                break;
+            }
             let (seq, op_id, device, device_name, time, ops) = row?;
+            bytes += ops.len();
             out.push(Change {
                 seq: seq as u64,
                 op_id: cairn_protocol::OpId(blob16(op_id)?),

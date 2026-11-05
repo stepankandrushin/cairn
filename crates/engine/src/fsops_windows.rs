@@ -1000,6 +1000,30 @@ pub fn data_runs(fd: BorrowedFd<'_>, size: u64) -> io::Result<Vec<(u64, u64)>> {
     Ok(runs)
 }
 
+/// No watch on what is done to a file is had here yet: every placed file is read again by the next scan.
+pub struct WriteWatch;
+
+impl WriteWatch {
+    pub fn new() -> Option<Self> {
+        None
+    }
+
+    pub fn watch(&mut self, _: BorrowedFd<'_>) -> Option<i32> {
+        None
+    }
+
+    pub fn untouched(&mut self, _: i32) -> bool {
+        false
+    }
+
+    pub fn forget(&mut self, _: i32) {}
+}
+
+/// Not asked here yet: what comes down is still brought in slices, so the cache stays small.
+pub fn free_space(_: &Dir) -> io::Result<Option<u64>> {
+    Ok(None)
+}
+
 /// Whether another program has this file open for writing: a second open that shares reading but not
 /// writing is refused while any handle can write. `None` where that cannot be asked.
 pub fn open_for_writing(fd: BorrowedFd<'_>) -> Option<bool> {

@@ -127,10 +127,19 @@ program has it open for writing, which Linux tells by refusing a read lease, or 
 an emptied file still open for writing waits for its writer however long, since a program that truncates and
 then writes, stalled on a busy machine, leaves exactly that) → chunk it → ask the server which chunks are missing → upload those → commit a revision naming
 its base revision and a unique operation ID → durable acknowledgement. A retried operation ID returns
-the first result, so a lost response is harmless. Small files take a simpler batched path.
+the first result, so a lost response is harmless. Small files take a simpler batched path, and the server
+makes a request's chunks durable together before it answers. A change too big for one commit goes in several
+from one scan, the server checking each against what the ones before it left.
 
 **Applying a change.** Download to a temp file in the same directory → verify hashes → fsync → set
-metadata → check the destination has not changed locally → atomic `rename()`.
+metadata → check the destination has not changed locally → atomic `rename()`. Chunks come through a cache a
+slice at a time, each gone once the files that take it are written, so a first download needs the tree's size
+free and not twice that, and one that would not fit is refused before anything moves. On a local Linux
+filesystem a placed file is watched (inotify) from its last write until a later write would move its
+timestamps, so its record vouches for it with no read back unless the watch saw it written to or its metadata
+changed. A watch holds nobody back: a program that saves a file the moment it arrives waits for nothing,
+whatever the sync is doing, and its save is read by the next scan. A lease would make that save wait until
+the sync gave it up, which a sync blocked in an fsync or stopped cannot.
 
 **Three-way merge per object** (base, local, remote). It is state-based: each round works from what is on
 disk and what the journal says, so a crash only means the next run finds some of the work done. What was

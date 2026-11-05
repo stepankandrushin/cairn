@@ -4,13 +4,20 @@
 use anyhow::{bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::Hash;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 pub trait ChunkStore: Send + Sync {
     /// Durable on return.
-    fn put(&self, hash: &Hash, data: &[u8]) -> Result<()>;
+    fn put(&self, hash: &Hash, data: &[u8]) -> Result<()> {
+        self.put_all(&[(*hash, data)])
+    }
+    /// Every one durable on return, made so together: an upload request's chunks.
+    fn put_all(&self, chunks: &[(Hash, &[u8])]) -> Result<()>;
     /// The stored length, if the chunk exists.
     fn len_of(&self, hash: &Hash) -> Result<Option<u64>>;
     /// Whether the chunk exists and its bytes match its hash.
@@ -50,6 +57,51 @@ fn open_dir(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// How many chunks of one request are written and synced at once. On a SATA disk 64 at once make a
+/// small durable chunk about 40 times cheaper than one after the other.
+const WRITERS: usize = 64;
+
+/// `f` on every item, on up to `WRITERS` threads; the first error stops the others taking more.
+fn in_parallel<T: Sync>(items: &[T], f: impl Fn(&T) -> Result<()> + Sync) -> Result<()> {
+    if items.len() <= 1 {
+        return items.iter().try_for_each(f);
+    }
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let work = || loop {
+        if failed.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return;
+        }
+        let Some(item) = items.get(next.fetch_add(1, Ordering::SeqCst)) else {
+            return;
+        };
+        if let Err(e) = f(item) {
+            failed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(e);
+            return;
+        }
+    };
+    std::thread::scope(|scope| {
+        let spawned = (0..items.len().min(WRITERS))
+            .filter(|_| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, work)
+                    .is_ok()
+            })
+            .count();
+        // No thread to be had: the work is done here, one at a time.
+        if spawned == 0 {
+            work();
+        }
+    });
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 impl FsChunkStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let store = Self { root: root.into() };
@@ -75,43 +127,92 @@ impl FsChunkStore {
 }
 
 impl ChunkStore for FsChunkStore {
-    fn put(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        if Hash::of(data) != *hash {
-            bail!("chunk {hash} does not match its hash");
+    fn put_all(&self, chunks: &[(Hash, &[u8])]) -> Result<()> {
+        // All checked before any is written: a damaged batch leaves nothing behind.
+        in_parallel(chunks, |(hash, data)| {
+            if Hash::of(data) != *hash {
+                bail!("chunk {hash} does not match its hash");
+            }
+            Ok(())
+        })?;
+        // The directories whose entries must be durable before the answer.
+        let mut fans: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut new: Vec<(&[u8], PathBuf, PathBuf)> = Vec::new();
+        let mut seen = HashSet::new();
+        for (hash, data) in chunks {
+            if !seen.insert(*hash) {
+                continue;
+            }
+            let dest = self.path(hash);
+            let fan = dest.parent().expect("a chunk path has a parent");
+            // Already here: a concurrent upload may not have fsynced its entry yet, and a damaged copy
+            // is replaced rather than trusted.
+            if fs::read(&dest).is_ok_and(|existing| existing == *data) {
+                fans.insert(fan.to_path_buf());
+                continue;
+            }
+            let tmp = self
+                .root
+                .join("incoming")
+                .join(format!("{hash}.{}", hex::encode(rand::random::<[u8; 8]>())));
+            new.push((data, tmp, dest));
         }
-        let dest = self.path(hash);
-        let fan = dest.parent().expect("a chunk path has a parent");
-        // Already here: a concurrent upload may not have fsynced its entry yet, and a damaged copy is
-        // replaced rather than trusted.
-        if fs::read(&dest).is_ok_and(|existing| existing == data) {
-            sync_dir(fan)?;
-            return Ok(());
+        let mut made = false;
+        for (.., dest) in &new {
+            let fan = dest.parent().expect("a chunk path has a parent");
+            if !fan.exists() {
+                fs::create_dir_all(fan)?;
+                made = true;
+            }
         }
-        if !fan.exists() {
-            fs::create_dir_all(fan)?;
-            sync_dir(fan.parent().expect("a fan directory has a parent"))?;
+        if made {
+            sync_dir(&self.root.join("chunks"))?;
         }
-        let tmp = self
-            .root
-            .join("incoming")
-            .join(format!("{hash}.{}", hex::encode(rand::random::<[u8; 8]>())));
-        let written = (|| -> Result<()> {
+        // Written and synced in `incoming/`, many at once: their fsyncs overlap, so the filesystem
+        // commits them in a few flushes rather than one each. None is at its final path yet.
+        let written = in_parallel(&new, |(data, tmp, _)| {
             check("server.chunk.before_write")?;
-            let mut f = File::create(&tmp)?;
+            let mut f = File::create(tmp)?;
             f.write_all(data)?;
             hit("server.chunk.written");
             f.sync_all()?;
             hit("server.chunk.synced");
-            fs::rename(&tmp, &dest)?;
+            Ok(())
+        });
+        if let Err(e) = written {
+            for (_, tmp, _) in &new {
+                let _ = fs::remove_file(tmp);
+            }
+            return Err(e);
+        }
+        // Only whole, durable chunks reach their final path.
+        let mut renamed = 0;
+        let moved = new.iter().try_for_each(|(_, tmp, dest)| -> Result<()> {
+            fs::rename(tmp, dest)?;
             hit("server.chunk.renamed");
+            fans.insert(
+                dest.parent()
+                    .expect("a chunk path has a parent")
+                    .to_path_buf(),
+            );
+            renamed += 1;
+            Ok(())
+        });
+        if moved.is_err() {
+            for (_, tmp, _) in &new[renamed..] {
+                let _ = fs::remove_file(tmp);
+            }
+        }
+        // Then each directory once, for every entry made in it, whatever stopped the renames: the
+        // request is answered only once all of it is durable.
+        let fans: Vec<PathBuf> = fans.into_iter().collect();
+        let synced = in_parallel(&fans, |fan| {
             sync_dir(fan)?;
             hit("server.chunk.durable");
             Ok(())
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        written
+        });
+        moved?;
+        synced
     }
 
     fn len_of(&self, hash: &Hash) -> Result<Option<u64>> {

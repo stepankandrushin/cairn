@@ -147,9 +147,16 @@ impl Repo {
         Ok(None)
     }
 
-    pub fn changes(&self, ns: &str, after: u64, limit: u32) -> Result<(Vec<Change>, u64)> {
+    /// Up to `limit` entries after `after`, stopping once their operations pass `max_bytes`.
+    pub fn changes(
+        &self,
+        ns: &str,
+        after: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<(Vec<Change>, u64)> {
         let mut meta = self.meta();
-        Ok((meta.changes(ns, after, limit)?, meta.head(ns)?))
+        Ok((meta.changes(ns, after, limit, max_bytes)?, meta.head(ns)?))
     }
 
     /// As `changes`, without the operations.
@@ -328,6 +335,40 @@ mod tests {
         let repo = Repo::open(&dir).unwrap();
         assert!(Repo::open(&dir).is_err());
         drop(repo);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_batch_is_stored_whole_or_not_at_all() {
+        let dir = tempdir();
+        let store = FsChunkStore::open(&dir).unwrap();
+        let data: Vec<Vec<u8>> = (0..300u32)
+            .map(|i| i.to_le_bytes().repeat(i as usize + 1))
+            .collect();
+        let mut batch: Vec<(Hash, &[u8])> =
+            data.iter().map(|d| (Hash::of(d), d.as_slice())).collect();
+        // Twice in one batch, and one already there.
+        batch.push(batch[7]);
+        store.put(&batch[3].0, batch[3].1).unwrap();
+        store.put_all(&batch).unwrap();
+        for (h, d) in &batch {
+            assert_eq!(store.get(h).unwrap().as_deref(), Some(*d));
+        }
+        assert_eq!(store.list().unwrap().len(), 300);
+        assert_eq!(std::fs::read_dir(dir.join("incoming")).unwrap().count(), 0);
+
+        // One frame that does not match its hash: nothing of the batch is written.
+        let more: Vec<Vec<u8>> = (0..20u32)
+            .map(|i| format!("more {i}").into_bytes())
+            .collect();
+        let mut bad: Vec<(Hash, &[u8])> =
+            more.iter().map(|d| (Hash::of(d), d.as_slice())).collect();
+        bad[11].1 = b"not what the hash says";
+        assert!(store.put_all(&bad).is_err());
+        for (h, _) in &bad {
+            assert_eq!(store.len_of(h).unwrap(), None);
+        }
+        assert_eq!(std::fs::read_dir(dir.join("incoming")).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

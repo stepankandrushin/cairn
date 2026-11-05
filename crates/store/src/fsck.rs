@@ -112,7 +112,7 @@ fn replay(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<Tree> {
     let mut tree = Tree::new();
     let mut after = 0;
     loop {
-        let batch = repo.with_meta(|m| m.changes(ns, after, 1000))?;
+        let batch = repo.with_meta(|m| m.changes(ns, after, 1000, 64 << 20))?;
         let Some(last) = batch.last() else { break };
         after = last.seq;
         for change in &batch {

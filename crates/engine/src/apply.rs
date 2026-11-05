@@ -4,12 +4,12 @@
 //! synced paths (invariant 4).
 
 use crate::client::Client;
-use crate::fsops::{self, is_exists, is_not_found, is_permission, AsFd, Dir};
+use crate::fsops::{self, is_exists, is_not_found, is_permission, AsFd, Dir, OwnedFd};
 use crate::identify::{Arriving, CopyIntent};
 use crate::merge::{ConflictCopy, Plan, TNode};
 use crate::metadata::{self, Accounts};
 use crate::root::Root;
-use crate::scan::{fingerprint, Scanned};
+use crate::scan::{fingerprint, racy_within, Scanned, RACY_WINDOW_NS};
 use crate::schedule::{is_stage, schedule, Topo, TopoOp};
 use crate::state::{Fingerprint, Row, Synced};
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +20,7 @@ use cairn_protocol::{
     SkipKind, Tree, STAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// The losing side of a same-field metadata conflict, for the activity log: noted before the first
 /// step, since once the winner is applied nothing on disk says there was a conflict, and gone once the
@@ -83,6 +83,68 @@ pub struct RelinkIntent {
 type OldVersion = (Dir, Vec<u8>, BTreeMap<Hash, u64>);
 
 const NOT_OBSERVED: &str = "not observed by this scan, so a newer version from the server waits";
+
+/// Manifests asked of the server in one request, and stored in one transaction: one each would cost
+/// a round trip and an fsync for every file that comes down.
+const MANIFESTS_A_REQUEST: usize = 2_000;
+
+/// What the chunk cache takes on at once for what is about to be placed. A download larger than this
+/// comes in slices, each dropped from the cache as its files are written, so that it needs about the
+/// tree's size free and not twice that.
+const SLICE_BYTES: u64 = 1 << 30;
+
+/// Rows this run writes, stored together: one transaction, and one fsync, for this many.
+const ROWS_A_TRANSACTION: u64 = 4_096;
+
+/// Files placed and watched at once, each until a later write could no longer leave its timestamps as
+/// they are. A watch holds nobody back: it only notes what is done to the file meanwhile.
+const WATCHED_AT_ONCE: usize = 64;
+
+/// A file placed by this run, watched from its last write here: while the watch has seen nothing, nobody
+/// has written to it or changed its metadata.
+struct Watched {
+    id: ObjectId,
+    /// Opened read-only once written, to look at it when it settles.
+    fd: OwnedFd,
+    wd: i32,
+    /// What it was once written and synced.
+    wrote: Fingerprint,
+}
+
+/// The chunks a download still has to bring into the cache, and the files they are for.
+#[derive(Default)]
+struct Fetch {
+    /// For each file still to be written, the chunks it takes from the cache, in the order written.
+    needs: HashMap<ObjectId, VecDeque<(Hash, u32)>>,
+    /// How many of those still to be written take each chunk.
+    users: HashMap<Hash, u32>,
+    /// In the cache now.
+    cached: HashSet<Hash>,
+    /// The files in the order this run writes them, as far as it is known, and where each one is.
+    order: Vec<ObjectId>,
+    at: HashMap<ObjectId, usize>,
+}
+
+/// A size as a person reads it.
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} bytes")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// What a file of these bytes takes on disk, at most, in blocks of 4 KiB.
+fn on_disk(bytes: u64) -> u64 {
+    bytes.div_ceil(4096) * 4096
+}
 
 /// Why one step did not happen.
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +280,18 @@ pub struct Applier<'a> {
     /// Which mount the root is on, or 0 where that cannot be told.
     root_mnt: u64,
     outcome: ApplyOutcome,
+    fetch: Fetch,
+    /// Rows written by this run and not yet stored.
+    unstored: BTreeSet<ObjectId>,
+    /// What notes writes to the files this run places, where the filesystem lets it see them all.
+    writes: Option<fsops::WriteWatch>,
+    /// The file `write_temp` has just written, watched, and what it was then.
+    temp_watch: Option<(OwnedFd, i32, Fingerprint)>,
+    /// Files placed by this run, still watched, oldest first.
+    watched: VecDeque<Watched>,
+    /// Files nothing opened to write between this run writing them and the moment a later write would
+    /// have moved their timestamps: what is there is what was written, while the fingerprint holds.
+    vouched: HashMap<ObjectId, Fingerprint>,
 }
 
 fn step_path(cur: &BTreeMap<ObjectId, CurNode>, link: &Link) -> Vec<Name> {
@@ -262,6 +336,12 @@ impl<'a> Applier<'a> {
             superuser: fsops::is_superuser(),
             root_mnt,
             outcome: ApplyOutcome::default(),
+            fetch: Fetch::default(),
+            unstored: BTreeSet::new(),
+            writes: fsops::WriteWatch::new(),
+            temp_watch: None,
+            watched: VecDeque::new(),
+            vouched: HashMap::new(),
         }
     }
 
@@ -409,40 +489,205 @@ impl<'a> Applier<'a> {
         hash.to_string().into_bytes()
     }
 
-    /// Bring the chunks that the plan's new content needs into the local cache before touching the
-    /// tree, so that a full disk or a lost server shows up while nothing has changed yet.
+    /// Before touching the tree: the manifests of the plan's new content, room for it on this disk, and
+    /// the first slice of its chunks in the local cache, so that a full disk or a lost server shows up
+    /// while nothing has changed yet.
     fn prefetch(&mut self, plan: &Plan) -> Result<(), StepError> {
         let Some(client) = self.client else {
             return Ok(());
         };
-        let mut want: Vec<(Hash, u32)> = Vec::new();
-        let mut seen = HashSet::new();
         // A conflict copy's content is here on disk, and the server has yet to see it.
         let copies: BTreeSet<ObjectId> = plan.copies.iter().map(|c| c.copy).collect();
-        for (id, t) in &plan.target {
-            let Content::File { manifest, .. } = &t.body.content else {
-                continue;
-            };
-            if copies.contains(id)
-                || self
-                    .cur
-                    .get(id)
-                    .is_some_and(|c| c.content == t.body.content)
-            {
-                continue;
-            }
+        let files: Vec<(ObjectId, Hash)> = plan
+            .target
+            .iter()
+            .filter_map(|(id, t)| match &t.body.content {
+                Content::File { manifest, .. }
+                    if !copies.contains(id)
+                        && self.cur.get(id).is_none_or(|c| c.content != t.body.content) =>
+                {
+                    Some((*id, *manifest))
+                }
+                _ => None,
+            })
+            .collect();
+        self.fetch_manifests(client, plan, &files)?;
+
+        let cache = self.root.state_dir.open_dir(b"chunks")?;
+        let (mut created, mut grows, mut biggest) = (0u64, 0i64, 0u64);
+        for (id, manifest) in &files {
             let m = self.manifest(manifest)?;
             // A chunk the old local file holds comes from there instead.
-            let old = match self.cur.get(id).map(|c| c.content.clone()) {
-                Some(Content::File { manifest: old, .. }) => self
-                    .manifest(&old)
-                    .map(|m| m.chunks().map(|c| c.hash).collect::<HashSet<_>>())
-                    .unwrap_or_default(),
-                _ => HashSet::new(),
+            let (old, old_size) = match self.cur.get(id).map(|c| c.content.clone()) {
+                Some(Content::File {
+                    manifest: old,
+                    size,
+                }) => (
+                    self.manifest(&old)
+                        .map(|m| m.chunks().map(|c| c.hash).collect::<HashSet<_>>())
+                        .unwrap_or_default(),
+                    Some(size),
+                ),
+                _ => (HashSet::new(), None),
             };
-            for c in m.chunks() {
-                if !old.contains(&c.hash) && seen.insert(c.hash) {
-                    want.push((c.hash, c.len));
+            let mut needs = VecDeque::new();
+            for (_, c) in m.placed_chunks() {
+                if !old.contains(&c.hash) {
+                    needs.push_back((c.hash, c.len));
+                    *self.fetch.users.entry(c.hash).or_default() += 1;
+                }
+            }
+            let data = on_disk(m.chunks().map(|c| u64::from(c.len)).sum());
+            match old_size {
+                // Written beside the old one, which goes once the new one is in place.
+                Some(old) => {
+                    grows += data as i64 - on_disk(old) as i64;
+                    biggest = biggest.max(data);
+                }
+                None => created += data,
+            }
+            self.fetch.needs.insert(*id, needs);
+        }
+        let mut coming = 0u64;
+        let mut seen = HashSet::new();
+        for (hash, len) in self.fetch.needs.values().flatten() {
+            // A chunk already here is a transfer resumed after an interruption.
+            if seen.insert(*hash) {
+                if cache.try_stat(&Self::cache_path(hash))?.is_some() {
+                    self.fetch.cached.insert(*hash);
+                } else {
+                    coming += u64::from(*len);
+                }
+            }
+        }
+        // Each file's row and manifest, and the cache: the first slice may still be there while the
+        // last is fetched.
+        let records = 8192 * files.len() as u64;
+        let cached = coming.min(2 * cairn_failpoint::tuned("apply.slice_bytes", SLICE_BYTES));
+        let needed = created + grows.max(0) as u64 + biggest + cached + records;
+        if let Some(free) = fsops::free_space(&self.root.dir)? {
+            if needed > free {
+                return Err(StepError::Other(anyhow!(
+                    "this disk would be full: what comes down needs about {} free here ({} of files, \
+                     {} for chunks on their way, {} for this device's records), and {} is free. \
+                     Nothing was changed: free some space, or leave folders out with .cairn/ignore or \
+                     `cairn exclude`, and sync again",
+                    human(needed),
+                    human(created + grows.max(0) as u64 + biggest),
+                    human(cached),
+                    human(records),
+                    human(free)
+                )));
+            }
+        }
+        self.fetch.order = files.iter().map(|(id, _)| *id).collect();
+        self.fetch.at = self
+            .fetch
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        if let Some(first) = self.fetch.order.first().copied() {
+            self.fetch_slice(first)?;
+        }
+        Ok(())
+    }
+
+    /// The manifests of what comes down that this device does not have, many to a request and a
+    /// transaction. Each is verified against its hash on the way in.
+    fn fetch_manifests(
+        &mut self,
+        client: &Client,
+        plan: &Plan,
+        files: &[(ObjectId, Hash)],
+    ) -> Result<(), StepError> {
+        let mut asked = HashSet::new();
+        let mut batch: Vec<Hash> = Vec::new();
+        let mut size = 0u64;
+        for (id, manifest) in files {
+            if !asked.insert(*manifest) || self.root.state.has_manifest(manifest)? {
+                continue;
+            }
+            // About 80 bytes for each chunk of its file: a few huge files make a request big.
+            let bytes = match &plan.target[id].body.content {
+                Content::File { size, .. } => 128 + size / (512 * 1024) * 80,
+                _ => 128,
+            };
+            if !batch.is_empty()
+                && (batch.len() as u64
+                    >= cairn_failpoint::tuned(
+                        "apply.manifests_a_request",
+                        MANIFESTS_A_REQUEST as u64,
+                    )
+                    || size + bytes > MAX_CHUNK_BATCH_BYTES as u64 / 2)
+            {
+                self.store_manifests(client, &batch)?;
+                batch.clear();
+                size = 0;
+            }
+            batch.push(*manifest);
+            size += bytes;
+        }
+        if !batch.is_empty() {
+            self.store_manifests(client, &batch)?;
+        }
+        Ok(())
+    }
+
+    fn store_manifests(&mut self, client: &Client, hashes: &[Hash]) -> Result<(), StepError> {
+        let got = client.download(hashes)?;
+        check("apply.manifests.store")?;
+        self.root.state.put_manifests(&got)?;
+        hit("apply.manifests.stored");
+        Ok(())
+    }
+
+    /// The order in which this run writes files, now that its steps are known: new files as they are
+    /// created, then new content for those already here.
+    fn order_writes(&mut self, steps: &[TopoOp], plan: &Plan) {
+        let mut order = Vec::with_capacity(self.fetch.needs.len());
+        let mut placed = HashSet::new();
+        for step in steps {
+            if let TopoOp::Create { object, .. } = step {
+                if self.fetch.needs.contains_key(object) && placed.insert(*object) {
+                    order.push(*object);
+                }
+            }
+        }
+        for id in plan.target.keys() {
+            if self.fetch.needs.contains_key(id) && placed.insert(*id) {
+                order.push(*id);
+            }
+        }
+        self.fetch.at = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        self.fetch.order = order;
+    }
+
+    /// Bring the next slice into the cache: what `id` still takes from it, then what the files after it
+    /// take, up to a slice's bytes.
+    fn fetch_slice(&mut self, id: ObjectId) -> Result<(), StepError> {
+        let Some(client) = self.client else {
+            return Ok(());
+        };
+        let limit = cairn_failpoint::tuned("apply.slice_bytes", SLICE_BYTES);
+        let after = self
+            .fetch
+            .at
+            .get(&id)
+            .map_or(self.fetch.order.len(), |i| i + 1);
+        let files = std::iter::once(id).chain(self.fetch.order[after..].iter().copied());
+        let mut want: Vec<(Hash, u32)> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut size = 0u64;
+        'files: for file in files {
+            for (hash, len) in self.fetch.needs.get(&file).into_iter().flatten() {
+                if size >= limit {
+                    break 'files;
+                }
+                if !self.fetch.cached.contains(hash) && seen.insert(*hash) {
+                    want.push((*hash, *len));
+                    size += u64::from(*len);
                 }
             }
         }
@@ -450,13 +695,9 @@ impl<'a> Applier<'a> {
         let mut batch: Vec<Hash> = Vec::new();
         let mut size = 0usize;
         for (hash, len) in want {
-            // A chunk already here is a transfer resumed after an interruption.
-            if cache.try_stat(&Self::cache_path(&hash))?.is_some() {
-                continue;
-            }
             if size + len as usize > MAX_CHUNK_BATCH_BYTES && !batch.is_empty() {
                 Self::fetch_batch(client, &cache, &batch)?;
-                batch.clear();
+                self.fetch.cached.extend(batch.drain(..));
                 size = 0;
             }
             batch.push(hash);
@@ -464,8 +705,112 @@ impl<'a> Applier<'a> {
         }
         if !batch.is_empty() {
             Self::fetch_batch(client, &cache, &batch)?;
+            self.fetch.cached.extend(batch);
         }
+        hit("apply.slice.fetched");
         Ok(())
+    }
+
+    /// One more of `id`'s chunks is written, if it took this one from the cache. A chunk nothing else
+    /// still to be written takes leaves the cache.
+    fn used(&mut self, id: ObjectId, hash: &Hash) {
+        let Some(needs) = self.fetch.needs.get_mut(&id) else {
+            return;
+        };
+        if needs.front().is_some_and(|(h, _)| h == hash) {
+            needs.pop_front();
+            self.release(hash);
+        }
+    }
+
+    /// Whatever `id` was still to take from the cache, it no longer will in this run.
+    fn done_with(&mut self, id: ObjectId) {
+        for (hash, _) in self.fetch.needs.remove(&id).unwrap_or_default() {
+            self.release(&hash);
+        }
+    }
+
+    fn release(&mut self, hash: &Hash) {
+        let Some(n) = self.fetch.users.get_mut(hash) else {
+            return;
+        };
+        *n -= 1;
+        if *n == 0 {
+            self.fetch.users.remove(hash);
+            if self.fetch.cached.remove(hash) {
+                if let Ok(cache) = self.root.state_dir.open_dir(b"chunks") {
+                    let _ = cache.unlink(&Self::cache_path(hash));
+                }
+            }
+        }
+    }
+
+    /// Stop watching files: each whose file has gone long enough unchanged that a later write would move
+    /// its timestamps, and, with `all`, every one. A file the watch saw nothing done to holds what this
+    /// run wrote, and its row may say so without a read.
+    fn settle_watches(&mut self, all: bool) {
+        let precision = self.root.dir.fstype_precision_ns();
+        let window = cairn_failpoint::tuned("apply.watch_window_ns", RACY_WINDOW_NS as u64);
+        while let Some(front) = self.watched.front() {
+            let st = fsops::fstat(front.fd.as_fd()).ok();
+            let settled = st
+                .as_ref()
+                .is_some_and(|st| !racy_within(st, precision, i128::from(window)));
+            if !settled && !all && self.watched.len() <= WATCHED_AT_ONCE {
+                return;
+            }
+            let file = self.watched.pop_front().expect("there is a front");
+            let Some(writes) = self.writes.as_mut() else {
+                continue;
+            };
+            // Looked at before the events are read: anything after the look shows in its timestamps.
+            let untouched = writes.untouched(file.wd);
+            writes.forget(file.wd);
+            let Some(st) = st.filter(|_| settled) else {
+                continue;
+            };
+            let now = fingerprint(&st);
+            let w = &file.wrote;
+            if (now.dev, now.ino, now.size, now.mtime) == (w.dev, w.ino, w.size, w.mtime)
+                && untouched
+            {
+                self.vouched.insert(file.id, now);
+            }
+        }
+    }
+
+    /// A watch on what `write_temp` has just written and synced: `None` where nothing can watch it, or
+    /// the file changed in between.
+    fn watch(
+        &mut self,
+        dir: &Dir,
+        name: &[u8],
+        wrote: Fingerprint,
+    ) -> Option<(OwnedFd, i32, Fingerprint)> {
+        let writes = self.writes.as_mut()?;
+        let fd = dir.open_read(name).ok()?;
+        let wd = writes.watch(fd.as_fd())?;
+        match fsops::fstat(fd.as_fd()) {
+            Ok(now) if fingerprint(&now) == wrote => Some((fd, wd, wrote)),
+            _ => {
+                writes.forget(wd);
+                None
+            }
+        }
+    }
+
+    fn drop_temp_watch(&mut self) {
+        if let (Some((_, wd, _)), Some(writes)) = (self.temp_watch.take(), self.writes.as_mut()) {
+            writes.forget(wd);
+        }
+    }
+
+    /// After the rename that placed `id`: watched until it settles.
+    fn keep_watching(&mut self, id: ObjectId, watch: Option<(OwnedFd, i32, Fingerprint)>) {
+        if let Some((fd, wd, wrote)) = watch {
+            self.watched.push_back(Watched { id, fd, wd, wrote });
+        }
+        self.settle_watches(false);
     }
 
     fn fetch_batch(client: &Client, cache: &Dir, hashes: &[Hash]) -> Result<(), StepError> {
@@ -530,7 +875,9 @@ impl<'a> Applier<'a> {
         display: &[Name],
     ) -> Result<Vec<u8>, StepError> {
         let tmp = self.root.temp_name();
+        self.drop_temp_watch();
         let done = self.write_temp_inner(dir, &tmp, id, t, display);
+        self.done_with(id);
         if let Err(e) = done {
             let _ = dir.unlink(&tmp);
             return Err(e);
@@ -565,9 +912,16 @@ impl<'a> Applier<'a> {
                     let source = old.as_ref().and_then(|(d, name, map)| {
                         map.get(&chunk.hash).map(|at| (d, name.as_slice(), *at))
                     });
+                    let wanted = self.fetch.needs.get(&id).and_then(|n| n.front());
+                    if wanted
+                        .is_some_and(|(h, _)| *h == chunk.hash && !self.fetch.cached.contains(h))
+                    {
+                        self.fetch_slice(id)?;
+                    }
                     let data = self.read_chunk(chunk, source)?;
                     check("apply.temp.write")?;
                     fsops::write_all_at(fd.as_fd(), &data, offset)?;
+                    self.used(id, &chunk.hash);
                 }
                 crate::chunker::restore_holes(fd.as_fd(), &m);
                 hit("apply.temp.written");
@@ -577,6 +931,10 @@ impl<'a> Applier<'a> {
                 self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display)?;
                 fsops::sync_fd(fd.as_fd())?;
                 hit("apply.temp.meta");
+                // From here until a later write would show, whatever is done to it is seen.
+                let wrote = fingerprint(&fsops::fstat(fd.as_fd())?);
+                drop(fd);
+                self.temp_watch = self.watch(dir, tmp, wrote);
                 return Ok(());
             }
         }
@@ -658,6 +1016,7 @@ impl<'a> Applier<'a> {
             self.touched_dirs.insert(id);
         } else {
             let tmp = self.write_temp(&dir, id, t, &display)?;
+            let watch = self.temp_watch.take();
             // Taken before the rename: any later difference but ctime is someone's edit.
             written = Some(fingerprint(&dir.stat(&tmp)?));
             hit("apply.create.before_rename");
@@ -667,6 +1026,7 @@ impl<'a> Applier<'a> {
                 return Err(unholdable(&dir, &name, e));
             }
             hit("apply.create.renamed");
+            self.keep_watching(id, watch);
         }
         let st = dir.stat(&name)?;
         self.cur.insert(
@@ -830,6 +1190,7 @@ impl<'a> Applier<'a> {
         self.check_fp(id, &dir, &name)?;
         let display = step_path(&self.cur, &first);
         let tmp = self.write_temp(&dir, id, t, &display)?;
+        let watch = self.temp_watch.take();
         let relink_key = format!("{INTENT_RELINK}{id}");
         if links.len() > 1 {
             // No single rename can move every name to the new inode: note the work, so a crash in
@@ -887,6 +1248,7 @@ impl<'a> Applier<'a> {
             dir.rename_over(&aside, &dir, &name)?;
         }
         hit("apply.replace.renamed");
+        self.keep_watching(id, watch);
         self.touched_dirs.insert(first.parent);
         // The other hard links follow, each atomically. Swapped, as above: what comes out of a name that
         // no longer held what was scanned is someone's edit, kept beside the names, which stay one file.
@@ -1293,9 +1655,10 @@ impl<'a> Applier<'a> {
         let old = self.rows.get(&id);
         let row = Row {
             fp: fingerprint(&st),
-            // Only a scan, which reads the file, may vouch that a fingerprint means this content: an
-            // edit since the rename would otherwise be recorded as the content just written.
-            racy: true,
+            // Only a scan, which reads the file, may vouch that a fingerprint means this content, or
+            // this run, for a file its watch saw nothing done to from its write until a later write would
+            // show: an edit since the rename would otherwise be recorded as the content just written.
+            racy: self.vouched.get(&id) != Some(&fingerprint(&st)),
             content: cur.content.clone(),
             incomplete: !problems.is_empty(),
             scan,
@@ -1313,8 +1676,31 @@ impl<'a> Applier<'a> {
                     .collect(),
             ),
         };
-        self.root.state.store_rows(&[(id, &row)], &[])?;
         self.rows.insert(id, row);
+        self.unstored.insert(id);
+        if self.unstored.len() as u64
+            >= cairn_failpoint::tuned("apply.rows_a_transaction", ROWS_A_TRANSACTION)
+        {
+            self.store_unstored(&[])?;
+        }
+        Ok(())
+    }
+
+    /// The rows this run wrote and has not stored yet, with the marks they answer, in one transaction.
+    /// Each was written once what it says was durable, so storing it later only leaves more for the
+    /// next scan to find out.
+    fn store_unstored(&mut self, marks: &[String]) -> Result<()> {
+        let ids = std::mem::take(&mut self.unstored);
+        let list: Vec<(ObjectId, &Row)> = ids
+            .iter()
+            .filter_map(|id| self.rows.get(id).map(|r| (*id, r)))
+            .collect();
+        if list.is_empty() && marks.is_empty() {
+            return Ok(());
+        }
+        check("apply.rows.store")?;
+        self.root.state.store_rows_dropping(&list, marks)?;
+        hit("apply.rows.stored");
         Ok(())
     }
 
@@ -1535,7 +1921,7 @@ impl<'a> Applier<'a> {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        self.root.state.drop_intents(&done)
+        self.store_unstored(&done)
     }
 
     /// Reach the plan's target as far as possible.
@@ -1582,6 +1968,7 @@ impl<'a> Applier<'a> {
             .map(|(id, c)| (*id, (c.kind, c.links.clone())))
             .collect();
         let steps = schedule(&from, &to).context("ordering local changes")?;
+        self.order_writes(&steps, plan);
         self.give_up_what_goes(&steps)?;
         // Folders this filesystem cannot hold: what goes in them waits with them.
         let mut unheld_dirs: BTreeSet<ObjectId> = BTreeSet::new();
@@ -1645,6 +2032,8 @@ impl<'a> Applier<'a> {
         // Durable before any row says so, or a power cut would leave a row claiming a file that the
         // disk does not have, and the old file would read as a local revert.
         self.sync_touched_dirs()?;
+        self.settle_watches(true);
+        hit("apply.dirs.synced");
         self.store_placed_files(plan)?;
         self.store_moved(plan)?;
         self.finish_dirs(plan)?;
@@ -1652,6 +2041,7 @@ impl<'a> Applier<'a> {
         if self.outcome.clean() {
             self.drop_settled_marks(plan, &marks)?;
         }
+        self.store_unstored(&[])?;
         self.outcome.touched =
             self.outcome.applied_steps > 0 || !self.placed.is_empty() || !plan.copies.is_empty();
         hit("apply.finished");

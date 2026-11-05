@@ -537,6 +537,16 @@ impl State {
             .optional()?)
     }
 
+    pub fn has_manifest(&self, hash: &Hash) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM manifests WHERE hash = ?1", [hash.0], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some())
+    }
+
     /// Drop every manifest not in `keep`.
     pub fn retain_manifests(&mut self, keep: &BTreeSet<Hash>) -> Result<()> {
         let tx = self.conn.transaction()?;

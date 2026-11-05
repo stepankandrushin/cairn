@@ -382,6 +382,120 @@ pub fn open_for_writing(_: BorrowedFd<'_>) -> Option<bool> {
     None
 }
 
+/// Writes to files this process has just written, seen through inotify: a record can vouch for a file
+/// nothing was done to without making anyone wait, as a watch holds nothing back. Only on filesystems
+/// whose every write goes through this kernel, which a watch then sees.
+#[cfg(target_os = "linux")]
+pub struct WriteWatch {
+    fd: OwnedFd,
+    /// Watches that saw a write, a change of metadata or a writer's close since they were added.
+    touched: std::collections::HashSet<i32>,
+    /// Events were lost: nothing can be vouched for.
+    overflowed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl WriteWatch {
+    pub fn new() -> Option<Self> {
+        use rustix::fs::inotify::{self, CreateFlags};
+        Some(Self {
+            fd: inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK).ok()?,
+            touched: Default::default(),
+            overflowed: false,
+        })
+    }
+
+    /// Watch the file behind `fd`, which this process opened refusing symlinks. `None` on a filesystem
+    /// another kernel may write through, or past the limit on watches.
+    pub fn watch(&mut self, fd: BorrowedFd<'_>) -> Option<i32> {
+        use rustix::fs::inotify::{self, WatchFlags};
+        // Local filesystems: ext2 to 4, XFS, Btrfs, tmpfs, F2FS, bcachefs, ZFS.
+        const LOCAL: [i64; 7] = [
+            0xEF53,
+            0x5846_5342,
+            0x9123_683E,
+            0x0102_1994,
+            0xF2F5_2010,
+            0xCA45_1A4E,
+            0x2FC1_2FC1,
+        ];
+        #[allow(clippy::unnecessary_cast)]
+        if !fs::fstatfs(fd).is_ok_and(|s| LOCAL.contains(&(s.f_type as i64))) {
+            return None;
+        }
+        let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let mask = WatchFlags::MODIFY | WatchFlags::ATTRIB | WatchFlags::CLOSE_WRITE;
+        inotify::add_watch(&self.fd, path.as_str(), mask).ok()
+    }
+
+    /// Whether nothing was written to the file of `wd`, its metadata changed, or a writer of it closed,
+    /// since it was watched.
+    pub fn untouched(&mut self, wd: i32) -> bool {
+        self.read();
+        !self.overflowed && !self.touched.contains(&wd)
+    }
+
+    pub fn forget(&mut self, wd: i32) {
+        self.read();
+        let _ = rustix::fs::inotify::remove_watch(&self.fd, wd);
+        self.touched.remove(&wd);
+    }
+
+    fn read(&mut self) {
+        use rustix::fs::inotify::{ReadFlags, Reader};
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+        let mut reader = Reader::new(&self.fd, &mut buf);
+        loop {
+            match reader.next() {
+                Ok(event) => {
+                    let flags = event.events();
+                    if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
+                        self.overflowed = true;
+                    } else if flags
+                        .intersects(ReadFlags::MODIFY | ReadFlags::ATTRIB | ReadFlags::CLOSE_WRITE)
+                    {
+                        self.touched.insert(event.wd());
+                    }
+                }
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
+                // What could not be read may have been a write.
+                Err(_) => {
+                    self.overflowed = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// No watch to be had here: every placed file is read again by the next scan.
+#[cfg(not(target_os = "linux"))]
+pub struct WriteWatch;
+
+#[cfg(not(target_os = "linux"))]
+impl WriteWatch {
+    pub fn new() -> Option<Self> {
+        None
+    }
+
+    pub fn watch(&mut self, _: BorrowedFd<'_>) -> Option<i32> {
+        None
+    }
+
+    pub fn untouched(&mut self, _: i32) -> bool {
+        false
+    }
+
+    pub fn forget(&mut self, _: i32) {}
+}
+
+/// The bytes free to this user on the filesystem holding `dir`.
+pub fn free_space(dir: &Dir) -> io::Result<Option<u64>> {
+    let s = fs::fstatvfs(&dir.0)?;
+    Ok(Some(s.f_bavail.saturating_mul(s.f_frsize)))
+}
+
 /// `F_PUNCHHOLE`, which rustix does not have. Both must be multiples of the filesystem's block.
 #[cfg(target_os = "macos")]
 pub fn punch_hole(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {

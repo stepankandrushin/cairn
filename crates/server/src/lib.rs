@@ -28,6 +28,10 @@ struct App {
     closing: tokio::sync::watch::Sender<bool>,
 }
 
+/// About as much of the journal as one `GET /changes` answers: a new device asks for all of it, and
+/// a commit can hold 48 MiB of operations. One entry goes out whatever its size.
+const CHANGES_BYTES: usize = 16 * 1024 * 1024;
+
 /// The longest a `GET /changes` may wait. A reverse proxy's read timeout is the client's to stay under.
 const MAX_WAIT_SECS: u64 = 120;
 
@@ -124,18 +128,20 @@ async fn upload(
     Path(ns): Path<String>,
     body: Bytes,
 ) -> ApiResult<StatusCode> {
-    if wire::read_frames(&body).is_err() {
-        return Ok(StatusCode::BAD_REQUEST);
-    }
-    blocking(move || {
-        let store = app.repo.chunks(&ns)?;
-        for (hash, data) in wire::read_frames(&body)? {
-            store.put(&hash, data)?;
-        }
-        Ok(())
+    let stored = blocking(move || {
+        let Ok(frames) = wire::read_frames(&body) else {
+            return Ok(false);
+        };
+        // Synced together, and every one durable before the answer.
+        app.repo.chunks(&ns)?.put_all(&frames)?;
+        Ok(true)
     })
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(if stored {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::BAD_REQUEST
+    })
 }
 
 async fn download(
@@ -227,14 +233,16 @@ async fn changes(
     if q.wait > 0 {
         wait_for_change(&app, &ns, q.after, q.wait.min(MAX_WAIT_SECS)).await?;
     }
+    let budget = cairn_failpoint::tuned("server.changes_bytes", CHANGES_BYTES as u64) as usize;
     let (changes, head) = blocking(move || {
         if q.ops {
-            app.repo.changes(&ns, q.after, limit)
+            app.repo.changes(&ns, q.after, limit, budget)
         } else {
             app.repo.changes_without_ops(&ns, q.after, limit)
         }
     })
     .await?;
+    cairn_failpoint::hit("server.changes.answered");
     // A proxy that caches must not answer a later ask from this one.
     Ok((
         [(header::CACHE_CONTROL, "no-store")],

@@ -18,9 +18,11 @@ device notices that the server no longer has what it last saw and pauses. Removi
 and running `cairn init` again merges by name and content and sends the server what it lost.
 
 **Chunks** are the raw bytes, with no compression in this format version. A chunk reaches its final
-path only by: write to `incoming/`, fsync, rename, fsync the directory. Reading verifies the hash, so
-bit rot is an error rather than data. Each namespace has its own set: dedup never crosses a namespace,
-so "which chunks are missing" reveals nothing about another namespace.
+path only by: write to `incoming/`, fsync, rename, fsync the directory. An upload request's chunks go
+together, so that their fsyncs overlap: every one written and synced, then each renamed, then each
+directory synced once, and only then the answer. Reading verifies the hash, so bit rot is an error
+rather than data. Each namespace has its own set: dedup never crosses a namespace, so "which chunks are
+missing" reveals nothing about another namespace.
 
 **Manifests** are stored like chunks. The hash of a file's content is the hash of its manifest's
 canonical encoding: compact JSON with fields in the order below.
@@ -65,14 +67,15 @@ the root.
   daemon.json    what a running daemon last reported; for reading only, and never needed
   state.sqlite   WAL, synchronous=FULL
   stage/         entries lifted out for a moment, for swaps and cycles
-  chunks/        downloads in progress, by hash; resumes after an interruption
+  chunks/        downloads in progress, by hash, in slices of about 1 GiB, each chunk gone once the
+                 files that take it are written; resumes after an interruption
 ```
 
 | Table | Holds |
 |---|---|
 | `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way. `generation`, which triggers in the file move on every write to any table, whatever build makes it, and `steady`, what the last sync that had nothing to do and wrote nothing read: that generation, the cursor and its operation, a hash of the build, configuration and rules, a digest of its scan, and what it reported |
 | `base` | The server's tree as of the cursor: the common ancestor for merging |
-| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
+| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read, or last written by a run whose watch on the file saw nothing done to it until a later write would have shown; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
 | `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here, the policy it applied by, and whether it is a folder only something inside changes or one the run makes, private until its last pass, which the next scan compares with the disk to tell what arrived from what this device did |

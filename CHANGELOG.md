@@ -34,6 +34,25 @@
 - Every sync downloaded the whole commit at its cursor to check that the server still has its history, megabytes
   after a big one. `GET /changes` takes `ops=false`, which answers an entry without its operations; an older server
   sends them anyway.
+- A device's first sync of a big tree took a night or more: on a SATA disk, for a tree of 842,000 entries and
+  53 GB, about 5.6 hours to upload and 6 hours to download, 11 over a 15 ms path, with twice the tree's size free.
+  It now takes 45 minutes and 3 h 43 min there, with the tree's size free. The server made each chunk durable on
+  its own, two fsyncs one after the other; it now makes an upload request's chunks durable together, their fsyncs
+  overlapping, and still answers only once all of them are.
+- A big upload scanned the whole tree again for each commit of 20,000 operations. Its commits now go one after
+  another from one scan, and one the server refuses stops the rest, so that none after it records a tree the
+  server never had.
+- A download asked for each file's manifest in a request of its own and stored it, and each file's row, in a
+  transaction of its own: a round trip and two fsyncs a file. Manifests now come 2,000 to a request, and they and
+  the rows thousands to a transaction.
+- A download brought every chunk into its cache before placing anything, and read every file back afterwards. A
+  chunk now leaves the cache once the files that take it are written, chunks come a slice of about 1 GiB at a time,
+  and a download that would not fit is refused before anything moves, saying what it needs and what is free. On
+  Linux a placed file is watched until a later write would show, and its record needs no read unless the watch saw
+  something done to it; nothing waits on the watch, so a save of a file that has just arrived is never held up.
+- A new device read the whole journal in one answer of `GET /changes`, hundreds of megabytes and twice that of the
+  server's memory. An answer now stops at about 16 MiB, always with one entry; every client asks again from where
+  it ended.
 
 ## 0.1.2
 

@@ -713,16 +713,17 @@ pub fn remote_ops(remote: &Tree, plan: &Plan) -> Result<Vec<Op>> {
 const MAX_OPS_PER_COMMIT: usize = 20_000;
 const MAX_COMMIT_BYTES: usize = 48 * 1024 * 1024;
 
-/// Keep as many operations as one commit should hold. Returns whether any were left out. Every
-/// operation leaves a valid tree, so any cut is valid, except that a stage name must not outlive
-/// its commit: the cut only falls where nothing is staged.
-fn truncate_ops(ops: &mut Vec<Op>) -> bool {
+/// How many of these operations the next commit holds. Every operation leaves a valid tree, so any
+/// cut is valid, except that a stage name must not outlive its commit: the cut only falls where
+/// nothing is staged.
+fn commit_cut(ops: &[Op]) -> usize {
+    let max_ops = cairn_failpoint::tuned("sync.ops_a_commit", MAX_OPS_PER_COMMIT as u64) as usize;
     let mut bytes = 0usize;
     let mut staged = 0i64;
     let mut cut = 0usize;
     for (i, op) in ops.iter().enumerate() {
         bytes += serde_json::to_vec(op).map_or(0, |v| v.len());
-        if i > 0 && (i >= MAX_OPS_PER_COMMIT || bytes > MAX_COMMIT_BYTES) {
+        if i > 0 && (i >= max_ops || bytes > MAX_COMMIT_BYTES) {
             break;
         }
         if let Op::Move { from, to, .. } = op {
@@ -733,12 +734,35 @@ fn truncate_ops(ops: &mut Vec<Op>) -> bool {
             cut = i + 1;
         }
     }
-    if cut == 0 || cut == ops.len() {
+    if cut == 0 {
         // Everything staged at once, however large, has to go together.
-        return false;
+        return ops.len();
     }
+    cut
+}
+
+/// The operations cut into commits, in order.
+fn commits(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
+    let mut cuts = Vec::new();
+    let mut at = 0;
+    while at < ops.len() {
+        at += commit_cut(&ops[at..]);
+        cuts.push(at);
+    }
+    cuts.pop();
+    // Split from the end, so that each operation moves once.
+    let mut out: Vec<Vec<Op>> = cuts.iter().rev().map(|&cut| ops.split_off(cut)).collect();
+    out.push(ops);
+    out.reverse();
+    out
+}
+
+#[cfg(test)]
+fn truncate_ops(ops: &mut Vec<Op>) -> bool {
+    let cut = commit_cut(ops);
+    let truncated = cut < ops.len();
     ops.truncate(cut);
-    true
+    truncated
 }
 
 enum Upload {
@@ -1677,7 +1701,6 @@ fn sync_full(
                 }
             }
         }
-        let first_note = ops.len();
         ops.extend(notes.iter().map(|(object, text)| Op::Note {
             object: *object,
             text: text.clone(),
@@ -1703,81 +1726,83 @@ fn sync_full(
                 SyncOutcome::Synced
             };
         }
-        // A huge change goes in several commits, the next round picking up where this one ended, and
-        // the notes left out with it.
-        let truncated = truncate_ops(&mut ops);
-        let notes_sent = ops.len().saturating_sub(first_note);
-
-        match upload(&client, &root, &cur, &ops)? {
-            Upload::FileChanged => {
-                retryable = true;
-                continue;
+        // A huge change goes in several commits, one after another from this one plan: each leaves a
+        // valid tree, and the server checks every operation against what is there by then, so one
+        // that something else has overtaken is refused, and the next round merges again. What the
+        // filesystem does meanwhile is for that round too, which compares the disk with this scan.
+        // The notes go last, so each commit's are the first of those still to go.
+        let mut landed: Tree = view.remote.clone().into_owned();
+        for ops in commits(ops) {
+            match upload(&client, &root, &cur, &ops)? {
+                Upload::FileChanged => {
+                    retryable = true;
+                    break;
+                }
+                Upload::Done { chunks, bytes } => {
+                    report.chunks_uploaded += chunks;
+                    report.bytes_uploaded += bytes;
+                }
             }
-            Upload::Done { chunks, bytes } => {
-                report.chunks_uploaded += chunks;
-                report.bytes_uploaded += bytes;
-            }
-        }
-        hit("sync.uploaded");
+            hit("sync.uploaded");
 
-        let req = CommitRequest {
-            op_id: OpId::random(),
-            device: root.config.device,
-            device_name: root.config.device_name.clone(),
-            ops,
-        };
-        let pushed = mark_synced(&mut rows, &view.remote, &cur, &req);
-        let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
-        // The queue delivers the notes in it from here on.
-        let delivered: Vec<String> = req
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                Op::Note { object, text } => Some(
-                    NoteIntent {
-                        object: *object,
-                        text: text.clone(),
+            let req = CommitRequest {
+                op_id: OpId::random(),
+                device: root.config.device,
+                device_name: root.config.device_name.clone(),
+                ops,
+            };
+            let pushed = mark_synced(&mut rows, &mut landed, &cur, &req);
+            let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
+            // The queue delivers the notes in it from here on.
+            let delivered: Vec<String> = req
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Note { object, text } => Some(
+                        NoteIntent {
+                            object: *object,
+                            text: text.clone(),
+                        }
+                        .key(),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            root.state.enqueue(&req, &list, &delivered)?;
+            hit("sync.enqueued");
+            let resp = client.commit(&req)?;
+            hit("sync.committed");
+            // Before the commit leaves the queue, so that dying here costs nothing.
+            if matches!(resp, CommitResponse::Rejected { .. }) {
+                notes_back(&mut root, &req)?;
+                let changed = take_back_refused(&req, &mut rows);
+                let list: Vec<(ObjectId, &Row)> =
+                    changed.iter().map(|id| (*id, &rows[id])).collect();
+                root.state.store_rows(&list, &[])?;
+            }
+            root.state.dequeue(&req.op_id)?;
+            hit("sync.dequeued");
+            match resp {
+                CommitResponse::Committed { .. } => {
+                    notes.drain(..delivered.len());
+                    report.commits += 1;
+                    report.ops_pushed += req.ops.len() as u64;
+                    report
+                        .activity
+                        .extend(up_activity(&view.remote, &plan, &req.ops));
+                }
+                CommitResponse::Rejected { reject } => {
+                    // Someone else got in first, or a chunk has gone: the next round sees why.
+                    let line =
+                        format!("the server refused a commit and this client rebased: {reject:?}");
+                    if seen_events.insert(line.clone()) {
+                        report.events.push(line);
                     }
-                    .key(),
-                ),
-                _ => None,
-            })
-            .collect();
-        root.state.enqueue(&req, &list, &delivered)?;
-        hit("sync.enqueued");
-        let resp = client.commit(&req)?;
-        hit("sync.committed");
-        // Before the commit leaves the queue, so that dying here costs nothing.
-        if matches!(resp, CommitResponse::Rejected { .. }) {
-            notes_back(&mut root, &req)?;
-            let changed = take_back_refused(&req, &mut rows);
-            let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
-            root.state.store_rows(&list, &[])?;
-        }
-        root.state.dequeue(&req.op_id)?;
-        hit("sync.dequeued");
-        match resp {
-            CommitResponse::Committed { .. } => {
-                notes.drain(..notes_sent);
-                report.commits += 1;
-                report.ops_pushed += req.ops.len() as u64;
-                report
-                    .activity
-                    .extend(up_activity(&view.remote, &plan, &req.ops));
-                // A huge change is not a tree failing to settle, as long as it is getting through.
-                if truncated {
-                    report.rounds -= 1;
-                }
-            }
-            CommitResponse::Rejected { reject } => {
-                // Someone else got in first, or a chunk has gone: the next round sees why.
-                let line =
-                    format!("the server refused a commit and this client rebased: {reject:?}");
-                if seen_events.insert(line.clone()) {
-                    report.events.push(line);
+                    break;
                 }
             }
         }
+        hit("sync.pushed");
         if failed {
             break SyncOutcome::Partial;
         }
@@ -1810,13 +1835,14 @@ fn sync_full(
 /// What this commit will leave on the server, as far as this filesystem holds it too, paired with
 /// what is on disk, so that the next round can tell a later local edit from the commit itself. It
 /// means nothing until the commit is seen in the journal: `shared_state` checks that.
+/// `after` is the server's tree as the commits before this one leave it, and becomes the tree as this
+/// one leaves it.
 fn mark_synced(
     rows: &mut BTreeMap<ObjectId, Row>,
-    remote: &Tree,
+    after: &mut Tree,
     cur: &BTreeMap<ObjectId, CurNode>,
     req: &CommitRequest,
 ) -> Vec<ObjectId> {
-    let mut after = remote.clone();
     let mut touched: BTreeSet<ObjectId> = BTreeSet::new();
     let mut gave_up: BTreeSet<ObjectId> = BTreeSet::new();
     for op in &req.ops {

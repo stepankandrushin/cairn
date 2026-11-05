@@ -14,6 +14,8 @@
 //!   to a file this user does not own. Not a step: numbered points elsewhere stay where they were.
 //! - `CAIRN_FP_UNSUPPORTED=<name>`: `unsupported` says yes at that point, as a filesystem says it
 //!   cannot do what is asked, the way NTFS cannot swap two names. Not a step either.
+//! - `CAIRN_FP_TUNE=<name>=<n>[,...]`: `tuned` gives `n` for that name instead of its default, to
+//!   make a limit small enough for a test to cross. Not a step either.
 
 use std::io;
 
@@ -51,6 +53,18 @@ pub fn refuse_name(name: &[u8]) -> io::Result<()> {
     {
         let _ = name;
         Ok(())
+    }
+}
+
+/// A limit, as the code sets it or as a test makes it.
+#[inline]
+pub fn tuned(name: &str, default: u64) -> u64 {
+    #[cfg(feature = "enabled")]
+    return imp::tuned(name).unwrap_or(default);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = name;
+        default
     }
 }
 
@@ -103,7 +117,8 @@ mod imp {
                 .create(true)
                 .open(path)
             {
-                let _ = writeln!(f, "{name}");
+                // One write, so that threads hitting points at once do not mix their lines.
+                let _ = f.write_all(format!("{name}\n").as_bytes());
             }
         }
         if let Ok(spec) = std::env::var("CAIRN_FP_CRASH") {
@@ -178,6 +193,14 @@ mod imp {
 
     pub fn unsupported(name: &str) -> bool {
         std::env::var("CAIRN_FP_UNSUPPORTED").is_ok_and(|point| point == name)
+    }
+
+    pub fn tuned(name: &str) -> Option<u64> {
+        let spec = std::env::var("CAIRN_FP_TUNE").ok()?;
+        spec.split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(point, _)| *point == name)
+            .and_then(|(_, n)| n.parse().ok())
     }
 
     pub fn deny(name: &str) -> io::Result<()> {

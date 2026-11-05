@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A write within this window of a read may leave the timestamps it read unchanged.
-const RACY_WINDOW_NS: i128 = 100_000_000;
+pub(crate) const RACY_WINDOW_NS: i128 = 100_000_000;
 
 /// A file changed more recently than this may be in the middle of a save: a program that truncates
 /// and then writes leaves an empty file that reads as perfectly steady. It waits this long first.
@@ -123,7 +123,12 @@ fn ns(t: Timestamp) -> i128 {
 /// Whether a later write could leave these timestamps as they are. ctime alone decides: every write
 /// moves it, and unlike mtime it cannot be set by hand.
 pub fn is_racy(st: &Stat, precision_ns: u32) -> bool {
-    now_ns() - ns(st.ctime) < RACY_WINDOW_NS + i128::from(precision_ns)
+    racy_within(st, precision_ns, RACY_WINDOW_NS)
+}
+
+/// As `is_racy`, for a window of `window_ns`.
+pub fn racy_within(st: &Stat, precision_ns: u32, window_ns: i128) -> bool {
+    now_ns() - ns(st.ctime) < window_ns + i128::from(precision_ns)
 }
 
 /// Wait out what is left of the stable window since this file last changed.

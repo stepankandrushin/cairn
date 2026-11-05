@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 **New:**
 
@@ -21,6 +21,14 @@
   shows every root of this user on this machine, from a list `cairn init` and each daemon add to, a root that
   has gone included, until `cairn forget` takes it off; `--json` gives either as JSON, and `cairn ask` sends
   one request.
+- A macOS client: FSEvents for the daemon, xattrs and holes on APFS. A name APFS takes for another (a decomposed
+  name and its composed form, or two cases) waits until it is renamed, as below. macOS is not in CI.
+- A Windows client: NTFS by handle, no link followed, names Windows refuses left out and reported. Windows holds no
+  symlinks, owners or xattrs: what it does not hold is kept on the server as it was, and a file's read-only
+  attribute is its write bits. The failure harness runs there too, though not in CI.
+- A tray for macOS and Windows, in tray/, a workspace of its own: each daemon's state, its problems and conflicts,
+  pause and resume, and Forget for a root that is gone. It reads the local API and believes only a daemon of its
+  own user.
 
 **Fixed:**
 
@@ -91,6 +99,14 @@
   something new at a name the server had in the other form went up as a second name, a folder with everything in
   it, and every device that keeps names as bytes then held both. It now waits, reported with both names, until it
   is renamed here to the server's form, and then the two merge.
+
+**Known limits:**
+
+- A big tree costs whole-tree work on every sync: at about 840,000 entries, a sync with nothing to do takes about a
+  minute of one core and 10 GB of memory, and a change takes one to three minutes to reach another device. A first
+  sync of such a tree takes hours per device. The next release works on this.
+- On Linux, at the usual limit of 1,024 open files, the daemon's watcher can leave folders unwatched in a tree with a
+  folder of thousands of subfolders, without saying so. Changes there wait for the hourly full sync.
 
 ## 0.1.1
 

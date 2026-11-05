@@ -332,7 +332,7 @@ fn inner_xattr_on_a_full_disk() {
 
     // Data, then inodes, then what is left of tmpfs's room for xattrs, which inodes share.
     let ballast = small.join("ballast");
-    let run = sync_while_filling(&sb, &b, "apply.temp.synced", || {
+    let run = sync_while_filling(&sb, &b, "apply.temp.written", || {
         std::fs::create_dir(&ballast).unwrap();
         let mut big = std::fs::File::create(ballast.join("big")).unwrap();
         for size in [1 << 20, 4096, 512] {

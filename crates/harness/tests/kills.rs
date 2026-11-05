@@ -1803,7 +1803,6 @@ const SAME_AS_A_NEIGHBOUR: &[&str] = &[
     "scan.file",
     "apply.temp.created",
     "apply.temp.written",
-    "apply.temp.synced",
     "apply.temp.meta",
     "apply.temp.write",
 ];

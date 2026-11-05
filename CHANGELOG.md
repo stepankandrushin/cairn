@@ -11,6 +11,10 @@
   `synced` until its hourly full sync, and once the root was back in another folder, as a disk mounted back on its
   folder is, changes in it waited for that full sync too, as the watch stayed on the folder that had gone. A second
   watch, on the folder above the root, now notices at once, and the root's watch moves to what is at its path.
+- A file that came down was flushed to disk twice, after its data and again after its metadata, and each flush
+  has the disk empty its cache. It is now flushed once, after both, still before the rename that puts it in place.
+  A first download places a small file on an HDD under Windows in about 20 ms where it took 29, and on a busy
+  Linux disk array in about 18 ms where it took 31: most of what is left is that one flush.
 
 ## 0.1.3
 

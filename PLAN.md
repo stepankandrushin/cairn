@@ -131,8 +131,9 @@ the first result, so a lost response is harmless. Small files take a simpler bat
 makes a request's chunks durable together before it answers. A change too big for one commit goes in several
 from one scan, the server checking each against what the ones before it left.
 
-**Applying a change.** Download to a temp file in the same directory → verify hashes → fsync → set
-metadata → check the destination has not changed locally → atomic `rename()`. Chunks come through a cache a
+**Applying a change.** Download to a temp file in the same directory → verify hashes → set metadata →
+fsync, once for both, as a flush empties the disk's cache → check the destination has not changed locally →
+atomic `rename()`. Chunks come through a cache a
 slice at a time, each gone once the files that take it are written, so a first download needs the tree's size
 free and not twice that, and one that would not fit is refused before anything moves. On a local Linux
 filesystem a placed file is watched (inotify) from its last write until a later write would move its

@@ -722,6 +722,9 @@ mod tests {
             rescued_temps: Vec::new(),
             rescued: Vec::new(),
             excluded: Vec::new(),
+            excluded_ids: Vec::new(),
+            stopped: false,
+            started: std::time::Instant::now(),
         }
     }
 

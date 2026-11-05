@@ -239,6 +239,17 @@ impl Client {
         )
     }
 
+    /// The journal entry at `seq`, without its operations, and the head: where this device is, and
+    /// whether anything came after it, for the price of one entry however large its commit. An older
+    /// server sends the operations too.
+    pub fn change_at(&self, seq: u64) -> Result<ChangesResponse> {
+        let query = match seq {
+            0 => "after=0&limit=0".to_string(),
+            seq => format!("after={}&limit=1&ops=false", seq - 1),
+        };
+        self.get_json("reading the journal", &format!("/changes?{query}"))
+    }
+
     /// The head, once it is not `after` or `wait` has gone by. A plain request and answer, so it
     /// passes through any reverse proxy. Bounded here too: a connection a firewall silently dropped
     /// answers nothing, ever.

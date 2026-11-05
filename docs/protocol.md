@@ -29,7 +29,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `POST /chunks/upload` | chunk batch | 204: all durable. 400: damaged batch |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
 | `POST /commit` | `CommitRequest` | `CommitResponse` |
-| `GET /changes?after=N&limit=M&wait=S` | | `{changes, head}`: journal entries after sequence N. With `wait`, see [Waiting](#waiting) |
+| `GET /changes?after=N&limit=M&wait=S&ops=false` | | `{changes, head}`: journal entries after sequence N. With `wait`, see [Waiting](#waiting). With `ops=false`, each without its operations: where a client stands, for the price of one entry however large its commit |
 | `GET /conflicts` | | The conflict inbox |
 
 401 means a missing or wrong token, 404 an unknown namespace, and 507 a full disk on the server, in

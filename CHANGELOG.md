@@ -7,6 +7,29 @@
 - `cairn init` with a server it could not reach, or one that refused its token, still made the folder a root and
   listed it, so the same init run again called it a root already. The server is now asked first, and an init it
   does not take leaves the folder as it was and lists nothing.
+- Every sync, with something to do or nothing, loaded, merged and scheduled the whole tree in memory: on a tree
+  of 840,000 entries about a minute of one core and 10.6 GB, of which reading the disk was 6 seconds. A sync that
+  finds what the last sync with nothing to do found, the same state, server, rules and tree, now stops after its
+  scan, which reads no file. The first sync after a change still goes the whole way, and writes down what it
+  agreed on for the next. The state file gets triggers that count every write to it, which an older version
+  opens and moves too.
+- A sync that does go the whole way holds less at once: no copy of the server's tree when nothing came from it,
+  and neither the scan nor what the merge was given once it is done with them. The daemon gives that memory back
+  to the system once it has been idle half a minute past its pause, instead of keeping it until the next sync.
+- The daemon's watcher held every subfolder waiting its turn open, and in a folder of thousands of them ran out
+  of open files at the usual soft limit of 1,024: the rest went unwatched, and the daemon fell back to a full sync
+  every 5 minutes. It now holds one folder for each level down, the daemon takes the hard limit on open files at
+  start, and it names the first folders it could not watch, and why.
+- A device that applied a change synced once more for its own writes, and one whose sync took in commits after
+  its own synced once more for the feed's news of them. A wake from before the scan a sync agreed on now wakes
+  nothing: that scan saw it.
+- The pause after a sync was twice its scan alone, a fraction of a sync of a big tree, so the daemon was busy most
+  of the time while changes kept coming. It is now twice what every sync repeats, loading the state, the scan and
+  the merge, not the data it moved, and 30 seconds at the most, so that a change written as a sync ends waits at
+  most about that and one sync.
+- Every sync downloaded the whole commit at its cursor to check that the server still has its history, megabytes
+  after a big one. `GET /changes` takes `ops=false`, which answers an entry without its operations; an older server
+  sends them anyway.
 
 ## 0.1.2
 

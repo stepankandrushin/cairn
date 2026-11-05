@@ -266,6 +266,11 @@ impl Watcher {
             .in_motion = paths;
     }
 
+    /// Folders that could not be watched: none, as the tree is watched whole.
+    pub fn missed(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     pub fn counts(&self) -> WatchCounts {
         WatchCounts {
             watched: 1,

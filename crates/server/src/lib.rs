@@ -189,6 +189,13 @@ struct ChangesQuery {
     /// Hold the answer for up to this many seconds until the head is no longer `after`.
     #[serde(default)]
     wait: u64,
+    /// `false`: each entry without its operations, for a client that only checks where it is.
+    #[serde(default = "yes")]
+    ops: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Until the head differs from `after`, the time is up, or the server is stopping. A head behind
@@ -220,7 +227,14 @@ async fn changes(
     if q.wait > 0 {
         wait_for_change(&app, &ns, q.after, q.wait.min(MAX_WAIT_SECS)).await?;
     }
-    let (changes, head) = blocking(move || app.repo.changes(&ns, q.after, limit)).await?;
+    let (changes, head) = blocking(move || {
+        if q.ops {
+            app.repo.changes(&ns, q.after, limit)
+        } else {
+            app.repo.changes_without_ops(&ns, q.after, limit)
+        }
+    })
+    .await?;
     // A proxy that caches must not answer a later ask from this one.
     Ok((
         [(header::CACHE_CONTROL, "no-store")],

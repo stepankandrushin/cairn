@@ -42,10 +42,16 @@ const QUIET: Duration = Duration::from_millis(300);
 const MOST_QUIET: Duration = Duration::from_secs(3);
 /// Between the end of one sync and the next, at the very least.
 const MIN_GAP: Duration = Duration::from_secs(1);
+/// And at the most: a change written as a sync of a big tree ends waits this long and one sync, not
+/// twice that sync first.
+const MAX_GAP: Duration = Duration::from_secs(30);
 /// A wait shorter than this is not worth writing the status for.
 const SHOW_WAIT: Duration = Duration::from_secs(2);
 /// With directories out of the watcher's reach, the safety net does more of the work.
 const DEGRADED_RECONCILE: Duration = Duration::from_secs(300);
+/// Idle this long past the pause after a sync, the daemon gives back the memory that sync freed. Not at
+/// once: a change that comes in the meantime finds it still there, which in a big tree is seconds.
+const IDLE_BEFORE_GIVING_BACK: Duration = Duration::from_secs(30);
 /// Below any reverse proxy's usual read timeout (nginx: 60 seconds).
 const FEED_WAIT: Duration = Duration::from_secs(25);
 const LOCK_ATTEMPTS: u32 = 5;
@@ -78,8 +84,10 @@ impl Default for DaemonOptions {
 }
 
 enum Wake {
-    Local,
-    Remote(u64),
+    /// Something changed under the root, or a person asked; when that was known.
+    Local(Instant),
+    /// The head the feed was waiting on, and the one it found.
+    Remote { after: u64, head: u64 },
     /// The server can be reached again, after it could not.
     ServerBack,
     /// The feed cannot reach the server, which an idle daemon would otherwise not find out.
@@ -297,7 +305,7 @@ fn handler(root: &Path, pause: &Arc<Pause>, wake: &Sender<Wake>) -> Arc<Handler>
                     text: "this daemon is paused: resume it to sync".into(),
                 };
             }
-            let _ = wake.send(Wake::Local);
+            let _ = wake.send(Wake::Local(Instant::now()));
             Reply::Done
         }
         r @ (Request::Pause | Request::Resume) => {
@@ -381,7 +389,7 @@ fn feed(
                 backoff = Duration::from_secs(1);
                 seen = head;
                 if head != after {
-                    if wake.send(Wake::Remote(head)).is_err() {
+                    if wake.send(Wake::Remote { after, head }).is_err() {
                         return;
                     }
                 } else if took < wait / 2 {
@@ -419,6 +427,9 @@ struct Schedule {
     /// When the gap after the last sync ends.
     gap_until: Instant,
     backoff: Duration,
+    /// When the scan began that the last sync's agreement rests on: a change before it, that sync saw,
+    /// its own writes included, so an event from then wakes nothing.
+    covered: Option<Instant>,
 }
 
 impl Schedule {
@@ -456,7 +467,7 @@ impl Schedule {
         let why = if self.holding && self.retry_at == Some(due) {
             "the wait after a failure, before trying again"
         } else if self.gap_until == due {
-            "the pause after the last sync, twice as long as its scan"
+            "the pause after the last sync, twice the part of it every sync repeats, at most 30 s"
         } else {
             "for the files to be quiet"
         };
@@ -465,13 +476,17 @@ impl Schedule {
 
     fn note(&mut self, wake: Wake, synced_head: u64) {
         match wake {
-            Wake::Local => {
+            Wake::Local(at) if self.covered.is_some_and(|c| at < c) => {}
+            Wake::Local(_) => {
                 let now = Instant::now();
                 self.first_event.get_or_insert(now);
                 self.last_event = Some(now);
             }
-            // An answer to a question asked before this device's own last commit.
-            Wake::Remote(head) => self.remote |= head != synced_head,
+            // Ahead of what the last sync saw, or behind where the feed was: news. In between, it is an
+            // answer to a question asked before this device's own last commits, which it has seen.
+            Wake::Remote { after, head } => {
+                self.remote |= head > synced_head || head < after;
+            }
             Wake::ServerBack => {
                 self.retry_at = None;
                 self.remote = true;
@@ -556,6 +571,56 @@ fn report_lines(report: &SyncReport) -> BTreeSet<String> {
     lines
 }
 
+/// The watcher holds a folder open for each level it walks down, and the scan the same: the soft limit
+/// on open files a session starts a daemon with, often 1,024, is no limit of the tree's, and the hard
+/// one is this process's to take.
+fn raise_open_files(log: &mut dyn FnMut(&str)) {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        let limit = getrlimit(Resource::Nofile);
+        if limit.current.is_some() && limit.current != limit.maximum {
+            let raised = Rlimit {
+                current: limit.maximum,
+                maximum: limit.maximum,
+            };
+            if let Err(e) = setrlimit(Resource::Nofile, raised) {
+                log(&format!(
+                    "cannot raise the limit on open files from {:?} to {:?}: {e}",
+                    limit.current, limit.maximum
+                ));
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = log;
+}
+
+/// Hand what the allocator holds free back to the system: after a sync of a big tree that is gigabytes,
+/// which would otherwise stay this process's while it waits.
+fn give_back_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: glibc's own; it only returns free pages to the system.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: libSystem's own; a null zone means every zone, and a goal of 0 as much as it can.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 /// Run until the process ends. Comes back only for what no retry would cure.
 pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Result<()> {
     let (wake_tx, wake_rx) = channel();
@@ -569,10 +634,11 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         }))
     };
 
+    raise_open_files(log);
     let watcher = if opts.watch {
         let tx = wake_tx.clone();
         match Watcher::start(path, move || {
-            let _ = tx.send(Wake::Local);
+            let _ = tx.send(Wake::Local(Instant::now()));
         }) {
             Ok(w) => Some(w),
             Err(e) => {
@@ -607,6 +673,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         holding: false,
         gap_until: now,
         backoff: Duration::ZERO,
+        covered: None,
     };
     let mut status = Status {
         pid: std::process::id(),
@@ -622,6 +689,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
+    // When to give back what the last sync freed, if nothing has started another by then.
+    let mut give_back_at: Option<Instant> = None;
 
     loop {
         for note in hub.take_notes() {
@@ -655,6 +724,9 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             Some(_) => Duration::from_secs(3600),
             None => schedule.due().saturating_duration_since(Instant::now()),
         };
+        let wait = give_back_at.map_or(wait, |at| {
+            wait.min(at.saturating_duration_since(Instant::now()))
+        });
         match wake_rx.recv_timeout(wait) {
             Ok(wake) => {
                 schedule.note(wake, synced_head.load(Ordering::SeqCst));
@@ -689,6 +761,13 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                     }
                     continue;
                 }
+            }
+            Err(RecvTimeoutError::Timeout)
+                if give_back_at.is_some_and(|at| Instant::now() >= at) =>
+            {
+                give_back_memory();
+                give_back_at = None;
+                continue;
             }
             Err(RecvTimeoutError::Timeout)
                 if pause.get().is_some() || pause.get() != was_paused =>
@@ -760,6 +839,9 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
 
         let started = Instant::now();
         let reconcile = started >= schedule.reconcile_at;
+        // A change here the watcher saw: the sync is to go the whole way, without first looking for
+        // nothing to do, which in a big tree is a scan of its own.
+        let changed_here = schedule.first_event.is_some();
         schedule.first_event = None;
         schedule.last_event = None;
         schedule.remote = false;
@@ -776,17 +858,28 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         hub.publish(&status);
         status.syncing = false;
         hit("daemon.sync");
-        let result = sync(path, &SyncOptions::default());
+        let result = sync(
+            path,
+            &SyncOptions {
+                changed_here,
+                ..SyncOptions::default()
+            },
+        );
         hit("daemon.synced");
-        // Every sync repeats its scan; the rest of a long one was moving data, which the next does not
-        // do again. Twice the scan keeps a tree that never rests from keeping the daemon scanning more
-        // than a third of the time, and a change after a big download waits about a scan, not twice
-        // the download.
+        // What a sync with nothing to do takes: loading the state, the scan, the merge. The rest of a
+        // long one was moving data, which the next does not do again. Twice that keeps a tree that never
+        // rests from keeping the daemon busy more than a third of the time, and a change after a big
+        // download waits about a sync with nothing to do, not twice the download. Up to 30 s: past that,
+        // a change waits on the pause longer than on the sync that sends it.
         let repeated = match &result {
-            Ok(report) => report.scan_time,
+            Ok(report) => report.repeated,
             Err(_) => started.elapsed(),
         };
-        schedule.gap_until = Instant::now() + MIN_GAP.max(repeated * 2);
+        schedule.gap_until = Instant::now() + (repeated * 2).clamp(MIN_GAP, MAX_GAP);
+        schedule.covered = result.as_ref().ok().and_then(|r| r.agreed_since);
+        // What the sync held is free again, and goes back to the system once the daemon is idle,
+        // rather than staying this process's until the next sync.
+        give_back_at = Some(schedule.gap_until + IDLE_BEFORE_GIVING_BACK);
 
         status.syncs += 1;
         status.last_sync = now_secs();
@@ -882,9 +975,17 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         } else if counts.stopped && !said_counts.stopped {
             log("the watcher has stopped: changes here are found only by the full sync");
         } else if counts.unwatched > 0 && said_counts.unwatched == 0 {
+            let missed = watcher.as_ref().map(Watcher::missed).unwrap_or_default();
+            let more = counts.unwatched.saturating_sub(missed.len());
             log(&format!(
-                "{} folders could not be watched, so changes in them wait for a full sync",
-                counts.unwatched
+                "{} folders could not be watched, so changes in them wait for a full sync: {}{}",
+                counts.unwatched,
+                missed.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
             ));
         }
         said_counts = counts;

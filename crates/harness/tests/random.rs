@@ -398,8 +398,62 @@ fn run_seed(seed: u64, with_rules: bool) {
             context("temporary files left".into())
         );
     }
+
+    // On the trees these steps made, every device's syncs settle into one with nothing to do, which
+    // the full sync run after it in this build must agree with. d0's may stay with the full sync,
+    // where its rules kept something out by inode, which only the full sync can tell.
+    for (i, d) in devices.iter().enumerate() {
+        let reached = settles_fast(d);
+        assert!(
+            reached || (with_rules && i == 0),
+            "{}",
+            context(format!(
+                "{} never took a sync for one with nothing to do",
+                d.name
+            ))
+        );
+    }
+    // Then a change on each, which the fast path must leave to the full sync, and which survives like
+    // any other.
+    for d in &devices {
+        mutate(&mut rng, d, &mut live, &mut named_away, &mut log);
+    }
+    let p = converge(&refs);
+    let found = token::all_in(&p);
+    let lost: Vec<_> = live
+        .difference(&found)
+        .filter(|v| !named_away.contains(v))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{}",
+        context(format!(
+            "versions lost after a sync with nothing to do: {lost:?}\n{}",
+            log.join("\n")
+        ))
+    );
     let report = server.fsck();
     assert!(report.contains("clean"), "{}", context(report));
+}
+
+/// Syncs until one is found to have nothing to do, and the full sync after it agrees.
+fn settles_fast(d: &Device) -> bool {
+    for _ in 0..4 {
+        let log = d
+            .root
+            .with_extension(format!("steps-{:016x}", rand::random::<u64>()));
+        let run = d.cairn_env(
+            &["sync", "--allow-mass-delete"],
+            &[("CAIRN_FP_LOG", log.to_str().unwrap())],
+        );
+        let steps = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        assert!(run.ok() || run.code == Some(3), "{}", run.text());
+        if steps.lines().any(|l| l == "sync.fast.confirmed") {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]

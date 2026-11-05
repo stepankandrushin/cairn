@@ -33,6 +33,14 @@ pub trait MetaStore: Send {
     /// All or nothing. Durable when this returns `Committed`.
     fn commit(&mut self, ns: &str, req: &CommitRequest, time: i64) -> Result<CommitOutcome>;
     fn changes(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>>;
+    /// As `changes`, without the operations: which entry is where, for a client checking its cursor.
+    fn changes_without_ops(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>> {
+        let mut out = self.changes(ns, after, limit)?;
+        for c in &mut out {
+            c.ops.clear();
+        }
+        Ok(out)
+    }
     fn conflicts(&mut self, ns: &str) -> Result<Vec<ConflictEntry>>;
     fn revisions(&mut self, ns: &str) -> Result<Vec<StoredRevision>>;
     /// Current entries and heads, for `fsck` to compare with a replay of the journal.

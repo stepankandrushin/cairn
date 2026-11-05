@@ -70,12 +70,16 @@ the root.
 
 | Table | Holds |
 |---|---|
-| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way |
+| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way. `generation`, which triggers in the file move on every write to any table, whatever build makes it, and `steady`, what the last sync that had nothing to do and wrote nothing read: that generation, the cursor and its operation, a hash of the build, configuration and rules, a digest of its scan, and what it reported |
 | `base` | The server's tree as of the cursor: the common ancestor for merging |
 | `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
 | `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here, the policy it applied by, and whether it is a folder only something inside changes, which the next scan compares with the disk to tell what arrived from what this device did |
+
+The triggers are not a migration: an older build opens the file as before, and its writes move the generation
+too. A file found without all of them, or with one changed, gets them all again and loses its `steady` record, in
+one transaction.
 
 `rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field

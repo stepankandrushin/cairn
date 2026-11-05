@@ -17,7 +17,7 @@ use crate::root::{Paused, Root};
 use crate::scan::{scan, ScanOptions, ScanResult};
 use crate::schedule::{schedule, Topo, TopoOp};
 use crate::selection::Selection;
-use crate::state::{Row, Synced};
+use crate::state::{Known, Row, Synced};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::local::{Activity, Change, Direction};
@@ -26,6 +26,7 @@ use cairn_protocol::{
     ChunkRef, ConflictOf, Content, Hash, Link, Manifest, Name, ObjectId, ObjectKind, Op, OpId,
     RevisionId, Skip, Tree,
 };
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -43,6 +44,8 @@ const MASS_DELETE_MIN: usize = 10;
 pub struct SyncOptions {
     pub allow_mass_delete: bool,
     pub dry_run: bool,
+    /// Something changed under the root, by the watcher's word: no use looking for nothing to do.
+    pub changed_here: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,15 +82,21 @@ pub struct SyncReport {
     pub excluded_here: Vec<String>,
     /// The topmost entries on the server that this device does not sync.
     pub not_synced_here: Vec<String>,
-    /// How long the scans took: the part of a sync that every one repeats, whatever there is to do.
+    /// How long the scans took.
     pub scan_time: std::time::Duration,
+    /// What the next sync will repeat, whatever there is to do: loading the state, and the last
+    /// round's scan, merge, scheduling and record, without the data it moved or any wait.
+    pub repeated: std::time::Duration,
+    /// When the scan began that this sync's result rests on, if it ended agreeing with the server:
+    /// whatever happened in the tree before that, it has seen.
+    pub agreed_since: Option<std::time::Instant>,
     /// What it sent and what it applied here, in order, for the daemon's list of recent changes.
     /// Not metadata applied here alone, which a filesystem that cannot hold all of it would repeat.
     pub activity: Vec<Activity>,
 }
 
 impl SyncReport {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             outcome: SyncOutcome::Partial,
             skips: Vec::new(),
@@ -106,6 +115,8 @@ impl SyncReport {
             excluded_here: Vec::new(),
             not_synced_here: Vec::new(),
             scan_time: std::time::Duration::ZERO,
+            repeated: std::time::Duration::ZERO,
+            agreed_since: None,
             activity: Vec::new(),
         }
     }
@@ -160,11 +171,24 @@ pub fn fetch_changes(
     seq: &mut u64,
     seen: &mut Seen,
 ) -> Result<()> {
+    let mut cow = Cow::Owned(std::mem::replace(tree, Tree::new()));
+    let fetched = fetch_into(client, &mut cow, seq, seen);
+    *tree = cow.into_owned();
+    fetched
+}
+
+/// The same, copying the tree only once there is something to replay onto it.
+fn fetch_into(
+    client: &Client,
+    tree: &mut Cow<'_, Tree>,
+    seq: &mut u64,
+    seen: &mut Seen,
+) -> Result<()> {
     loop {
         let resp = client.changes(*seq)?;
         for change in &resp.changes {
             for op in &change.ops {
-                tree.apply(op).map_err(|e| {
+                tree.to_mut().apply(op).map_err(|e| {
                     anyhow!(
                         "the server's journal does not replay at seq {}: {e}",
                         change.seq
@@ -188,12 +212,25 @@ fn check_history(client: &Client, cursor: u64, cursor_op: Option<OpId>) -> Resul
     if cursor == 0 {
         return Ok(None);
     }
-    let resp = client.changes(cursor - 1)?;
+    // The entry alone: its commit can be thousands of operations.
+    let resp = client.change_at(cursor)?;
+    Ok(history_gone(&resp, cursor, cursor_op))
+}
+
+/// Why sync must pause, if the server's journal at the cursor is not what this device saw there.
+pub(crate) fn history_gone(
+    resp: &wire::ChangesResponse,
+    cursor: u64,
+    cursor_op: Option<OpId>,
+) -> Option<String> {
+    if cursor == 0 {
+        return None;
+    }
     let same = resp
         .changes
         .first()
         .is_some_and(|c| c.seq == cursor && cursor_op.is_none_or(|op| op == c.op_id));
-    Ok((!same).then(|| {
+    (!same).then(|| {
         format!(
             "the server no longer has the history this device last saw (sequence {cursor}; it is at {}): was it \
              restored from a backup? Sync is paused and nothing was changed. Files only here are safe. To \
@@ -201,7 +238,7 @@ fn check_history(client: &Client, cursor: u64, cursor_op: Option<OpId>) -> Resul
              name and content, keeps every difference as a conflict copy, and sends the server what it lost.",
             resp.head
         )
-    }))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,8 +253,10 @@ fn scan_stable(
     trees: (&Tree, &Tree),
     kept_edits: &mut u64,
 ) -> Result<ScanResult> {
-    let by_inode: HashMap<(u64, u64), &Row> =
-        rows.values().map(|r| ((r.fp.dev, r.fp.ino), r)).collect();
+    let by_inode: HashMap<(u64, u64), Known> = rows
+        .values()
+        .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
+        .collect();
     let prefix = root.temp_prefix();
     let on_its_way: Vec<(Content, Vec<Name>)> = root
         .state
@@ -235,6 +274,7 @@ fn scan_stable(
         remove_own_temps: remove_temps,
         arriving: &on_its_way,
         excluded,
+        probe: false,
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
     let mut rescued = Vec::new();
@@ -467,7 +507,7 @@ fn layout(m: &Manifest) -> Vec<(u64, u64)> {
 /// read again.
 fn keep_what_only_moved_holes(
     root: &Root,
-    by_inode: &HashMap<(u64, u64), &Row>,
+    by_inode: &HashMap<(u64, u64), Known>,
     result: &mut ScanResult,
 ) {
     let mut new: Option<HashMap<Hash, &[u8]>> = None;
@@ -937,7 +977,7 @@ fn adopt_rows(
 /// future local changes are measured from.
 fn finalize(
     root: &mut Root,
-    base: &mut Tree,
+    base: &Tree,
     remote: &Tree,
     seq: u64,
     last_op: Option<OpId>,
@@ -975,7 +1015,6 @@ fn finalize(
     root.state
         .store_base(base, remote, seq, last_op, &list, &gone)?;
     hit("sync.finalize.base");
-    *base = remote.clone();
 
     for (key, _) in root.state.intents::<CopyIntent>(INTENT_COPY)? {
         root.state.drop_intent(&key)?;
@@ -1213,23 +1252,73 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let client = Client::new(&root.config)?;
     let accounts = Accounts::load();
     // Read once, before anything is touched: a rule that cannot be read must stop the sync.
-    let mut selection = Selection::load(&root)?;
+    let selection = Selection::load(&root)?;
     // Purely local, and first: anything else may send a person to act on this folder.
     if !opts.dry_run {
         report.events.extend(recover(&mut root)?);
     }
+    let generation = root.state.generation()?;
+    // A sync that sees what the last one with nothing to do saw has nothing to do either.
+    let fast = match !opts.dry_run && !opts.changed_here && report.events.is_empty() {
+        true => {
+            crate::steady::try_fast(&mut root, &client, &accounts, &selection, opts, generation)
+                .unwrap_or(None)
+        }
+        false => None,
+    };
+    if let Some(fast) = fast {
+        hit("sync.fast");
+        if !crate::steady::oracle() {
+            return Ok(fast.report);
+        }
+        // Every failpoint stays live in it, so that a test stopping or killing a sync at a step the
+        // fast path passes over still finds it.
+        let full = sync_full(
+            root,
+            client,
+            accounts,
+            selection,
+            opts,
+            SyncReport::new(),
+            generation,
+        )?;
+        return crate::steady::compare(fast, full);
+    }
+    let (report, _) = sync_full(root, client, accounts, selection, opts, report, generation)?;
+    Ok(report)
+}
+
+/// The whole sync: every object scanned, identified, merged, applied and pushed, until both sides agree.
+fn sync_full(
+    mut root: Root,
+    client: Client,
+    accounts: Accounts,
+    mut selection: Selection,
+    opts: &SyncOptions,
+    mut report: SyncReport,
+    generation: Option<u64>,
+) -> Result<(SyncReport, crate::steady::Trace)> {
+    let mut trace = crate::steady::Trace::default();
+    // What a record of a sync with nothing to do needs: that nothing came before the merge either.
+    let recovered = !report.events.is_empty();
+    let inputs = crate::steady::inputs(&root, &selection, opts);
     let cursor_op = root.state.cursor_op()?;
     if let Some(why) = check_history(&client, root.state.cursor()?, cursor_op)? {
         report.outcome = SyncOutcome::Paused(why);
-        return Ok(report);
+        return Ok((report, trace));
     }
     if !opts.dry_run {
         replay_outbox(&mut root, &client, &mut report)?;
     }
 
-    let mut base = root.state.load_base()?;
+    let loading = std::time::Instant::now();
+    let base = root.state.load_base()?;
     let mut rows = root.state.load_rows()?;
-    let mut remote = base.clone();
+    // What every sync repeats, whatever it has to do: loading the state, then in each round the scan,
+    // the merge, the scheduling and the record, but not the data it moves or the waits between.
+    let loaded = loading.elapsed();
+    // The server's tree: the base until the journal says otherwise, and only then a copy of it.
+    let mut remote: Cow<Tree> = Cow::Borrowed(&base);
     let mut seq = root.state.cursor()?;
     let date = utc_date(now_secs());
     let mut seen_events: BTreeSet<String> = report.events.iter().cloned().collect();
@@ -1238,6 +1327,9 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     // the next round finds the conflict settled.
     let mut notes: Vec<(ObjectId, String)> = Vec::new();
     let mut noted: HashSet<(ObjectId, String)> = HashSet::new();
+    // This round had nothing to do: the record can be made once the outcome is known.
+    let mut steady_round = false;
+    let mut round_work;
 
     let mut seen = Seen {
         last: cursor_op,
@@ -1245,6 +1337,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     };
     let finish = loop {
         report.rounds += 1;
+        round_work = std::time::Duration::ZERO;
         if report.rounds > MAX_ROUNDS {
             report.events.push(format!(
                 "the tree kept changing for {MAX_ROUNDS} rounds; sync again once it settles"
@@ -1252,7 +1345,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             break SyncOutcome::Partial;
         }
         hit("sync.round");
-        fetch_changes(&client, &mut remote, &mut seq, &mut seen)?;
+        fetch_into(&client, &mut remote, &mut seq, &mut seen)?;
         report.head = seq;
 
         if selection.recheck_unheld(&root.dir, &remote) && !opts.dry_run {
@@ -1278,7 +1371,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
 
         let moved = RefCell::new(Vec::new());
         let scan_started = std::time::Instant::now();
-        let scanned = scan_stable(
+        let mut scanned = scan_stable(
             &mut root,
             &rows,
             &accounts,
@@ -1290,6 +1383,17 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &mut report.conflicts,
         )?;
         report.scan_time += scan_started.elapsed();
+        round_work += scan_started.elapsed();
+        // What a later sync with nothing to do would compare itself with, if this one turns out to be:
+        // worked out beside the identification, which reads the same scan and rows, unless what this
+        // scan rescued is about to change a row.
+        let digest = report.rounds == 1
+            && !opts.dry_run
+            && (crate::steady::oracle() || root.state.generation()? == generation);
+        let digest_beside = digest && scanned.rescued.is_empty();
+        if digest && !digest_beside {
+            trace.first = Some((crate::steady::digest_of(&scanned, &rows), seq));
+        }
         for id in &scanned.rescued {
             if let Some(row) = rows.get_mut(id) {
                 row.fp.dev = 0;
@@ -1300,6 +1404,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             selection.store(&root)?;
         }
         hit("sync.scanned");
+        let thinking = std::time::Instant::now();
         report.excluded_here = scanned
             .excluded
             .iter()
@@ -1325,15 +1430,24 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             .into_iter()
             .map(|(_, a)| (a.object, a))
             .collect();
-        let mut identified = identify(
-            &scanned,
-            &view.base,
-            &view.remote,
-            &rows,
-            &intents,
-            &arriving,
-            &seen.commits,
-        );
+        let mut identified = std::thread::scope(|s| {
+            let digest =
+                digest_beside.then(|| s.spawn(|| crate::steady::digest_of(&scanned, &rows)));
+            let identified = identify(
+                &scanned,
+                &view.base,
+                &view.remote,
+                &rows,
+                &intents,
+                &arriving,
+                &seen.commits,
+            );
+            if let Some(d) = digest {
+                let d = d.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                trace.first = Some((d, seq));
+            }
+            identified
+        });
         // In a tree still moving, what was seen was seen, and only what was not is asked again.
         if !arriving.is_empty() {
             let holds = what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run)?;
@@ -1362,6 +1476,9 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                 &seen.commits,
             );
         }
+        // Every node is in `identified` now, and the scan's own copy of the tree can go.
+        scanned.nodes = Vec::new();
+        scanned.new_manifests = Vec::new();
         update_rows(&mut root, &mut rows, &identified, &view.base)?;
         // Found here means held, however that came about. Not found, and given up, is no delete.
         view.settle(&rows);
@@ -1369,10 +1486,11 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
 
         if !opts.allow_mass_delete {
             if let Some(why) = check_vanished(&view.base, &view.remote, &rows, &identified.local) {
-                return Ok(SyncReport {
+                let report = SyncReport {
                     outcome: SyncOutcome::Paused(why),
                     ..report
-                });
+                };
+                return Ok((report, trace));
             }
         }
 
@@ -1395,6 +1513,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             date: &date,
             fresh_id: &mut ObjectId::random,
         });
+        round_work += thinking.elapsed();
         for r in &plan.reports {
             // A new object kept beside the server's at a name both took is a conflict copy too.
             let beside = r.kind == ReportKind::SameNameKeptBoth
@@ -1464,7 +1583,10 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &view.remote,
         )?;
         let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
+        // What the merge was given has served: from here on the plan and the disk say it all.
+        drop(identified);
         let arriving = down_activity(&cur, &plan);
+        let applying = std::time::Instant::now();
         let (outcome, cur) = Applier::new(
             &mut root,
             Some(&client),
@@ -1474,6 +1596,9 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             &view.remote,
         )
         .run(&plan)?;
+        if !outcome.touched && outcome.applied_steps == 0 {
+            round_work += applying.elapsed();
+        }
         hit("sync.applied");
         report.steps_applied += outcome.applied_steps;
         // What did not get there is no change made, and comes again in a later round.
@@ -1533,7 +1658,9 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                 s
             }));
 
+        let ordering = std::time::Instant::now();
         let mut ops = remote_ops(&view.remote, &plan)?;
+        round_work += ordering.elapsed();
         // The loser of a metadata conflict goes in the log even when nothing else is to be pushed.
         // Unless applying failed: the conflict stands, and would be logged on every run. A run killed
         // after applying the winner left its notes noted, and they go now.
@@ -1564,10 +1691,12 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
                 continue;
             }
             drop(view);
-            finalize(
-                &mut root, &mut base, &remote, seq, seen.last, &mut rows, &plan,
-            )?;
+            let finalizing = std::time::Instant::now();
+            finalize(&mut root, &base, &remote, seq, seen.last, &mut rows, &plan)?;
+            round_work += finalizing.elapsed();
             hit("sync.finalized");
+            report.agreed_since = Some(scanned.started);
+            steady_round = report.rounds == 1 && !unstable && !recovered;
             break if unstable {
                 SyncOutcome::Partial
             } else {
@@ -1658,7 +1787,24 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         SyncOutcome::Synced if retryable => SyncOutcome::Partial,
         other => other,
     };
-    Ok(report)
+    report.repeated = loaded + round_work;
+    // Nothing to do, and nothing written: the next sync that sees the same may say so at once.
+    if let (true, Some(g), Some((scan, _))) = (steady_round, generation, trace.first) {
+        if root.state.generation()? == Some(g) {
+            let record = crate::steady::Steady::new(
+                g,
+                inputs,
+                seq,
+                seen.last,
+                scan,
+                crate::steady::Recorded::of(&report),
+            );
+            crate::steady::store(&root, &record)?;
+            hit("sync.steady.recorded");
+            trace.steady = Some(record);
+        }
+    }
+    Ok((report, trace))
 }
 
 /// What this commit will leave on the server, as far as this filesystem holds it too, paired with

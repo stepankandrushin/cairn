@@ -152,6 +152,17 @@ impl Repo {
         Ok((meta.changes(ns, after, limit)?, meta.head(ns)?))
     }
 
+    /// As `changes`, without the operations.
+    pub fn changes_without_ops(
+        &self,
+        ns: &str,
+        after: u64,
+        limit: u32,
+    ) -> Result<(Vec<Change>, u64)> {
+        let mut meta = self.meta();
+        Ok((meta.changes_without_ops(ns, after, limit)?, meta.head(ns)?))
+    }
+
     pub fn conflicts(&self, ns: &str) -> Result<Vec<ConflictEntry>> {
         self.meta().conflicts(ns)
     }

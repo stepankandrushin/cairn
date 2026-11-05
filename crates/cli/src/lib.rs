@@ -537,6 +537,7 @@ fn run_inner() -> Result<u8> {
             SyncOptions {
                 allow_mass_delete,
                 dry_run,
+                ..SyncOptions::default()
             },
         ),
         Command::Daemon {
@@ -638,6 +639,7 @@ fn run_inner() -> Result<u8> {
                 &SyncOptions {
                     allow_mass_delete: true,
                     dry_run: true,
+                    ..SyncOptions::default()
                 },
             );
             if json {

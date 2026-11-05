@@ -390,6 +390,35 @@ impl MetaStore for SqliteStore {
         Ok(out)
     }
 
+    fn changes_without_ops(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, op_id, device, device_name, time FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![ns_id, after as i64, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, op_id, device, device_name, time) = row?;
+            out.push(Change {
+                seq: seq as u64,
+                op_id: cairn_protocol::OpId(blob16(op_id)?),
+                device: cairn_protocol::DeviceId(blob16(device)?),
+                device_name,
+                time,
+                ops: Vec::new(),
+            });
+        }
+        Ok(out)
+    }
+
     fn conflicts(&mut self, ns: &str) -> Result<Vec<ConflictEntry>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(

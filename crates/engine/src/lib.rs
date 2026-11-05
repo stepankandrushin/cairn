@@ -18,6 +18,7 @@ pub mod scan;
 pub mod schedule;
 pub mod selection;
 pub mod state;
+pub mod steady;
 pub mod sync;
 pub mod twins;
 #[cfg_attr(target_os = "macos", path = "watch_fsevents.rs")]

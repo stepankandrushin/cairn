@@ -164,13 +164,22 @@ made it logs "this device had 700" once the rule goes.
 | Same new name, different objects | Identical content or two directories become one object. With no base its metadata still merges field by field, each side's own: what only one has stays, and where both have a value the server's stands and the other is in the activity log (times and owners, which differ between any two copies, without an entry). A file the server holds under several names takes separate equal copies at them as its links, the copy with the most of its own staying, unless another has something the file would not hold. Otherwise keep both under a conflict name, in the conflict inbox like any other |
 | Concurrent moves that would form a cycle | The server rejects the second; that client rebases |
 
+**A sync with nothing to do** does not merge. One that ran in full, had nothing to do and wrote nothing records
+what it read: the state, by a generation that every write to it moves; the entry at the cursor and the head; the
+build, the configuration and the rules; and the tree, by a digest of its scan. A later sync that reads all of that
+again, by a scan that stops before it would read a file, would decide the same, so it stops there, before the base
+is loaded; anything else, and it runs in full. A harness build runs both and compares them.
+
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
 before submitting old state, comparing against history, so deleted files do not come back.
 
 **The daemon** decides when to sync and nothing else: it runs the same state-based sync a person runs. An
 event from the watcher or the change feed only says "look", and says nothing about what to look at, so a
 lost event, a stale path or a missed folder delays a change and cannot lose one, and the full reconcile
-covers whatever both miss. A watch is always placed before the sync it leads to. Change feed: a long-poll
+covers whatever both miss. A watch is always placed before the sync it leads to; the walk that places them
+holds one folder open for each level down, the daemon takes its hard limit on open files, and a folder it cannot
+watch is named. A wake for a change from before the scan the last sync agreed on is none, as that scan saw it, the
+sync's own writes included, and so is the feed's news of commits that sync took in. Change feed: a long-poll
 of `GET /changes`, not a stream, since a plain response survives any proxy; when one cuts it off, the
 client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, and
 it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
@@ -178,9 +187,10 @@ unmounted, but says nothing when only a bind mount goes away, or when anything i
 reconcile finds the first, and retrying while paused the second. After a failure it backs off, up to a
 minute, and holds every change back until then. A file still being written is no failure: the daemon comes
 back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
-its close does. Between syncs it rests for twice the last one's scan, the part every sync repeats, so a tree
-that never rests keeps it scanning at most a third of the time; the length of a big download is no reason to
-wait, as the next sync does not repeat it. `cairn status` says when changes wait, until when, and why. It serves the local API
+its close does. Between syncs it rests for twice what the last one did that every sync repeats, loading the
+state, the scan and the merge, so a tree that never rests keeps it busy at most a third of the time, but for 30 s at
+the most, so that a change written as a sync ends waits at most about 30 s and one sync, however big the tree; the
+data a big download moved is no reason to wait, as the next sync does not move it again. `cairn status` says when changes wait, until when, and why. It serves the local API
 (`cairn_protocol::local`) on a socket only its user can open: its status, pushed on each change, the open
 conflicts, and three requests that change no tree: look now, pause, resume. A pause outlives a restart
 and shows as `paused`. Each user's roots on a device are listed in a registry the CLI and the daemon add

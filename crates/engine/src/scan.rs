@@ -8,12 +8,12 @@ use crate::fsops::{
 };
 use crate::metadata::{capture, Accounts};
 use crate::root::aside_origin;
-use crate::state::{Fingerprint, Row};
+use crate::state::{Fingerprint, Known};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
 use cairn_protocol::{Bytes, Content, Hash, Metadata, Name, Skip, SkipKind, Timestamp, STATE_DIR};
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A write within this window of a read may leave the timestamps it read unchanged.
 const RACY_WINDOW_NS: i128 = 100_000_000;
@@ -75,18 +75,28 @@ pub struct ScanResult {
     pub rescued: Vec<cairn_protocol::ObjectId>,
     /// The topmost entries left alone because this device excludes them.
     pub excluded: Vec<Vec<Name>>,
+    /// What each of those was: device, inode, birth time and whether a directory, all a filter may
+    /// decide by.
+    pub excluded_ids: Vec<(u64, u64, Option<Timestamp>, bool)>,
+    /// A probe stopped where a full scan would have read a file or removed a leftover.
+    pub stopped: bool,
+    /// When the walk began: whatever happened in the tree before this, it saw.
+    pub started: Instant,
 }
 
 pub struct ScanOptions<'a> {
     pub temp_prefix: &'a [u8],
     pub accounts: &'a Accounts,
     /// What is known by inode, to avoid reading unchanged files.
-    pub rows: &'a HashMap<(u64, u64), &'a Row>,
+    pub rows: &'a HashMap<(u64, u64), Known<'a>>,
     pub remove_own_temps: bool,
     /// What this device was about to place, and at which names, by a run that may have been killed.
     pub arriving: &'a [(Content, Vec<Name>)],
     /// Whether an entry is excluded, given that its parent is not.
     pub excluded: &'a dyn Fn(&[Name], &Stat) -> bool,
+    /// Stop instead of reading a file's content or removing a leftover: for a sync that expects to
+    /// have nothing to do, which reads no file.
+    pub probe: bool,
 }
 
 pub fn fingerprint(st: &Stat) -> Fingerprint {
@@ -150,6 +160,8 @@ struct Walk<'a> {
     excluded: Vec<Vec<Name>>,
     /// Entries seen so far that are neither excluded nor directories holding only what is.
     solid: u64,
+    excluded_ids: Vec<(u64, u64, Option<Timestamp>, bool)>,
+    stopped: bool,
 }
 
 /// What was moved aside by a killed run, if it can be someone's only copy of something: not while another
@@ -230,6 +242,10 @@ impl Walk<'_> {
                 continue;
             }
             if raw.starts_with(self.opts.temp_prefix) {
+                if self.opts.probe {
+                    self.stopped = true;
+                    return true;
+                }
                 // Our own leftover from a killed run: nothing that has to stay, unless it is the old
                 // file of a swap with an edit in it.
                 if self.opts.remove_own_temps {
@@ -262,6 +278,9 @@ impl Walk<'_> {
         };
         self.dirs.push((path.clone(), st.mtime, st.ctime));
         for name in entries {
+            if self.stopped {
+                break;
+            }
             path.push(name);
             self.entry(dir, path, st_mnt);
             path.pop();
@@ -286,6 +305,8 @@ impl Walk<'_> {
         self.current_inode = Some((st.dev, st.ino));
         if (self.opts.excluded)(path, &st) {
             self.excluded.push(path.clone());
+            let is_dir = st.file_type == FileType::Directory;
+            self.excluded_ids.push((st.dev, st.ino, st.btime, is_dir));
             return;
         }
         if st.file_type != FileType::Directory {
@@ -357,17 +378,13 @@ impl Walk<'_> {
         let raw = path.last().expect("an entry has a name").as_bytes();
         let fp = fingerprint(&st);
         if let Some(row) = self.opts.rows.get(&(st.dev, st.ino)) {
-            if row.fp.current() == fp
-                && !row.racy
-                && !row.incomplete
-                && matches!(row.content, Content::File { .. })
-            {
+            if row.vouches_for(&fp) {
                 self.nodes.push(Scanned {
                     paths: vec![path.to_vec()],
                     fp,
                     racy: false,
                     content: row.content.clone(),
-                    metadata: row.scan.clone(),
+                    metadata: row.scan.cloned().unwrap_or_default(),
                     metadata_incomplete: false,
                     holds_excluded: false,
                     only_excluded: false,
@@ -419,6 +436,11 @@ impl Walk<'_> {
             if let Some(why) = self.being_written(&fd, &before) {
                 self.forget_link(&st);
                 return self.unobservable(path, SkipKind::KeepsChanging, Some(why.into()));
+            }
+            if self.opts.probe {
+                self.forget_link(&st);
+                self.stopped = true;
+                return;
             }
             hit("scan.file.reading");
             let manifest = match manifest_of(&fd, before.size) {
@@ -606,6 +628,7 @@ impl Walk<'_> {
 }
 
 pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
+    let started = Instant::now();
     let precision_ns = root.fstype_precision_ns();
     let mut walk = Walk {
         opts,
@@ -624,12 +647,15 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         dirs: Vec::new(),
         excluded: Vec::new(),
         solid: 0,
+        excluded_ids: Vec::new(),
+        stopped: false,
     };
     let st = root.stat_self()?;
     let mut path = Vec::new();
     walk.walk_dir(root, &mut path, st.mnt_id);
     hit("scan.done");
-    let unstable = !walk.dirs_unchanged(root);
+    // A probe that stopped says nothing more, and is not worth the second look.
+    let unstable = !walk.stopped && !walk.dirs_unchanged(root);
 
     let st = root.stat_self()?;
     let mut problems = Vec::new();
@@ -657,5 +683,8 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         rescued_temps: walk.rescued_temps,
         rescued: Vec::new(),
         excluded: walk.excluded,
+        excluded_ids: walk.excluded_ids,
+        stopped: walk.stopped,
+        started,
     })
 }

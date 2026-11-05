@@ -28,18 +28,24 @@ pub const IGNORE_FILE: &[u8] = b"ignore";
 const KEY_EXCLUDED: &str = "excluded";
 const RULE_READ_ATTEMPTS: u32 = 5;
 
-/// Rules in `.gitignore` syntax, relative to the root.
+/// Rules in `.gitignore` syntax, relative to the root, and the hash of the text they were read from.
 #[derive(Default)]
-pub struct Rules(Option<Gitignore>);
+pub struct Rules(Option<Gitignore>, Option<cairn_protocol::Hash>);
 
 impl Rules {
     pub fn none() -> Self {
-        Self(None)
+        Self(None, None)
+    }
+
+    /// What the rules were read from, so that a sync can tell they have not changed since another.
+    pub fn text_hash(&self) -> Option<cairn_protocol::Hash> {
+        self.1
     }
 
     /// Anything wrong with the rules is an error, never "no rules": those are what keep a secret or a
     /// huge folder from being uploaded.
     pub fn parse(text: &[u8]) -> Result<Self> {
+        let hash = cairn_protocol::Hash::of(text);
         let text = std::str::from_utf8(text).map_err(|_| anyhow!("it is not valid UTF-8"))?;
         // Some editors start a file with this, and it would quietly disable the first rule.
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -59,6 +65,7 @@ impl Rules {
         let matcher = builder.build()?;
         Ok(Self(
             (matcher.num_ignores() + matcher.num_whitelists() > 0).then_some(matcher),
+            Some(hash),
         ))
     }
 
@@ -386,6 +393,15 @@ impl Selection {
             stat: st.clone(),
         });
         true
+    }
+
+    /// What `leaves_out` says, without the trees: the same, but for an entry at a copy's name or inode
+    /// that this device holds or knows, which `leaves_out` keeps in and this leaves out. For a scan that
+    /// is compared whole with one `leaves_out` filtered: where the two differ, the scans do too.
+    pub fn leaves_out_roughly(&self, path: &[Name], st: &Stat) -> bool {
+        self.rules
+            .excludes(path, st.file_type == FileType::Directory)
+            || self.copies.iter().any(|c| c.is(st) || c.path == path)
     }
 
     /// Bring the records up to date with a scan. Returns whether any changed.

@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 
 /// A batch of events is cut here, so that a storm cannot hold the wake back for long.
 const MAX_BATCH: usize = 4096;
+/// Folders that could not be watched are named, up to this many, for the daemon to say.
+const MAX_MISSED: usize = 10;
 
 fn dir_mask() -> WatchFlags {
     WatchFlags::CREATE
@@ -67,6 +69,16 @@ struct Inner {
     /// Files the last sync found still being written, by their printable paths: their writes wake
     /// nothing, as the daemon comes back for them anyway, and their close does.
     in_motion: HashSet<String>,
+    /// The first folders that could not be watched, each with why.
+    missed: Vec<String>,
+}
+
+/// A folder being walked, with the subfolders of it still to go.
+struct Level {
+    dir: Dir,
+    path: Vec<Name>,
+    mnt: u64,
+    subdirs: std::vec::IntoIter<Vec<u8>>,
 }
 
 fn load_rules(root: &Dir) -> Rules {
@@ -92,43 +104,75 @@ impl Inner {
             }
             Err(Errno::NOSPC) => {
                 self.counts.limit_reached = true;
-                self.counts.unwatched += 1;
+                self.missed(path, "the kernel's limit on inotify watches");
             }
-            Err(_) => self.counts.unwatched += 1,
+            Err(e) => self.missed(path, &e.to_string()),
         }
     }
 
-    /// Watch a directory and all under it, stopping where a scan stops.
+    fn missed(&mut self, path: &[Name], why: &str) {
+        self.counts.unwatched += 1;
+        if self.missed.len() < MAX_MISSED {
+            let shown = match path {
+                [] => ".".to_string(),
+                _ => display_path(path),
+            };
+            self.missed.push(format!("{shown} ({why})"));
+        }
+    }
+
+    /// Watch a directory and all under it, stopping where a scan stops. Depth first, with one folder
+    /// open for each level down and none for the folders waiting their turn: a folder of thousands of
+    /// subfolders would otherwise hold them all open at once, past the limit on open files.
     fn walk(&mut self, top: Dir, top_path: Vec<Name>, seen: &mut HashSet<i32>) {
-        let mut stack = vec![(top, top_path)];
-        while let Some((dir, path)) = stack.pop() {
-            self.add_watch(&dir, &path, seen);
-            let Ok(subdirs) = dir.subdirs() else {
+        let mut stack: Vec<Level> = self.enter(top, top_path, seen).into_iter().collect();
+        while let Some(level) = stack.last_mut() {
+            let Some(raw) = level.subdirs.next() else {
+                stack.pop();
                 continue;
             };
-            let mnt = dir.stat_self().map_or(0, |s| s.mnt_id);
-            for raw in subdirs {
-                if path.is_empty() && raw == STATE_DIR {
-                    continue;
-                }
-                let Ok(name) = Name::new(raw) else {
-                    continue;
-                };
-                let Ok(st) = dir.stat(name.as_bytes()) else {
-                    continue;
-                };
-                if st.file_type != FileType::Directory || (mnt != 0 && st.mnt_id != mnt) {
-                    continue;
-                }
-                let mut child_path = path.clone();
-                child_path.push(name);
-                if self.rules.excludes(&child_path, true) {
-                    continue;
-                }
-                match dir.open_dir(child_path.last().expect("just pushed").as_bytes()) {
-                    Ok(child) => stack.push((child, child_path)),
-                    Err(_) => self.counts.unwatched += 1,
-                }
+            if let Some((child, path)) = self.child(level, raw) {
+                stack.extend(self.enter(child, path, seen));
+            }
+        }
+    }
+
+    /// Watch this folder, and list what to walk into.
+    fn enter(&mut self, dir: Dir, path: Vec<Name>, seen: &mut HashSet<i32>) -> Option<Level> {
+        self.add_watch(&dir, &path, seen);
+        let subdirs = dir.subdirs().ok()?;
+        let mnt = dir.stat_self().map_or(0, |s| s.mnt_id);
+        Some(Level {
+            dir,
+            path,
+            mnt,
+            subdirs: subdirs.into_iter(),
+        })
+    }
+
+    /// A subfolder to walk into, opened now, if a scan would go there too.
+    fn child(&mut self, level: &Level, raw: Vec<u8>) -> Option<(Dir, Vec<Name>)> {
+        if level.path.is_empty() && raw == STATE_DIR {
+            return None;
+        }
+        let name = Name::new(raw).ok()?;
+        let st = level.dir.stat(name.as_bytes()).ok()?;
+        if st.file_type != FileType::Directory || (level.mnt != 0 && st.mnt_id != level.mnt) {
+            return None;
+        }
+        let mut path = level.path.clone();
+        path.push(name);
+        if self.rules.excludes(&path, true) {
+            return None;
+        }
+        match level
+            .dir
+            .open_dir(path.last().expect("just pushed").as_bytes())
+        {
+            Ok(child) => Some((child, path)),
+            Err(e) => {
+                self.missed(&path, &e.to_string());
+                None
             }
         }
     }
@@ -136,6 +180,7 @@ impl Inner {
     /// All of it, from the path of the root as it is now: after a remount that is another directory.
     fn walk_all(&mut self) {
         self.counts = WatchCounts::default();
+        self.missed.clear();
         let mut seen = HashSet::new();
         self.state_watch = None;
         if let Ok(root) = Dir::open_root(&self.root) {
@@ -277,6 +322,7 @@ impl Watcher {
             counts: WatchCounts::default(),
             stopped: false,
             in_motion: HashSet::new(),
+            missed: Vec::new(),
         }));
         let shared = inner.clone();
         std::thread::spawn(move || read_events(reader, shared, wake));
@@ -292,6 +338,11 @@ impl Watcher {
     /// The files the last sync found still being written, by their printable paths.
     pub fn set_in_motion(&self, paths: HashSet<String>) {
         self.lock().in_motion = paths;
+    }
+
+    /// The first folders that could not be watched, each with why.
+    pub fn missed(&self) -> Vec<String> {
+        self.lock().missed.clone()
     }
 
     pub fn counts(&self) -> WatchCounts {

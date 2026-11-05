@@ -78,8 +78,11 @@ fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Make a directory a sync root. It may hold files; the first sync merges them with the server.
-pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
+/// Make a directory a sync root, and say where its server is: at what sequence. It may hold files; the
+/// first sync merges them with the server. The server is asked first, so one that cannot be reached,
+/// refuses the token or speaks another protocol leaves the folder as it was, with nothing to list and
+/// nothing in the way of the same init run again.
+pub fn init_root(path: &Path, opts: InitOptions) -> Result<u64> {
     let meta = std::fs::symlink_metadata(path).with_context(|| format!("{}", path.display()))?;
     if !meta.is_dir() {
         bail!("{} is not a directory", path.display());
@@ -88,9 +91,6 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
     if state.exists() {
         bail!("{} is already a sync root", path.display());
     }
-    std::fs::create_dir(&state)?;
-    fsops::make_private_dir(&state)?;
-
     let config = Config {
         server: opts.server.trim_end_matches('/').to_string(),
         namespace: opts.namespace,
@@ -101,13 +101,25 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<()> {
         filenames: FilenamePolicy::Faithful,
         allow_http: opts.allow_http,
     };
+    let head = crate::client::Client::new(&config)
+        .and_then(|c| c.info())
+        .with_context(|| {
+            format!(
+                "{} was not made a sync root, and nothing in it changed",
+                path.display()
+            )
+        })?
+        .head;
+
+    std::fs::create_dir(&state)?;
+    fsops::make_private_dir(&state)?;
     let root_id = hex::encode(rand::random::<[u8; 16]>());
     write_private(&state, CONFIG, &serde_json::to_vec_pretty(&config)?)?;
     let db = State::open(&state.join("state.sqlite"))?;
     db.set(KEY_ROOT_ID, &root_id)?;
     write_private(&state, MARKER, root_id.as_bytes())?;
     fsops::sync_dir_path(path)?;
-    Ok(())
+    Ok(head)
 }
 
 /// This root's marker, without taking its lock.

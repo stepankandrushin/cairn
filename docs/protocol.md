@@ -131,7 +131,7 @@ line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out
 The user dir is `$XDG_STATE_HOME/cairn` or `~/.local/state/cairn` on Linux, `~/Library/Application
 Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`, for tests. It holds
 `roots.json`, the registry of this user's roots (`{ roots: [{ path, root_id, server, added }] }`), which
-`cairn init` and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
+`cairn init`, once its server has answered, and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
 whose folder no longer holds its ID is listed as gone, not dropped, until `cairn forget` takes it off, by
 its path or ID, under the same lock: it refuses a root still there unless given `--even-if-present`, and
 that root's daemon lists it again when it starts. The tray's Forget, offered for a root it shows as gone, does

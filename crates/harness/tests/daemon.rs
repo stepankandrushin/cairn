@@ -1883,6 +1883,66 @@ fn forget_takes_off_a_root_that_has_gone_and_one_still_there_only_when_asked() {
     });
 }
 
+/// An init its server does not answer, or refuses, makes nothing and lists nothing, and says so: one with
+/// no server to reach once left a root listed, and a folder that a second init called a root already.
+#[test]
+fn an_init_the_server_does_not_take_leaves_no_root_and_no_entry() {
+    let sb = Sandbox::on_disk("d-init-fails");
+    let server = Server::start(sb.path("server"));
+    let user = UserDir::new();
+    let env = user.env();
+    let token = server.token_file.to_str().unwrap().to_string();
+    let wrong = sb.path("wrong-token");
+    std::fs::write(&wrong, "not the token").unwrap();
+    let wrong = wrong.to_str().unwrap();
+    // A port nobody listens on.
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let r = sb.path("r");
+    std::fs::create_dir_all(&r).unwrap();
+    let root = r.to_str().unwrap();
+    let init = |url: &str, token: &str| {
+        run(
+            &[
+                "init",
+                "--server",
+                url,
+                "--token-file",
+                token,
+                "--device-name",
+                "r",
+                root,
+            ],
+            &env,
+        )
+    };
+    let listed = || json(&run(&["status", "--all", "--json"], &env).expect_ok());
+    for (url, token, why) in [
+        (closed.as_str(), token.as_str(), "cannot reach the server"),
+        (server.url.as_str(), wrong, "refused the access token"),
+    ] {
+        let out = init(url, token);
+        assert!(
+            !out.ok() && out.stderr.contains(why) && out.stderr.contains("not made a sync root"),
+            "{url}: {}",
+            out.text()
+        );
+        assert!(!r.join(".cairn").exists(), "{url}: {}", out.text());
+        assert_eq!(listed(), serde_json::json!([]), "{url}: {}", out.text());
+    }
+
+    // The same folder, with its server there: a root, and listed.
+    init(&server.url, &token).expect_ok();
+    let all = listed();
+    let all = all.as_array().unwrap();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0]["root"]["path"], root, "{all:?}");
+    assert_eq!(all[0]["root"]["server"], server.url.as_str(), "{all:?}");
+    assert_eq!(all[0]["present"], true, "{all:?}");
+}
+
 /// The harness's own `cairn` keeps its list of roots, and on macOS and Windows its daemons' locks and
 /// sockets, out of the user's own directory, where test runs once left a lock file for each root made.
 #[test]

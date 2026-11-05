@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- `cairn init` with a server it could not reach, or one that refused its token, still made the folder a root and
+  listed it, so the same init run again called it a root already. The server is now asked first, and an init it
+  does not take leaves the folder as it was and lists nothing.
+
 ## 0.1.2
 
 **New:**

@@ -505,7 +505,7 @@ fn run_inner() -> Result<u8> {
                 mode: !no_mode,
                 ..ApplyPolicy::default()
             };
-            init_root(
+            let head = init_root(
                 &dir,
                 InitOptions {
                     server,
@@ -523,10 +523,6 @@ fn run_inner() -> Result<u8> {
             if let Err(e) = listed {
                 errln!("cairn: this root could not be added to the list of roots, so `cairn status --all` does not show it until its daemon starts: {e:#}");
             }
-            let head = Client::new(&root.config)
-                .context("checking the server")?
-                .info()?
-                .head;
             outln!(
                 "{} is a sync root; the server is at sequence {head}",
                 dir.display()

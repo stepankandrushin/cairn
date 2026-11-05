@@ -15,11 +15,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# This user's own list of roots is left as it was: every `cairn` here keeps to the test's own, and the end
+# checks that nothing reached the user's. Release runs once left their roots in it, listed as gone.
+user_dir=${CAIRN_USER_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cairn}
+user_names() { if [ -d "$user_dir" ]; then find "$user_dir" -mindepth 1 -printf '%P\n' | LC_ALL=C sort; fi; }
+user_names >"$work/user-names"
+if [ -f "$user_dir/roots.json" ]; then cp "$user_dir/roots.json" "$work/user-roots.json"; fi
+export CAIRN_USER_DIR="$work/user"
+
+# The first line a process prints, once all of it is there: under load that may take long, so this waits
+# while the process runs, up to ten minutes, and otherwise fails saying why. A port read before it was
+# written once made a URL with none.
+first_line() { # <file> <pid> <what> <pattern the line matches>
+    local until=$((SECONDS + 600)) line
+    until [ -s "$1" ] && [ "$(wc -l <"$1")" -ge 1 ]; do
+        if ! kill -0 "$2" 2>/dev/null; then
+            echo "smoke test: $3 ended without saying where it listens: $(cat "$1" 2>/dev/null)" >&2
+            return 1
+        fi
+        if [ "$SECONDS" -ge "$until" ]; then
+            echo "smoke test: $3 has not said where it listens in ten minutes" >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+    line=$(head -n 1 "$1")
+    if ! [[ $line =~ $4 ]]; then
+        echo "smoke test: $3 said \"$line\", not where it listens" >&2
+        return 1
+    fi
+    printf '%s\n' "$line"
+}
+
 "$bin/cairn-server" init --data "$work/data" >/dev/null
 "$bin/cairn-server" serve --data "$work/data" --listen 127.0.0.1:0 >"$work/server.out" &
 server_pid=$!
-for _ in $(seq 100); do grep -q listening "$work/server.out" && break; sleep 0.05; done
-backend=$(sed -n 's/^listening on //p' "$work/server.out")
+backend=$(first_line "$work/server.out" "$server_pid" "the server" '^listening on 127\.0\.0\.1:[0-9]+$')
+backend=${backend#listening on }
 
 # A private CA and a certificate from it, as a self-hosted proxy would have.
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=smoke test CA" \
@@ -30,13 +62,16 @@ openssl x509 -req -in "$work/cert.csr" -CA "$work/ca.pem" -CAkey "$work/ca-key.p
     -extfile "$work/ext" -out "$work/cert.pem" 2>/dev/null
 python3 -I "$here/tls_proxy.py" "$work/cert.pem" "$work/key.pem" "$backend" >"$work/proxy.out" &
 proxy_pid=$!
-for _ in $(seq 100); do [ -s "$work/proxy.out" ] && break; sleep 0.05; done
-url="https://localhost:$(cat "$work/proxy.out")"
+url="https://localhost:$(first_line "$work/proxy.out" "$proxy_pid" "the TLS proxy" '^[0-9]+$')"
 
 export SSL_CERT_FILE="$work/ca.pem"
 mkdir "$work/a" "$work/b"
 "$bin/cairn" init --server "$url" --token-file "$work/data/token" --device-name a "$work/a" >/dev/null
 "$bin/cairn" init --server "$url" --token-file "$work/data/token" --device-name b "$work/b" >/dev/null
+# Both listed, in the test's own list.
+listed=$("$bin/cairn" status --all --json)
+grep -qF "\"$work/a\"" <<<"$listed"
+grep -qF "\"$work/b\"" <<<"$listed"
 
 # Metadata and names across two devices.
 printf 'hello\n' >"$work/a/hello.txt"
@@ -111,4 +146,10 @@ fi
 
 kill "$server_pid"; wait "$server_pid" 2>/dev/null || true; server_pid=""
 "$bin/cairn-server" fsck --data "$work/data" | grep -q clean
+
+if ! user_names | cmp -s - "$work/user-names" \
+    || { [ -f "$work/user-roots.json" ] && ! cmp -s "$user_dir/roots.json" "$work/user-roots.json"; }; then
+    echo "smoke test: $user_dir, this user's own list of roots, changed while the test ran" >&2
+    exit 1
+fi
 echo "smoke test passed"

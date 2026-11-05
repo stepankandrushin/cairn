@@ -193,7 +193,10 @@ of `GET /changes`, not a stream, since a plain response survives any proxy; when
 client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, and
 it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
 unmounted, but says nothing when only a bind mount goes away, or when anything is mounted back: the
-reconcile finds the first, and retrying while paused the second. After a failure it backs off, up to a
+reconcile finds the first, and retrying while paused the second. On Windows a watched folder says nothing
+when it is itself renamed, so a second watch, on the folder above, notices the root renamed away or another
+folder put at its path, and the root's watch moves there; a folder further up renamed waits for the
+reconcile, as on Linux. After a failure it backs off, up to a
 minute, and holds every change back until then. A file still being written is no failure: the daemon comes
 back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
 its close does. Between syncs it rests for twice what the last one did that every sync repeats, loading the

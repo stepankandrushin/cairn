@@ -7,6 +7,10 @@
 - On Windows, a conflict on a hard-linked file, killed while its conflict copy was taking its names, brought back a
   name deleted on another device, holding this device's version: the next sync never finished moving the copy's
   names, as NTFS gives no file a creation time that marks it. Linux and macOS were not affected.
+- On Windows the daemon did not notice its root renamed away, or another folder put at its path: it said
+  `synced` until its hourly full sync, and once the root was back in another folder, as a disk mounted back on its
+  folder is, changes in it waited for that full sync too, as the watch stayed on the folder that had gone. A second
+  watch, on the folder above the root, now notices at once, and the root's watch moves to what is at its path.
 
 ## 0.1.3
 

@@ -840,25 +840,21 @@ fn a_server_stops_at_once_with_requests_waiting() {
 }
 
 /// The root marker gone, as when a mount has gone: it stops, says why, and carries on when it is back.
-/// On Windows the reconcile is what notices: a folder being watched there says nothing when it is
-/// itself renamed, and the watch goes with it.
+/// On Windows a folder being watched says nothing when it is itself renamed: the watch on the folder
+/// above is what notices.
 #[test]
 fn a_root_that_goes_away_pauses_deletes_nothing_and_resumes() {
     let (sb, _s, a, b) = pair("d-gone");
     for i in 0..20 {
         a.write(&format!("f{i}"), "x");
     }
-    let da = if cfg!(windows) {
-        Daemon::start(&a, &["--reconcile-secs", "5"])
-    } else {
-        Daemon::events_only(&a)
-    };
+    let da = Daemon::events_only(&a);
     let db = Daemon::events_only(&b);
     wait_file(&db, b.path("f19"), b"x");
     da.wait_rest();
     db.wait_rest();
 
-    // With everything at rest, so that only the watcher, or on Windows the reconcile, can notice.
+    // With everything at rest, so that only the watcher can notice.
     let held = sb.path("held-away");
     std::fs::rename(&a.root, &held).unwrap();
     std::fs::create_dir(&a.root).unwrap();
@@ -877,6 +873,34 @@ fn a_root_that_goes_away_pauses_deletes_nothing_and_resumes() {
     da.wait_state("synced");
     assert!(a.exists("f19"));
     // The watches are on the root as it is now.
+    a.write("back", "back");
+    wait_file(&db, b.path("back"), b"back");
+}
+
+/// Put back at its path in another folder, as a disk mounted back on its mount point is, a root is
+/// watched there. On Windows a watch is on the folder it was opened on, wherever that goes.
+#[test]
+fn a_root_back_in_another_folder_is_watched_there() {
+    let (sb, _s, a, b) = pair("d-refolder");
+    a.write("f", "x");
+    let da = Daemon::events_only(&a);
+    let db = Daemon::events_only(&b);
+    wait_file(&db, b.path("f"), b"x");
+    da.wait_rest();
+
+    // Paused, so that no sync looks at it halfway there.
+    a.cairn(&["pause"]).expect_ok();
+    da.wait_state("paused");
+    let held = sb.path("held-away");
+    std::fs::rename(&a.root, &held).unwrap();
+    std::fs::create_dir(&a.root).unwrap();
+    for entry in std::fs::read_dir(&held).unwrap() {
+        let name = entry.unwrap().file_name();
+        std::fs::rename(held.join(&name), a.root.join(&name)).unwrap();
+    }
+    a.cairn(&["resume"]).expect_ok();
+    da.wait_state("synced");
+
     a.write("back", "back");
     wait_file(&db, b.path("back"), b"back");
 }

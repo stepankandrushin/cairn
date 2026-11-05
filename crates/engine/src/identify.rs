@@ -57,6 +57,10 @@ pub struct Arriving {
     /// would read what it left unapplied as a change. Absent in a mark an older version left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<crate::metadata::ApplyPolicy>,
+    /// A folder the run makes, private until the last pass gives it its metadata, though this device
+    /// may have held it before: one removed here that comes back.
+    #[serde(default)]
+    pub made: bool,
 }
 
 #[derive(Debug, Default)]
@@ -345,6 +349,11 @@ fn settled_row(
         held
     };
     let (body, applied, unapplied) = match &from_body {
+        // Made by the run: what is on disk is no pair of anything until the last pass, whatever this
+        // device held of it before.
+        Some(_) if a.made && whole && node.content == Content::Dir => {
+            (a.body.clone(), node.metadata.clone(), true)
+        }
         Some(from) if from.content == a.body.content => match &baseline {
             Some(baseline) if !node.metadata_incomplete => {
                 let (metadata, applied) = crate::metadata::arrived_fields(

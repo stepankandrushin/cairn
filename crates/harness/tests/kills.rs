@@ -500,6 +500,29 @@ fn a_folder_killed_twice_while_arriving_still_gets_its_mode() {
     assert_eq!(b.read("d/f"), b"1");
 }
 
+/// A folder removed here comes back, as something in it was edited elsewhere: made again by the run,
+/// it is private until the last pass even though this device held it before. Killed before that pass,
+/// it must not be recorded as a folder this filesystem keeps at 0700, or no later run gives it its mode.
+#[test]
+fn a_folder_removed_here_that_comes_back_killed_still_gets_its_mode() {
+    for point in ["apply.dir.meta", "apply.dir.meta.done"] {
+        let (_sb, _s, a, b) = pair("killed-folder-back");
+        filler(&a);
+        a.write("d/f", "1");
+        a.write("d/sub/g", "2");
+        chmod(&a.path("d"), 0o775);
+        a.synced();
+        b.synced();
+        a.write("d/f", "1, edited");
+        a.synced();
+        fs::remove_dir_all(b.path("d")).unwrap();
+        killed_at(&b, point);
+        let p = converge(&[&a, &b]);
+        assert_eq!(p.entries[b"d".as_slice()].mode & 0o777, 0o775, "{point}");
+        assert_eq!(b.read("d/f"), b"1, edited", "{point}");
+    }
+}
+
 // --- A conflict copy and what comes after it ---
 
 #[test]

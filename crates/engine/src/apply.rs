@@ -1456,6 +1456,7 @@ impl<'a> Applier<'a> {
                     names: t.links.clone(),
                     folder_touched: false,
                     policy: Some(self.root.config.policy.clone()),
+                    made: t.body.content == Content::Dir && !self.cur.contains_key(id),
                 },
             ));
         }
@@ -1507,6 +1508,7 @@ impl<'a> Applier<'a> {
                     names: t.links.clone(),
                     folder_touched: true,
                     policy: Some(self.root.config.policy.clone()),
+                    made: false,
                 },
             ));
         }

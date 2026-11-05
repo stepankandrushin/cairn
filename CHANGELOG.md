@@ -4,6 +4,10 @@
 
 **Fixed:**
 
+- A folder removed on one device while something in it was edited on another comes back to the first. Stopped
+  before its last pass, by a kill or a full disk, it stayed private (mode 0700) there for good, with no change
+  shown: that device took 0700 for a mode it keeps. The server and the other devices had the right mode. It now
+  gets it on the next sync.
 - `cairn init` with a server it could not reach, or one that refused its token, still made the folder a root and
   listed it, so the same init run again called it a root already. The server is now asked first, and an init it
   does not take leaves the folder as it was and lists nothing.

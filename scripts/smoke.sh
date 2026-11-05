@@ -62,7 +62,7 @@ echo from-b >"$work/b/hello.txt"
 "$bin/cairn" --root "$work/b" sync >/dev/null
 test "$(cat "$work/b/hello.txt")" = from-a
 test "$(cat "$work/b/"hello\ \(conflict\ b\ *\).txt)" = from-b
-"$bin/cairn" --root "$work/b" conflicts | grep -q copy
+"$bin/cairn" --root "$work/b" conflicts | grep -q " (conflict b [0-9-]*)[^:]*: the competing version of "
 "$bin/cairn" --root "$work/a" sync >/dev/null
 "$bin/cairn" --root "$work/a" restore hello.txt --at 1 >/dev/null
 test "$(cat "$work/a/hello.txt")" = hello

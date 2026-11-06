@@ -12,6 +12,7 @@ pub mod identify;
 pub mod incr;
 pub mod merge;
 pub mod metadata;
+pub mod rebuild;
 pub mod registry;
 pub mod restore;
 pub mod root;

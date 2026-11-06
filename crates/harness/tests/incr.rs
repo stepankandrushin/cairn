@@ -121,6 +121,19 @@ fn looked_at(run: &Run) -> (u64, u64) {
     (words[2].parse().unwrap(), words[4].parse().unwrap())
 }
 
+/// The ledger rebuilt from the state, and why: what changed alone, as the state says.
+#[track_caller]
+fn rebuilt(run: &Run, why: &str) {
+    assert!(run.ok(), "{}", run.text());
+    assert!(
+        run.stdout.lines().any(|l| l.starts_with("looked at ")
+            && l.contains(", the ledger rebuilt from the state: ")
+            && l.contains(why)),
+        "expected the ledger rebuilt, because {why}: {}",
+        run.text()
+    );
+}
+
 /// The whole tree, and why.
 #[track_caller]
 fn whole(run: &Run, why: &str) {
@@ -377,6 +390,159 @@ fn changes_that_meet_go_the_incremental_way() {
     }
 }
 
+/// Today's date as a conflict copy's name has it.
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    cairn_engine::sync::utc_date(secs)
+}
+
+/// A file rewritten in place, with its one name and its inode as they were, takes no name, so a round
+/// need not open its folder for it: whatever else takes a name there opens it for itself. Each case
+/// meets such a rewrite with something that takes a name beside it, here or elsewhere, and the oracle
+/// checks every round: a conflict copy whose first name is the rewritten file's, an adoption by name and
+/// content, a rename into the folder elsewhere, a rename elsewhere onto the rewritten file's name, the
+/// folder deleted or renamed elsewhere, a new name beside it either side, and a hard-linked file.
+#[test]
+fn a_rewrite_in_place_meets_what_takes_a_name_beside_it() {
+    type Both = fn(&Device, &Device);
+    let cases: Vec<(&str, Both)> = vec![
+        (
+            "a conflict copy's first name, a file rewritten in place",
+            |a, b| {
+                let date = today();
+                for host in ["a", "b"] {
+                    a.write(&format!("d/f2 (conflict {host} {date})"), "already here");
+                }
+                for d in [a, b, a, b] {
+                    d.synced();
+                }
+                // In place: `write` truncates the file it opens, its inode and name as they were.
+                std::fs::write(a.path("d/f2"), "edited on a").unwrap();
+                std::fs::write(
+                    a.path(&format!("d/f2 (conflict a {date})")),
+                    "rewritten on a",
+                )
+                .unwrap();
+                std::fs::write(b.path("d/f2"), "edited on b").unwrap();
+                std::fs::write(
+                    b.path(&format!("d/f2 (conflict b {date})")),
+                    "rewritten on b",
+                )
+                .unwrap();
+            },
+        ),
+        ("an adoption by name and content beside it", |a, b| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            a.write("d/same", "the same");
+            b.write("d/same", "the same");
+        }),
+        ("a rename elsewhere into its folder", |a, b| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            std::fs::rename(b.path("f1"), b.path("d/f1")).unwrap();
+        }),
+        ("a rename elsewhere onto its name", |a, b| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            std::fs::remove_file(b.path("d/f2")).unwrap();
+            std::fs::rename(b.path("f1"), b.path("d/f2")).unwrap();
+        }),
+        ("its folder deleted elsewhere", |a, b| {
+            std::fs::write(a.path("d/e/f3"), "rewritten on a").unwrap();
+            std::fs::remove_dir_all(b.path("d/e")).unwrap();
+        }),
+        ("its folder renamed elsewhere", |a, b| {
+            std::fs::write(a.path("d/e/f3"), "rewritten on a").unwrap();
+            std::fs::rename(b.path("d/e"), b.path("d/e2")).unwrap();
+        }),
+        ("a new name beside it elsewhere", |a, b| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            b.write("d/new", "new on b");
+        }),
+        ("a new name beside it here", |a, _| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            a.write("d/new", "new on a");
+        }),
+        (
+            "a hard-linked file rewritten, its other name renamed elsewhere",
+            |a, b| {
+                std::fs::write(a.path("h1"), "rewritten on a").unwrap();
+                std::fs::rename(b.path("h2"), b.path("d/h2")).unwrap();
+            },
+        ),
+        ("a rewrite on each side, apart", |a, b| {
+            std::fs::write(a.path("d/f2"), "rewritten on a").unwrap();
+            std::fs::write(b.path("fill/3"), "rewritten on b").unwrap();
+        }),
+    ];
+    for (what, both) in &cases {
+        let (_sb, _s, a, b) = started("incr-in-place");
+        both(&a, &b);
+        for d in [&a, &b, &a, &b, &a] {
+            incremental(d);
+        }
+        same_trees(&a, &b, what);
+    }
+}
+
+/// A file rewritten in place, in a folder of hundreds: the rounds of the device that rewrote it, the
+/// second of which takes its own commit back from the journal, look at the file and the folders above
+/// it, and not at what is beside it. On the other device the edit's arrival moves the folder's times,
+/// which opens the folder as any folder changed here is opened, in the round after.
+#[test]
+fn a_rewrite_in_place_does_not_open_its_folder() {
+    let (_sb, _s, a, b) = pair("incr-in-place-big");
+    for i in 0..400 {
+        a.write(&format!("big/{i}"), format!("{i}"));
+    }
+    a.write("big/sub/deep", "deep");
+    for d in [&a, &b, &a, &b] {
+        d.synced();
+    }
+    std::fs::write(a.path("big/7"), "rewritten").unwrap();
+    std::fs::write(a.path("big/sub/deep"), "rewritten too").unwrap();
+    let run = incremental(&a);
+    let (took, of) = looked_at(&run);
+    assert!(of > 400 && took < 20, "{took} of {of}: {}", run.text());
+    incremental(&b);
+    assert_eq!(b.read("big/7"), b"rewritten");
+    assert_eq!(b.read("big/sub/deep"), b"rewritten too");
+    same_trees(&a, &b, "after the rewrites");
+}
+
+/// On a filesystem that folds case: a file rewritten in place beside a new name here that the server has
+/// in another case, which waits, said.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_rewrite_in_place_beside_a_name_in_another_case() {
+    let (_sb, _s, a, b) = started("incr-in-place-case");
+    a.write("d/Readme.txt", "from a");
+    checked(&a);
+    b.write("d/README.txt", "from b");
+    std::fs::write(b.path("d/f2"), "rewritten on b").unwrap();
+    let (whole, run) = checked(&b);
+    assert!(!whole, "{}", run.text());
+    assert!(
+        run.stdout
+            .lines()
+            .any(|l| l.starts_with("skipped: d/README.txt")),
+        "{}",
+        run.text()
+    );
+    checked(&a);
+    assert_eq!(a.read("d/f2"), b"rewritten on b");
+    assert!(
+        !exists_exact(&a, "d", "README.txt"),
+        "went up as a second name"
+    );
+    std::fs::rename(b.path("d/README.txt"), b.path("d/Readme.txt")).unwrap();
+    for d in [&b, &a, &b, &a] {
+        checked(d);
+    }
+    same_trees(&a, &b, "after the rename to the server's case");
+}
+
 /// Rules by path: what the server has out of view here stays in sight of every round, a folder the
 /// server moves takes everything in it out of view or into it, and a folder removed here that holds what
 /// a rule leaves out comes back, empty of that.
@@ -595,8 +761,10 @@ fn a_folder_of_thousands_renamed_looks_at_what_is_in_it_and_no_more() {
     same_trees(&a, &b, "after the rename");
 }
 
+/// Where the ledger cannot vouch for a sync, it is rebuilt from the state, or, with nothing to rebuild it
+/// from or no part of the tree to take, the whole tree is taken; either is said.
 #[test]
-fn the_whole_tree_is_taken_and_said_where_the_ledger_cannot_vouch() {
+fn where_the_ledger_cannot_vouch_it_is_rebuilt_or_the_whole_tree_taken() {
     let (_sb, _s, a, b) = pair("incr-whole");
     everything(&a);
     whole(&a.sync(), "no full sync has agreed");
@@ -604,7 +772,7 @@ fn the_whole_tree_is_taken_and_said_where_the_ledger_cannot_vouch() {
     incremental(&a);
     // A rule.
     std::fs::write(a.path(".cairn/ignore"), "d/sub/\n").unwrap();
-    whole(&a.sync(), "the rules");
+    rebuilt(&a.sync(), "the rules");
     incremental(&a);
     // A dry run.
     a.write("d/f2", "edited");
@@ -625,8 +793,18 @@ fn the_whole_tree_is_taken_and_said_where_the_ledger_cannot_vouch() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config["device_name"] = "renamed".into();
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-    whole(&a.sync(), "the configuration");
+    rebuilt(&a.sync(), "the configuration");
     incremental(&a);
+    // The ledger gone, as an older build that knew none would leave it.
+    let conn = rusqlite::Connection::open(a.path(".cairn/state.sqlite")).unwrap();
+    conn.execute_batch("DELETE FROM ledger_anchor; DELETE FROM ledger; DELETE FROM dirty;")
+        .unwrap();
+    drop(conn);
+    a.write("d/e/f3", "edited with no ledger");
+    rebuilt(&a.sync(), "no full sync has agreed");
+    incremental(&a);
+    incremental(&b);
+    assert_eq!(b.read("d/e/f3"), b"edited with no ledger");
     // A copy kept here by `cairn exclude`, found by inode wherever it goes.
     let run = a.cairn(&["exclude", "fill"]);
     assert!(run.ok(), "{}", run.text());
@@ -635,6 +813,55 @@ fn the_whole_tree_is_taken_and_said_where_the_ledger_cannot_vouch() {
     whole(&a.sync(), "copies kept here");
     incremental(&b);
     assert_eq!(b.read("f1"), b"edited again");
+}
+
+/// A run killed once it had stored what its scan read, before it pushed anything: an edit and, on Unix,
+/// a mode, in the rows and not on the server. A sync that rebuilds the ledger from the state finds those
+/// rows unsettled, their metadata not what the base was agreed at, and pushes both, the oracle checking.
+#[test]
+fn what_a_killed_run_stored_of_its_scan_is_taken_up_by_a_rebuilt_ledger() {
+    let (_sb, _s, a, b) = started("incr-killed-rebuilt");
+    a.write("d/e/f3", "edited before the kill");
+    #[cfg(unix)]
+    chmod(&a.path("f1"), 0o640);
+    let run = a.sync_env(&[("CAIRN_FP_CRASH", "sync.identified")]);
+    assert!(run.was_killed(), "{}", run.text());
+    rebuilt(
+        &a.sync_env(&[("CAIRN_FP_LEDGER_REBUILD", "1")]),
+        "asked for by the harness",
+    );
+    incremental(&b);
+    assert_eq!(b.read("d/e/f3"), b"edited before the kill");
+    #[cfg(unix)]
+    assert_eq!(mode_of(&b.path("f1")) & 0o777, 0o640);
+    incremental(&a);
+    same_trees(&a, &b, "after the killed run");
+}
+
+/// A record lost from the state, with its mark, and the file gone here too: the base still has the file,
+/// which this device then never held. The full sync brings it down; so does a sync that rebuilds the
+/// ledger, which takes what is in view here and has no record as unsettled, not as out of view.
+#[test]
+fn a_file_with_no_record_comes_down_in_a_rebuilt_ledger() {
+    let (_sb, _s, a, _b) = started("incr-no-record");
+    let conn = rusqlite::Connection::open(a.path(".cairn/state.sqlite")).unwrap();
+    // The base64 of `f2`, as a link holds it.
+    let n = conn
+        .execute(
+            "DELETE FROM rows WHERE object IN (SELECT object FROM base WHERE node LIKE '%\"name\":\"ZjI=\"%')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    conn.execute("DELETE FROM dirty", []).unwrap();
+    drop(conn);
+    std::fs::remove_file(a.path("d/f2")).unwrap();
+    rebuilt(
+        &a.sync_env(&[("CAIRN_FP_LEDGER_REBUILD", "1")]),
+        "asked for by the harness",
+    );
+    assert_eq!(a.read("d/f2"), b"second file");
+    incremental(&a);
 }
 
 /// Writes to the state by anything else, an older build or a person with sqlite3, mark what they touch,
@@ -665,7 +892,7 @@ fn a_row_written_by_another_build_is_taken_up() {
     conn.execute_batch("DROP TRIGGER dirty_rows_update;")
         .unwrap();
     drop(conn);
-    whole(&a.sync(), "no full sync has agreed");
+    rebuilt(&a.sync(), "no full sync has agreed");
     incremental(&a);
 }
 
@@ -1218,9 +1445,9 @@ fn a_case_twin_folder_renamed_on_a_case_sensitive_volume_comes_down_whole() {
 /// One inode at two places in a scan the sync goes on with: a file moved, while the walk went, from a
 /// folder it had been through to one it had not, and no second scan to settle it. The full sync takes the
 /// first place for the file and the second for something new; the round, which keeps one place an inode,
-/// goes the whole way instead, and says so.
+/// scans again with the ledger rebuilt from the state instead, and says so.
 #[test]
-fn an_inode_the_scan_finds_twice_sends_the_round_the_whole_way() {
+fn an_inode_the_scan_finds_twice_sends_the_round_to_a_rebuilt_ledger() {
     let (sb, _s, a, b) = started("incr-inode-twice");
     a.write("p/m", "moves while the walk goes");
     std::fs::create_dir_all(a.path("q")).unwrap();
@@ -1253,7 +1480,7 @@ fn an_inode_the_scan_finds_twice_sends_the_round_the_whole_way() {
     std::fs::rename(a.path("p/m"), a.path("q/m")).unwrap();
     std::fs::write(gate.join("go"), b"").unwrap();
     let run = worker.join().unwrap();
-    whole(
+    rebuilt(
         &run,
         "the scan found q/m at an inode it had found elsewhere",
     );

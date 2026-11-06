@@ -275,6 +275,18 @@ fn run_seed(seed: u64, with_rules: bool) {
 
     for step in 0..steps {
         let d = &devices[rng.random_range(0..devices.len())];
+        // A share of the syncs, fixed by the seed and the step and drawing nothing from the steps' own
+        // randomness, rebuild the ledger from the state, which the oracle compares with the full sync.
+        let rebuild: &[(&str, &str)] =
+            match (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ step as u64).count_ones() % 3 {
+                0 => &[("CAIRN_FP_LEDGER_REBUILD", "1")],
+                _ => &[],
+            };
+        let mark = if rebuild.is_empty() {
+            ""
+        } else {
+            " (ledger rebuilt)"
+        };
         // The rules come and go: everything at those paths is left out, then merged back in.
         if with_rules && rng.random_bool(0.08) {
             let on = std::fs::read(&rules_file).is_ok_and(|t| !t.is_empty());
@@ -298,7 +310,7 @@ fn run_seed(seed: u64, with_rules: bool) {
                 let target = all[rng.random_range(0..all.len())];
                 let (mode, ino) = (mode_of(target), inode(target));
                 chmod(target, 0o000);
-                let run = d.cairn(&["sync", "--allow-mass-delete"]);
+                let run = d.cairn_env(&["sync", "--allow-mass-delete"], rebuild);
                 // Another device may have moved it meanwhile: a rename needs no access to what moves.
                 let (files, dirs) = entries(&d.root);
                 let now = files
@@ -309,7 +321,7 @@ fn run_seed(seed: u64, with_rules: bool) {
                     chmod(now, mode);
                 }
                 log.push(format!(
-                    "{} sync with {} unreadable -> {:?}: {}",
+                    "{} sync{mark} with {} unreadable -> {:?}: {}",
                     d.name,
                     target.strip_prefix(&d.root).unwrap().display(),
                     run.code,
@@ -322,9 +334,9 @@ fn run_seed(seed: u64, with_rules: bool) {
                 );
             }
             60..=84 => {
-                let run = d.cairn(&["sync", "--allow-mass-delete"]);
+                let run = d.cairn_env(&["sync", "--allow-mass-delete"], rebuild);
                 log.push(format!(
-                    "{} sync -> {:?}: {}",
+                    "{} sync{mark} -> {:?}: {}",
                     d.name,
                     run.code,
                     run.stdout.trim().replace('\n', " | ")
@@ -338,12 +350,11 @@ fn run_seed(seed: u64, with_rules: bool) {
             // Killed partway; the next run recovers.
             85..=94 => {
                 let crash = rng.random_range(1..150).to_string();
-                let run = d.cairn_env(
-                    &["sync", "--allow-mass-delete"],
-                    &[("CAIRN_FP_CRASH", &crash)],
-                );
+                let mut env = vec![("CAIRN_FP_CRASH", crash.as_str())];
+                env.extend(rebuild);
+                let run = d.cairn_env(&["sync", "--allow-mass-delete"], &env);
                 log.push(format!(
-                    "{} sync killed at {crash} -> {:?}",
+                    "{} sync{mark} killed at {crash} -> {:?}",
                     d.name, run.code
                 ));
                 assert!(

@@ -61,8 +61,8 @@ const FEED_WAIT_RECOVERY: Duration = Duration::from_secs(3600);
 pub struct DaemonOptions {
     /// Between syncs when nothing asks for one, each with a scan of the whole tree.
     pub reconcile: Duration,
-    /// Between syncs that decide everything the full way as well, the check on the syncs that take
-    /// what changed alone: one is due this long after the last whose every decision was the full sync's.
+    /// Between checks of the ledger the syncs that take what changed alone rest on, against what the
+    /// state says: one is due this long after the last whose every decision was the full sync's.
     pub full_sync: Duration,
     /// The longest wait before trying again after a failure, or while paused.
     pub retry: Duration,
@@ -571,6 +571,8 @@ fn report_lines(report: &SyncReport) -> BTreeSet<String> {
     }
     if let Some(why) = &report.whole_because {
         lines.insert(format!("looked at the whole tree: {why}"));
+    } else if let Some(why) = &report.rebuilt_because {
+        lines.insert(format!("rebuilt the ledger from the state: {why}"));
     }
     lines
 }
@@ -935,7 +937,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 }
                 if report.checked == Some(true) {
                     log(&format!(
-                        "decided the full way as well, as every {} seconds: the incremental path agrees",
+                        "checked the ledger against the state, as every {} seconds: it agrees",
                         opts.full_sync.as_secs()
                     ));
                 }

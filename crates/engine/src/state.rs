@@ -137,10 +137,21 @@ fn ensure_ledger(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// A table the ledger is rebuilt from.
+#[derive(Clone, Copy)]
+pub enum StateTable {
+    Base,
+    Rows,
+}
+
+/// Every entry of a ledger besides those a finalize puts, each to the writer as it comes.
+pub type LedgerRest<'a> =
+    Box<dyn Fn(&mut dyn FnMut(ObjectId, Vec<u8>) -> Result<()>) -> Result<()> + 'a>;
+
 /// What a finalize leaves in the ledger, in its transaction.
 #[derive(Default)]
-pub struct LedgerWrite {
-    /// The whole ledger anew: everything not put or marked here goes.
+pub struct LedgerWrite<'a> {
+    /// The whole ledger anew: everything not put, marked or in `rest` here goes.
     pub whole: bool,
     pub put: Vec<(ObjectId, Vec<u8>)>,
     pub drop: Vec<ObjectId>,
@@ -148,6 +159,9 @@ pub struct LedgerWrite {
     pub clean: Vec<ObjectId>,
     pub dirty: Vec<ObjectId>,
     pub anchor: Option<String>,
+    /// With `whole`, a ledger rebuilt from the state: its entries for what the round did not take,
+    /// written before those the round put.
+    pub rest: Option<LedgerRest<'a>>,
 }
 
 const KEY_GENERATION: &str = "generation";
@@ -410,6 +424,68 @@ impl State {
             nodes.insert(id, node);
         }
         Ok(Tree::from_nodes(nodes))
+    }
+
+    /// How many objects the base holds, the root and those deleted among them.
+    pub fn base_len(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM base", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Whether the base holds anything besides the root: a first sync's has nothing.
+    pub fn has_base(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM base WHERE object != ?1)",
+            [ObjectId::ROOT.0],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every base node, then every row, as text, in the order of the objects, in batches to `each`:
+    /// what the ledger is rebuilt from, read once, with no more of it held than a batch.
+    pub fn each_in_batches(
+        &self,
+        table: StateTable,
+        batch: usize,
+        each: &mut dyn FnMut(Vec<(ObjectId, String)>) -> Result<()>,
+    ) -> Result<()> {
+        let sql = match table {
+            StateTable::Base => "SELECT object, node FROM base ORDER BY object",
+            StateTable::Rows => "SELECT object, row FROM rows ORDER BY object",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::with_capacity(batch);
+        while let Some(row) = rows.next()? {
+            let id: [u8; 16] = row
+                .get_ref(0)?
+                .as_blob()?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
+            out.push((ObjectId(id), row.get_ref(1)?.as_str()?.to_string()));
+            if out.len() == batch {
+                each(std::mem::replace(&mut out, Vec::with_capacity(batch)))?;
+            }
+        }
+        if !out.is_empty() {
+            each(out)?;
+        }
+        Ok(())
+    }
+
+    /// The ledger no longer speaks for these objects, as if something had written them.
+    pub fn mark_dirty(&mut self, objects: &[ObjectId]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut mark = tx.prepare_cached("INSERT OR IGNORE INTO dirty (object) VALUES (?1)")?;
+            for id in objects {
+                mark.execute([id.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Whether a mark or a queued commit waits: something a run began, which only the full sync settles.
@@ -688,7 +764,7 @@ impl State {
         cursor_op: Option<OpId>,
         rows: &[(ObjectId, &Row)],
         gone: &[ObjectId],
-        ledger: Option<&LedgerWrite>,
+        ledger: Option<&LedgerWrite<'_>>,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         put_rows(&tx, rows, gone)?;
@@ -946,7 +1022,7 @@ impl State {
 }
 
 /// After the base and rows, whose triggers have marked what they wrote: the entries, then the marks.
-fn write_ledger(tx: &rusqlite::Transaction<'_>, l: &LedgerWrite) -> Result<()> {
+fn write_ledger(tx: &rusqlite::Transaction<'_>, l: &LedgerWrite<'_>) -> Result<()> {
     if l.whole {
         tx.execute_batch("DELETE FROM ledger; DELETE FROM dirty;")?;
     }
@@ -958,6 +1034,12 @@ fn write_ledger(tx: &rusqlite::Transaction<'_>, l: &LedgerWrite) -> Result<()> {
         let mut put = tx.prepare_cached(
             "INSERT INTO ledger (object, entry) VALUES (?1, ?2) ON CONFLICT (object) DO UPDATE SET entry = excluded.entry",
         )?;
+        if let Some(rest) = &l.rest {
+            rest(&mut |id, entry| {
+                put.execute(params![id.0, entry])?;
+                Ok(())
+            })?;
+        }
         for (id, entry) in &l.put {
             put.execute(params![id.0, entry])?;
         }

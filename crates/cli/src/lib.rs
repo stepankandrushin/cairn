@@ -121,8 +121,8 @@ enum Command {
         /// for missed events.
         #[arg(long, default_value_t = 3600)]
         reconcile_secs: u64,
-        /// Seconds between syncs that decide everything the full way as well, the check on syncs that
-        /// take what changed alone: anything one would have missed is taken then, and said as a defect.
+        /// Seconds between checks of the ledger that syncs taking what changed alone rest on, against
+        /// what the state says: anything it vouched for wrongly is taken up then, and said as a defect.
         #[arg(long, default_value_t = 86_400)]
         full_sync_secs: u64,
         /// The longest wait in seconds before trying again after a failure, or while paused.
@@ -286,6 +286,8 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     }
     if let Some(why) = &report.whole_because {
         outln!("looked at the whole tree: {why}");
+    } else if let (Some((_, took, of)), Some(why)) = (report.part, &report.rebuilt_because) {
+        outln!("looked at {took} of {of} entries, the ledger rebuilt from the state: {why}");
     } else if let Some((_, took, of)) = report.part {
         outln!("looked at {took} of {of} entries: the rest are as the last agreement left them");
     }

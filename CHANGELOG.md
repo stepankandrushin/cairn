@@ -20,6 +20,21 @@
 - On macOS, and on Linux in a build against glibc, the daemon held what a sync had used, up to that sync's peak, for
   the pause after it and 30 s more: gigabytes for about a minute after a big tree's sync. It now gives it back as the
   sync ends. The Linux release binaries did not hold it: musl gives freed memory back by itself.
+- The daemon's daily check held the tree twice, deciding every round the full way beside the round itself: on
+  842,000 entries 17.4 GB and over a minute. It now checks the bookkeeping instead: the record that syncs carrying
+  a change rest on, rebuilt from the state, against the one kept, object by object. An object the record vouched
+  for that the state does not is said in the log as a defect and taken up in the same sync, as the full sync
+  would. The check now takes 1.15 GB and 7 s there. Whether a round decides as the full sync would is still
+  checked on every sync of the test suite, and no longer on devices.
+- The first sync after an upgrade, after a change of rules or configuration, or after a run that did not finish,
+  went the whole way: 7.8 GB and a minute on 842,000 entries. It now rebuilds the record from the state, its base,
+  its rows and a scan, in one pass, and then takes what changed alone, and says so and why: 1.2 GB and 8 s there.
+  So does a sync whose scan saw something move under it, which went the whole way too. A first sync, a dry run,
+  copies kept by `cairn exclude` and a change to more than a quarter of the tree still take the whole tree.
+- A file rewritten in place had a sync look at every other name in its folder too, so that 1,000 rewrites in big
+  folders looked at 137,000 entries and held 3.4 GB. A rewrite takes no name, so a sync now looks at the file and
+  the folders above it, unless the file changed on both sides: those 1,000 now look at 3,300 entries and hold
+  1.1 GB, and one edit 83 entries where it looked at 9,159.
 
 ## 0.1.4
 

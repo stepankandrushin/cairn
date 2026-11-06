@@ -19,11 +19,15 @@
 //!
 //! and runs the full sync's own code on those alone: the trees, rows and scan it is given hold only them,
 //! and what they leave out is the same on every side. A decision about an object loaded only as a
-//! neighbour means the set was too small: it is widened and the round decided again. Whatever this cannot
-//! vouch for goes the full way, said in a log line. In a harness build every incremental round is decided
-//! the full way as well, on the same scan, journal and state (sync.rs `oracle_full`), and `compare` fails
-//! the sync unless the two agree on every decision; after its finalize, `check_finalized` checks the state
-//! against what a full one leaves.
+//! neighbour means the set was too small: it is widened and the round decided again. A file rewritten in
+//! place, whose one name, inode and kind are as the ledger has them, opens no folder: it takes no name.
+//!
+//! Where the ledger does not speak for a sync, it is rebuilt from the state (rebuild.rs), and the round
+//! runs on that; what neither can vouch for goes the full way, said in a log line. In a harness build every
+//! incremental round is decided the full way as well, on the same scan, journal and state (sync.rs
+//! `oracle_full`), and `compare` fails the sync unless the two agree on every decision; after its
+//! finalize, `check_finalized` checks the state against what a full one leaves, and every round on a
+//! ledger kept checks it against the ledger rebuilt from the state, as the daemon's check does.
 
 use crate::fsops::birth_mark;
 use crate::merge::LNode;
@@ -364,15 +368,117 @@ impl Ledger {
         self.ids.is_empty()
     }
 
-    fn find(&self, id: &ObjectId) -> Option<usize> {
+    pub(crate) fn find(&self, id: &ObjectId) -> Option<usize> {
         self.ids.binary_search(id).ok()
+    }
+
+    /// One more of the base's objects, after every one before it in order, with no entry yet: a
+    /// skeleton of the base, which `rebuilt` makes a ledger of.
+    pub(crate) fn push_object(&mut self, id: ObjectId, kind: ObjectKind, links: &BTreeSet<Link>) {
+        if self.link_off.is_empty() {
+            self.link_off.push(0);
+        }
+        self.ids.push(id);
+        self.kinds.push(kind);
+        for link in links {
+            self.link_bytes.extend_from_slice(&link.parent.0);
+            let name = link.name.as_bytes();
+            self.link_bytes
+                .extend_from_slice(&(name.len() as u32).to_le_bytes());
+            self.link_bytes.extend_from_slice(name);
+        }
+        self.link_off.push(self.link_bytes.len() as u32);
+    }
+
+    /// What finds a skeleton's objects by folder.
+    pub(crate) fn index_children(&mut self) {
+        let mut children = Vec::with_capacity(self.ids.len());
+        for i in 0..self.ids.len() {
+            for (parent, _) in self.raw_links(i) {
+                children.push((parent, i as u32));
+            }
+        }
+        children.sort_unstable();
+        children.shrink_to_fit();
+        self.children = children;
+    }
+
+    pub(crate) fn ids(&self) -> &[ObjectId] {
+        &self.ids
+    }
+
+    pub(crate) fn id_at(&self, i: usize) -> ObjectId {
+        self.ids[i]
+    }
+
+    pub(crate) fn kind_at(&self, i: usize) -> ObjectKind {
+        self.kinds[i]
+    }
+
+    /// The objects with an entry in this folder, by index, each once.
+    pub(crate) fn child_indices(&self, parent: &ObjectId) -> impl Iterator<Item = usize> + '_ {
+        let parent = *parent;
+        let start = self.children.partition_point(|(p, _)| *p < parent);
+        let mut last = None;
+        self.children[start..]
+            .iter()
+            .take_while(move |(p, _)| *p == parent)
+            .filter(move |(_, i)| last.replace(*i) != Some(*i))
+            .map(|(_, i)| *i as usize)
+    }
+
+    /// How many entries object `i` has.
+    pub(crate) fn link_count(&self, i: usize) -> usize {
+        self.raw_links(i).count()
+    }
+
+    /// Whether object `i`'s entries are these, in order.
+    pub(crate) fn links_at_are(&self, i: usize, links: &[Link]) -> bool {
+        let mut mine = self.raw_links(i);
+        for l in links {
+            match mine.next() {
+                Some((parent, name)) if parent == l.parent && name == l.name.as_bytes() => {}
+                _ => return false,
+            }
+        }
+        mine.next().is_none()
+    }
+
+    /// The ledger a skeleton of the base makes: the objects `keep` says, each with what was seen of it.
+    pub(crate) fn rebuilt(self, mut seen: Vec<Option<Seen>>, keep: &[bool]) -> Ledger {
+        let n = keep.iter().filter(|k| **k).count();
+        let mut l = Ledger {
+            ids: Vec::with_capacity(n),
+            kinds: Vec::with_capacity(n),
+            link_off: Vec::with_capacity(n + 1),
+            link_bytes: Vec::new(),
+            seen: Vec::with_capacity(n),
+            ..Ledger::default()
+        };
+        l.link_off.push(0);
+        for i in 0..self.ids.len() {
+            if !keep[i] {
+                continue;
+            }
+            l.ids.push(self.ids[i]);
+            l.kinds.push(self.kinds[i]);
+            l.link_bytes.extend_from_slice(
+                &self.link_bytes[self.link_off[i] as usize..self.link_off[i + 1] as usize],
+            );
+            l.link_off.push(l.link_bytes.len() as u32);
+            l.seen.push(seen[i].take());
+        }
+        drop(self);
+        l.link_bytes.shrink_to_fit();
+        l.index();
+        l
     }
 
     pub fn contains(&self, id: &ObjectId) -> bool {
         self.find(id).is_some()
     }
 
-    fn raw_links(&self, i: usize) -> impl Iterator<Item = (ObjectId, &[u8])> + '_ {
+    pub(crate) fn raw_links(&self, i: usize) -> impl Iterator<Item = (ObjectId, &[u8])> + '_ {
         let mut b = &self.link_bytes[self.link_off[i] as usize..self.link_off[i + 1] as usize];
         std::iter::from_fn(move || {
             if b.is_empty() {
@@ -386,7 +492,7 @@ impl Ledger {
         })
     }
 
-    fn links_at(&self, i: usize) -> Vec<Link> {
+    pub(crate) fn links_at(&self, i: usize) -> Vec<Link> {
         self.raw_links(i)
             .filter_map(|(parent, name)| {
                 Some(Link {
@@ -553,57 +659,125 @@ pub struct Session {
     pub journal: Journal,
     /// Manifests rows of this sync held at some point: what a finalize may find nothing holds.
     pub released: BTreeSet<Hash>,
+    /// Why the ledger is rebuilt from the state rather than read, when it is: the next round rebuilds
+    /// it while `to_rebuild`, and every round takes what the rebuild found unsettled as written since.
+    pub rebuilt: Option<String>,
+    pub to_rebuild: bool,
+    pub unsettled: BTreeSet<ObjectId>,
+    /// How many objects the ledger speaks for, or will once rebuilt: what a round is measured against.
+    pub size: usize,
+}
+
+/// Why a sync cannot read the ledger, and whether rebuilding it from the state stands in for it.
+pub struct Closed {
+    pub why: String,
+    pub rebuild: bool,
+}
+
+/// In a harness build, `CAIRN_FP_LEDGER_REBUILD=1` rebuilds the ledger from the state in every sync
+/// that could read it, so that the oracle compares the rebuild with the full sync everywhere.
+pub fn forced_rebuild() -> bool {
+    cfg!(feature = "failpoints") && std::env::var("CAIRN_FP_LEDGER_REBUILD").is_ok_and(|v| v == "1")
 }
 
 /// Fewer than this many objects is never too many to take alone, whatever the size of the tree.
 const FLOOR: usize = 4_096;
 
 impl Session {
-    /// The ledger, when it speaks for this sync; otherwise why not, for the log.
+    /// The ledger, when it speaks for this sync; otherwise why not, for the log, and whether the
+    /// ledger rebuilt from the state may stand in for it.
     pub fn open(
         root: &Root,
         selection: &Selection,
         dry_run: bool,
-    ) -> Result<std::result::Result<Session, String>> {
+    ) -> Result<std::result::Result<Session, Closed>> {
+        let closed = |why: &str, rebuild: bool| {
+            Ok(Err(Closed {
+                why: why.into(),
+                rebuild,
+            }))
+        };
         if dry_run {
-            return Ok(Err("a dry run goes the full way".into()));
-        }
-        let Some(text) = root.state.ledger_anchor()? else {
-            return Ok(Err(
-                "no full sync has agreed with the server since this build first ran here".into(),
-            ));
-        };
-        let Ok(anchor) = serde_json::from_str::<Anchor>(&text) else {
-            return Ok(Err("the ledger was written by another build".into()));
-        };
-        if anchor.format != FORMAT {
-            return Ok(Err("the ledger was written by another build".into()));
-        }
-        if anchor.inputs != inputs(root, selection) {
-            return Ok(Err(
-                "the build, the configuration, the rules or what is excluded have changed since the last full sync"
-                    .into(),
-            ));
+            return closed("a dry run goes the full way", false);
         }
         if !selection.copies.is_empty() {
-            return Ok(Err(
-                "copies kept here by `cairn exclude` are found by inode, which needs the whole tree".into(),
-            ));
+            return closed(
+                "copies kept here by `cairn exclude` are found by inode, which needs the whole tree",
+                false,
+            );
+        }
+        // A first sync has nothing to rebuild from.
+        let rebuild = root.state.has_base()?;
+        let Some(text) = root.state.ledger_anchor()? else {
+            return closed(
+                "no full sync has agreed with the server since this build first ran here",
+                rebuild,
+            );
+        };
+        let Ok(anchor) = serde_json::from_str::<Anchor>(&text) else {
+            return closed("the ledger was written by another build", rebuild);
+        };
+        if anchor.format != FORMAT {
+            return closed("the ledger was written by another build", rebuild);
+        }
+        if anchor.inputs != inputs(root, selection) {
+            return closed(
+                "the build, the configuration, the rules or what is excluded have changed since the last full sync",
+                rebuild,
+            );
         }
         if root.state.pending()? {
-            return Ok(Err(
-                "a mark or a queued commit from a run that did not finish is the full sync's to settle".into(),
-            ));
+            return closed(
+                "a mark or a queued commit from a run that did not finish is left",
+                rebuild,
+            );
+        }
+        if forced_rebuild() {
+            return closed("asked for by the harness", rebuild);
         }
         let Some(ledger) = Ledger::load(root)? else {
-            return Ok(Err("the ledger was written by another build".into()));
+            return closed("the ledger was written by another build", rebuild);
         };
         Ok(Ok(Session {
+            size: ledger.len(),
             ledger,
             anchor,
             journal: Journal::default(),
             released: BTreeSet::new(),
+            rebuilt: None,
+            to_rebuild: false,
+            unsettled: BTreeSet::new(),
         }))
+    }
+
+    /// A session whose ledger its first round rebuilds from the state.
+    pub fn rebuilding(root: &Root, selection: &Selection, why: String) -> Result<Session> {
+        Ok(Session {
+            size: root.state.base_len()?,
+            ledger: Ledger::default(),
+            anchor: Anchor {
+                format: FORMAT,
+                inputs: inputs(root, selection),
+                reserved: BTreeSet::new(),
+            },
+            journal: Journal::default(),
+            released: BTreeSet::new(),
+            rebuilt: Some(why),
+            to_rebuild: true,
+            unsettled: BTreeSet::new(),
+        })
+    }
+
+    /// From the next round on, the ledger rebuilt from the state, for this reason.
+    pub fn rebuild(&mut self, root: &Root, selection: &Selection, why: String) -> Result<()> {
+        let journal = std::mem::take(&mut self.journal);
+        let released = std::mem::take(&mut self.released);
+        *self = Session {
+            journal,
+            released,
+            ..Session::rebuilding(root, selection, why)?
+        };
+        Ok(())
     }
 
     /// More than this, and the full sync costs less.
@@ -611,7 +785,7 @@ impl Session {
         let configured = cfg!(feature = "failpoints")
             .then(|| std::env::var("CAIRN_FP_INCR_LIMIT").ok()?.parse().ok())
             .flatten();
-        configured.unwrap_or_else(|| (self.ledger.len() / 4).max(FLOOR))
+        configured.unwrap_or_else(|| (self.size / 4).max(FLOOR))
     }
 }
 
@@ -625,6 +799,11 @@ pub struct Before<'a> {
     pub dirty_rows: &'a BTreeMap<ObjectId, Row>,
     /// What the journal since the cursor does.
     pub journal: &'a Journal,
+    /// The scan was given every row as a glance (the round that rebuilds the ledger), not the ledger's
+    /// entries and the rows written since: every row but those of `unscanned`, which the selection's
+    /// view takes.
+    pub glanced: bool,
+    pub unscanned: &'a BTreeSet<ObjectId>,
 }
 
 impl Before<'_> {
@@ -709,10 +888,45 @@ pub struct Journal {
     pub kinds: HashMap<ObjectId, ObjectKind>,
     /// Objects moved, or linked back.
     pub moved: BTreeSet<ObjectId>,
+    /// The commit of every update of each object, and the objects anything but an update names.
+    updates: HashMap<ObjectId, Vec<cairn_protocol::OpId>>,
+    named: HashSet<ObjectId>,
 }
 
 impl Journal {
+    /// Whether anything in the journal gives or takes an entry.
+    pub fn moves_any(&self) -> bool {
+        !self.links.is_empty()
+    }
+
+    /// Whether the journal names this object in updates alone, and if `commit`, of that commit alone.
+    pub fn only_updated(&self, x: &ObjectId, commit: Option<cairn_protocol::OpId>) -> bool {
+        !self.named.contains(x)
+            && self
+                .updates
+                .get(x)
+                .is_some_and(|by| commit.is_none_or(|commit| by.iter().all(|c| *c == commit)))
+    }
+
+    /// An operation of the commit `commit`.
+    pub fn add_of(&mut self, op: &Op, commit: cairn_protocol::OpId) {
+        if let Op::Update { object, .. } = op {
+            self.updates.entry(*object).or_default().push(commit);
+        }
+        self.add(op);
+    }
+
     pub fn add(&mut self, op: &Op) {
+        match op {
+            Op::Update { .. } => {}
+            Op::Create { object, .. }
+            | Op::Link { object, .. }
+            | Op::Unlink { object, .. }
+            | Op::Move { object, .. }
+            | Op::Note { object, .. } => {
+                self.named.insert(*object);
+            }
+        }
         let mut link = |object: ObjectId, l: &Link, into: bool| {
             self.links.entry(object).or_default().push(l.clone());
             if into {
@@ -774,12 +988,16 @@ pub struct Classified<'s> {
     /// Found as the ledger has it.
     pub quiet: Vec<bool>,
     pub node_of: FxMap<ObjectId, usize>,
-    dir_at: FxMap<&'s [Name], usize>,
+    pub(crate) dir_at: FxMap<&'s [Name], usize>,
     local_children: FxMap<usize, Vec<usize>>,
     /// What the ledger cannot vouch for, and the folders whose every name the merge may look at.
     pub seeds: BTreeSet<ObjectId>,
     pub open: BTreeSet<ObjectId>,
     pub changed: Vec<usize>,
+    /// Rewritten in place: found at the inode, kind and one entry the ledger has, which nothing has
+    /// written since and the journal does not name. Such an object takes no name, so the round needs
+    /// the folders above it and not what is beside it.
+    pub in_place: HashSet<ObjectId>,
 }
 
 impl<'s> Classified<'s> {
@@ -859,6 +1077,7 @@ impl<'s> Classified<'s> {
         self.changed.push(i);
         if let Some(x) = self.provisional[i] {
             self.seeds.insert(x);
+            self.in_place.remove(&x);
         }
         for p in &self.scan.nodes[i].paths {
             if let Some(o) = self.parent_node(p).and_then(|j| self.object_of_node(j)) {
@@ -1034,6 +1253,7 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
         seeds: BTreeSet::new(),
         open: BTreeSet::new(),
         changed: Vec::new(),
+        in_place: HashSet::new(),
     };
     c.node_of.reserve(nodes.len());
     for (i, n) in nodes.iter().enumerate() {
@@ -1102,6 +1322,16 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
         found[*li] = true;
     }
     c.quiet = quiet.iter().map(Option::is_some).collect();
+    let in_place: Vec<bool> = par_map(nodes.len(), |i| {
+        !c.quiet[i]
+            && c.provisional[i].is_some_and(|x| {
+                rewritten_in_place(b, &c, &nodes[i], digests[i], x, &dirty_by_inode)
+            })
+    });
+    c.in_place = (0..nodes.len())
+        .filter(|i| in_place[*i])
+        .filter_map(|i| c.provisional[i])
+        .collect();
     for (li, seen) in b.ledger.seen.iter().enumerate() {
         if seen.is_some() && !found[li] {
             c.seeds.insert(b.ledger.ids[li]);
@@ -1116,6 +1346,9 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
         c.changed.push(i);
         if let Some(x) = c.provisional[i] {
             c.seeds.insert(x);
+            if c.in_place.contains(&x) {
+                continue;
+            }
         }
         for p in &n.paths {
             if let Some(o) = c.parent_node(p).and_then(|j| c.object_of_node(j)) {
@@ -1126,8 +1359,84 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
     c
 }
 
+/// Whether a node that is not quiet is its object rewritten in place, here or elsewhere: at the inode,
+/// kind and one entry the base has, with nothing that could give it a name, a conflict copy above all.
+/// So not written since its ledger entry, and either not named by the journal or named only in updates
+/// of it while it is as it was here; or written since for what this sync pushed of it or brought here,
+/// which its row holds as shared with the server and the scan finds as the row has it, with the journal
+/// naming it in updates alone, and of the commit that pushed it, if one did.
+fn rewritten_in_place(
+    b: &Before<'_>,
+    c: &Classified<'_>,
+    n: &Scanned,
+    digest: Option<Hash>,
+    x: ObjectId,
+    dirty_by_inode: &HashMap<(u64, u64), Vec<ObjectId>>,
+) -> bool {
+    let [path] = n.paths.as_slice() else {
+        return false;
+    };
+    let (Some(parent), Some(name)) = (
+        c.parent_node(path).and_then(|j| c.object_of_node(j)),
+        path.last(),
+    ) else {
+        return false;
+    };
+    let link = Link {
+        parent,
+        name: name.clone(),
+    };
+    let key = (n.fp.dev, n.fp.ino);
+    let ledger_at = b.ledger.at_inode(&key).filter(|y| !b.is_dirty(y)).count();
+    if !b.is_dirty(&x) {
+        let Some(li) = b.ledger.find(&x) else {
+            return false;
+        };
+        let Some(seen) = &b.ledger.seen[li] else {
+            return false;
+        };
+        let as_it_was = || match n.content {
+            Content::File { .. } => seen.known().vouches_for(&n.fp) && n.content == seen.content,
+            _ => digest.is_some() && digest == seen.digest,
+        };
+        return (!b.journal.touched.contains(&x)
+            || (b.journal.only_updated(&x, None) && as_it_was()))
+            && !dirty_by_inode.contains_key(&key)
+            && ledger_at == 1
+            && b.ledger.kinds[li] == n.content.kind()
+            && (seen.fp.dev, seen.fp.ino) == key
+            && b.ledger.links_are(&x, std::slice::from_ref(&link));
+    }
+    let (Some(node), Some(row)) = (b.dirty_nodes.get(&x), b.dirty_rows.get(&x)) else {
+        return false;
+    };
+    let Some(synced) = &row.synced else {
+        return false;
+    };
+    let one = |links: &BTreeSet<Link>| links.len() == 1 && links.contains(&link);
+    let as_the_row_has_it = matches!(n.content, Content::File { .. })
+        && row.known().vouches_for(&n.fp)
+        && n.content == row.content;
+    b.journal.only_updated(&x, synced.commit)
+        && as_the_row_has_it
+        && synced.body.content == row.content
+        && !synced.unapplied
+        && synced.folder_time.is_none()
+        && one(&node.links)
+        && one(&synced.links)
+        && row.held.as_ref().is_none_or(one)
+        && node.kind() == n.content.kind()
+        && row.content.kind() == n.content.kind()
+        && synced.body.content.kind() == n.content.kind()
+        && (row.fp.dev, row.fp.ino) == key
+        && ledger_at == 0
+        && dirty_by_inode
+            .get(&key)
+            .is_some_and(|at| at.as_slice() == [x])
+}
+
 /// `f` of every index below `n`, in order, on as many threads as there are.
-fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub(crate) fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, 8);
@@ -1193,7 +1502,7 @@ pub fn inode_twice(scan: &ScanResult) -> Option<String> {
 }
 
 /// The digest of every node but a file's, on as many threads as there are.
-fn digests(nodes: &[Scanned]) -> Vec<Option<Hash>> {
+pub(crate) fn digests(nodes: &[Scanned]) -> Vec<Option<Hash>> {
     const PIECE: usize = 16_384;
     let pieces: Vec<&[Scanned]> = nodes.chunks(PIECE).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1270,6 +1579,8 @@ struct Closing<'a, 's> {
     /// Whether rules by path decide what is in view, so that a folder the journal moves can take
     /// everything in it out of view, or bring it in.
     rules: bool,
+    /// Decided about here for what a decision fell on or a mark names, whatever the scan found.
+    also: &'a BTreeSet<ObjectId>,
     r: Reach,
 }
 
@@ -1394,8 +1705,11 @@ impl Closing<'_, '_> {
                 continue;
             }
             if let Some(x) = self.r.core_work.pop() {
-                for p in self.parents(&x) {
-                    self.open(p);
+                // A rewrite in place takes no name: the folders above it are in the closure already.
+                if !self.c.in_place.contains(&x) || self.also.contains(&x) {
+                    for p in self.parents(&x) {
+                        self.open(p);
+                    }
                 }
                 if self.b.kind(&x) == Some(ObjectKind::Dir) || self.node_is_dir(&x) {
                     self.open(x);
@@ -1436,6 +1750,7 @@ pub fn reach(
         c,
         dirty_children,
         rules,
+        also,
         r: Reach::default(),
     };
     k.r.add_core(ObjectId::ROOT);
@@ -1508,23 +1823,25 @@ pub struct World {
     pub scan: ScanResult,
 }
 
-/// Which row a scan's map of rows gives for an inode, when that row is the ledger's.
+/// Which row a scan's map of rows gives for an inode, when it was given without the metadata: the
+/// ledger's, or with every row glanced at, whichever row it was.
 fn ledger_source(b: &Before<'_>, key: (u64, u64)) -> Option<ObjectId> {
     let ledger = b.ledger.at_inode(&key).filter(|x| !b.is_dirty(x)).max();
     let dirty = b
         .dirty_rows
         .iter()
-        .filter(|(_, r)| (r.fp.dev, r.fp.ino) == key)
+        .filter(|(id, r)| (r.fp.dev, r.fp.ino) == key && !b.unscanned.contains(id))
         .map(|(id, _)| *id)
         .max();
     match (ledger, dirty) {
-        (Some(x), Some(y)) if y > x => None,
+        (Some(x), Some(y)) if y > x => b.glanced.then_some(y),
+        (None, y) if b.glanced => y,
         (x, _) => x,
     }
 }
 
-/// A file the scan did not read was given its row's metadata, which a ledger entry does not carry: this
-/// puts it back, for every such node in `nodes`, from `rows`.
+/// A file the scan did not read was given its row's metadata, which a ledger entry or a glance does not
+/// carry: this puts it back, for every such node in `nodes`, from `rows`.
 pub fn fill_unread(
     b: &Before<'_>,
     nodes: &mut [Scanned],
@@ -1537,10 +1854,14 @@ pub fn fill_unread(
         let Some(x) = ledger_source(b, (n.fp.dev, n.fp.ino)) else {
             continue;
         };
-        let Some(seen) = b.ledger.seen_of(&x) else {
-            continue;
+        let vouched = match b.dirty_rows.get(&x).filter(|_| b.is_dirty(&x)) {
+            Some(row) => row.known().vouches_for(&n.fp),
+            None => b
+                .ledger
+                .seen_of(&x)
+                .is_some_and(|seen| seen.known().vouches_for(&n.fp)),
         };
-        if !seen.known().vouches_for(&n.fp) {
+        if !vouched {
             continue;
         }
         let Some(row) = rows.get(&x) else {
@@ -1695,17 +2016,37 @@ pub fn seen_of(scanned: &BTreeMap<ObjectId, Scanned>) -> HashMap<ObjectId, Optio
     })
 }
 
-/// The ledger after a finalize: whole after a full round, or for what an incremental one held.
-pub fn ledger_write(
+/// The ledger after a finalize: whole after a full round, or for what an incremental one held, or,
+/// with a ledger rebuilt from the state, whole: the rebuilt entries for what the round did not hold and
+/// the round's own for what it did.
+pub fn ledger_write<'a>(
     agreement: &Agreement<'_>,
-    held: Option<(&Session, &BTreeSet<ObjectId>, &BTreeSet<ObjectId>)>,
+    held: Option<(&'a Session, &'a BTreeSet<ObjectId>, &BTreeSet<ObjectId>)>,
     anchor: &Anchor,
-) -> Result<crate::state::LedgerWrite> {
+) -> Result<crate::state::LedgerWrite<'a>> {
+    let rebuilt = held.is_some_and(|(s, _, _)| s.rebuilt.is_some());
     let mut w = crate::state::LedgerWrite {
-        whole: held.is_none(),
+        whole: held.is_none() || rebuilt,
         anchor: Some(serde_json::to_string(anchor)?),
         ..Default::default()
     };
+    if let (Some((s, all, _)), true) = (held, rebuilt) {
+        w.rest = Some(Box::new(move |put| {
+            for i in 0..s.ledger.len() {
+                let id = s.ledger.ids[i];
+                if all.contains(&id) || s.unsettled.contains(&id) {
+                    continue;
+                }
+                let e = Entry {
+                    kind: s.ledger.kinds[i],
+                    links: s.ledger.links_at(i),
+                    seen: s.ledger.seen[i].clone(),
+                };
+                put(id, e.encode())?;
+            }
+            Ok(())
+        }));
+    }
     let ids: BTreeSet<ObjectId> = match held {
         Some((_, all, _)) => all
             .iter()
@@ -1719,25 +2060,15 @@ pub fn ledger_write(
             .chain(agreement.rows.keys().copied())
             .collect(),
     };
-    // A harness build can leave the entry of a file of one name as it was, as a defect here would: for
-    // the tests of the daemon's check on the incremental path.
-    let stale: Option<String> = cfg!(feature = "failpoints")
-        .then(|| std::env::var("CAIRN_FP_INCR_STALE").ok())
-        .flatten();
-    let stale = |e: &Entry| {
-        stale
-            .as_ref()
-            .is_some_and(|n| e.links.iter().any(|l| l.name.as_bytes() == n.as_bytes()))
-    };
     for id in ids {
         let verdict = agreement.verdict(id);
         match (verdict, held) {
             (Verdict::Put(e), None) => w.put.push((id, e.encode())),
             (Verdict::Drop, None) => {}
             (Verdict::Dirty, None) => w.dirty.push(id),
-            (Verdict::Put(e), Some((s, _, _))) if stale(&e) && s.ledger.contains(&id) => {
-                w.clean.push(id);
-            }
+            (Verdict::Put(e), Some(_)) if rebuilt => w.put.push((id, e.encode())),
+            (Verdict::Drop, Some(_)) if rebuilt => {}
+            (Verdict::Dirty, Some(_)) if rebuilt => w.dirty.push(id),
             (Verdict::Put(e), Some((s, _, dirty))) => {
                 if dirty.contains(&id) || s.ledger.entry(&id).as_ref() != Some(&e) {
                     w.put.push((id, e.encode()));
@@ -2252,6 +2583,8 @@ mod tests {
             dirty_nodes: &dn,
             dirty_rows: &dr,
             journal: &journal,
+            glanced: false,
+            unscanned: &BTreeSet::new(),
         };
         let scan = scan_of(nodes);
         let c = classify(&b, &scan);

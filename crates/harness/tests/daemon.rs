@@ -357,11 +357,11 @@ fn a_change_with_every_event_lost_is_found_by_the_reconcile() {
 
 /// The check on the syncs that take what changed alone: a change the incremental path misses, here by a
 /// failpoint standing for a defect in it, in a release build's way, stays missed by every such sync, and
-/// by every sync with nothing to do; the first sync the check is due for decides the full way as well,
-/// takes the full sync's answer, and says in the log that the incremental round would have missed it. A
-/// check that agrees says so, once.
+/// by every sync with nothing to do; the first sync the check is due for sets the ledger against what
+/// the state says, finds the ledger vouched for what the state does not, says so in the log as a defect,
+/// and takes it up as the full sync would, within the round. A check that agrees says so, once.
 #[test]
-fn the_periodic_full_sync_takes_what_the_incremental_path_missed_and_says_so() {
+fn the_periodic_check_takes_what_the_incremental_path_missed_and_says_so() {
     let (_sb, _s, a, b) = pair("d-full-check");
     // Apart, so that the one is no neighbour of the other. On Unix a folder, whose mode the scan reads
     // nothing new for, so that a sync with nothing to do records it as it is; Windows holds no folder's
@@ -424,27 +424,22 @@ fn the_periodic_full_sync_takes_what_the_incremental_path_missed_and_says_so() {
     );
     let log = da.log.clone();
     wait_for("the mode to arrive", &log, || missed(&b));
-    wait_for("the sync to end", &log, || {
-        da.log().contains("looked at the whole tree")
-    });
+    wait_for("the defect", &log, || da.log().contains("event: a defect"));
     let text = da.log();
     assert!(
-        text.contains("event: a defect: the incremental path would have decided otherwise"),
-        "{text}"
-    );
-    assert!(
         text.contains(
-            "looked at the whole tree: the incremental round would have decided otherwise"
+            "event: a defect: the incremental bookkeeping vouched for far/blind, which the state says is not settled"
         ),
         "{text}"
     );
+    // Taken up within the bounded round, not the whole tree.
+    assert!(!text.contains("looked at the whole tree"), "{text}");
     std::thread::sleep(Duration::from_millis(1100));
     a.write("near/seen", "again");
     wait_file(&db, b.path("near/seen"), b"again");
     wait_for("a check that agrees", &log, || {
-        da.log().contains(
-            "decided the full way as well, as every 1 seconds: the incremental path agrees",
-        )
+        da.log()
+            .contains("checked the ledger against the state, as every 1 seconds: it agrees")
     });
     assert_eq!(
         da.log().matches("event: a defect").count(),
@@ -454,47 +449,156 @@ fn the_periodic_full_sync_takes_what_the_incremental_path_missed_and_says_so() {
     );
 }
 
-/// The same check after a finalize that leaves the ledger otherwise than a full one would, here by a
-/// failpoint that keeps one entry as it was: said as a defect, and the ledger goes, so that the next sync
-/// takes the whole tree and writes it again.
+/// The same failpoint on a file edited in place, whose folder's times say nothing: missed by the syncs
+/// that take what changed alone, found by the check, by what the state says of its content, and taken up
+/// within the round.
 #[test]
-fn a_check_whose_finalize_is_not_the_full_ones_drops_the_ledger_and_says_so() {
-    let (_sb, _s, a, b) = pair("d-full-check-finalize");
-    a.write("far/stale", "first");
+fn the_periodic_check_finds_an_edit_the_incremental_path_missed() {
+    let (_sb, _s, a, b) = pair("d-check-edit");
+    a.write("far/e/blind", "first");
     a.write("near/seen", "first");
     for d in [&a, &b, &a, &b] {
         d.synced();
     }
-    let env = [
+    let blind = [
         ("CAIRN_FP_INCR_ORACLE", "0"),
-        ("CAIRN_FP_INCR_STALE", "stale"),
+        ("CAIRN_FP_INCR_BLIND", "blind"),
     ];
+    std::fs::write(a.path("far/e/blind"), "edited in place").unwrap();
+    a.write("near/seen", "edited");
+    let run = a.sync_env(&blind);
+    assert!(run.ok(), "{}", run.text());
+    b.synced();
+    assert_eq!(
+        b.read("far/e/blind"),
+        b"first",
+        "nothing missed it: {}",
+        run.text()
+    );
     std::thread::sleep(Duration::from_millis(1100));
     let da = Daemon::start_env(
         &a,
         &["--reconcile-secs", DAY, "--full-sync-secs", "1"],
-        &env,
+        &blind,
     );
-    let path = da.log.clone();
-    wait_for("the first check", &path, || {
-        da.log().contains("the incremental path agrees")
-    });
+    let db = Daemon::events_only(&b);
+    wait_file(&db, b.path("far/e/blind"), b"edited in place");
+    let text = da.log();
+    let line = "the incremental bookkeeping vouched for far/e/blind, which the state says is not settled: the scan found another file than its record";
+    assert!(text.contains(line), "{text}");
+    assert!(!text.contains("looked at the whole tree"), "{text}");
+}
+
+/// A write to the state whose mark was lost, as a trigger that did not fire would lose it: here a file's
+/// record made racy, which says it is to be read again, with its mark taken away. Syncs that take what
+/// changed alone trust the ledger, which still vouches for the file; the check finds the state says
+/// otherwise, says so as a defect, and reads the file as a full sync would.
+#[test]
+fn the_periodic_check_finds_a_write_whose_mark_was_lost() {
+    let (_sb, _s, a, b) = pair("d-check-unmarked");
+    a.write("far/unmarked", "first");
+    a.write("near/seen", "first");
+    for d in [&a, &b, &a, &b] {
+        d.synced();
+    }
+    let db = a.path(".cairn/state.sqlite");
+    // The base64 of the name, as a link holds it.
+    let named = "%\"name\":\"dW5tYXJrZWQ=\"%";
+    let racy = || -> bool {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row(
+            "SELECT row FROM rows WHERE object IN (SELECT object FROM base WHERE node LIKE ?1)",
+            [named],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+        .contains("\"racy\":true")
+    };
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE rows SET row = replace(row, '\"racy\":false', '\"racy\":true') \
+                 WHERE object IN (SELECT object FROM base WHERE node LIKE ?1)",
+                [named],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        conn.execute("DELETE FROM dirty", []).unwrap();
+    }
+    assert!(racy());
+    // A sync that takes what changed alone, as a release build runs it, goes by the ledger.
+    let release = [("CAIRN_FP_INCR_ORACLE", "0")];
+    a.write("near/seen", "edited");
+    let run = a.sync_env(&release);
+    assert!(run.ok(), "{}", run.text());
+    assert!(racy(), "the ledger was not trusted: {}", run.text());
     std::thread::sleep(Duration::from_millis(1100));
-    a.write("far/stale", "edited");
-    wait_for("the defect", &path, || da.log().contains("event: a defect"));
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY, "--full-sync-secs", "1"],
+        &release,
+    );
+    let log = da.log.clone();
+    wait_for("the defect", &log, || da.log().contains("event: a defect"));
+    wait_for("the file read again", &log, || !racy());
     assert!(
-        da.log().contains("after an incremental finalize"),
+        da.log().contains(
+            "the incremental bookkeeping vouched for far/unmarked, which the state says is not settled: its record was read too soon after a change to trust"
+        ),
         "{}",
         da.log()
     );
-    a.write("near/seen", "edited");
-    wait_for("a sync of the whole tree", &path, || {
-        da.log()
-            .contains("looked at the whole tree: no full sync has agreed")
+    std::thread::sleep(Duration::from_millis(1100));
+    a.write("near/seen", "again");
+    wait_for("a check that agrees", &log, || {
+        da.log().contains("as every 1 seconds: it agrees")
     });
-    let db = Daemon::events_only(&b);
-    wait_file(&db, b.path("far/stale"), b"edited");
-    wait_file(&db, b.path("near/seen"), b"edited");
+    let dbd = Daemon::events_only(&b);
+    wait_file(&dbd, b.path("near/seen"), b"again");
+    assert_eq!(b.read("far/unmarked"), b"first");
+}
+
+/// The check holds little besides the round it checks: the ledger against the state object by object,
+/// no second decision, no second copy of the tree. Peak memory of a daemon whose sync is the check, on a
+/// tree of thousands, against one whose sync is not, each with one edit to take: within a fifth more,
+/// and a few megabytes whatever the tree's size, for the threads that parse the state, where a second
+/// decision beside the round would hold some 20 KB an entry, a quarter of a gigabyte here.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_periodic_check_holds_little_more_than_the_round() {
+    let (_sb, _s, a, b) = pair("d-check-memory");
+    for i in 0..12_000 {
+        a.write(&format!("t/{}/{}/{i}", i % 30, i % 7), format!("{i}"));
+    }
+    for d in [&a, &b, &a] {
+        d.synced();
+    }
+    let release = [("CAIRN_FP_INCR_ORACLE", "0"), ("CAIRN_FP_FAST_ORACLE", "0")];
+    let peak = |full_sync: &str, edit: &str, done: &str| -> u64 {
+        a.write(edit, "edited");
+        let d = Daemon::start_env(
+            &a,
+            &["--reconcile-secs", DAY, "--full-sync-secs", full_sync],
+            &release,
+        );
+        let log = d.log.clone();
+        wait_for(done, &log, || d.log().contains(done));
+        let status = std::fs::read_to_string(format!("/proc/{}/status", d.child.id())).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    };
+    let round = peak(DAY, "t/3/3/3", "synced to sequence");
+    std::thread::sleep(Duration::from_millis(1100));
+    let check = peak("1", "t/4/4/4", "checked the ledger against the state");
+    eprintln!("the check peaked at {check} kB, the round at {round} kB");
+    assert!(
+        check <= round + round / 5 + 8 * 1024,
+        "the check peaked at {check} kB, the round at {round} kB"
+    );
 }
 
 #[test]

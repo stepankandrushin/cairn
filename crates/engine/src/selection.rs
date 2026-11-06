@@ -320,7 +320,7 @@ impl Selection {
         })
     }
 
-    fn is_unheld(&self, id: ObjectId, link: &Link) -> bool {
+    pub(crate) fn is_unheld(&self, id: ObjectId, link: &Link) -> bool {
         self.unheld
             .iter()
             .any(|u| u.object == id && &u.link == link)

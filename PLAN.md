@@ -201,26 +201,43 @@ by path, paths), every name in each folder any of its entries is or was in, on e
 conflict names, adoption by name and content, what is out of view at that name), every name of a hard-linked
 file (the node and the scanned inode whole), everything in a folder among them (what is kept inside one
 deleted, what goes with one moved or excluded), with rules the whole of a folder the journal moves, and what
-was out of view at the last agreement. The round runs the full sync's own identification, merge, apply,
+was out of view at the last agreement. An object rewritten in place, at the one entry, inode and kind it had,
+takes no name, so its folders are not opened for it while no conflict copy can come of it: while the journal
+names it in updates alone if at all, and then only while it is as it was here or as this sync pushed or
+brought it. The round runs the full sync's own identification, merge, apply,
 push and finalize on those alone: the trees, rows and scan it gives them hold nothing else, and what they
 leave out is the same on every side. Any decision about an object loaded only as a neighbour means the set
 was too small: it is widened and decided again, and nothing is written before that settles. An agreeing
-round writes the ledger for what it held, a full one writes it whole. The full sync runs instead, said in
-the sync's output and the daemon's log, with no ledger from a full sync of this build, configuration, rules
-and selection; on a dry run; with copies kept by `cairn exclude`, found by inode; with a mark or queued commit
-from a run that did not finish, or a leftover of one; when the journal or the set comes to more than a
-quarter of the tree; when the journal does not replay on the part loaded; when the scan finds one inode at
-two places, as when something moves while it walks; when identification takes a folder for another object
-than its inode says; or after four widenings. A round holds the scan and the ledger, a
-few hundred bytes an entry, and decodes the base and rows of the set alone. A harness build decides every
+round writes the ledger for what it held, a full one writes it whole. With no ledger from a sync of this
+build, configuration, rules and selection, or with a mark or queued commit from a run that did not finish,
+the ledger is rebuilt from the state instead, said in the sync's output and the daemon's log: a scan given
+every row, then one pass over the base and the rows in object order, puts for each object the entry a full
+finalize that decided nothing would write, where a full sync would find it settled (its row read whole, not
+racy, nothing on its way, the metadata the base was agreed at, held at the base's entries, and the scan
+finding it as the object its inode says, at those entries, as its row has it; or with no row, out of view
+here), and takes everything else as written since. The round then runs as on a ledger kept, and its finalize
+writes the ledger whole. A round on a ledger kept that finds one inode at two places in the scan, as when
+something moves while it walks, or that identification takes a folder for another object than its inode
+says, goes again on a fresh scan and the ledger rebuilt. The full sync runs instead, said too, on a first
+sync, with no base to rebuild from; on a dry run; with copies kept by `cairn exclude`, found by inode; with
+a leftover of a run that did not finish; when the journal, the set or what a rebuild finds unsettled comes
+to more than a quarter of the tree; when the journal does not replay on the part loaded; when a round on a
+rebuilt ledger cannot go on either, or a rebuild finds records going out of view while the journal moves things;
+or after four widenings. A round holds the scan and the ledger, a few
+hundred bytes an entry, and decodes the base and rows of the set alone; a rebuild holds every row's glance
+for the scan besides, and reads the base and rows once without holding them. A harness build decides every
 incremental round the full way as well, on the same scan, journal and state, and fails the sync unless every
 decision is the same: the rows the scan was given, identification, the rows, the mass-delete check, twins,
 the plan, the operations, the local steps, what is out of view, and nothing at all outside the set; after a
-finalize, the base, rows and ledger must be what a full one leaves. A release build has no such oracle, so
-the daemon runs it as a check, a day (`--full-sync-secs`) after the last sync whose every decision was the
-full sync's, one that ended taking the whole tree or the last check: where the two differ the round says so
-in the log as a defect and goes the whole way, and a finalize that is not what a full one leaves drops the
-ledger, so that the next sync takes the whole tree.
+finalize, the base, rows and ledger must be what a full one leaves; and on a ledger kept, the ledger rebuilt
+from the state must be it for everything the round leaves alone. A release build has no such oracle, so the
+daemon checks the bookkeeping instead, a day (`--full-sync-secs`) after the last sync whose every decision was
+the full sync's (one that took the whole tree or a rebuilt ledger, or the last check): the ledger kept against
+the ledger rebuilt from the state, object by object. An object it vouched for whose entry is not the state's,
+or that it has no word of though the state has it, is a defect, said in the log and taken as written since,
+and the round goes again on a fresh scan, so that it decides about that object now as the full sync would.
+What it does not compare is decisions: a neighbour the closure leaves out, with both ledgers agreeing, is the
+harness's oracle to find, on its trees, and no longer the daemon's on every device's.
 
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
 before submitting old state, comparing against history, so deleted files do not come back.
@@ -228,9 +245,9 @@ before submitting old state, comparing against history, so deleted files do not 
 **The daemon** decides when to sync and nothing else: it runs the same state-based sync a person runs. An
 event from the watcher or the change feed only says "look", and says nothing about what to look at, so a
 lost event, a stale path or a missed folder delays a change and cannot lose one: the reconcile, a sync
-an hour whatever wakes it, scans the whole tree, and a sync a day decides every round the full way as well
-and takes that answer, so whatever both miss, and whatever a sync that carries a change would have missed,
-is taken within a day. A watch is always placed before the sync it leads to; the walk that places them
+an hour whatever wakes it, scans the whole tree, and a sync a day checks the ledger the syncs that carry a
+change rest on against the state and takes up whatever it vouched for wrongly, so whatever both miss, and
+whatever a ledger gone wrong would have hidden, is taken within a day. A watch is always placed before the sync it leads to; the walk that places them
 holds one folder open for each level down, the daemon takes its hard limit on open files, and a folder it cannot
 watch is named. A wake for a change from before the scan the last sync agreed on is none, as that scan saw it, the
 sync's own writes included, and so is the feed's news of commits that sync took in. Change feed: a long-poll

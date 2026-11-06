@@ -47,12 +47,12 @@ pub struct SyncOptions {
     /// Something changed under the root, by the watcher's word: no use looking for nothing to do.
     pub changed_here: bool,
     /// The daemon's check on the incremental path: a sync this long after the last whose every decision
-    /// was the full sync's decides each round the full way as well and takes that answer, saying so loudly
-    /// wherever the incremental round would have decided otherwise.
+    /// was the full sync's sets the ledger it keeps against what the state says, object by object, and
+    /// takes up, saying so loudly, whatever the ledger vouched for that the state does not.
     pub full_every: Option<std::time::Duration>,
 }
 
-/// Whether this sync is to check the incremental path against the full one.
+/// Whether this sync is to check the ledger against the state.
 fn full_check_due(root: &Root, opts: &SyncOptions) -> bool {
     let Some(every) = opts.full_every else {
         return false;
@@ -64,10 +64,10 @@ fn full_check_due(root: &Root, opts: &SyncOptions) -> bool {
         .is_none_or(|t| now_secs().saturating_sub(t) >= every.as_secs() as i64)
 }
 
-/// What a sync that checks the incremental path says where it would have decided otherwise.
-fn defect(what: &str) -> String {
+/// What the daemon's check says of an object the ledger vouched for and the state does not.
+fn defect(path: &str, what: &str) -> String {
     format!(
-        "a defect: the incremental path would have decided otherwise than the full sync, whose answer this sync took ({what}); please report it, with this log"
+        "a defect: the incremental bookkeeping vouched for {path}, which the state says is not settled: {what}; this sync takes it up as the full sync would; please report it, with this log"
     )
 }
 
@@ -118,10 +118,12 @@ pub struct SyncReport {
     pub activity: Vec<Activity>,
     /// Why a round took the whole tree, if one did, when it could have taken what changed alone.
     pub whole_because: Option<String>,
+    /// Why the ledger was rebuilt from the state, if it was, where it could not be read.
+    pub rebuilt_because: Option<String>,
     /// For a sync whose rounds took what changed alone: the most objects one round decided about,
     /// the most it loaded with their neighbours, and how many the ledger holds.
     pub part: Option<(u64, u64, u64)>,
-    /// For a sync that checked the incremental path against the full one: whether the two agreed.
+    /// For a sync that checked the ledger against the state: whether the two agreed.
     pub checked: Option<bool>,
     /// How many times a request the network failed was tried again.
     pub retries: u64,
@@ -151,6 +153,7 @@ impl SyncReport {
             agreed_since: None,
             activity: Vec::new(),
             whole_because: None,
+            rebuilt_because: None,
             part: None,
             checked: None,
             retries: 0,
@@ -220,7 +223,7 @@ fn fetch_into(
     seq: &mut u64,
     seen: &mut Seen,
 ) -> Result<()> {
-    fetch_ops(client, seq, seen, &mut |op| {
+    fetch_ops(client, seq, seen, &mut |op, _| {
         tree.to_mut().apply(op).map_err(anyhow::Error::from)
     })
 }
@@ -230,13 +233,13 @@ fn fetch_ops(
     client: &Client,
     seq: &mut u64,
     seen: &mut Seen,
-    each: &mut dyn FnMut(&Op) -> Result<()>,
+    each: &mut dyn FnMut(&Op, OpId) -> Result<()>,
 ) -> Result<()> {
     loop {
         let resp = client.changes(*seq)?;
         for change in &resp.changes {
             for op in &change.ops {
-                each(op).map_err(|e| {
+                each(op, change.op_id).map_err(|e| {
                     anyhow!(
                         "the server's journal does not replay at seq {}: {e}",
                         change.seq
@@ -1489,8 +1492,6 @@ fn sync_full(
     generation: Option<u64>,
 ) -> Result<(SyncReport, crate::steady::Trace)> {
     let mut trace = crate::steady::Trace::default();
-    // A check whose finalize was not what a full one leaves.
-    let mut unconfirmed = false;
     // What a record of a sync with nothing to do needs: that nothing came before the merge either.
     let recovered = !report.events.is_empty();
     let inputs = crate::steady::inputs(&root, &selection, opts);
@@ -1509,7 +1510,13 @@ fn sync_full(
     if crate::incr::enabled() {
         match crate::incr::Session::open(&root, &selection, opts.dry_run)? {
             Ok(s) => session = Some(s),
-            Err(why) => report.whole_because = Some(why),
+            Err(closed) if closed.rebuild => {
+                report.rebuilt_because = Some(closed.why.clone());
+                session = Some(crate::incr::Session::rebuilding(
+                    &root, &selection, closed.why,
+                )?);
+            }
+            Err(closed) => report.whole_because = Some(closed.why),
         }
     }
     let mut whole: Option<Whole> = match session {
@@ -1546,11 +1553,11 @@ fn sync_full(
         }
         hit("sync.round");
         match (&mut session, &mut whole) {
-            (Some(s), _) => fetch_ops(&client, &mut seq, &mut seen, &mut |op| {
-                s.journal.add(op);
+            (Some(s), _) => fetch_ops(&client, &mut seq, &mut seen, &mut |op, commit| {
+                s.journal.add_of(op, commit);
                 Ok(())
             })?,
-            (None, Some(w)) => fetch_ops(&client, &mut seq, &mut seen, &mut |op| w.apply(op))?,
+            (None, Some(w)) => fetch_ops(&client, &mut seq, &mut seen, &mut |op, _| w.apply(op))?,
             (None, None) => bail!("a sync with neither the ledger nor the whole tree"),
         }
         report.head = seq;
@@ -1566,10 +1573,11 @@ fn sync_full(
 
         // An incremental round decides everything up to the merge on the part of the tree it takes.
         let mut part: Option<Ready> = None;
-        if let Some(s) = session.as_mut() {
+        let mut again = false;
+        while let Some(s) = session.as_mut() {
             let first = report.rounds == 1
                 && (crate::steady::oracle() || root.state.generation()? == generation);
-            match incremental_head(
+            let why = match incremental_head(
                 &mut root,
                 s,
                 &mut selection,
@@ -1581,11 +1589,26 @@ fn sync_full(
                 &mut trace,
                 &mut round_work,
                 first,
-                check,
+                (check, again),
             )? {
-                Ok(r) => part = Some(r),
-                Err(why) => decline(&root, &mut session, &mut whole, &mut report, why)?,
-            }
+                Ok(r) => {
+                    part = Some(r);
+                    break;
+                }
+                Err(Declined::Again) if !again => {
+                    again = true;
+                    continue;
+                }
+                Err(Declined::Rebuild(why)) if s.rebuilt.is_none() => {
+                    hit("sync.incr.rebuilding");
+                    s.rebuild(&root, &selection, why.clone())?;
+                    report.rebuilt_because = Some(why);
+                    continue;
+                }
+                Err(Declined::Again) => "the check kept finding defects".to_string(),
+                Err(Declined::Whole(why) | Declined::Rebuild(why)) => why,
+            };
+            decline(&root, &mut session, &mut whole, &mut report, why)?;
         }
         let p_base: Tree;
         let p_remote: Tree;
@@ -2036,18 +2059,8 @@ fn sync_full(
             round_work += finalizing.elapsed();
             hit("sync.finalized");
             if let Some(o) = &p_oracle {
-                match crate::incr::check_finalized(&root, o) {
-                    Ok(()) => hit("sync.incr.finalize_confirmed"),
-                    // What the finalize wrote is done; the ledger goes, so the next sync takes the whole
-                    // tree and writes it again.
-                    Err(e) if check => {
-                        report.events.push(defect(&format!("{e:#}")));
-                        report.checked = Some(false);
-                        root.state.forget_ledger()?;
-                        unconfirmed = true;
-                    }
-                    Err(e) => return Err(e),
-                }
+                crate::incr::check_finalized(&root, o)?;
+                hit("sync.incr.finalize_confirmed");
             }
             report.agreed_since = Some(scanned.started);
             steady_round = report.rounds == 1 && !unstable && !recovered;
@@ -2144,11 +2157,14 @@ fn sync_full(
         other => other,
     };
     // Every decision the full sync's: the last round took the whole tree, which covers whatever the
-    // rounds before it decided, or this was the check and every round agreed. Not on every sync the
-    // harness's oracle confirms, as the write would cost the next sync with nothing to do its shortcut.
+    // rounds before it decided, or a ledger rebuilt from the state, or this was the check, which took up
+    // whatever it found the ledger had missed. Not on every sync the harness's oracle confirms, as the
+    // write would cost the next sync with nothing to do its shortcut.
     if report.outcome == SyncOutcome::Synced
         && !opts.dry_run
-        && (session.is_none() || (check && !unconfirmed))
+        && (session
+            .as_ref()
+            .is_none_or(|s| s.rebuilt.is_some() || check))
     {
         root.set_full_checked(now_secs())?;
     }
@@ -2267,9 +2283,34 @@ type Settled = (Vec<(ObjectId, Row)>, Vec<String>);
 /// Rounds of widening before a round gives up on what changed alone.
 const WIDENINGS: usize = 4;
 
+/// Every row's view for the scan, from a glance at each, but those the selection's view takes: on two
+/// rows at one inode, the later object's.
+fn glanced<'g>(
+    g: &'g [(ObjectId, crate::state::Glance)],
+    purged: &BTreeSet<ObjectId>,
+) -> HashMap<(u64, u64), Known<'g>> {
+    g.iter()
+        .filter(|(id, _)| !purged.contains(id))
+        .map(|(_, g)| ((g.fp.dev, g.fp.ino), g.known()))
+        .collect()
+}
+
+/// Why a round on what changed alone cannot go on.
+enum Declined {
+    /// The whole tree is the round's to take, and why.
+    Whole(String),
+    /// The tree moved under the scan, or identification went otherwise than the ledger: the ledger
+    /// rebuilt from the state, with a new scan, may still take what changed alone.
+    Rebuild(String),
+    /// The check found what the ledger vouched for and should not have, which is now marked as
+    /// written since: the round again, with a new scan that reads it as the state says.
+    Again,
+}
+
 /// A round on what changed alone, up to the merge: the scan, then the part of the tree the ledger cannot
-/// vouch for and its neighbours, identified and merged by the full sync's own code. `Err` sends the round
-/// the full way, with why; nothing is written before the round knows it can go on.
+/// vouch for and its neighbours, identified and merged by the full sync's own code; the first round of a
+/// session that rebuilds its ledger rebuilds it from the state and this scan. `Err` says why the round
+/// cannot go on; nothing is written before the round knows it can, but for the marks a check leaves.
 #[allow(clippy::too_many_arguments)]
 fn incremental_head(
     root: &mut Root,
@@ -2283,11 +2324,11 @@ fn incremental_head(
     trace: &mut crate::steady::Trace,
     round_work: &mut std::time::Duration,
     first: bool,
-    check: bool,
-) -> Result<std::result::Result<Ready, String>> {
+    (check, again): (bool, bool),
+) -> Result<std::result::Result<Ready, Declined>> {
     use crate::incr::{self, Before};
     // The state as the full sync would read it, for the oracle, before this round writes anything.
-    let snapshot = match incr::oracle() || check {
+    let snapshot = match incr::oracle() {
         true => Some((
             root.state.load_base()?,
             root.state.load_rows()?,
@@ -2295,10 +2336,20 @@ fn incremental_head(
         )),
         false => None,
     };
-    let dirty = root.state.dirty()?;
-    let dirty_list: Vec<ObjectId> = dirty.iter().copied().collect();
-    let dirty_nodes = root.state.nodes_of(&dirty_list)?;
-    let dirty_rows = root.state.rows_of(&dirty_list)?;
+    let rebuilding = session.to_rebuild;
+    // What the ledger does not speak for: what was written since it was, and what a rebuild of it found
+    // unsettled. A rebuild starts from the state itself, and finds both again.
+    let (mut dirty, mut dirty_nodes, mut dirty_rows) = match rebuilding {
+        true => (BTreeSet::new(), BTreeMap::new(), BTreeMap::new()),
+        false => {
+            let mut dirty = root.state.dirty()?;
+            dirty.extend(session.unsettled.iter().copied());
+            let dirty_list: Vec<ObjectId> = dirty.iter().copied().collect();
+            let nodes = root.state.nodes_of(&dirty_list)?;
+            let rows = root.state.rows_of(&dirty_list)?;
+            (dirty, nodes, rows)
+        }
+    };
     let mut released: BTreeSet<Hash> = BTreeSet::new();
     let hold = |rows: &BTreeMap<ObjectId, Row>, released: &mut BTreeSet<Hash>| {
         for r in rows.values() {
@@ -2307,6 +2358,109 @@ fn incremental_head(
             }
         }
     };
+    // Every row as a scan needs it, for a rebuild: the scan is given what the state says, not the ledger.
+    let mut glance = match rebuilding {
+        true => Some(root.state.glance_rows()?),
+        false => None,
+    };
+    // For a rebuild, the base as a skeleton, what of it is in view here, and the rows the selection's
+    // view takes, which the scan is not given, as the full sync's is not.
+    let mut purged: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut skeleton = None;
+    if let Some(g) = &glance {
+        let sk = crate::rebuild::skeleton(root)?;
+        let vis = crate::rebuild::visible(&sk, selection);
+        match crate::rebuild::purged(&sk, selection, g, session.journal.moves_any()) {
+            Some(p) => purged = p,
+            None => {
+                return Ok(Err(Declined::Whole(
+                    "records here go out of view while the server moves things, which may bring them back".into(),
+                )))
+            }
+        }
+        skeleton = Some((sk, vis));
+    }
+
+    let scan_started = std::time::Instant::now();
+    let scanned = {
+        let before = Before {
+            ledger: &session.ledger,
+            dirty: &dirty,
+            dirty_nodes: &dirty_nodes,
+            dirty_rows: &dirty_rows,
+            journal: &session.journal,
+            glanced: rebuilding,
+            unscanned: &purged,
+        };
+        let known = match &glance {
+            Some(g) => glanced(g, &purged),
+            None => before.scan_rows(),
+        };
+        let scanned = scan_stable(
+            root,
+            &known,
+            None,
+            accounts,
+            true,
+            &|path, st| selection.leaves_out_roughly(path, st),
+            date,
+            &mut report.events,
+            &mut report.conflicts,
+        )?;
+        let Some(scanned) = scanned else {
+            return Ok(Err(Declined::Whole(
+                "leftovers of a run that did not finish are the full sync's to settle".into(),
+            )));
+        };
+        report.scan_time += scan_started.elapsed();
+        *round_work += scan_started.elapsed();
+        if first {
+            trace.first = Some((crate::steady::digest(&scanned, &known), seq));
+        }
+        scanned
+    };
+    hit("sync.scanned");
+    if let Some(path) = incr::inode_twice(&scanned) {
+        return Ok(Err(Declined::Rebuild(format!(
+            "the scan found {path} at an inode it had found elsewhere, as when something moves while it walks"
+        ))));
+    }
+    if rebuilding {
+        let rebuild_started = std::time::Instant::now();
+        let provisional = crate::rebuild::provisional(
+            glance.as_deref().unwrap_or_default(),
+            &purged,
+            &scanned.nodes,
+        );
+        // The oracle compares the scan's rows with the state's; nothing else needs them now.
+        if !incr::oracle() {
+            glance = None;
+        }
+        let Some(skeleton) = skeleton.take() else {
+            bail!("a rebuild with no skeleton of the base");
+        };
+        match crate::rebuild::rebuild(
+            root,
+            skeleton,
+            &scanned.nodes,
+            &provisional,
+            session.limit(),
+        )? {
+            Err(why) => return Ok(Err(Declined::Whole(why))),
+            Ok(r) => {
+                hit("sync.incr.rebuilt");
+                session.ledger = r.ledger;
+                session.anchor.reserved = r.reserved;
+                session.size = session.ledger.len() + r.unsettled.len();
+                session.unsettled = r.unsettled.clone();
+                session.to_rebuild = false;
+                dirty = r.unsettled;
+                dirty_nodes = r.nodes;
+                dirty_rows = r.rows;
+            }
+        }
+        *round_work += rebuild_started.elapsed();
+    }
     hold(&dirty_rows, &mut released);
     let before = Before {
         ledger: &session.ledger,
@@ -2314,37 +2468,9 @@ fn incremental_head(
         dirty_nodes: &dirty_nodes,
         dirty_rows: &dirty_rows,
         journal: &session.journal,
+        glanced: rebuilding,
+        unscanned: &purged,
     };
-    let known = before.scan_rows();
-
-    let scan_started = std::time::Instant::now();
-    let scanned = scan_stable(
-        root,
-        &known,
-        None,
-        accounts,
-        true,
-        &|path, st| selection.leaves_out_roughly(path, st),
-        date,
-        &mut report.events,
-        &mut report.conflicts,
-    )?;
-    let Some(scanned) = scanned else {
-        return Ok(Err(
-            "leftovers of a run that did not finish are the full sync's to settle".into(),
-        ));
-    };
-    report.scan_time += scan_started.elapsed();
-    *round_work += scan_started.elapsed();
-    if first {
-        trace.first = Some((crate::steady::digest(&scanned, &known), seq));
-    }
-    hit("sync.scanned");
-    if let Some(path) = incr::inode_twice(&scanned) {
-        return Ok(Err(format!(
-            "the scan found {path} at an inode it had found elsewhere, as when something moves while it walks"
-        )));
-    }
     let thinking = std::time::Instant::now();
     report.excluded_here = scanned
         .excluded
@@ -2417,18 +2543,67 @@ fn incremental_head(
     let ids = incr::Ids::for_round();
     let host = root.config.device_name.clone();
     let mut promoted: BTreeSet<ObjectId> = BTreeSet::new();
+    // The check of the ledger kept: the state's own word on each object it vouches for, set against it.
+    // In a harness build on every round whose ledger was not rebuilt just now, where any difference is a
+    // failure; in the daemon's check, a defect said in the log, and the round again with what the
+    // ledger missed taken as written since.
+    let checking = check && session.rebuilt.is_none();
+    if checking || (incr::oracle() && !rebuilding) {
+        let skip =
+            |id: &ObjectId| *id == ObjectId::ROOT || c.seeds.contains(id) || unheld.contains(id);
+        let places = crate::rebuild::Places {
+            nodes: &scanned.nodes,
+            dir_at: &c.dir_at,
+            provisional: &c.provisional,
+            node_of: &c.node_of,
+        };
+        let defects = crate::rebuild::check(root, &session.ledger, selection, &places, &skip)?;
+        if defects.is_empty() {
+            if checking {
+                report.checked.get_or_insert(true);
+            }
+        } else {
+            let ids: Vec<ObjectId> = defects.iter().map(|d| d.object).collect();
+            let paths = crate::rebuild::paths_of(root, &ids)?;
+            let mut lines: Vec<String> = defects
+                .iter()
+                .take(20)
+                .map(|d| defect(&paths[&d.object], &d.what))
+                .collect();
+            if defects.len() > lines.len() {
+                lines.push(format!(
+                    "and {} more such defects, taken up the same way",
+                    defects.len() - lines.len()
+                ));
+            }
+            if !checking {
+                bail!(
+                    "the ledger vouches for what the state says is not settled:\n{}",
+                    lines.join("\n")
+                );
+            }
+            report.events.extend(lines);
+            report.checked = Some(false);
+            hit("sync.incr.defect");
+            if !again {
+                root.state.mark_dirty(&ids)?;
+                return Ok(Err(Declined::Again));
+            }
+            promoted.extend(ids);
+        }
+    }
     for _ in 0..WIDENINGS {
         let also: BTreeSet<ObjectId> = unheld.union(&promoted).copied().collect();
         let reach = incr::reach(&before, &c, rules, &also, &beside);
         if reach.all.len() > limit {
-            return Ok(Err(format!(
+            return Ok(Err(Declined::Whole(format!(
                 "{} objects changed or are next to a change, more than taking the whole tree costs",
                 reach.all.len()
-            )));
+            ))));
         }
         let world = match incr::world(root, &before, &scanned, &reach)? {
             Ok(w) => w,
-            Err(why) => return Ok(Err(why)),
+            Err(why) => return Ok(Err(Declined::Whole(why))),
         };
         let incr::World {
             base,
@@ -2484,7 +2659,7 @@ fn incremental_head(
             );
         }
         if let Some(why) = c.misidentified(&reach, &identified) {
-            return Ok(Err(why));
+            return Ok(Err(Declined::Rebuild(why)));
         }
         let changed = rows_after_scan(&mut rows, &identified, &view.base);
         view.settle(&rows);
@@ -2540,6 +2715,11 @@ fn incremental_head(
                     moving: moving_with_excluded(&plan, &identified, &scanned.excluded),
                     reserved: view.hidden.reserved.clone(),
                 };
+                // The rows the scan was given, again, as the scan had them.
+                let known = match &glance {
+                    Some(g) => glanced(g, &purged),
+                    None => before.scan_rows(),
+                };
                 let full = oracle_full(
                     root,
                     (sbase, srows, ssel),
@@ -2574,33 +2754,12 @@ fn incremental_head(
                         .take(8)
                         .map(|id| c.explain(&before, id, &reach))
                         .collect();
-                    // The check a release build runs now and then takes the full sync's answer, said.
-                    if check {
-                        let mut what: String = diff
-                            .lines()
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if let Some((cut, _)) = what.char_indices().nth(400) {
-                            what.truncate(cut);
-                            what.push_str("...");
-                        }
-                        report.events.push(defect(&what));
-                        report.checked = Some(false);
-                        return Ok(Err(
-                            "the incremental round would have decided otherwise, which is a defect, said above".into(),
-                        ));
-                    }
                     bail!(
                         "the incremental round and the full one on the same scan, journal and state decide differently:\n{diff}\nwhat the round knew of what it left out:\n{}",
                         outside.join("\n")
                     );
                 }
                 hit("sync.incr.confirmed");
-                if check {
-                    report.checked.get_or_insert(true);
-                }
                 Some(incr::FullRound {
                     decisions: full.decisions,
                     remote: full.remote,
@@ -2653,7 +2812,7 @@ fn incremental_head(
         let (core, all, of) = (
             reach.core.len().saturating_sub(1) as u64,
             reach.all.len().saturating_sub(1) as u64,
-            session.ledger.len() as u64,
+            session.size as u64,
         );
         report.part = Some(match report.part {
             Some((c0, a0, _)) => (c0.max(core), a0.max(all), of),
@@ -2679,9 +2838,9 @@ fn incremental_head(
             oracle,
         }));
     }
-    Ok(Err(
+    Ok(Err(Declined::Whole(
         "the round's decisions kept reaching past what was loaded for them".into(),
-    ))
+    )))
 }
 
 /// What the oracle's full round leaves for the comparison and the check after a finalize.

@@ -12,6 +12,7 @@ mod icon;
 mod link;
 mod model;
 mod registry;
+mod settings;
 
 use cairn_protocol::local::{registry_path, user_dir, Direction, Reply, Request};
 use hub::{Link, RootView};
@@ -32,7 +33,8 @@ macro_rules! say {
 const USAGE: &str =
     "usage: cairn-tray [--open TAB | --probe [--conflicts] | --login on|off | --version]
   (none)       the tray icon, its menu and window
-  --open TAB   the same, with its window open at status, recent, problems or conflicts
+  --open TAB   the same, with its window open at status, recent, problems, conflicts or
+               settings
   --probe      print, with no window, what the tray would show for each root; exit 2 if the
                registry of roots cannot be read. With --conflicts, the open conflicts too, which
                has the server replay its journal
@@ -63,7 +65,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         [] => tray(None),
-        ["--open", tab @ ("status" | "recent" | "problems" | "conflicts")] => tray(Some(tab)),
+        ["--open", tab @ ("status" | "recent" | "problems" | "conflicts" | "settings")] => {
+            tray(Some(tab))
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(64)
@@ -91,6 +95,11 @@ fn tray(open: Option<&str>) -> ExitCode {
         "cairn-tray {} starting",
         env!("CARGO_PKG_VERSION")
     ));
+    if let Some(e) = settings::load() {
+        log(&format!(
+            "{e}: using the defaults until a setting is changed"
+        ));
+    }
     match gui::run(hub::Hub::start(), open.map(str::to_string)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -144,6 +153,9 @@ pub fn log(line: &str) {
 }
 
 fn probe(with_conflicts: bool) -> ExitCode {
+    if let Some(e) = settings::load() {
+        say!("settings: {e}: using the defaults");
+    }
     let Some(path) = registry_path() else {
         say!("registry: no home directory to find it in");
         return ExitCode::from(2);

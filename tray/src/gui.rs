@@ -6,6 +6,7 @@ use crate::hub::{Hub, Link, State};
 use crate::icon;
 use crate::link;
 use crate::model::{self, Light, Problem};
+use crate::settings::{self, Clock};
 use cairn_protocol::local::{Activity, Request};
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
@@ -33,7 +34,8 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             conflict,
             forget,
             open_folder,
-            open_server
+            open_server,
+            set_clock
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -263,6 +265,13 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
         None::<&str>,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "settings",
+        "Settings…",
+        true,
+        None::<&str>,
+    )?)?;
     menu.append(&CheckMenuItem::with_id(
         app,
         "login",
@@ -287,7 +296,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
     let (what, root) = (what.to_string(), root.to_string());
     match what.as_str() {
         "quit" => app.exit(0),
-        "recent" | "problems" | "conflicts" => show_window(app, &what),
+        "recent" | "problems" | "conflicts" | "settings" => show_window(app, &what),
         "login" => {
             let on = !actions::login::enabled();
             if let Err(e) = actions::login::set(on) {
@@ -376,6 +385,10 @@ struct UiState {
     registry_error: Option<String>,
     tab: (u64, String),
     notice: (u64, String),
+    clock: Clock,
+    /// Why `tray.json` could not be read, so its defaults are in use.
+    settings_error: Option<String>,
+    settings_path: Option<String>,
     roots: Vec<UiRoot>,
 }
 
@@ -394,13 +407,23 @@ struct UiRoot {
     paused_by_you: bool,
     version: String,
     problems: Vec<Problem>,
-    recent: Vec<Activity>,
+    recent: Vec<UiActivity>,
     conflicts: Option<UiConflicts>,
+}
+
+/// Each time goes to the window as `model::when` writes it, so the window, the menu and `--probe` show
+/// it on the same clock.
+#[derive(Serialize)]
+struct UiActivity {
+    #[serde(flatten)]
+    activity: Activity,
+    when: String,
 }
 
 #[derive(Serialize)]
 struct UiConflicts {
     at: i64,
+    at_when: String,
     error: Option<String>,
     open: Vec<UiConflict>,
 }
@@ -409,6 +432,7 @@ struct UiConflicts {
 struct UiConflict {
     seq: u64,
     time: i64,
+    when: String,
     device_name: String,
     copy_display: String,
     original_display: Option<String>,
@@ -431,7 +455,13 @@ async fn snapshot() -> UiState {
                     true,
                     st.paused_since.is_some(),
                     st.version.clone(),
-                    st.recent.clone(),
+                    st.recent
+                        .iter()
+                        .map(|a| UiActivity {
+                            activity: a.clone(),
+                            when: model::when(a.time),
+                        })
+                        .collect(),
                 ),
                 _ => (false, false, String::new(), Vec::new()),
             };
@@ -453,17 +483,20 @@ async fn snapshot() -> UiState {
                 conflicts: r.conflicts.as_ref().map(|(at, c)| match c {
                     Err(e) => UiConflicts {
                         at: *at,
+                        at_when: model::when(*at),
                         error: Some(e.clone()),
                         open: Vec::new(),
                     },
                     Ok(list) => UiConflicts {
                         at: *at,
+                        at_when: model::when(*at),
                         error: None,
                         open: list
                             .iter()
                             .map(|c| UiConflict {
                                 seq: c.seq,
                                 time: c.time,
+                                when: model::when(c.time),
                                 device_name: c.device_name.clone(),
                                 copy_display: c.copy_display.clone(),
                                 original_display: c.original_display.clone(),
@@ -491,6 +524,9 @@ async fn snapshot() -> UiState {
         registry_error: s.registry_error,
         tab: s.tab,
         notice: s.notice,
+        clock: settings::clock(),
+        settings_error: settings::error(),
+        settings_path: settings::path().map(|p| p.display().to_string()),
         roots,
     }
 }
@@ -545,4 +581,10 @@ async fn open_folder(root_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_server(root_id: String) -> Result<(), String> {
     blocking(move || open_server_of(&root_id)).await
+}
+
+/// The window's next snapshot shows the new clock; the menu's next redraw, within two seconds, too.
+#[tauri::command]
+async fn set_clock(clock: Clock) -> Result<(), String> {
+    blocking(move || settings::set_clock(clock)).await
 }

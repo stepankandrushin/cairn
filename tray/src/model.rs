@@ -3,6 +3,7 @@
 
 use crate::hub::{Link, RootView};
 use crate::link::LinkError;
+use crate::settings::{self, Clock};
 use cairn_protocol::local::{Change, DaemonStatus, Secs};
 use cairn_protocol::SkipKind;
 use serde::Serialize;
@@ -44,16 +45,29 @@ pub fn now_secs() -> Secs {
         .map_or(0, |d| d.as_secs() as Secs)
 }
 
-/// `16:52` today, `3 Nov 16:52` before.
+/// `16:52` today, `3 Nov 16:52` before; `4:52 PM` and `3 Nov 4:52 PM` on a 12-hour clock. The
+/// window shows these strings too, rather than the webview's own, which follow the locale.
 pub fn when(secs: Secs) -> String {
     use chrono::{Local, TimeZone};
     let Some(t) = Local.timestamp_opt(secs, 0).single() else {
         return format!("{secs}");
     };
-    if t.date_naive() == Local::now().date_naive() {
-        t.format("%H:%M").to_string()
+    when_at(
+        t.naive_local(),
+        Local::now().date_naive(),
+        settings::clock(),
+    )
+}
+
+fn when_at(t: chrono::NaiveDateTime, today: chrono::NaiveDate, clock: Clock) -> String {
+    let time = match clock {
+        Clock::H24 => "%H:%M",
+        Clock::H12 => "%-I:%M %p",
+    };
+    if t.date() == today {
+        t.format(time).to_string()
     } else {
-        t.format("%-d %b %H:%M").to_string()
+        t.format(&format!("%-d %b {time}")).to_string()
     }
 }
 
@@ -295,6 +309,19 @@ pub fn open_conflicts(view: &RootView) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_is_shown_on_the_clock_chosen() {
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
+        let at = |d, h, m| day(d).and_hms_opt(h, m, 0).unwrap();
+        assert_eq!(when_at(at(6, 16, 52), day(6), Clock::H24), "16:52");
+        assert_eq!(when_at(at(6, 9, 5), day(6), Clock::H24), "09:05");
+        assert_eq!(when_at(at(3, 16, 52), day(6), Clock::H24), "3 Nov 16:52");
+        assert_eq!(when_at(at(6, 16, 52), day(6), Clock::H12), "4:52 PM");
+        assert_eq!(when_at(at(6, 0, 7), day(6), Clock::H12), "12:07 AM");
+        assert_eq!(when_at(at(6, 12, 0), day(6), Clock::H12), "12:00 PM");
+        assert_eq!(when_at(at(3, 9, 5), day(6), Clock::H12), "3 Nov 9:05 AM");
+    }
 
     #[test]
     fn a_skip_finds_its_action_by_its_reason() {

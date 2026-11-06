@@ -16,6 +16,8 @@ mod link;
 mod model;
 #[path = "../src/registry.rs"]
 mod registry;
+#[path = "../src/settings.rs"]
+mod settings;
 
 use cairn_protocol::local::Request;
 use std::process::ExitCode;

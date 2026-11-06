@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
+  24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
+  window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the
+  window's new Settings tab (also the menu's Settings…, or `--open settings`). The choice is kept in `tray.json`
+  beside the registry of roots.
+
 ## 0.1.5
 
 **Fixed:**

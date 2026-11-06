@@ -96,10 +96,15 @@ fn lock(dir: &Path) -> Result<std::fs::File, String> {
     }
 }
 
-/// A new file, durable, renamed over the old, so a reader sees one or the other whole.
 fn write(file: &Path, reg: &Registry) -> std::io::Result<()> {
+    write_new(file, &serde_json::to_vec_pretty(reg)?)
+}
+
+/// A new file, durable, renamed over the old, so a reader sees one or the other whole.
+pub fn write_new(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = file.parent().expect("a file in a folder");
-    let tmp = dir.join(format!("roots.json.{}.new", std::process::id()));
+    let name = file.file_name().expect("a file's name").to_string_lossy();
+    let tmp = dir.join(format!("{name}.{}.new", std::process::id()));
     let result = (|| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -109,7 +114,7 @@ fn write(file: &Path, reg: &Registry) -> std::io::Result<()> {
             opts.mode(0o600);
         }
         let mut f = opts.open(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(reg)?)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, file)?;

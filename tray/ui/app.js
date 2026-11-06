@@ -29,14 +29,6 @@ function el(tag, attrs, ...children) {
   return e;
 }
 
-function when(secs) {
-  if (!secs) return 'never';
-  const d = new Date(secs * 1000);
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  if (d.toDateString() === new Date().toDateString()) return time;
-  return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + time;
-}
-
 function notice(text) {
   document.getElementById('notice-text').textContent = text;
   document.getElementById('notice').hidden = !text;
@@ -103,6 +95,10 @@ function counts() {
   return { problems, conflicts };
 }
 
+const TABS = {
+  status: 'Status', recent: 'Recent activity', problems: 'Problems', conflicts: 'Conflicts', settings: 'Settings',
+};
+
 function draw(force) {
   if (!state) return;
   const key = JSON.stringify([tab, { ...state, now: 0 }, [...confirming], [...busy]]);
@@ -115,11 +111,13 @@ function draw(force) {
   for (const b of document.querySelectorAll('#tabs button')) {
     b.classList.toggle('on', b.dataset.tab === tab);
     const n = b.dataset.tab === 'problems' ? problems : b.dataset.tab === 'conflicts' ? conflicts : 0;
-    const label = { status: 'Status', recent: 'Recent activity', problems: 'Problems', conflicts: 'Conflicts' }[b.dataset.tab];
+    const label = TABS[b.dataset.tab];
     b.textContent = n ? `${label} (${n})` : label;
   }
   const main = document.getElementById('content');
-  const body = { status: drawStatus, recent: drawRecent, problems: drawProblems, conflicts: drawConflicts }[tab]();
+  const body = {
+    status: drawStatus, recent: drawRecent, problems: drawProblems, conflicts: drawConflicts, settings: drawSettings,
+  }[tab]();
   main.replaceChildren(...body);
 }
 
@@ -189,7 +187,7 @@ function drawRecent() {
     !r.up ? el('div', { class: 'empty' }, 'Its daemon is not running, so its activity cannot be read.')
       : r.recent.length === 0 ? el('div', { class: 'empty' }, 'Nothing synced since the daemon started.')
         : el('table', {}, r.recent.map((a) => el('tr', {},
-          el('td', { class: 'time' }, when(a.time)),
+          el('td', { class: 'time' }, a.when),
           el('td', { class: 'dir', title: a.direction === 'up' ? 'sent from here' : 'from the server' },
             a.direction === 'up' ? '↑ sent' : '↓ came'),
           el('td', { class: 'change' }, CHANGE[a.change] || a.change),
@@ -255,14 +253,32 @@ function drawConflicts() {
       body = el('ul', { class: 'list' }, r.conflicts.open.map((c) => el('li', {},
         el('div', {}, c.copy_display),
         el('div', { class: 'todo' },
-          `the competing version of ${c.original_display || 'what is since deleted'}, from ${c.device_name} at ${when(c.time)}`
+          `the competing version of ${c.original_display || 'what is since deleted'}, from ${c.device_name} at ${c.when}`
           + (c.copy_here ? '' : ' · the copy is not on this device')),
         conflictButtons(r, c))));
     }
     return el('div', { class: 'card' }, title(r),
-      r.conflicts && !r.conflicts.error ? el('div', { class: 'meta' }, 'listed at ' + when(r.conflicts.at)) : null,
+      r.conflicts && !r.conflicts.error ? el('div', { class: 'meta' }, 'listed at ' + r.conflicts.at_when) : null,
       body);
   });
+}
+
+// Times come from the tray already written on the clock chosen here, as the menu shows them.
+function drawSettings() {
+  const choice = (value, label, example) => el('label', { class: 'choice' },
+    el('input', Object.assign({
+      type: 'radio', name: 'clock', value,
+      // Drawn again either way, so a choice the tray could not keep shows unchosen.
+      onclick: async () => { await call('set_clock', { clock: value }); await tick(); draw(true); },
+    }, state.clock === value ? { checked: '' } : {})),
+    label, el('span', { class: 'meta' }, example));
+  return [el('div', { class: 'card' },
+    el('h2', {}, 'Clock'),
+    el('div', { class: 'choices' },
+      choice('24h', '24-hour', '16:52'),
+      choice('12h', '12-hour', '4:52 PM')),
+    state.settings_error ? el('div', { class: 'todo' }, state.settings_error + '; the defaults are in use until a choice here writes it anew.') : null,
+    state.settings_path ? el('div', { class: 'meta' }, 'Kept in ' + state.settings_path) : null)];
 }
 
 setInterval(tick, 1000);

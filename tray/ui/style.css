@@ -52,3 +52,6 @@ td.p { word-break: break-all; }
 #notice[hidden] { display: none; }
 #notice-text { flex: 1; white-space: pre-wrap; }
 #notice-close { border: 0; background: none; color: var(--muted); font-size: 16px; cursor: pointer; line-height: 1; }
+.choices { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.choice { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.choice .meta { margin-left: 2px; }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- On macOS the daemon woke and scanned for every write under a folder the rules leave out, such as a build
+  folder: its watcher asked the rules about the written path itself, which a rule naming only the folder does not
+  match. It now asks about each folder above it too, as on Windows; Linux never watches an excluded folder.
+
 ## 0.1.4
 
 **Fixed:**

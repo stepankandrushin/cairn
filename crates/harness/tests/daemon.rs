@@ -1166,6 +1166,38 @@ fn a_busy_file_that_is_ignored_does_not_wake_the_daemon() {
     assert_eq!(da.syncs(), before, "{}", da.log());
 }
 
+/// Nor a build writing under a folder the rules leave out, though the rule names only the folder: on
+/// macOS the stream reports every path in the tree, and the file's own path matches no rule.
+#[test]
+fn a_busy_build_under_an_ignored_folder_does_not_wake_the_daemon() {
+    let (_sb, _s, a, _b) = pair("d-busy-dir");
+    std::fs::write(a.path(".cairn/ignore"), "build/\n").unwrap();
+    std::fs::create_dir_all(a.path("app/build/out")).unwrap();
+    let da = Daemon::events_only(&a);
+    da.wait_state("synced");
+    std::thread::sleep(Duration::from_secs(2));
+    let before = da.syncs();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (dir, stop) = (a.path("app/build/out"), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                i += 1;
+                std::fs::write(dir.join("main.o"), i.to_string()).unwrap();
+                let tmp = dir.join(format!("t{}", i % 4));
+                std::fs::write(&tmp, "x").unwrap();
+                std::fs::remove_file(&tmp).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_secs(4));
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    assert_eq!(da.syncs(), before, "{}", da.log());
+}
+
 /// A program writing one file for a long time, a download say, holds back nothing else, however long
 /// it takes, and its file arrives whole once it is closed.
 #[test]

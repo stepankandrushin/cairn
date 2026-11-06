@@ -160,8 +160,12 @@ impl Inner {
         if only_written && !is_dir && self.in_motion.contains(&display_path(&names)) {
             return false;
         }
-        // A busy log file that is ignored must not keep the daemon scanning.
-        names.is_empty() || !self.rules.excludes(&names, is_dir)
+        // A busy log file that is ignored must not keep the daemon scanning, nor a busy build folder:
+        // the stream reports the whole tree, and nothing under an excluded directory can be brought
+        // back, as in git, so each directory above the entry is asked too.
+        names.is_empty()
+            || !(1..=names.len())
+                .any(|n| self.rules.excludes(&names[..n], n < names.len() || is_dir))
     }
 }
 

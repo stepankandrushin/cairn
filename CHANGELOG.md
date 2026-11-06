@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Added:**
+
+- On macOS the daemon can run from its own app bundle, Cairn Sync.app, which `tray/macos/bundle.sh` makes around the
+  `cairn` binary, so that System Settings shows it as Cairn Sync with its icon, in Login Items and in the privacy
+  lists, where it was a bare `cairn` with the generic executable's tile; the Local Network prompt names it and says
+  why it asks. README.md has the launchd agent for it. The tray's agent now names Cairn.app
+  (`AssociatedBundleIdentifiers`), so Login Items shows Cairn rather than `cairn-tray`.
+- New icons for both, a cairn of three stones, the daemon's inside two sync arrows, drawn on macOS's icon grid and
+  compiled into an asset catalog when Xcode is installed, as macOS 26 and later draw a plain icon on a gray tile at
+  small sizes. `bundle.sh` signs with `CAIRN_SIGN`, an Apple-issued certificate, with which Login Items ties each
+  agent to its app and macOS keeps the Local Network answer from one build to the next.
+
 **Fixed:**
 
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to

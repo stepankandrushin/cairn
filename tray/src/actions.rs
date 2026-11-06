@@ -361,7 +361,8 @@ pub mod login {
         plist().is_some_and(|p| p.exists())
     }
 
-    /// Restarted after a crash, not after Quit, and only in a desktop session.
+    /// Restarted after a crash, not after Quit, and only in a desktop session. The label is also Cairn.app's
+    /// bundle id, which the plist names so that Login Items shows the app with its icon.
     #[cfg(target_os = "macos")]
     pub fn set(on: bool) -> Result<(), String> {
         let path = plist().ok_or("HOME is not set")?;
@@ -387,6 +388,7 @@ pub mod login {
 <dict>
     <key>Label</key><string>{LABEL}</string>
     <key>ProgramArguments</key><array><string>{exe}</string></array>
+    <key>AssociatedBundleIdentifiers</key><array><string>{LABEL}</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>LimitLoadToSessionType</key><string>Aqua</string>

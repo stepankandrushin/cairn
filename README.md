@@ -101,14 +101,47 @@ Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn.exe"   # t
 Its cost: what the client writes into the tree is scanned only when another program opens it. `Get-MpPreference`
 lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
 
+On macOS, run the daemon from its app bundle, Cairn Sync.app, so that System Settings shows it as Cairn Sync with
+its icon, in Login Items and in the privacy lists, rather than as a bare `cairn`. From tray/, `bash macos/bundle.sh
+../target/release/cairn "$HOME/Applications/Cairn Sync.app"` makes it around the binary (with Xcode installed,
+its icon is compiled for macOS 26 and later, which otherwise draw it on a gray tile at small sizes). Link
+`~/.local/bin/cairn` to `Contents/MacOS/cairn` inside it, and start the daemon with a launchd user agent that
+names the bundle, one per root, as `~/Library/LaunchAgents/com.cairn.home.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.cairn.home</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/Applications/Cairn Sync.app/Contents/MacOS/cairn</string>
+    <string>daemon</string><string>--root</string><string>/Users/you/Sync</string>
+  </array>
+  <key>AssociatedBundleIdentifiers</key><array><string>com.cairn.sync</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/you/Library/Logs/cairn-home.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/Library/Logs/cairn-home.log</string>
+</dict>
+</plist>
+```
+
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cairn.home.plist` starts it. The tray's Cairn.app is
+made the same way (`bash macos/bundle.sh target/release/cairn-tray "$HOME/Applications/Cairn.app"`), and
+`cairn-tray --login on` writes its agent. Sign both with a certificate Apple issued: `CAIRN_SIGN` for bundle.sh,
+one of `security find-identity -v -p codesigning`. Login Items ties an agent to its app only for such a
+signature, and macOS keeps the Local Network answer below for the same certificate and identifier from one
+build to the next, where an ad-hoc build is a new program at each upgrade and asks again. A signed bundle put
+where an ad-hoc one was can be left under the certificate's team name in Login Items: load the agent once from
+an ad-hoc copy, then from the signed bundle with its plist written anew, and it is filed under its app.
+
 On macOS 15 and later, a daemon that launchd starts as a user agent needs the Local Network permission to reach a
 server on the same local network (one started from Terminal or SSH does not, which is why `cairn sync` there
-works). macOS asks once, "Allow "cairn" to find devices on local networks?"; until someone answers, every
-connection fails with "No route to host", and nothing syncs, though nothing is lost. The answer is kept for that
-code signature: an ad-hoc signed build is a new program to macOS at each upgrade and asks again, while builds
-signed with the same Apple-issued certificate and identifier keep it (`codesign -f -s "<your certificate>" -i
-<identifier> ~/.local/bin/cairn`). A server reached through a router, not on the Mac's own network, needs no
-permission.
+works). macOS asks once, "Allow "Cairn Sync" to find devices on local networks?"; until someone answers, every
+connection fails with "No route to host", and nothing syncs, though nothing is lost. A server reached through a
+router, not on the Mac's own network, needs no permission.
 
 ## Leaving things out
 

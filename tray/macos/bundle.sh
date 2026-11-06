@@ -1,18 +1,67 @@
 #!/usr/bin/env bash
-# Makes Cairn.app around a built cairn-tray: `bash macos/bundle.sh target/release/cairn-tray out/Cairn.app`,
-# from tray/. LSUIElement keeps it out of the Dock. Signed ad hoc, so the bundle's seal matches what is in it.
-# Install it by moving the new bundle into place, never by copying over the binary of a running one:
+# Makes a macOS app bundle around a built binary, from tray/:
+#   bash macos/bundle.sh target/release/cairn-tray out/Cairn.app        # the tray, com.cairn.tray
+#   bash macos/bundle.sh ../target/release/cairn "out/Cairn Sync.app"   # the CLI and daemon, com.cairn.sync
+# The daemon runs from inside its bundle, so that System Settings shows "Cairn Sync" with its icon, in Login
+# Items and in the privacy lists, rather than a bare "cairn"; ~/.local/bin/cairn can be a link to it.
+# LSUIElement keeps either out of the Dock.
+#
+# The icons come from icons/ (make.py): an asset catalog compiled by Xcode's actool when there is one, which
+# macOS 26 and later draw properly at every size, and a plain .icns either way.
+#
+# Signed with CAIRN_SIGN, a codesigning identity from `security find-identity -v -p codesigning`, or ad hoc
+# when it is unset. Login Items ties a LaunchAgent to its app (AssociatedBundleIdentifiers) only for a real
+# signature, and macOS keeps the Local Network answer for the same certificate and identifier across builds,
+# where an ad-hoc build is a new program each time. Over SSH, unlock the login keychain in the same
+# connection first.
+#
+# Install a bundle by moving the new one into place, never by copying over the binary of a running one:
 # macOS kills what starts from a signed binary changed in place.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=$1
 app=$2
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+case $(basename "$binary") in
+    cairn-tray)
+        plist=macos/Info.plist icons=icons/Cairn.xcassets icns=icon exe=cairn-tray
+        version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+        ;;
+    cairn)
+        plist=macos/Sync-Info.plist icons=icons/Sync.xcassets icns=sync exe=cairn
+        version=$("$binary" --version | awk '{print $2}')
+        ;;
+    *)
+        echo "bundle.sh: $binary is neither cairn-tray nor cairn" >&2
+        exit 2
+        ;;
+esac
+[[ $version =~ ^[0-9A-Za-z.+-]+$ ]] || { echo "bundle.sh: no version from $binary" >&2; exit 1; }
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-sed "s/VERSION/$version/g" macos/Info.plist > "$app/Contents/Info.plist"
-cp icons/icon.icns "$app/Contents/Resources/icon.icns"
-cp "$binary" "$app/Contents/MacOS/cairn-tray"
-codesign --force --sign - --timestamp=none "$app"
+sed "s/VERSION/$version/g" "$plist" > "$app/Contents/Info.plist"
+cp "icons/$icns.icns" "$app/Contents/Resources/$icns.icns"
+xcode=()
+if [[ -z ${DEVELOPER_DIR-} ]] && ! xcrun --find actool >/dev/null 2>&1 &&
+    [[ -d /Applications/Xcode.app/Contents/Developer ]]; then
+    xcode=(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)
+fi
+# ${xcode[@]+...}: macOS's bash 3.2 calls an empty array unbound under set -u.
+if env ${xcode[@]+"${xcode[@]}"} xcrun --find actool >/dev/null 2>&1; then
+    partial=$(mktemp)
+    # actool reads stdin, which would swallow the rest of a script piped into a shell.
+    env ${xcode[@]+"${xcode[@]}"} xcrun actool "$icons" --compile "$app/Contents/Resources" --platform macosx \
+        --minimum-deployment-target 11.0 --app-icon AppIcon --output-partial-info-plist "$partial" \
+        </dev/null >/dev/null
+    rm -f "$partial"
+    [[ -e $app/Contents/Resources/Assets.car ]] || { echo "bundle.sh: actool made no Assets.car" >&2; exit 1; }
+    # actool writes AppIcon.icns from the same images, beside the catalog: name both, as GuiIO does.
+    rm "$app/Contents/Resources/$icns.icns"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile AppIcon' -c 'Add :CFBundleIconName string AppIcon' \
+        "$app/Contents/Info.plist"
+else
+    echo "bundle.sh: no actool (Xcode), so the icon is the plain $icns.icns, on a gray tile at small sizes"
+fi
+cp "$binary" "$app/Contents/MacOS/$exe"
+codesign --force --sign "${CAIRN_SIGN:--}" --timestamp=none "$app"
 codesign --verify --strict "$app"
-echo "$app: cairn-tray $version"
+echo "$app: $exe $version, signed by ${CAIRN_SIGN:-ad hoc}"

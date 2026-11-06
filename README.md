@@ -14,15 +14,17 @@ release and has run on no real tree yet. See
 Cairn focuses on preserving the whole filesystem and its history. This comparison covers desktop
 filesystem sync; metadata support depends on the operating system, filesystem and privileges.
 
-| Feature | Cairn | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
+✅ Supported · ⚠️ Partial or conditional support · ❌ Not supported
+
+| Feature | **Cairn** | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
 |---|---|---|---|---|
-| Names excluded by default | None: `.git`, `node_modules` and `.venv` sync whole | Built-in exclusions for temporary and system files | Built-in exclusions for temporary and system files | Internal control and temporary files; user-defined ignore rules |
-| Symlinks | Preserved as links | Skipped | Targets copied instead of preserving links | Preserved, except on Windows |
-| Filesystem metadata | Modes, owners, xattrs, ACLs, hard links and sparse layout preserved | No full Unix metadata round-trip | Executable bit on Unix; not full modes or ownership | Modes; owners and xattrs opt-in; hard links not preserved |
-| Small edits to large files | Only new content-defined chunks transferred | Whole file uploaded again | Only new content-defined blocks transferred | Only changed fixed-size blocks transferred |
-| Version storage | Versions share chunks | Whole-file versions | Versions share blocks | Optional whole-file archives of changes received from peers; off by default |
-| Conflicts | Three-way merge; both versions kept, with an inbox | Local conflict copy; not uploaded by default | Both versions kept; one renamed as a conflict file | Both versions kept; one renamed as a conflict file |
-| Missing disks / mass deletion | Mount checks; sync pauses and asks | Confirmation before mass deletion | Confirmation above a deletion-count threshold | Sync stops if the folder's `.stfolder` marker is missing |
+| No built-in filename exclusions | ✅ `.git`, `node_modules` and `.venv` sync whole | ❌ Built-in exclusions for temporary and system files | ❌ Built-in exclusions for temporary and system files | ⚠️ Internal control and temporary files excluded; user-defined ignore rules |
+| Preserve symlinks | ✅ Preserved as links | ❌ Skipped | ❌ Targets copied instead of preserving links | ⚠️ Preserved, except on Windows |
+| Preserve full filesystem metadata | ✅ Modes, owners, xattrs, ACLs, hard links and sparse layout | ❌ No full Unix metadata round-trip | ⚠️ Executable bit on Unix; not full modes or ownership | ⚠️ Modes; owners and xattrs opt-in; hard links not preserved |
+| Transfer only changed chunks | ✅ Content-defined chunks | ❌ Whole file uploaded again | ✅ Content-defined blocks | ✅ Fixed-size blocks |
+| Versions share chunks | ✅ Shared chunks | ❌ Whole-file versions | ✅ Shared blocks | ❌ Whole-file archives of changes received from peers; off by default |
+| Keep both sides of a conflict | ✅ Three-way merge; both versions kept, with an inbox | ⚠️ Local conflict copy; not uploaded by default | ✅ Both versions kept; one renamed as a conflict file | ✅ Both versions kept; one renamed as a conflict file |
+| Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
 [^nextcloud]: Nextcloud: [exclusions](https://github.com/nextcloud/desktop/blob/master/sync-exclude.lst),
     [symlinks](https://docs.nextcloud.com/server/latest/user_manual/en/desktop/usage.html),

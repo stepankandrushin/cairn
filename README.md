@@ -19,6 +19,7 @@ filesystem and privileges.
 
 | Feature | **Cairn**[^cairn] | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
 |---|---|---|---|---|
+| Installed application size (macOS)[^macos-size] | **17.1 MB** — tray + sync daemon, Apple Silicon | **414.4 MB** — desktop client, universal Intel + Apple Silicon | Not measured | Not measured |
 | Application download size (Linux x86-64)[^downloads] | **6.3 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
 | RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
 | Implementation languages | **Rust** — CLI, daemon and server | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
@@ -31,6 +32,12 @@ filesystem and privileges.
 | Keep both sides of a conflict | ✅ Three-way merge; both versions kept, with an inbox | ⚠️ Local conflict copy; not uploaded by default | ✅ Both versions kept; one renamed as a conflict file | ✅ Both versions kept; one renamed as a conflict file |
 | Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
+[^macos-size]: Installed bundles measured on an Apple Silicon Mac on 2026-11-07:
+    Cairn 0.1.5 — `Cairn.app` 9.1 MB + `Cairn Sync.app` 8.0 MB; Nextcloud 34.0.5 — `Nextcloud.app` 414.4 MB.
+    Sizes sum regular-file bytes inside each bundle, excluding symlinks, with 1 MB = 1,000,000 bytes.
+    These are installed application files, not download sizes or allocated disk space; user data and
+    server components are excluded. Nextcloud's executable is universal (Intel + Apple Silicon), while
+    these Cairn builds are Apple Silicon only. Seafile and Syncthing were not installed for measurement.
 [^downloads]: Download sizes checked on 2026-11-07: [Cairn 0.1.5](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.5),
     [Nextcloud Desktop 35.0.3](https://download.nextcloud.com/desktop/releases/Linux/),
     [Seafile Client 9.0.22](https://github.com/haiwen/seafile-client/releases/tag/v9.0.22),

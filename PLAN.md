@@ -150,7 +150,11 @@ nothing, whatever the sync is doing, and its save is read by the next scan. A le
 until the sync gave it up, which a sync blocked in an fsync or stopped cannot.
 
 **Three-way merge per object** (base, local, remote). It is state-based: each round works from what is on
-disk and what the journal says, so a crash only means the next run finds some of the work done. What was
+disk and what the journal says, so a crash only means the next run finds some of the work done. A round that
+wrote here is confirmed by a fresh scan in one more, which reads no new commits: so a sync agrees as of the
+sequence it applied, a device whose rounds take longer than another device takes to commit still comes to agree,
+and what came after is the next sync's. What a person changes here once that round's scan has begun is no part
+of the agreement, and the next scan finds it. What was
 on its way is noted before the first step, in one transaction however much it is, and claims nothing: the
 next scan compares it with the disk, field by field and name by name, and what got there counts as shared
 with the server. New content arrived whole, and what its fields should read is asked of the filesystem, on a

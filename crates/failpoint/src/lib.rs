@@ -7,7 +7,10 @@
 //! - `CAIRN_FP_CRASH=<n>`: SIGKILL this process on the n-th hit (1-based), or `<name>` on that name;
 //!   on Windows `TerminateProcess`, exiting with `KILLED_EXIT_CODE`.
 //! - `CAIRN_FP_ENOSPC=<n>`: `check` returns ENOSPC from the n-th hit on, or `<name>` on that name.
-//! - `CAIRN_FP_PAUSE=<name>:<dir>`: on the hit, create `<dir>/reached` and wait for `<dir>/go`.
+//! - `CAIRN_FP_PAUSE=<name>:<dir>`: on the hit, create `<dir>/reached` and wait for `<dir>/go`; with
+//!   `<name>#<n>:<dir>`, on the n-th hit of that name alone.
+//! - `CAIRN_FP_DELAY=<name>:<ms>[,...]`: sleep that long on every hit of that name, as a slow disk or
+//!   a busy machine makes a step take. Not a step either.
 //! - `CAIRN_FP_REFUSE_NAME=<name>`: `refuse_name` refuses that name as a filesystem refuses bytes it
 //!   cannot hold (EILSEQ), as APFS does a name that is not UTF-8.
 //! - `CAIRN_FP_EPERM=<name>`: `deny` refuses that point with EPERM, as a filesystem refuses a change
@@ -144,6 +147,22 @@ mod imp {
 
     static HITS: AtomicU64 = AtomicU64::new(0);
     static NET_FAILED: AtomicU64 = AtomicU64::new(0);
+    /// Hits of each name, for a pause on the n-th of one.
+    static BY_NAME: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    fn nth_of(name: &str) -> u64 {
+        let mut all = BY_NAME.lock().unwrap_or_else(|e| e.into_inner());
+        match all.iter_mut().find(|(n, _)| n == name) {
+            Some((_, k)) => {
+                *k += 1;
+                *k
+            }
+            None => {
+                all.push((name.to_string(), 1));
+                1
+            }
+        }
+    }
 
     fn matches(spec: &str, name: &str, seq: u64) -> bool {
         match spec.parse::<u64>() {
@@ -169,9 +188,23 @@ mod imp {
                 let _ = sigkill_self();
             }
         }
+        if let Ok(spec) = std::env::var("CAIRN_FP_DELAY") {
+            for (point, ms) in spec.split(',').filter_map(|p| p.split_once(':')) {
+                if point == name {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
+            }
+        }
+        let nth = nth_of(name);
         if let Ok(spec) = std::env::var("CAIRN_FP_PAUSE") {
             if let Some((point, dir)) = spec.split_once(':') {
-                if point == name {
+                let (point, wanted) = match point.split_once('#') {
+                    Some((p, n)) => (p, n.parse::<u64>().ok()),
+                    None => (point, None),
+                };
+                if point == name && wanted.is_none_or(|n| n == nth) {
                     let dir = Path::new(dir);
                     let _ = std::fs::write(dir.join("reached"), b"");
                     while !dir.join("go").exists() {

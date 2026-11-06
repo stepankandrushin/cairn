@@ -170,6 +170,9 @@ pub fn display_path(path: &[Name]) -> String {
     parts.join("/")
 }
 
+/// A directory as it looked when listed: its path, device and inode, mtime and ctime.
+type Listed = (Vec<Name>, (u64, u64), Timestamp, Timestamp);
+
 struct Walk<'a> {
     opts: &'a ScanOptions<'a>,
     precision_ns: u32,
@@ -185,7 +188,7 @@ struct Walk<'a> {
     stale_temps: Vec<(Vec<Name>, Vec<u8>)>,
     rescued_temps: Vec<(Vec<Name>, Vec<u8>, Fingerprint)>,
     /// Each directory with what it looked like when listed.
-    dirs: Vec<(Vec<Name>, Timestamp, Timestamp)>,
+    dirs: Vec<Listed>,
     excluded: Vec<Vec<Name>>,
     /// Entries seen so far that are neither excluded nor directories holding only what is.
     solid: u64,
@@ -305,7 +308,8 @@ impl Walk<'_> {
         } else {
             st
         };
-        self.dirs.push((path.clone(), st.mtime, st.ctime));
+        self.dirs
+            .push((path.clone(), (st.dev, st.ino), st.mtime, st.ctime));
         for name in entries {
             if self.stopped {
                 break;
@@ -648,12 +652,14 @@ impl Walk<'_> {
         }
     }
 
-    /// Whether a directory still looks as it did when listed.
+    /// Whether every directory listed still looks as it did then, at the same path: the same inode,
+    /// and times that an entry made, removed or renamed in it would have moved. So an entry moved
+    /// from a folder the walk had yet to list into one it had listed, which neither listing holds, is
+    /// a scan to take again, not a delete. Through no symlink, so a folder swapped for one counts.
     fn dirs_unchanged(&self, root: &Dir) -> bool {
-        self.dirs.iter().all(|(path, mtime, ctime)| {
-            root.open_path(path.iter())
-                .and_then(|d| d.stat_self())
-                .is_ok_and(|s| s.mtime == *mtime && s.ctime == *ctime)
+        self.dirs.iter().all(|(path, inode, mtime, ctime)| {
+            root.stat_dir_at(path)
+                .is_ok_and(|s| (s.dev, s.ino) == *inode && s.mtime == *mtime && s.ctime == *ctime)
         })
     }
 }

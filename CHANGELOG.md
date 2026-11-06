@@ -46,6 +46,17 @@
 - An edit that landed on a file in the moment a sync set its metadata, between the check and the record, was
   taken, mtime and all, for what the sync had set: the content went up, but its mtime read as the pair of the
   server's and never did, and the devices kept different times. It is now the next round's to take up.
+- A device whose sync rounds take longer than another device takes to commit never came to agree: a round that
+  applied anything had to be confirmed by another, which found a newer commit to apply, until after 12 rounds the
+  sync gave up, "the tree kept changing", exit 3, having agreed on nothing, so the next sync looked at the whole
+  tree again. A Windows device on an HDD joining 468k entries beside one committing every 30 s or so ended so
+  twice, and a Mac's daemon went round for an hour. The round that confirms an apply now reads no new commits,
+  so the sync agrees as of the sequence it applied and leaves what came after to the next: such a join beside a
+  device committing every 0.6 s now agrees in 3 rounds where it ran 12 and failed.
+- The check at the end of every walk, which catches an entry moved from a folder not yet listed into one already
+  listed, reopened each folder from the root, a level at a time. On Linux it now opens each in one `openat2` that
+  refuses any symlink on the way, and compares the inode as well as the times: on a tree of 27,550 folders a walk's
+  opens, dups and closes fall from 325,476 to 165,374.
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
   24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
   window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the

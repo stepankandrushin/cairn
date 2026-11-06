@@ -37,6 +37,17 @@ const MAX_ROUNDS: u32 = 12;
 const ROUNDS_BEFORE_PUSHING: u32 = 3;
 /// Walks of the tree in one round, while it changes under the walk.
 const SCAN_ATTEMPTS: u32 = 3;
+
+/// What a round takes of the server's journal before it scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Journal {
+    /// Everything up to the head: the first round, and one after a commit, which must see it.
+    Head,
+    /// Nothing more: the round confirms what the one before it applied, against the same sequence, so
+    /// that a sync beside a device that commits more often than a round takes still comes to agree, as
+    /// of that sequence. What came after it is the next sync's.
+    Pinned,
+}
 /// At least this many vanished entries, making up half the tree, pause sync.
 const MASS_DELETE_MIN: usize = 10;
 
@@ -414,7 +425,7 @@ fn scan_stable(
         }
         result = scan(&root.dir, &opts).context("scanning the root")?;
     }
-    for _ in 1..SCAN_ATTEMPTS {
+    for _ in 1..cairn_failpoint::tuned("sync.scan_attempts", SCAN_ATTEMPTS.into()) {
         if !result.unstable {
             break;
         }
@@ -1542,6 +1553,7 @@ fn sync_full(
         last: cursor_op,
         ..Seen::default()
     };
+    let mut journal = Journal::Head;
     let finish = loop {
         report.rounds += 1;
         round_work = std::time::Duration::ZERO;
@@ -1552,13 +1564,20 @@ fn sync_full(
             break SyncOutcome::Partial;
         }
         hit("sync.round");
-        match (&mut session, &mut whole) {
-            (Some(s), _) => fetch_ops(&client, &mut seq, &mut seen, &mut |op, commit| {
-                s.journal.add_of(op, commit);
-                Ok(())
-            })?,
-            (None, Some(w)) => fetch_ops(&client, &mut seq, &mut seen, &mut |op, _| w.apply(op))?,
-            (None, None) => bail!("a sync with neither the ledger nor the whole tree"),
+        match (journal, &mut session, &mut whole) {
+            (Journal::Pinned, _, _) => hit("sync.round.pinned"),
+            (Journal::Head, Some(s), _) => {
+                fetch_ops(&client, &mut seq, &mut seen, &mut |op, commit| {
+                    s.journal.add_of(op, commit);
+                    Ok(())
+                })?
+            }
+            (Journal::Head, None, Some(w)) => {
+                fetch_ops(&client, &mut seq, &mut seen, &mut |op, _| w.apply(op))?
+            }
+            (Journal::Head, None, None) => {
+                bail!("a sync with neither the ledger nor the whole tree")
+            }
         }
         report.head = seq;
         if let Some(s) = &session {
@@ -1966,6 +1985,7 @@ fn sync_full(
             report.skips.extend(outcome.failed);
             report.skips.extend(outcome.changed);
             retryable = true;
+            journal = Journal::Pinned;
             continue;
         }
         let failed = !outcome.failed.is_empty() || !outcome.changed.is_empty();
@@ -2011,7 +2031,9 @@ fn sync_full(
                 break SyncOutcome::Partial;
             }
             if outcome.touched {
-                // The filesystem was written: confirm it with a fresh scan before calling this agreed.
+                // The filesystem was written: confirm it with a fresh scan before calling this agreed,
+                // against the same sequence, as a busy device elsewhere may commit within every round.
+                journal = Journal::Pinned;
                 continue;
             }
             // Out of view here: what the ledger keeps with no scan of it.
@@ -2076,6 +2098,8 @@ fn sync_full(
         // filesystem does meanwhile is for that round too, which compares the disk with this scan.
         // The notes go last, so each commit's are the first of those still to go.
         let mut landed: Tree = view.remote.clone().into_owned();
+        // Nothing went up: the next round looks again against the same sequence.
+        journal = Journal::Pinned;
         for ops in commits(ops) {
             match upload(&client, &root, &cur, &ops)? {
                 Upload::FileChanged => {
@@ -2128,6 +2152,8 @@ fn sync_full(
             hit("sync.dequeued");
             match resp {
                 CommitResponse::Committed { .. } => {
+                    // The next round reads the journal again, to see this commit there.
+                    journal = Journal::Head;
                     notes.drain(..delivered.len());
                     report.commits += 1;
                     report.ops_pushed += req.ops.len() as u64;
@@ -2142,6 +2168,8 @@ fn sync_full(
                     if seen_events.insert(line.clone()) {
                         report.events.push(line);
                     }
+                    // Someone got there first: what they committed is the next round's to see.
+                    journal = Journal::Head;
                     break;
                 }
             }

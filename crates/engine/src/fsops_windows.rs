@@ -1117,6 +1117,14 @@ impl Dir {
         Ok(at)
     }
 
+    /// The directory at this path below, as `open_path(path)?.stat_self()` finds it.
+    pub fn stat_dir_at(&self, path: &[Name]) -> io::Result<Stat> {
+        if path.is_empty() {
+            return self.stat_self();
+        }
+        self.open_path(path.iter())?.stat_self()
+    }
+
     /// Create a directory if it is not there, without following links. For state directories.
     pub fn ensure_dir(&self, name: &[u8], mode: u32) -> io::Result<Dir> {
         match self.mkdir(name, mode) {

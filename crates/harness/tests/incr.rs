@@ -1492,6 +1492,78 @@ fn an_inode_the_scan_finds_twice_sends_the_round_to_a_rebuilt_ledger() {
     same_trees(&a, &b, "after the move during the walk");
 }
 
+/// An entry moved while the walk goes, from a folder it has yet to list into one it has listed, is in
+/// neither listing. The check at the end of the walk, which stats each folder listed by its path in one
+/// call, finds the folder it went into changed, and with no second walk allowed the round goes on with
+/// a scan it knows moved: nothing is deleted for it, and a later round finds the move. On the whole
+/// tree and on what changed alone.
+#[test]
+fn an_entry_moved_back_past_the_walk_is_no_delete() {
+    for incremental in [true, false] {
+        let (sb, server, a, b) = pair(&format!("incr-moved-back-{incremental}"));
+        std::fs::create_dir_all(a.path("p")).unwrap();
+        a.write("q/m", "moves back while the walk goes");
+        a.write("q/stays", "stays");
+        for d in [&a, &b, &a, &b] {
+            d.synced();
+        }
+        // Something new on the server, so that a's sync looks for nothing to do no further than the head
+        // and its walk is the round's own.
+        b.write("other", "from b");
+        b.synced();
+        let gate = sb.path("gate-moved-back");
+        std::fs::create_dir(&gate).unwrap();
+        // The root is the first folder the walk lists, p the second, q the third.
+        let pause = format!("scan.dir#3:{}", gate.display());
+        let device = a.clone();
+        let worker = std::thread::spawn(move || {
+            let mut env = vec![
+                ("CAIRN_FP_PAUSE", pause.as_str()),
+                ("CAIRN_FP_TUNE", "sync.scan_attempts=1"),
+            ];
+            if !incremental {
+                env.push(("CAIRN_FP_INCR", "0"));
+            }
+            device.sync_env(&env)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !gate.join("reached").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the walk never got to q"
+            );
+            assert!(
+                !worker.is_finished(),
+                "the sync ended before the walk got to q"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::rename(a.path("q/m"), a.path("p/m")).unwrap();
+        std::fs::write(gate.join("go"), b"").unwrap();
+        let run = worker.join().unwrap();
+        assert!(run.ok(), "{}", run.text());
+        assert_eq!(a.read("other"), b"from b");
+        // What went up was a move, and no delete.
+        let conn = rusqlite::Connection::open(server.data.join("meta.sqlite")).unwrap();
+        let mut ops = conn.prepare("SELECT ops FROM journal").unwrap();
+        let all: Vec<String> = ops
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !all.iter().any(|o| o.contains(r#""op":"unlink""#)),
+            "a delete went up for what moved under the walk: {}\n{all:?}",
+            run.text()
+        );
+        assert!(all.iter().any(|o| o.contains(r#""op":"move""#)), "{all:?}");
+        b.synced();
+        assert_eq!(b.read("p/m"), b"moves back while the walk goes");
+        assert!(!b.exists("q/m"));
+        same_trees(&a, &b, "after the move back past the walk");
+    }
+}
+
 /// A kill at any step of a sync that takes what changed alone, then syncs until both devices agree:
 /// both trees as with no kill, and every later sync the oracle checks.
 #[test]

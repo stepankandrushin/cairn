@@ -603,6 +603,54 @@ impl Dir {
         Ok(at)
     }
 
+    /// The directory at this path below, as `open_path(path)?.stat_self()` finds it, through no
+    /// symlink on the way: on Linux in one `openat2`, refusing any symlink and anything above this
+    /// directory, where the walk from here costs an open and a close a level.
+    pub fn stat_dir_at(&self, path: &[Name]) -> io::Result<Stat> {
+        if path.is_empty() {
+            return self.stat_self();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            /// The kernel, or a filter in front of it, does not take `openat2`: the walk from here.
+            static REFUSED: AtomicBool = AtomicBool::new(false);
+            if !REFUSED.load(Ordering::Relaxed) {
+                let mut joined =
+                    Vec::with_capacity(path.iter().map(|n| n.as_bytes().len() + 1).sum());
+                for (i, name) in path.iter().enumerate() {
+                    if i > 0 {
+                        joined.push(b'/');
+                    }
+                    joined.extend_from_slice(name.as_bytes());
+                }
+                match fs::openat2(
+                    &self.0,
+                    OsStr::from_bytes(&joined),
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    fs::ResolveFlags::BENEATH
+                        | fs::ResolveFlags::NO_SYMLINKS
+                        | fs::ResolveFlags::NO_MAGICLINKS,
+                ) {
+                    Ok(fd) => {
+                        return Ok(from_statx(fs::statx(
+                            &fd,
+                            "",
+                            AtFlags::EMPTY_PATH,
+                            STATX_WANT,
+                        )?))
+                    }
+                    Err(Errno::NOSYS | Errno::PERM | Errno::INVAL | Errno::TOOBIG) => {
+                        REFUSED.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        self.open_path(path.iter())?.stat_self()
+    }
+
     /// Create a chain of directories as needed, without following symlinks. For state directories.
     pub fn ensure_dir(&self, name: &[u8], mode: u32) -> io::Result<Dir> {
         match fs::mkdirat(&self.0, os(name), Mode::from_raw_mode(mode as _)) {

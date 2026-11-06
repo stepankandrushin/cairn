@@ -996,9 +996,10 @@ fn a_journal_bigger_than_one_answer_comes_in_several() {
     std::fs::write(&log, "").unwrap();
     let b = Device::new(&sb, &server, "b");
     b.synced();
-    // Six commits, one an answer: the six, and the one that says there is no more.
+    // Six commits, one an answer each: the last of them is at the head, so nothing more is asked, and
+    // the round that confirms what arrived reads no new commits.
     assert!(
-        count(&steps(&log), "server.changes.answered") >= 7,
+        count(&steps(&log), "server.changes.answered") >= 6,
         "{:?}",
         steps(&log)
     );

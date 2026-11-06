@@ -84,6 +84,30 @@ pub struct ScanResult {
     pub started: Instant,
 }
 
+impl ScanResult {
+    /// The same scan, with only these of its nodes: what a round that takes part of the tree is given.
+    pub fn with_nodes(&self, nodes: Vec<Scanned>) -> ScanResult {
+        ScanResult {
+            root: self.root.clone(),
+            nodes,
+            skips: self.skips.clone(),
+            unobserved: self.unobserved.clone(),
+            unobserved_inodes: self.unobserved_inodes.clone(),
+            unidentified: self.unidentified,
+            unlisted: self.unlisted.clone(),
+            unstable: self.unstable,
+            new_manifests: Vec::new(),
+            stale_temps: self.stale_temps.clone(),
+            rescued_temps: self.rescued_temps.clone(),
+            rescued: self.rescued.clone(),
+            excluded: self.excluded.clone(),
+            excluded_ids: self.excluded_ids.clone(),
+            stopped: self.stopped,
+            started: self.started,
+        }
+    }
+}
+
 pub struct ScanOptions<'a> {
     pub temp_prefix: &'a [u8],
     pub accounts: &'a Accounts,

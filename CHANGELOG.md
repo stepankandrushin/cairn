@@ -15,6 +15,14 @@
   has the disk empty its cache. It is now flushed once, after both, still before the rename that puts it in place.
   A first download places a small file on an HDD under Windows in about 20 ms where it took 29, and on a busy
   Linux disk array in about 18 ms where it took 31: most of what is left is that one flush.
+- A sync that carried a change still went the whole way, twice, at a cost that grew with the tree and not with
+  the change: on 840,000 entries about a minute and up to 8.6 GB a round. A round now decides only about what
+  changed, here or on the server, and what is next to it: the other names in its folders, the folders above it,
+  what is in a folder that changes, every name of a hard-linked file. Everything else is as the last agreement
+  left it, which the state now keeps a compact record of, with triggers that mark whatever any version writes
+  since. Its cost is the scan and what changed. Where the record cannot vouch for that, after an upgrade, a
+  change of rules or configuration, a run that did not finish, or a change to a quarter of the tree, the sync
+  goes the whole way and says why.
 
 ## 0.1.3
 

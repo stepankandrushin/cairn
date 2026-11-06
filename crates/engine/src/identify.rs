@@ -81,6 +81,7 @@ fn rows_by_inode(rows: &BTreeMap<ObjectId, Row>) -> HashMap<(u64, u64), Vec<Obje
     by_inode
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn identify(
     scan: &ScanResult,
     base: &Tree,
@@ -89,6 +90,7 @@ pub fn identify(
     intents: &[CopyIntent],
     arriving: &BTreeMap<ObjectId, Arriving>,
     landed: &BTreeSet<OpId>,
+    fresh: &dyn Fn(&Scanned) -> ObjectId,
 ) -> Identified {
     let by_inode = rows_by_inode(rows);
     let copies: HashMap<(u64, u64), &CopyIntent> =
@@ -185,7 +187,7 @@ pub fn identify(
                 claimed.insert(candidate).then_some(candidate)
             });
         }
-        let id = *ids[i].get_or_insert_with(ObjectId::random);
+        let id = *ids[i].get_or_insert_with(|| fresh(node));
         if node.content == Content::Dir {
             for path in &node.paths {
                 dir_ids.insert(path.clone(), id);
@@ -746,6 +748,7 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &|_| ObjectId::random(),
         )
         .local
         .keys()
@@ -814,6 +817,7 @@ mod tests {
             &[intent],
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &|_| ObjectId::random(),
         )
         .local
         .contains_key(&copy)

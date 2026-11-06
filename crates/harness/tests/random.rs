@@ -434,6 +434,53 @@ fn run_seed(seed: u64, with_rules: bool) {
     );
     let report = server.fsck();
     assert!(report.contains("clean"), "{}", context(report));
+
+    // And once more a change on each, which every device's next sync takes up by what changed alone,
+    // the full round beside each of its rounds agreeing. d0 may take the whole tree where its rules
+    // keep something out by inode, which only the whole tree can tell.
+    for d in &devices {
+        mutate(&mut rng, d, &mut live, &mut named_away, &mut log);
+    }
+    for (i, d) in devices.iter().enumerate() {
+        let (rounds, confirmed) = takes_part(d);
+        assert!(
+            rounds > 0 || (with_rules && i == 0),
+            "{}",
+            context(format!("{} took no round by what changed alone", d.name))
+        );
+        assert_eq!(rounds, confirmed, "{}", context(d.name.clone()));
+    }
+    let p = converge(&refs);
+    let found = token::all_in(&p);
+    let lost: Vec<_> = live
+        .difference(&found)
+        .filter(|v| !named_away.contains(v))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{}",
+        context(format!(
+            "versions lost after syncs by what changed: {lost:?}\n{}",
+            log.join("\n")
+        ))
+    );
+}
+
+/// One sync, and how many of its rounds took what changed alone, and how many of those the full round
+/// beside them confirmed.
+fn takes_part(d: &Device) -> (usize, usize) {
+    let log = d
+        .root
+        .with_extension(format!("steps-{:016x}", rand::random::<u64>()));
+    let run = d.cairn_env(
+        &["sync", "--allow-mass-delete"],
+        &[("CAIRN_FP_LOG", log.to_str().unwrap())],
+    );
+    let steps = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_file(&log);
+    assert!(run.ok() || run.code == Some(3), "{}", run.text());
+    let count = |name: &str| steps.lines().filter(|l| *l == name).count();
+    (count("sync.incr.round"), count("sync.incr.confirmed"))
 }
 
 /// Syncs until one is found to have nothing to do, and the full sync after it agrees.

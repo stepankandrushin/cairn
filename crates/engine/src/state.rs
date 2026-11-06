@@ -57,6 +57,99 @@ const GENERATION_TRIGGERS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// What the last agreement was, per object, for a sync that carries a change (incr.rs), and every
+/// object whose base node or row has been written since, by triggers in the file itself, whatever
+/// build writes it. Not a migration, like the generation: an older build opens the file as before, and
+/// its writes mark what they touch too.
+const LEDGER_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS ledger (object BLOB PRIMARY KEY, entry BLOB NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS dirty (object BLOB PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ledger_anchor (k INTEGER PRIMARY KEY, v TEXT NOT NULL);
+";
+
+/// Table, operation, condition, and the objects it marks.
+const DIRTY_TRIGGERS: &[(&str, &str, &str, &[&str])] = &[
+    ("base", "INSERT", "", &["NEW"]),
+    (
+        "base",
+        "UPDATE",
+        "WHEN OLD.node IS NOT NEW.node OR OLD.object IS NOT NEW.object",
+        &["OLD", "NEW"],
+    ),
+    ("base", "DELETE", "", &["OLD"]),
+    ("rows", "INSERT", "", &["NEW"]),
+    (
+        "rows",
+        "UPDATE",
+        "WHEN OLD.row IS NOT NEW.row OR OLD.object IS NOT NEW.object",
+        &["OLD", "NEW"],
+    ),
+    ("rows", "DELETE", "", &["OLD"]),
+];
+
+fn dirty_triggers() -> Vec<(String, String)> {
+    DIRTY_TRIGGERS
+        .iter()
+        .map(|(table, op, when, marks)| {
+            let name = format!("dirty_{table}_{}", op.to_lowercase());
+            let body: String = marks
+                .iter()
+                // Not `OR IGNORE`: an outer statement's conflict clause overrides a trigger's.
+                .map(|m| {
+                    format!(
+                        "INSERT INTO dirty (object) SELECT {m}.object WHERE NOT EXISTS \
+                         (SELECT 1 FROM dirty WHERE object = {m}.object); "
+                    )
+                })
+                .collect();
+            let sql = format!("CREATE TRIGGER {name} AFTER {op} ON {table} {when} BEGIN {body}END");
+            (name, sql)
+        })
+        .collect()
+}
+
+fn ensure_ledger(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(LEDGER_TABLES)?;
+    let want = dirty_triggers();
+    let have: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'dirty_*' ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut sorted = want.clone();
+    sorted.sort();
+    if have == sorted {
+        return Ok(());
+    }
+    // Missing, partial or different: what was written meanwhile may have gone unmarked, so the ledger
+    // speaks for nothing until a full sync writes it again.
+    let tx = conn.transaction()?;
+    for (name, _) in &have {
+        tx.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
+    }
+    for (_, sql) in &want {
+        tx.execute_batch(&format!("{sql};"))?;
+    }
+    tx.execute_batch("DELETE FROM ledger_anchor; DELETE FROM ledger; DELETE FROM dirty;")?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// What a finalize leaves in the ledger, in its transaction.
+#[derive(Default)]
+pub struct LedgerWrite {
+    /// The whole ledger anew: everything not put or marked here goes.
+    pub whole: bool,
+    pub put: Vec<(ObjectId, Vec<u8>)>,
+    pub drop: Vec<ObjectId>,
+    /// No longer written since its entry.
+    pub clean: Vec<ObjectId>,
+    pub dirty: Vec<ObjectId>,
+    pub anchor: Option<String>,
+}
+
 const KEY_GENERATION: &str = "generation";
 /// The last sync that had nothing to do and changed nothing, for the next to compare itself with.
 const KEY_STEADY: &str = "steady";
@@ -268,6 +361,7 @@ impl State {
             tx.commit()?;
         }
         ensure_generation(&mut conn)?;
+        ensure_ledger(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -428,6 +522,122 @@ impl State {
         Ok(self.get(KEY_CURSOR)?.map_or(Ok(0), |s| s.parse())?)
     }
 
+    /// What the ledger says it stands on, if a full sync has written it since it last could not.
+    pub fn ledger_anchor(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT v FROM ledger_anchor WHERE k = 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The ledger, as stored: incr.rs reads the entries.
+    pub fn ledger_entries(&self) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare("SELECT object, entry FROM ledger")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, entry) = row?;
+            out.push((object_id(id)?, entry));
+        }
+        Ok(out)
+    }
+
+    /// How many entries the ledger has.
+    pub fn ledger_len(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM ledger", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// The ledger, entry by entry, in the order of the objects, to `each`.
+    pub fn each_ledger_entry(&self, each: &mut dyn FnMut(ObjectId, &[u8])) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT object, entry FROM ledger ORDER BY object")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = object_id(row.get::<_, Vec<u8>>(0)?)?;
+            let entry = row.get_ref(1)?.as_blob()?;
+            each(id, entry);
+        }
+        Ok(())
+    }
+
+    /// Every object written since the ledger last spoke for it.
+    pub fn dirty(&self) -> Result<BTreeSet<ObjectId>> {
+        let mut stmt = self.conn.prepare("SELECT object FROM dirty")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(object_id(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// The base nodes of these objects, those it has.
+    pub fn nodes_of(&self, objects: &[ObjectId]) -> Result<BTreeMap<ObjectId, Node>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT node FROM base WHERE object = ?1")?;
+        let mut out = BTreeMap::new();
+        for id in objects {
+            if let Some(text) = stmt
+                .query_row([id.0], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                out.insert(*id, serde_json::from_str::<Node>(&text)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rows of these objects, those that have one.
+    pub fn rows_of(&self, objects: &[ObjectId]) -> Result<BTreeMap<ObjectId, Row>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT row FROM rows WHERE object = ?1")?;
+        let mut out = BTreeMap::new();
+        for id in objects {
+            if let Some(text) = stmt
+                .query_row([id.0], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                out.insert(*id, serde_json::from_str::<Row>(&text)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drops these manifests, which nothing holds any more.
+    pub fn drop_manifests(&mut self, hashes: &[Hash]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut del = tx.prepare_cached("DELETE FROM manifests WHERE hash = ?1")?;
+            for h in hashes {
+                del.execute([h.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The hashes of every manifest held.
+    pub fn manifest_hashes(&self) -> Result<BTreeSet<Hash>> {
+        let mut stmt = self.conn.prepare("SELECT hash FROM manifests")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            let h: [u8; 32] = row?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("a stored hash is not 32 bytes"))?;
+            out.insert(Hash(h));
+        }
+        Ok(out)
+    }
+
     pub fn load_base(&self) -> Result<Tree> {
         let mut nodes = BTreeMap::new();
         let mut stmt = self.conn.prepare("SELECT object, node FROM base")?;
@@ -455,6 +665,21 @@ impl State {
         rows: &[(ObjectId, &Row)],
         gone: &[ObjectId],
     ) -> Result<()> {
+        self.store_base_with(old, new, cursor, cursor_op, rows, gone, None)
+    }
+
+    /// The same, and the ledger with it: what it says is only ever about the base and rows beside it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_base_with(
+        &mut self,
+        old: &Tree,
+        new: &Tree,
+        cursor: u64,
+        cursor_op: Option<OpId>,
+        rows: &[(ObjectId, &Row)],
+        gone: &[ObjectId],
+        ledger: Option<&LedgerWrite>,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         put_rows(&tx, rows, gone)?;
         {
@@ -478,6 +703,9 @@ impl State {
                 "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 params![KEY_CURSOR_OP, op.to_string()],
             )?;
+        }
+        if let Some(l) = ledger {
+            write_ledger(&tx, l)?;
         }
         tx.commit()?;
         Ok(())
@@ -707,6 +935,48 @@ impl State {
     }
 }
 
+/// After the base and rows, whose triggers have marked what they wrote: the entries, then the marks.
+fn write_ledger(tx: &rusqlite::Transaction<'_>, l: &LedgerWrite) -> Result<()> {
+    if l.whole {
+        tx.execute_batch("DELETE FROM ledger; DELETE FROM dirty;")?;
+    }
+    {
+        let mut del = tx.prepare_cached("DELETE FROM ledger WHERE object = ?1")?;
+        for id in &l.drop {
+            del.execute([id.0])?;
+        }
+        let mut put = tx.prepare_cached(
+            "INSERT INTO ledger (object, entry) VALUES (?1, ?2) ON CONFLICT (object) DO UPDATE SET entry = excluded.entry",
+        )?;
+        for (id, entry) in &l.put {
+            put.execute(params![id.0, entry])?;
+        }
+        let mut clean = tx.prepare_cached("DELETE FROM dirty WHERE object = ?1")?;
+        for id in &l.clean {
+            clean.execute([id.0])?;
+        }
+        let mut mark = tx.prepare_cached("INSERT OR IGNORE INTO dirty (object) VALUES (?1)")?;
+        for id in &l.dirty {
+            mark.execute([id.0])?;
+        }
+    }
+    if let Some(anchor) = &l.anchor {
+        tx.execute("DELETE FROM ledger_anchor", [])?;
+        tx.execute(
+            "INSERT INTO ledger_anchor (k, v) VALUES (1, ?1)",
+            [anchor.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn object_id(bytes: Vec<u8>) -> Result<ObjectId> {
+    let id: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
+    Ok(ObjectId(id))
+}
+
 fn put_rows(
     tx: &rusqlite::Transaction<'_>,
     changed: &[(ObjectId, &Row)],
@@ -756,6 +1026,132 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = State::open(&dir.join("state.sqlite")).unwrap();
         (dir, state)
+    }
+
+    /// The ledger speaks for an object only until its base node or row is written: any write marks it,
+    /// whatever makes it, and only a write that changes something.
+    #[test]
+    fn every_write_to_a_base_node_or_row_marks_its_object_and_nothing_else_does() {
+        let (dir, mut state) = fresh();
+        let (id, other) = (ObjectId::random(), ObjectId::random());
+        let clean = |state: &mut State| {
+            let all: Vec<ObjectId> = state.dirty().unwrap().into_iter().collect();
+            let tx = state.conn.transaction().unwrap();
+            write_ledger(
+                &tx,
+                &LedgerWrite {
+                    clean: all,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        };
+        let marked = |state: &State, what: &str, expect: &[ObjectId]| {
+            let now: Vec<ObjectId> = state.dirty().unwrap().into_iter().collect();
+            let mut want = expect.to_vec();
+            want.sort();
+            assert_eq!(now, want, "{what}");
+        };
+        state.store_rows(&[(id, &row(1))], &[]).unwrap();
+        marked(&state, "a new row", &[id]);
+        clean(&mut state);
+        state.store_rows(&[(id, &row(1))], &[]).unwrap();
+        marked(&state, "the same row again", &[]);
+        state.store_rows(&[(id, &row(2))], &[]).unwrap();
+        marked(&state, "a changed row", &[id]);
+        clean(&mut state);
+        state.store_rows(&[], &[id]).unwrap();
+        marked(&state, "a row gone", &[id]);
+        clean(&mut state);
+        state
+            .put_manifests(&[(Hash::of(b"m"), b"m".to_vec())])
+            .unwrap();
+        state.put_intent("x/1", &1).unwrap();
+        state.set("cursor", "7").unwrap();
+        state.set_steady(Some("{}")).unwrap();
+        marked(&state, "manifests, intents, the cursor and the record", &[]);
+        let old = Tree::new();
+        let mut new = Tree::new();
+        let node = |n: u8| Node {
+            rev: cairn_protocol::RevisionId([n; 16]),
+            body: RevisionBody {
+                content: Content::Dir,
+                metadata: Metadata::default(),
+            },
+            links: BTreeSet::new(),
+        };
+        new.nodes.insert(id, node(1));
+        new.nodes.insert(other, node(1));
+        state.store_base(&old, &new, 7, None, &[], &[]).unwrap();
+        marked(&state, "two base nodes", &[id, other]);
+        clean(&mut state);
+        state.store_base(&new, &new, 7, None, &[], &[]).unwrap();
+        marked(&state, "the same base", &[]);
+        let mut newer = new.clone();
+        newer.nodes.insert(other, node(2));
+        state.store_base(&new, &newer, 8, None, &[], &[]).unwrap();
+        marked(&state, "one node changed", &[other]);
+        clean(&mut state);
+        // Written by anything else than these methods, as an older build would: still marked.
+        state
+            .conn
+            .execute("UPDATE rows SET row = row || ' '", [])
+            .unwrap();
+        state
+            .conn
+            .execute("DELETE FROM base WHERE object = ?1", [id.0])
+            .unwrap();
+        marked(&state, "plain SQL", &[id]);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_mark_trigger_is_made_again_and_the_ledger_dropped() {
+        let (dir, mut state) = fresh();
+        let id = ObjectId::random();
+        {
+            let tx = state.conn.transaction().unwrap();
+            write_ledger(
+                &tx,
+                &LedgerWrite {
+                    whole: true,
+                    put: vec![(id, vec![1, 2, 3])],
+                    anchor: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(state);
+        let state = State::open(&dir.join("state.sqlite")).unwrap();
+        assert_eq!(
+            state.ledger_anchor().unwrap().as_deref(),
+            Some("{}"),
+            "opened again"
+        );
+        assert_eq!(state.ledger_entries().unwrap().len(), 1);
+        state
+            .conn
+            .execute_batch("DROP TRIGGER dirty_base_update;")
+            .unwrap();
+        drop(state);
+        let state = State::open(&dir.join("state.sqlite")).unwrap();
+        assert_eq!(state.ledger_anchor().unwrap(), None);
+        assert!(state.ledger_entries().unwrap().is_empty());
+        let triggers: i64 = state
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'dirty_*'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers as usize, DIRTY_TRIGGERS.len());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The generation is what a sync with nothing to do trusts: any write moves it, whatever makes it,
@@ -887,7 +1283,7 @@ mod tests {
         let triggers: i64 = state
             .conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'",
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'generation_*'",
                 [],
                 |r| r.get(0),
             )

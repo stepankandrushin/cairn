@@ -93,6 +93,11 @@ pub struct SyncReport {
     /// What it sent and what it applied here, in order, for the daemon's list of recent changes.
     /// Not metadata applied here alone, which a filesystem that cannot hold all of it would repeat.
     pub activity: Vec<Activity>,
+    /// Why a round took the whole tree, if one did, when it could have taken what changed alone.
+    pub whole_because: Option<String>,
+    /// For a sync whose rounds took what changed alone: the most objects one round decided about,
+    /// the most it loaded with their neighbours, and how many the ledger holds.
+    pub part: Option<(u64, u64, u64)>,
 }
 
 impl SyncReport {
@@ -118,6 +123,8 @@ impl SyncReport {
             repeated: std::time::Duration::ZERO,
             agreed_since: None,
             activity: Vec::new(),
+            whole_because: None,
+            part: None,
         }
     }
 }
@@ -184,11 +191,23 @@ fn fetch_into(
     seq: &mut u64,
     seen: &mut Seen,
 ) -> Result<()> {
+    fetch_ops(client, seq, seen, &mut |op| {
+        tree.to_mut().apply(op).map_err(anyhow::Error::from)
+    })
+}
+
+/// Every operation after `seq` up to the server's head, in order, to `each`.
+fn fetch_ops(
+    client: &Client,
+    seq: &mut u64,
+    seen: &mut Seen,
+    each: &mut dyn FnMut(&Op) -> Result<()>,
+) -> Result<()> {
     loop {
         let resp = client.changes(*seq)?;
         for change in &resp.changes {
             for op in &change.ops {
-                tree.to_mut().apply(op).map_err(|e| {
+                each(op).map_err(|e| {
                     anyhow!(
                         "the server's journal does not replay at seq {}: {e}",
                         change.seq
@@ -242,21 +261,23 @@ pub(crate) fn history_gone(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The rows whole, and the base and the server's tree.
+type WholeRows<'a> = (&'a BTreeMap<ObjectId, Row>, (&'a Tree, &'a Tree));
+
+/// `whole` is the rows and trees whole, which leftovers of a killed run need; without them, a scan that
+/// finds any is `None`, for the full sync to take.
+#[allow(clippy::too_many_arguments)]
 fn scan_stable(
     root: &mut Root,
-    rows: &BTreeMap<ObjectId, Row>,
+    by_inode: &HashMap<(u64, u64), Known>,
+    whole: Option<WholeRows<'_>>,
     accounts: &Accounts,
     remove_temps: bool,
     excluded: &dyn Fn(&[cairn_protocol::Name], &crate::fsops::Stat) -> bool,
     date: &str,
     events: &mut Vec<String>,
-    trees: (&Tree, &Tree),
     kept_edits: &mut u64,
-) -> Result<ScanResult> {
-    let by_inode: HashMap<(u64, u64), Known> = rows
-        .values()
-        .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
-        .collect();
+) -> Result<Option<ScanResult>> {
     let prefix = root.temp_prefix();
     let on_its_way: Vec<(Content, Vec<Name>)> = root
         .state
@@ -270,7 +291,7 @@ fn scan_stable(
     let opts = ScanOptions {
         temp_prefix: prefix.as_bytes(),
         accounts,
-        rows: &by_inode,
+        rows: by_inode,
         remove_own_temps: remove_temps,
         arriving: &on_its_way,
         excluded,
@@ -278,6 +299,23 @@ fn scan_stable(
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
     let mut rescued = Vec::new();
+    let Some((rows, trees)) = whole else {
+        // Leftovers, and what was on its way into a folder left out here, are the whole tree's to see.
+        if !result.stale_temps.is_empty()
+            || !result.rescued_temps.is_empty()
+            || (remove_temps && !on_its_way.is_empty() && !result.excluded.is_empty())
+        {
+            return Ok(None);
+        }
+        for _ in 1..cairn_failpoint::tuned("sync.scan_attempts", SCAN_ATTEMPTS.into()) {
+            if !result.unstable {
+                break;
+            }
+            result = scan(&root.dir, &opts).context("scanning the root")?;
+        }
+        keep_what_only_moved_holes(root, by_inode, &mut result);
+        return Ok(Some(result));
+    };
     // A rule made since a kill can hide the folder its leftovers are in from the scan: looked for in the
     // folders of what was on its way, so that an edit caught there is kept under a name and said, not left
     // under a temporary one until the rule goes.
@@ -351,8 +389,8 @@ fn scan_stable(
         result = scan(&root.dir, &opts).context("scanning the root")?;
     }
     result.rescued = rescued;
-    keep_what_only_moved_holes(root, &by_inode, &mut result);
-    Ok(result)
+    keep_what_only_moved_holes(root, by_inode, &mut result);
+    Ok(Some(result))
 }
 
 /// This device's leftovers in folders the scan left out, where what was on its way was going.
@@ -623,13 +661,16 @@ fn what_arrives_here(
 }
 
 /// An empty or largely vanished tree is not a mass delete until a person says so (invariant 5).
+/// `outside` counts what a round that takes part of the tree found where it was and left out: live on
+/// both sides, and here.
 fn check_vanished(
     base: &Tree,
     remote: &Tree,
     rows: &BTreeMap<ObjectId, Row>,
     local: &BTreeMap<ObjectId, crate::merge::LNode>,
+    outside: usize,
 ) -> Option<String> {
-    let mut live = 0usize;
+    let mut live = outside;
     let mut gone = 0usize;
     for (id, _) in remote.live() {
         // Known here: in the base, or pushed from here and not in the base yet.
@@ -907,6 +948,18 @@ fn update_rows(
     identified: &crate::identify::Identified,
     base: &Tree,
 ) -> Result<()> {
+    let changed = rows_after_scan(rows, identified, base);
+    let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
+    root.state.store_rows(&list, &[])
+}
+
+/// What a scan says of each row it found: its fingerprint, content and metadata, and that what it was
+/// found at is held. Returns the rows that changed.
+fn rows_after_scan(
+    rows: &mut BTreeMap<ObjectId, Row>,
+    identified: &crate::identify::Identified,
+    base: &Tree,
+) -> Vec<ObjectId> {
     let mut changed = Vec::new();
     for (id, s) in &identified.scanned {
         let found = identified.local.get(id).map(|n| &n.links);
@@ -936,8 +989,7 @@ fn update_rows(
             changed.push(*id);
         }
     }
-    let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
-    root.state.store_rows(&list, &[])
+    changed
 }
 
 /// A new local object recognised as a remote one takes the remote identity. One the server does not
@@ -999,6 +1051,20 @@ fn adopt_rows(
 
 /// Both sides agree: the server's tree becomes the base, and what is on disk the baseline that
 /// future local changes are measured from.
+/// What a finalize needs for the ledger: what the round's scan saw, what was out of view, and, for an
+/// incremental round, the part of the tree it took.
+struct Ledgering<'a> {
+    seen: &'a HashMap<ObjectId, Option<Hash>>,
+    hidden: &'a BTreeSet<ObjectId>,
+    anchor: crate::incr::Anchor,
+    part: Option<(
+        &'a crate::incr::Session,
+        &'a BTreeSet<ObjectId>,
+        &'a BTreeSet<ObjectId>,
+    )>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     root: &mut Root,
     base: &Tree,
@@ -1007,6 +1073,7 @@ fn finalize(
     last_op: Option<OpId>,
     rows: &mut BTreeMap<ObjectId, Row>,
     plan: &Plan,
+    ledgering: Ledgering<'_>,
 ) -> Result<()> {
     hit("sync.finalize.begin");
     let mut changed = Vec::new();
@@ -1036,8 +1103,16 @@ fn finalize(
         rows.remove(id);
     }
     let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
+    let agreement = crate::incr::Agreement {
+        remote,
+        hidden: ledgering.hidden,
+        rows,
+        local: &plan.local,
+        seen: ledgering.seen,
+    };
+    let ledger = crate::incr::ledger_write(&agreement, ledgering.part, &ledgering.anchor)?;
     root.state
-        .store_base(base, remote, seq, last_op, &list, &gone)?;
+        .store_base_with(base, remote, seq, last_op, &list, &gone, Some(&ledger))?;
     hit("sync.finalize.base");
 
     for (key, _) in root.state.intents::<CopyIntent>(INTENT_COPY)? {
@@ -1053,12 +1128,59 @@ fn finalize(
             keep.insert(*manifest);
         }
     }
-    root.state.retain_manifests(&keep)?;
+    match ledgering.part {
+        None => root.state.retain_manifests(&keep)?,
+        // Of what this sync's rows held, what no row holds now: the rows it did not take are their
+        // ledger entries, which they have not changed from.
+        Some((session, all, _)) => {
+            let mut unheld: BTreeSet<Hash> = session.released.difference(&keep).copied().collect();
+            if !unheld.is_empty() {
+                for (id, seen) in session.ledger.iter_seen() {
+                    if let Content::File { manifest, .. } = &seen.content {
+                        if !all.contains(&id) {
+                            unheld.remove(manifest);
+                        }
+                    }
+                }
+                // Written since and not taken here, which nothing should leave, but a row's own
+                // manifest is never what goes.
+                let others: Vec<ObjectId> = root
+                    .state
+                    .dirty()?
+                    .into_iter()
+                    .filter(|id| !all.contains(id))
+                    .collect();
+                for r in root.state.rows_of(&others)?.values() {
+                    if let Content::File { manifest, .. } = &r.content {
+                        unheld.remove(manifest);
+                    }
+                }
+                let unheld: Vec<Hash> = unheld.into_iter().collect();
+                root.state.drop_manifests(&unheld)?;
+            }
+        }
+    }
     let cache = root.state_dir.open_dir(b"chunks")?;
     for name in cache.list()? {
         let _ = cache.unlink(&name);
     }
     Ok(())
+}
+
+/// Of the folders moving, those something excluded here is in: all that `keep_out_what_moves` reads.
+fn moving_with_excluded(
+    plan: &Plan,
+    identified: &Identified,
+    excluded: &[Vec<Name>],
+) -> BTreeMap<Vec<Name>, Vec<Name>> {
+    let parents: BTreeSet<&[Name]> = excluded
+        .iter()
+        .filter_map(|p| p.split_last().map(|(_, parent)| parent))
+        .collect();
+    folders_moving(plan, identified)
+        .into_iter()
+        .filter(|(from, _)| parents.contains(from.as_slice()))
+        .collect()
 }
 
 /// Where the folders here will be after this plan, for those that will not be where they are.
@@ -1336,13 +1458,21 @@ fn sync_full(
     }
 
     let loading = std::time::Instant::now();
-    let base = root.state.load_base()?;
-    let mut rows = root.state.load_rows()?;
+    // What changed alone, while the ledger vouches for the rest; otherwise the whole tree, and why.
+    let mut session: Option<crate::incr::Session> = None;
+    if crate::incr::enabled() {
+        match crate::incr::Session::open(&root, &selection, opts.dry_run)? {
+            Ok(s) => session = Some(s),
+            Err(why) => report.whole_because = Some(why),
+        }
+    }
+    let mut whole: Option<Whole> = match session {
+        Some(_) => None,
+        None => Some(Whole::load(&root, &[])?),
+    };
     // What every sync repeats, whatever it has to do: loading the state, then in each round the scan,
     // the merge, the scheduling and the record, but not the data it moves or the waits between.
     let loaded = loading.elapsed();
-    // The server's tree: the base until the journal says otherwise, and only then a copy of it.
-    let mut remote: Cow<Tree> = Cow::Borrowed(&base);
     let mut seq = root.state.cursor()?;
     let date = utc_date(now_secs());
     let mut seen_events: BTreeSet<String> = report.events.iter().cloned().collect();
@@ -1369,174 +1499,286 @@ fn sync_full(
             break SyncOutcome::Partial;
         }
         hit("sync.round");
-        fetch_into(&client, &mut remote, &mut seq, &mut seen)?;
+        match (&mut session, &mut whole) {
+            (Some(s), _) => fetch_ops(&client, &mut seq, &mut seen, &mut |op| {
+                s.journal.add(op);
+                Ok(())
+            })?,
+            (None, Some(w)) => fetch_ops(&client, &mut seq, &mut seen, &mut |op| w.apply(op))?,
+            (None, None) => bail!("a sync with neither the ledger nor the whole tree"),
+        }
         report.head = seq;
-
-        if selection.recheck_unheld(&root.dir, &remote) && !opts.dry_run {
-            selection.store(&root)?;
-        }
-        // From here to the push, everything sees only what this device takes part in. `base` and
-        // `remote` stay the real record, for the cursor and for the next round.
-        let mut view = selection.view(&base, &remote, &mut rows);
-        {
-            let list: Vec<(ObjectId, &Row)> =
-                view.changed.iter().map(|id| (*id, &rows[id])).collect();
-            if !opts.dry_run && !(list.is_empty() && view.purge.is_empty()) {
-                root.state.store_rows(&list, &view.purge)?;
+        if let Some(s) = &session {
+            if s.journal.len() > s.limit() {
+                let why = format!(
+                    "the server's journal brings {} operations, more than taking the whole tree costs",
+                    s.journal.len()
+                );
+                decline(&root, &mut session, &mut whole, &mut report, why)?;
             }
         }
-        report.not_synced_here = view
-            .hidden
-            .reserved
-            .iter()
-            .filter_map(|link| remote.path_of_link(link))
-            .map(|path| crate::scan::display_path(&path))
-            .collect();
 
-        let moved = RefCell::new(Vec::new());
-        let scan_started = std::time::Instant::now();
-        let mut scanned = scan_stable(
-            &mut root,
-            &rows,
-            &accounts,
-            !opts.dry_run,
-            &|path, st| selection.leaves_out(path, st, &view, &rows, &mut moved.borrow_mut()),
-            &date,
-            &mut report.events,
-            (&base, &remote),
-            &mut report.conflicts,
-        )?;
-        report.scan_time += scan_started.elapsed();
-        round_work += scan_started.elapsed();
-        // What a later sync with nothing to do would compare itself with, if this one turns out to be:
-        // worked out beside the identification, which reads the same scan and rows, unless what this
-        // scan rescued is about to change a row.
-        let digest = report.rounds == 1
-            && !opts.dry_run
-            && (crate::steady::oracle() || root.state.generation()? == generation);
-        let digest_beside = digest && scanned.rescued.is_empty();
-        if digest && !digest_beside {
-            trace.first = Some((crate::steady::digest_of(&scanned, &rows), seq));
-        }
-        for id in &scanned.rescued {
-            if let Some(row) = rows.get_mut(id) {
-                row.fp.dev = 0;
-                row.fp.ino = 0;
-            }
-        }
-        if selection.follow_copies(&moved.into_inner()) && !opts.dry_run {
-            selection.store(&root)?;
-        }
-        hit("sync.scanned");
-        let thinking = std::time::Instant::now();
-        report.excluded_here = scanned
-            .excluded
-            .iter()
-            .map(|path| crate::scan::display_path(path))
-            .collect();
-        root.state.put_manifests(&scanned.new_manifests)?;
-        let unstable = scanned.unstable;
-        report.skips = scanned.skips.clone();
-        report
-            .skips
-            .extend(selection.unheld.iter().map(|u| unheld_skip(&remote, u)));
-        retryable = report.skips.iter().any(|s| s.kind.retryable()) || unstable;
-
-        let intents: Vec<CopyIntent> = root
-            .state
-            .intents::<CopyIntent>(INTENT_COPY)?
-            .into_iter()
-            .map(|(_, i)| i)
-            .collect();
-        let mut arriving: BTreeMap<ObjectId, Arriving> = root
-            .state
-            .intents::<Arriving>(INTENT_ARRIVING)?
-            .into_iter()
-            .map(|(_, a)| (a.object, a))
-            .collect();
-        let mut identified = std::thread::scope(|s| {
-            let digest =
-                digest_beside.then(|| s.spawn(|| crate::steady::digest_of(&scanned, &rows)));
-            let identified = identify(
-                &scanned,
-                &view.base,
-                &view.remote,
-                &rows,
-                &intents,
-                &arriving,
+        // An incremental round decides everything up to the merge on the part of the tree it takes.
+        let mut part: Option<Ready> = None;
+        if let Some(s) = session.as_mut() {
+            let first = report.rounds == 1
+                && (crate::steady::oracle() || root.state.generation()? == generation);
+            match incremental_head(
+                &mut root,
+                s,
+                &mut selection,
+                &accounts,
+                &date,
                 &seen.commits,
-            );
-            if let Some(d) = digest {
-                let d = d.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-                trace.first = Some((d, seq));
+                seq,
+                &mut report,
+                &mut trace,
+                &mut round_work,
+                first,
+            )? {
+                Ok(r) => part = Some(r),
+                Err(why) => decline(&root, &mut session, &mut whole, &mut report, why)?,
             }
-            identified
-        });
-        // In a tree still moving, what was seen was seen, and only what was not is asked again.
-        if !arriving.is_empty() {
-            let holds = what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run)?;
-            let (changed, answered) =
-                settle_arriving(&identified, &arriving, &holds, &view.base, &mut rows);
-            if !opts.dry_run {
+        }
+        let p_base: Tree;
+        let p_remote: Tree;
+        let mut p_rows: BTreeMap<ObjectId, Row>;
+        let p_all: BTreeSet<ObjectId>;
+        let p_dirty: BTreeSet<ObjectId>;
+        let mut p_oracle: Option<crate::incr::FullRound> = None;
+        let base: &Tree;
+        let remote: &Tree;
+        let rows: &mut BTreeMap<ObjectId, Row>;
+        let mut view: crate::selection::View<'_>;
+        let mut scanned: ScanResult;
+        let mut identified: Identified;
+        let plan: Plan;
+        let unstable: bool;
+        let seen_now: HashMap<ObjectId, Option<Hash>>;
+        let mut held: Option<(&BTreeSet<ObjectId>, &BTreeSet<ObjectId>)> = None;
+        let thinking;
+        if let Some(r) = part {
+            if !opts.allow_mass_delete {
+                if let Some(why) = r.vanished {
+                    let report = SyncReport {
+                        outcome: SyncOutcome::Paused(why),
+                        ..report
+                    };
+                    return Ok((report, trace));
+                }
+            }
+            p_base = r.base;
+            p_remote = r.remote;
+            p_rows = r.rows;
+            p_all = r.all;
+            p_dirty = r.dirty;
+            p_oracle = r.oracle;
+            base = &p_base;
+            remote = &p_remote;
+            rows = &mut p_rows;
+            held = Some((&p_all, &p_dirty));
+            view = r.view;
+            scanned = r.scanned;
+            identified = r.identified;
+            plan = r.plan;
+            unstable = r.unstable;
+            seen_now = r.seen;
+            retryable = r.retryable;
+            thinking = std::time::Instant::now();
+        } else {
+            let Some(Whole {
+                base: w_base,
+                rows: w_rows,
+                remote: w_remote,
+            }) = whole.as_mut()
+            else {
+                bail!("a round with neither the ledger nor the whole tree");
+            };
+            base = &*w_base;
+            remote = w_remote.as_ref().unwrap_or(&*w_base);
+            rows = w_rows;
+            if selection.recheck_unheld(&root.dir, remote) && !opts.dry_run {
+                selection.store(&root)?;
+            }
+            // From here to the push, everything sees only what this device takes part in. `base` and
+            // `remote` stay the real record, for the cursor and for the next round.
+            view = selection.view(base, remote, rows);
+            {
                 let list: Vec<(ObjectId, &Row)> =
-                    changed.iter().map(|id| (*id, &rows[id])).collect();
-                let marks: Vec<String> = answered
-                    .iter()
-                    .map(|id| format!("{INTENT_ARRIVING}{id}"))
+                    view.changed.iter().map(|id| (*id, &rows[id])).collect();
+                if !opts.dry_run && !(list.is_empty() && view.purge.is_empty()) {
+                    root.state.store_rows(&list, &view.purge)?;
+                }
+            }
+            report.not_synced_here = view
+                .hidden
+                .reserved
+                .iter()
+                .filter_map(|link| remote.path_of_link(link))
+                .map(|path| crate::scan::display_path(&path))
+                .collect();
+
+            let moved = RefCell::new(Vec::new());
+            let scan_started = std::time::Instant::now();
+            scanned = {
+                let by_inode: HashMap<(u64, u64), Known> = rows
+                    .values()
+                    .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
                     .collect();
-                root.state.store_rows_dropping(&list, &marks)?;
+                scan_stable(
+                    &mut root,
+                    &by_inode,
+                    Some((&*rows, (base, remote))),
+                    &accounts,
+                    !opts.dry_run,
+                    &|path, st| {
+                        selection.leaves_out(path, st, &view, rows, &mut moved.borrow_mut())
+                    },
+                    &date,
+                    &mut report.events,
+                    &mut report.conflicts,
+                )?
+                .ok_or_else(|| anyhow!("a scan given the whole tree came back without one"))?
+            };
+            report.scan_time += scan_started.elapsed();
+            round_work += scan_started.elapsed();
+            // What a later sync with nothing to do would compare itself with, if this one turns out to be:
+            // worked out beside the identification, which reads the same scan and rows, unless what this
+            // scan rescued is about to change a row.
+            let digest = report.rounds == 1
+                && !opts.dry_run
+                && (crate::steady::oracle() || root.state.generation()? == generation);
+            let digest_beside = digest && scanned.rescued.is_empty();
+            if digest && !digest_beside {
+                trace.first = Some((crate::steady::digest_of(&scanned, rows), seq));
             }
-            hit("sync.arrivals_settled");
-            for id in &answered {
-                arriving.remove(id);
+            for id in &scanned.rescued {
+                if let Some(row) = rows.get_mut(id) {
+                    row.fp.dev = 0;
+                    row.fp.ino = 0;
+                }
             }
-            identified = identify(
-                &scanned,
-                &view.base,
-                &view.remote,
-                &rows,
-                &intents,
-                &arriving,
-                &seen.commits,
-            );
+            if selection.follow_copies(&moved.into_inner()) && !opts.dry_run {
+                selection.store(&root)?;
+            }
+            hit("sync.scanned");
+            thinking = std::time::Instant::now();
+            report.excluded_here = scanned
+                .excluded
+                .iter()
+                .map(|path| crate::scan::display_path(path))
+                .collect();
+            root.state.put_manifests(&scanned.new_manifests)?;
+            unstable = scanned.unstable;
+            report.skips = scanned.skips.clone();
+            report
+                .skips
+                .extend(selection.unheld.iter().map(|u| unheld_skip(remote, u)));
+            retryable = report.skips.iter().any(|s| s.kind.retryable()) || unstable;
+
+            let intents: Vec<CopyIntent> = root
+                .state
+                .intents::<CopyIntent>(INTENT_COPY)?
+                .into_iter()
+                .map(|(_, i)| i)
+                .collect();
+            let mut arriving: BTreeMap<ObjectId, Arriving> = root
+                .state
+                .intents::<Arriving>(INTENT_ARRIVING)?
+                .into_iter()
+                .map(|(_, a)| (a.object, a))
+                .collect();
+            let ids = crate::incr::Ids::for_round();
+            identified = std::thread::scope(|s| {
+                let digest =
+                    digest_beside.then(|| s.spawn(|| crate::steady::digest_of(&scanned, rows)));
+                let identified = identify(
+                    &scanned,
+                    &view.base,
+                    &view.remote,
+                    rows,
+                    &intents,
+                    &arriving,
+                    &seen.commits,
+                    &|n| ids.of_scanned(n),
+                );
+                if let Some(d) = digest {
+                    let d = d.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    trace.first = Some((d, seq));
+                }
+                identified
+            });
+            // In a tree still moving, what was seen was seen, and only what was not is asked again.
+            if !arriving.is_empty() {
+                let holds =
+                    what_arrives_here(&root, &accounts, &arriving, &identified, opts.dry_run)?;
+                let (changed, answered) =
+                    settle_arriving(&identified, &arriving, &holds, &view.base, rows);
+                if !opts.dry_run {
+                    let list: Vec<(ObjectId, &Row)> =
+                        changed.iter().map(|id| (*id, &rows[id])).collect();
+                    let marks: Vec<String> = answered
+                        .iter()
+                        .map(|id| format!("{INTENT_ARRIVING}{id}"))
+                        .collect();
+                    root.state.store_rows_dropping(&list, &marks)?;
+                }
+                hit("sync.arrivals_settled");
+                for id in &answered {
+                    arriving.remove(id);
+                }
+                identified = identify(
+                    &scanned,
+                    &view.base,
+                    &view.remote,
+                    rows,
+                    &intents,
+                    &arriving,
+                    &seen.commits,
+                    &|n| ids.of_scanned(n),
+                );
+            }
+            // Every node is in `identified` now, and the scan's own copy of the tree can go.
+            scanned.nodes = Vec::new();
+            scanned.new_manifests = Vec::new();
+            update_rows(&mut root, rows, &identified, &view.base)?;
+            // Found here means held, however that came about. Not found, and given up, is no delete.
+            view.settle(rows);
+            hit("sync.identified");
+
+            if !opts.allow_mass_delete {
+                if let Some(why) =
+                    check_vanished(&view.base, &view.remote, rows, &identified.local, 0)
+                {
+                    let report = SyncReport {
+                        outcome: SyncOutcome::Paused(why),
+                        ..report
+                    };
+                    return Ok((report, trace));
+                }
+            }
+
+            // A name the server has in another form goes up as a second name, unless it waits here.
+            report.skips.extend(crate::twins::hold_back_twins(
+                &root,
+                &mut identified,
+                base,
+                remote,
+            ));
+            seen_now = crate::incr::seen_of(&identified.scanned);
+
+            let host = root.config.device_name.clone();
+            plan = merge(MergeInput {
+                base: &view.base,
+                local: &identified.local,
+                remote: &view.remote,
+                shared: &identified.shared,
+                hidden: &view.hidden,
+                host: &host,
+                date: &date,
+                fresh_id: &mut ids.counter(),
+            });
         }
-        // Every node is in `identified` now, and the scan's own copy of the tree can go.
-        scanned.nodes = Vec::new();
-        scanned.new_manifests = Vec::new();
-        update_rows(&mut root, &mut rows, &identified, &view.base)?;
-        // Found here means held, however that came about. Not found, and given up, is no delete.
-        view.settle(&rows);
-        hit("sync.identified");
-
-        if !opts.allow_mass_delete {
-            if let Some(why) = check_vanished(&view.base, &view.remote, &rows, &identified.local) {
-                let report = SyncReport {
-                    outcome: SyncOutcome::Paused(why),
-                    ..report
-                };
-                return Ok((report, trace));
-            }
-        }
-
-        // A name the server has in another form goes up as a second name, unless it waits here.
-        report.skips.extend(crate::twins::hold_back_twins(
-            &root,
-            &mut identified,
-            &base,
-            &remote,
-        ));
-
-        let host = root.config.device_name.clone();
-        let plan = merge(MergeInput {
-            base: &view.base,
-            local: &identified.local,
-            remote: &view.remote,
-            shared: &identified.shared,
-            hidden: &view.hidden,
-            host: &host,
-            date: &date,
-            fresh_id: &mut ObjectId::random,
-        });
         round_work += thinking.elapsed();
         for r in &plan.reports {
             // A new object kept beside the server's at a name both took is a conflict copy too.
@@ -1599,27 +1841,15 @@ fn sync_full(
             }
         }
 
-        adopt_rows(
-            &mut root,
-            &mut rows,
-            &plan.adopted,
-            &view.base,
-            &view.remote,
-        )?;
+        adopt_rows(&mut root, rows, &plan.adopted, &view.base, &view.remote)?;
         let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
         // What the merge was given has served: from here on the plan and the disk say it all.
         drop(identified);
         let arriving = down_activity(&cur, &plan);
         let applying = std::time::Instant::now();
-        let (outcome, cur) = Applier::new(
-            &mut root,
-            Some(&client),
-            &accounts,
-            cur,
-            &mut rows,
-            &view.remote,
-        )
-        .run(&plan)?;
+        let (outcome, cur) =
+            Applier::new(&mut root, Some(&client), &accounts, cur, rows, &view.remote)
+                .run(&plan)?;
         if !outcome.touched && outcome.applied_steps == 0 {
             round_work += applying.elapsed();
         }
@@ -1646,7 +1876,7 @@ fn sync_full(
         }
         if !outcome.unholdable.is_empty() {
             for (unheld, _) in &outcome.unholdable {
-                report.skips.push(unheld_skip(&remote, unheld));
+                report.skips.push(unheld_skip(remote, unheld));
             }
             selection
                 .unheld
@@ -1713,11 +1943,54 @@ fn sync_full(
                 // The filesystem was written: confirm it with a fresh scan before calling this agreed.
                 continue;
             }
+            // Out of view here: what the ledger keeps with no scan of it.
+            let hidden: BTreeSet<ObjectId> = if std::ptr::eq(view.remote.as_ref(), remote) {
+                BTreeSet::new()
+            } else {
+                remote
+                    .live()
+                    .map(|(id, _)| id)
+                    .filter(|id| !view.remote.is_live(*id))
+                    .collect()
+            };
+            let anchor = crate::incr::Anchor {
+                format: crate::incr::FORMAT,
+                inputs: crate::incr::inputs(&root, &selection),
+                reserved: view.hidden.reserved.clone(),
+            };
             drop(view);
             let finalizing = std::time::Instant::now();
-            finalize(&mut root, &base, &remote, seq, seen.last, &mut rows, &plan)?;
+            let part = match held {
+                Some((all, dirty)) => Some((
+                    session
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("an incremental round without its session"))?,
+                    all,
+                    dirty,
+                )),
+                None => None,
+            };
+            finalize(
+                &mut root,
+                base,
+                remote,
+                seq,
+                seen.last,
+                rows,
+                &plan,
+                Ledgering {
+                    seen: &seen_now,
+                    hidden: &hidden,
+                    anchor,
+                    part,
+                },
+            )?;
             round_work += finalizing.elapsed();
             hit("sync.finalized");
+            if let Some(o) = &p_oracle {
+                crate::incr::check_finalized(&root, o)?;
+                hit("sync.incr.finalize_confirmed");
+            }
             report.agreed_since = Some(scanned.started);
             steady_round = report.rounds == 1 && !unstable && !recovered;
             break if unstable {
@@ -1751,7 +2024,7 @@ fn sync_full(
                 device_name: root.config.device_name.clone(),
                 ops,
             };
-            let pushed = mark_synced(&mut rows, &mut landed, &cur, &req);
+            let pushed = mark_synced(rows, &mut landed, &cur, &req);
             let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
             // The queue delivers the notes in it from here on.
             let delivered: Vec<String> = req
@@ -1775,7 +2048,7 @@ fn sync_full(
             // Before the commit leaves the queue, so that dying here costs nothing.
             if matches!(resp, CommitResponse::Rejected { .. }) {
                 notes_back(&mut root, &req)?;
-                let changed = take_back_refused(&req, &mut rows);
+                let changed = take_back_refused(&req, rows);
                 let list: Vec<(ObjectId, &Row)> =
                     changed.iter().map(|id| (*id, &rows[id])).collect();
                 root.state.store_rows(&list, &[])?;
@@ -1830,6 +2103,640 @@ fn sync_full(
         }
     }
     Ok((report, trace))
+}
+/// The base and rows whole, for rounds that take the whole tree, and the server's tree once the journal
+/// has brought something: until then, the base.
+struct Whole {
+    base: Tree,
+    rows: BTreeMap<ObjectId, Row>,
+    remote: Option<Tree>,
+}
+
+impl Whole {
+    fn load(root: &Root, journal: &[Op]) -> Result<Whole> {
+        let mut w = Whole {
+            base: root.state.load_base()?,
+            rows: root.state.load_rows()?,
+            remote: None,
+        };
+        for op in journal {
+            w.apply(op)?;
+        }
+        Ok(w)
+    }
+
+    fn apply(&mut self, op: &Op) -> Result<()> {
+        let Whole { base, remote, .. } = self;
+        remote
+            .get_or_insert_with(|| base.clone())
+            .apply(op)
+            .map_err(anyhow::Error::from)
+    }
+}
+
+/// From this round on the whole tree, and the report says why.
+fn decline(
+    root: &Root,
+    session: &mut Option<crate::incr::Session>,
+    whole: &mut Option<Whole>,
+    report: &mut SyncReport,
+    why: String,
+) -> Result<()> {
+    hit("sync.incr.declined");
+    let journal = session.take().map(|s| s.journal.ops).unwrap_or_default();
+    *whole = Some(Whole::load(root, &journal)?);
+    report.whole_because = Some(why);
+    Ok(())
+}
+
+/// What an incremental round hands on to the rest of the round: the part of the tree it took, decided.
+struct Ready {
+    base: Tree,
+    remote: Tree,
+    rows: BTreeMap<ObjectId, Row>,
+    view: crate::selection::View<'static>,
+    scanned: ScanResult,
+    identified: Identified,
+    plan: Plan,
+    unstable: bool,
+    retryable: bool,
+    vanished: Option<String>,
+    seen: HashMap<ObjectId, Option<Hash>>,
+    all: BTreeSet<ObjectId>,
+    dirty: BTreeSet<ObjectId>,
+    oracle: Option<crate::incr::FullRound>,
+}
+
+fn owned(v: crate::selection::View<'_>) -> crate::selection::View<'static> {
+    crate::selection::View {
+        base: Cow::Owned(v.base.into_owned()),
+        remote: Cow::Owned(v.remote.into_owned()),
+        hidden: v.hidden,
+        purge: v.purge,
+        changed: v.changed,
+    }
+}
+
+/// The steps that bring what is here to the plan, as the apply orders them.
+fn local_steps(plan: &Plan, identified: &Identified) -> Result<Vec<TopoOp>> {
+    let cur = cur_from_identified(&plan.local, &identified.scanned, &plan.adopted);
+    let from: Topo = cur
+        .iter()
+        .filter(|(i, _)| **i != ObjectId::ROOT)
+        .map(|(i, c)| (*i, (c.kind, c.links.clone())))
+        .collect();
+    let to: Topo = plan
+        .target
+        .iter()
+        .filter(|(i, _)| **i != ObjectId::ROOT)
+        .map(|(i, t)| (*i, (t.body.content.kind(), t.links.clone())))
+        .collect();
+    schedule(&from, &to).context("ordering local changes")
+}
+
+/// The rows the arrivals settled, and the marks they answered.
+type Settled = (Vec<(ObjectId, Row)>, Vec<String>);
+
+/// Rounds of widening before a round gives up on what changed alone.
+const WIDENINGS: usize = 4;
+
+/// A round on what changed alone, up to the merge: the scan, then the part of the tree the ledger cannot
+/// vouch for and its neighbours, identified and merged by the full sync's own code. `Err` sends the round
+/// the full way, with why; nothing is written before the round knows it can go on.
+#[allow(clippy::too_many_arguments)]
+fn incremental_head(
+    root: &mut Root,
+    session: &mut crate::incr::Session,
+    selection: &mut Selection,
+    accounts: &Accounts,
+    date: &str,
+    landed: &BTreeSet<OpId>,
+    seq: u64,
+    report: &mut SyncReport,
+    trace: &mut crate::steady::Trace,
+    round_work: &mut std::time::Duration,
+    first: bool,
+) -> Result<std::result::Result<Ready, String>> {
+    use crate::incr::{self, Before};
+    // The state as the full sync would read it, for the oracle, before this round writes anything.
+    let snapshot = match incr::oracle() {
+        true => Some((
+            root.state.load_base()?,
+            root.state.load_rows()?,
+            selection.clone(),
+        )),
+        false => None,
+    };
+    let dirty = root.state.dirty()?;
+    let dirty_list: Vec<ObjectId> = dirty.iter().copied().collect();
+    let dirty_nodes = root.state.nodes_of(&dirty_list)?;
+    let dirty_rows = root.state.rows_of(&dirty_list)?;
+    let mut released: BTreeSet<Hash> = BTreeSet::new();
+    let hold = |rows: &BTreeMap<ObjectId, Row>, released: &mut BTreeSet<Hash>| {
+        for r in rows.values() {
+            if let Content::File { manifest, .. } = &r.content {
+                released.insert(*manifest);
+            }
+        }
+    };
+    hold(&dirty_rows, &mut released);
+    let before = Before {
+        ledger: &session.ledger,
+        dirty: &dirty,
+        dirty_nodes: &dirty_nodes,
+        dirty_rows: &dirty_rows,
+        journal: &session.journal,
+    };
+    let known = before.scan_rows();
+
+    let scan_started = std::time::Instant::now();
+    let scanned = scan_stable(
+        root,
+        &known,
+        None,
+        accounts,
+        true,
+        &|path, st| selection.leaves_out_roughly(path, st),
+        date,
+        &mut report.events,
+        &mut report.conflicts,
+    )?;
+    let Some(scanned) = scanned else {
+        return Ok(Err(
+            "leftovers of a run that did not finish are the full sync's to settle".into(),
+        ));
+    };
+    report.scan_time += scan_started.elapsed();
+    *round_work += scan_started.elapsed();
+    if first {
+        trace.first = Some((crate::steady::digest(&scanned, &known), seq));
+    }
+    hit("sync.scanned");
+    if let Some(path) = incr::inode_twice(&scanned) {
+        return Ok(Err(format!(
+            "the scan found {path} at an inode it had found elsewhere, as when something moves while it walks"
+        )));
+    }
+    let thinking = std::time::Instant::now();
+    report.excluded_here = scanned
+        .excluded
+        .iter()
+        .map(|path| crate::scan::display_path(path))
+        .collect();
+    root.state.put_manifests(&scanned.new_manifests)?;
+    released.extend(scanned.new_manifests.iter().map(|(h, _)| *h));
+    let unstable = scanned.unstable;
+
+    // What this sync's own earlier rounds marked: read as the full round reads them, and decided here.
+    let intents: Vec<CopyIntent> = root
+        .state
+        .intents::<CopyIntent>(INTENT_COPY)?
+        .into_iter()
+        .map(|(_, i)| i)
+        .collect();
+    let arriving_marks: BTreeMap<ObjectId, Arriving> = root
+        .state
+        .intents::<Arriving>(INTENT_ARRIVING)?
+        .into_iter()
+        .map(|(_, a)| (a.object, a))
+        .collect();
+    let mut marked: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut marked_inodes: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for i in &intents {
+        marked.insert(i.copy);
+        marked.insert(i.conflict_of.object);
+        marked_inodes.insert((i.dev, i.ino));
+    }
+    marked.extend(arriving_marks.keys().copied());
+    for (_, n) in root.state.intents::<NoteIntent>(INTENT_NOTE)? {
+        marked.insert(n.object);
+    }
+
+    let mut c = incr::classify(&before, &scanned);
+    for (i, n) in scanned.nodes.iter().enumerate() {
+        if c.quiet[i] && marked_inodes.contains(&(n.fp.dev, n.fp.ino)) {
+            c.unquiet(i);
+        }
+    }
+    let rules = !selection.rules.is_empty();
+    let limit = session.limit();
+    let unheld: BTreeSet<ObjectId> = selection
+        .unheld
+        .iter()
+        .map(|u| u.object)
+        .chain(marked.iter().copied())
+        .collect();
+    // What was out of view at the last agreement stays in sight, with its folder, so that what the
+    // round says is out of view here is all of it.
+    let mut beside: BTreeSet<ObjectId> = BTreeSet::new();
+    for l in &session.anchor.reserved {
+        beside.insert(l.parent);
+        if let Some(x) = session
+            .ledger
+            .children_named(&l.parent, &l.name)
+            .filter(|x| !dirty.contains(x))
+        {
+            beside.insert(x);
+        }
+    }
+    // Where what is excluded here is: a folder above it that moves may take it where its rule does
+    // not match, which the round must see.
+    for path in &scanned.excluded {
+        if let Some(x) = c.folder_of(path) {
+            beside.insert(x);
+        }
+    }
+    let ids = incr::Ids::for_round();
+    let host = root.config.device_name.clone();
+    let mut promoted: BTreeSet<ObjectId> = BTreeSet::new();
+    for _ in 0..WIDENINGS {
+        let also: BTreeSet<ObjectId> = unheld.union(&promoted).copied().collect();
+        let reach = incr::reach(&before, &c, rules, &also, &beside);
+        if reach.all.len() > limit {
+            return Ok(Err(format!(
+                "{} objects changed or are next to a change, more than taking the whole tree costs",
+                reach.all.len()
+            )));
+        }
+        let world = match incr::world(root, &before, &scanned, &reach)? {
+            Ok(w) => w,
+            Err(why) => return Ok(Err(why)),
+        };
+        let incr::World {
+            base,
+            remote,
+            mut rows,
+            scan,
+        } = world;
+        let loaded = rows.clone();
+        let mut sel = selection.clone();
+        let unheld_changed = sel.recheck_unheld(&root.dir, &remote);
+        let mut view = owned(sel.view(&base, &remote, &mut rows));
+        let viewed: Vec<(ObjectId, Row)> = view
+            .changed
+            .iter()
+            .map(|id| (*id, rows[id].clone()))
+            .collect();
+        let mut arriving = arriving_marks.clone();
+        let mut identified = identify(
+            &scan,
+            &view.base,
+            &view.remote,
+            &rows,
+            &intents,
+            &arriving,
+            landed,
+            &|n| ids.of_scanned(n),
+        );
+        // In a tree still moving, what was seen was seen, and only what was not is asked again.
+        let mut settled: Option<Settled> = None;
+        if !arriving.is_empty() {
+            let holds = what_arrives_here(root, accounts, &arriving, &identified, false)?;
+            let (changed, answered) =
+                settle_arriving(&identified, &arriving, &holds, &view.base, &mut rows);
+            settled = Some((
+                changed.iter().map(|id| (*id, rows[id].clone())).collect(),
+                answered
+                    .iter()
+                    .map(|id| format!("{INTENT_ARRIVING}{id}"))
+                    .collect(),
+            ));
+            for id in &answered {
+                arriving.remove(id);
+            }
+            identified = identify(
+                &scan,
+                &view.base,
+                &view.remote,
+                &rows,
+                &intents,
+                &arriving,
+                landed,
+                &|n| ids.of_scanned(n),
+            );
+        }
+        if let Some(why) = c.misidentified(&reach, &identified) {
+            return Ok(Err(why));
+        }
+        let changed = rows_after_scan(&mut rows, &identified, &view.base);
+        view.settle(&rows);
+        let vanished = check_vanished(
+            &view.base,
+            &view.remote,
+            &rows,
+            &identified.local,
+            c.quiet_outside(&reach),
+        );
+        let before_twins = identified.local.clone();
+        let twins = crate::twins::hold_back_twins(root, &mut identified, &base, &remote);
+        let plan = merge(MergeInput {
+            base: &view.base,
+            local: &identified.local,
+            remote: &view.remote,
+            shared: &identified.shared,
+            hidden: &view.hidden,
+            host: &host,
+            date,
+            fresh_id: &mut ids.counter(),
+        });
+        let decided = incr::decided_outside(
+            &reach,
+            &view.remote,
+            &before_twins,
+            &identified,
+            &plan,
+            &loaded,
+            &rows,
+        );
+        if !decided.is_empty() {
+            hit("sync.incr.widened");
+            promoted.extend(decided);
+            continue;
+        }
+
+        let oracle = match &snapshot {
+            Some((sbase, srows, ssel)) => {
+                let mine = incr::Decisions {
+                    local: identified.local.clone(),
+                    shared: identified.shared.clone(),
+                    rows: rows.clone(),
+                    vanished: vanished.clone(),
+                    twins: twins.clone(),
+                    target: plan.target.clone(),
+                    copies: plan.copies.clone(),
+                    adopted: plan.adopted.clone(),
+                    reports: plan.reports.clone(),
+                    notes: plan.notes.clone(),
+                    ops: remote_ops(&view.remote, &plan)?,
+                    steps: local_steps(&plan, &identified)?,
+                    moving: moving_with_excluded(&plan, &identified, &scanned.excluded),
+                    reserved: view.hidden.reserved.clone(),
+                };
+                let full = oracle_full(
+                    root,
+                    (sbase, srows, ssel),
+                    &session.journal.ops,
+                    &scanned,
+                    &known,
+                    (&intents, &arriving_marks, accounts),
+                    landed,
+                    ids,
+                    &host,
+                    date,
+                )?;
+                // What the round made new is its own as much as what it loaded.
+                let held: BTreeSet<ObjectId> = reach
+                    .all
+                    .iter()
+                    .chain(mine.local.keys())
+                    .chain(mine.rows.keys())
+                    .chain(mine.target.keys())
+                    .copied()
+                    .collect();
+                if let Err(diff) =
+                    incr::compare(&mine, &full.decisions, &held, srows, &full.visible)
+                {
+                    // What the round knew of each object the full one decided about and it did not take.
+                    let outside: Vec<String> = full
+                        .decisions
+                        .target
+                        .keys()
+                        .chain(full.decisions.rows.keys())
+                        .filter(|id| !held.contains(id))
+                        .take(8)
+                        .map(|id| c.explain(&before, id, &reach))
+                        .collect();
+                    bail!(
+                        "the incremental round and the full one on the same scan, journal and state decide differently:\n{diff}\nwhat the round knew of what it left out:\n{}",
+                        outside.join("\n")
+                    );
+                }
+                hit("sync.incr.confirmed");
+                Some(incr::FullRound {
+                    decisions: full.decisions,
+                    remote: full.remote,
+                    local: full.local,
+                    seen: full.seen,
+                    hidden: full.hidden,
+                })
+            }
+            None => None,
+        };
+
+        // Decided, and within what was loaded for it: written as the full sync writes it.
+        if unheld_changed {
+            *selection = sel;
+            selection.store(root)?;
+        }
+        {
+            let list: Vec<(ObjectId, &Row)> = viewed.iter().map(|(id, r)| (*id, r)).collect();
+            if !(list.is_empty() && view.purge.is_empty()) {
+                root.state.store_rows(&list, &view.purge)?;
+            }
+        }
+        report.not_synced_here = view
+            .hidden
+            .reserved
+            .iter()
+            .filter_map(|link| remote.path_of_link(link))
+            .map(|path| crate::scan::display_path(&path))
+            .collect();
+        report.skips = scanned.skips.clone();
+        report
+            .skips
+            .extend(selection.unheld.iter().map(|u| unheld_skip(&remote, u)));
+        let retryable = report.skips.iter().any(|s| s.kind.retryable()) || unstable;
+        if let Some((list, marks)) = &settled {
+            let list: Vec<(ObjectId, &Row)> = list.iter().map(|(id, r)| (*id, r)).collect();
+            root.state.store_rows_dropping(&list, marks)?;
+            hit("sync.arrivals_settled");
+        }
+        {
+            let list: Vec<(ObjectId, &Row)> = changed.iter().map(|id| (*id, &rows[id])).collect();
+            root.state.store_rows(&list, &[])?;
+        }
+        hit("sync.identified");
+        report.skips.extend(twins);
+        hold(&loaded, &mut released);
+        let seen = incr::seen_of(&identified.scanned);
+        *round_work += thinking.elapsed();
+        // The root is always among them, and never in the ledger.
+        let (core, all, of) = (
+            reach.core.len().saturating_sub(1) as u64,
+            reach.all.len().saturating_sub(1) as u64,
+            session.ledger.len() as u64,
+        );
+        report.part = Some(match report.part {
+            Some((c0, a0, _)) => (c0.max(core), a0.max(all), of),
+            None => (core, all, of),
+        });
+        hit("sync.incr.round");
+        let (all, scanned_part) = (reach.all, scan);
+        session.released.extend(released);
+        return Ok(Ok(Ready {
+            base,
+            remote,
+            rows,
+            view,
+            scanned: scanned_part,
+            identified,
+            plan,
+            unstable,
+            retryable,
+            vanished,
+            seen,
+            all,
+            dirty,
+            oracle,
+        }));
+    }
+    Ok(Err(
+        "the round's decisions kept reaching past what was loaded for them".into(),
+    ))
+}
+
+/// What the oracle's full round leaves for the comparison and the check after a finalize.
+struct OracleFull {
+    decisions: crate::incr::Decisions,
+    remote: Tree,
+    visible: Tree,
+    local: BTreeMap<ObjectId, crate::merge::LNode>,
+    seen: HashMap<ObjectId, Option<Hash>>,
+    hidden: BTreeSet<ObjectId>,
+}
+
+/// The round the full way, on the state as it was before the round, the same journal and the same
+/// scan, with every file the scan did not read given its row's metadata as a full scan gives it; the
+/// rows the scan was given are checked to be what the state says.
+#[allow(clippy::too_many_arguments)]
+fn oracle_full(
+    root: &Root,
+    (base, rows0, sel0): (&Tree, &BTreeMap<ObjectId, Row>, &Selection),
+    journal: &[Op],
+    scanned: &ScanResult,
+    known: &HashMap<(u64, u64), Known>,
+    (intents, arriving0, accounts): (&[CopyIntent], &BTreeMap<ObjectId, Arriving>, &Accounts),
+    landed: &BTreeSet<OpId>,
+    ids: crate::incr::Ids,
+    host: &str,
+    date: &str,
+) -> Result<OracleFull> {
+    let mut remote = base.clone();
+    for op in journal {
+        remote.apply(op)?;
+    }
+    let mut sel = sel0.clone();
+    sel.recheck_unheld(&root.dir, &remote);
+    let mut rows = rows0.clone();
+    let mut view = sel.view(base, &remote, &mut rows);
+    let by_inode: HashMap<(u64, u64), Known> = rows
+        .values()
+        .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
+        .collect();
+    let same = |a: Option<&Known>, b: Option<&Known>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.fp == b.fp
+                && a.racy == b.racy
+                && a.incomplete == b.incomplete
+                && a.content == b.content
+        }
+        _ => false,
+    };
+    let mut nodes = scanned.nodes.clone();
+    for n in nodes.iter_mut() {
+        let key = (n.fp.dev, n.fp.ino);
+        if !same(known.get(&key), by_inode.get(&key)) {
+            bail!(
+                "the scan was given another row for {} than the state holds: {:?} against {:?}",
+                n.paths
+                    .first()
+                    .map(|p| crate::scan::display_path(p))
+                    .unwrap_or_default(),
+                known.get(&key),
+                by_inode.get(&key)
+            );
+        }
+        if let Some(k) = by_inode.get(&key) {
+            if matches!(n.content, Content::File { .. }) && k.vouches_for(&n.fp) {
+                n.metadata = k.scan.cloned().unwrap_or_default();
+            }
+        }
+    }
+    let scan = scanned.with_nodes(nodes);
+    let mut arriving = arriving0.clone();
+    let mut identified = identify(
+        &scan,
+        &view.base,
+        &view.remote,
+        &rows,
+        intents,
+        &arriving,
+        landed,
+        &|n| ids.of_scanned(n),
+    );
+    if !arriving.is_empty() {
+        let holds = what_arrives_here(root, accounts, &arriving, &identified, false)?;
+        let (_, answered) = settle_arriving(&identified, &arriving, &holds, &view.base, &mut rows);
+        for id in &answered {
+            arriving.remove(id);
+        }
+        identified = identify(
+            &scan,
+            &view.base,
+            &view.remote,
+            &rows,
+            intents,
+            &arriving,
+            landed,
+            &|n| ids.of_scanned(n),
+        );
+    }
+    rows_after_scan(&mut rows, &identified, &view.base);
+    view.settle(&rows);
+    let vanished = check_vanished(&view.base, &view.remote, &rows, &identified.local, 0);
+    let twins = crate::twins::hold_back_twins(root, &mut identified, base, &remote);
+    let plan = merge(MergeInput {
+        base: &view.base,
+        local: &identified.local,
+        remote: &view.remote,
+        shared: &identified.shared,
+        hidden: &view.hidden,
+        host,
+        date,
+        fresh_id: &mut ids.counter(),
+    });
+    let hidden: BTreeSet<ObjectId> = remote
+        .live()
+        .map(|(id, _)| id)
+        .filter(|id| !view.remote.is_live(*id))
+        .collect();
+    let decisions = crate::incr::Decisions {
+        local: identified.local.clone(),
+        shared: identified.shared.clone(),
+        rows: rows.clone(),
+        vanished,
+        twins,
+        target: plan.target.clone(),
+        copies: plan.copies.clone(),
+        adopted: plan.adopted.clone(),
+        reports: plan.reports.clone(),
+        notes: plan.notes.clone(),
+        ops: remote_ops(&view.remote, &plan)?,
+        steps: local_steps(&plan, &identified)?,
+        moving: moving_with_excluded(&plan, &identified, &scanned.excluded),
+        reserved: view.hidden.reserved.clone(),
+    };
+    let seen = crate::incr::seen_of(&identified.scanned);
+    let visible = view.remote.into_owned();
+    Ok(OracleFull {
+        decisions,
+        remote,
+        visible,
+        local: plan.local,
+        seen,
+        hidden,
+    })
 }
 
 /// What this commit will leave on the server, as far as this filesystem holds it too, paired with

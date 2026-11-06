@@ -79,10 +79,14 @@ the root.
 | `manifests` | Manifests of local content, needed to upload it |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
 | `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here, the policy it applied by, and whether it is a folder only something inside changes or one the run makes, private until its last pass, which the next scan compares with the disk to tell what arrived from what this device did |
+| `ledger` | Per live object of the base, the last agreement a sync can take what changed alone against: the kind and entries, and what the scan that agreed found, the device, inode and fingerprint, the content (a file's manifest and size, a link's target), and for anything but a file a BLAKE3 digest of the rest it read; no scan part for an entry out of view here. A compact binary record, its first byte the format |
+| `dirty` | Every object whose base node or row has been written since the ledger last spoke for it, put there by triggers on `base` and `rows` |
+| `ledger_anchor` | What the ledger stands on: its format, a hash of the build, configuration, rules and selection it was written under, and the entries on the server out of view then. Without it, or with any of that changed, a sync takes the whole tree and writes the ledger anew |
 
 The triggers are not a migration: an older build opens the file as before, and its writes move the generation
 too. A file found without all of them, or with one changed, gets them all again and loses its `steady` record, in
-one transaction.
+one transaction. The same for the ledger: an older build's writes mark what they touch, and a file found without
+the `dirty_*` triggers, or with one changed, gets them again and loses its ledger.
 
 `rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field

@@ -93,7 +93,7 @@ impl Recorded {
 
 /// The build that is running, as it was when it started: another build may decide otherwise on the
 /// same tree, so a record made by one says nothing to another. Unknown, it is this process's alone.
-fn build() -> &'static str {
+pub(crate) fn build() -> &'static str {
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| {
         // Linux names the file that is running even after it has been replaced.

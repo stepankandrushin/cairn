@@ -29,7 +29,7 @@ const KEY_EXCLUDED: &str = "excluded";
 const RULE_READ_ATTEMPTS: u32 = 5;
 
 /// Rules in `.gitignore` syntax, relative to the root, and the hash of the text they were read from.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Rules(Option<Gitignore>, Option<cairn_protocol::Hash>);
 
 impl Rules {
@@ -164,7 +164,7 @@ pub struct Unheld {
 }
 
 /// Everything this device does not sync: what it chose to leave out, and what it cannot hold.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Selection {
     pub rules: Rules,
     /// Excluded by identity, wherever on the server they go.

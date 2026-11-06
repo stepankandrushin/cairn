@@ -568,6 +568,9 @@ fn report_lines(report: &SyncReport) -> BTreeSet<String> {
     if let SyncOutcome::Paused(why) = &report.outcome {
         lines.insert(format!("paused: {why}"));
     }
+    if let Some(why) = &report.whole_because {
+        lines.insert(format!("looked at the whole tree: {why}"));
+    }
     lines
 }
 
@@ -938,8 +941,14 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                     }
                 }
                 if report.commits > 0 || report.steps_applied > 0 {
+                    let took = match (&report.whole_because, report.part) {
+                        (None, Some((_, took, of))) => {
+                            format!(", looked at {took} of {of} entries")
+                        }
+                        _ => String::new(),
+                    };
                     log(&format!(
-                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s)",
+                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s){took}",
                         report.head, report.steps_applied, report.commits, report.bytes_uploaded, report.conflicts
                     ));
                 }

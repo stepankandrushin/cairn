@@ -24,6 +24,7 @@ cairn-failpoint.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

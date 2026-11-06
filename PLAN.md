@@ -180,6 +180,44 @@ build, the configuration and the rules; and the tree, by a digest of its scan. A
 again, by a scan that stops before it would read a file, would decide the same, so it stops there, before the base
 is loaded; anything else, and it runs in full. A harness build runs both and compares them.
 
+**A sync that carries a change** costs what changed, and the scan. An agreement decided nothing about any
+object, and the merge looks at little besides the object itself, so an object whose own state and whose
+neighbours' are as they were at an agreement is decided about as it was then: not at all. The state keeps a
+ledger of the last agreement, per live object of the base: its kind and entries, and what the scan saw, the
+inode and fingerprint, the content, and for anything but a file a digest of the rest it read (a file is its
+row, which no scan reads while its fingerprint holds). Triggers in the file mark every object whose base node
+or row any build writes, so the ledger speaks for an object only until something touches it. A round's
+change set is:
+
+- from the journal since the cursor, every object an operation names and every folder an entry it gives or
+  takes is in;
+- from the scan, every object the ledger has that the scan did not find at the same entries, by its folders'
+  inodes, with the same fingerprint and, for a folder or link, the same digest; every inode the ledger does
+  not account for; everything marked, everything this filesystem cannot hold, and the whole of what the scan
+  could not see;
+
+closed under what the merge reads besides the object: its ancestors on every side (cycles, git folders, rules
+by path, paths), every name in each folder any of its entries is or was in, on every side (collisions, twins,
+conflict names, adoption by name and content, what is out of view at that name), every name of a hard-linked
+file (the node and the scanned inode whole), everything in a folder among them (what is kept inside one
+deleted, what goes with one moved or excluded), with rules the whole of a folder the journal moves, and what
+was out of view at the last agreement. The round runs the full sync's own identification, merge, apply,
+push and finalize on those alone: the trees, rows and scan it gives them hold nothing else, and what they
+leave out is the same on every side. Any decision about an object loaded only as a neighbour means the set
+was too small: it is widened and decided again, and nothing is written before that settles. An agreeing
+round writes the ledger for what it held, a full one writes it whole. The full sync runs instead, said in
+the sync's output and the daemon's log, with no ledger from a full sync of this build, configuration, rules
+and selection; on a dry run; with copies kept by `cairn exclude`, found by inode; with a mark or queued commit
+from a run that did not finish, or a leftover of one; when the journal or the set comes to more than a
+quarter of the tree; when the journal does not replay on the part loaded; when the scan finds one inode at
+two places, as when something moves while it walks; when identification takes a folder for another object
+than its inode says; or after four widenings. A round holds the scan and the ledger, a
+few hundred bytes an entry, and decodes the base and rows of the set alone. A harness build decides every
+incremental round the full way as well, on the same scan, journal and state, and fails the sync unless every
+decision is the same: the rows the scan was given, identification, the rows, the mass-delete check, twins,
+the plan, the operations, the local steps, what is out of view, and nothing at all outside the set; after a
+finalize, the base, rows and ledger must be what a full one leaves.
+
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
 before submitting old state, comparing against history, so deleted files do not come back.
 

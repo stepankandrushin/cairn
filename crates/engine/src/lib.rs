@@ -9,6 +9,7 @@ pub mod export;
 #[cfg_attr(windows, path = "fsops_windows.rs")]
 pub mod fsops;
 pub mod identify;
+pub mod incr;
 pub mod merge;
 pub mod metadata;
 pub mod registry;

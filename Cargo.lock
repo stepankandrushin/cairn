@@ -227,6 +227,7 @@ dependencies = [
  "cairn-protocol",
  "cairn-server",
  "rand",
+ "rusqlite",
  "rustix",
  "serde_json",
  "windows-sys 0.61.2",

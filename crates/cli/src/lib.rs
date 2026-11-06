@@ -279,6 +279,11 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     for w in &report.warnings {
         outln!("not applied here: {w}");
     }
+    if let Some(why) = &report.whole_because {
+        outln!("looked at the whole tree: {why}");
+    } else if let Some((_, took, of)) = report.part {
+        outln!("looked at {took} of {of} entries: the rest are as the last agreement left them");
+    }
     if !report.excluded_here.is_empty() || !report.not_synced_here.is_empty() {
         outln!(
             "by this device's choice: {} entries here not synced, {} on the server not here; `cairn status` lists them",

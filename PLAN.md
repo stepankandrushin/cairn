@@ -284,7 +284,12 @@ projects and anything needing faithful metadata.
 
 **Failure handling, where most of the test effort goes:** watchers plus reconcile, durable queues,
 files changing during a read, disk full, interrupted upgrades, and a missing mount (each root carries
-an ID marker; if it has gone, or an unusual share of the tree vanishes, sync pauses and asks). The UI
+an ID marker; if it has gone, or an unusual share of the tree vanishes, sync pauses and asks). A request
+the network fails in a way that says nothing about the request (no socket buffers, a connection reset,
+refused or closed before the whole answer, a name not found, a proxy's 502 to 504) is tried again within
+it: over about a minute in a sync, a few seconds in a command a person waits on, about three minutes at
+the most however slow each try. The daemon's log says a request's first new try and its outcome; past
+the budget the sync fails, and the next picks up from the durable queue. The UI
 names the state and the action: "waiting for permission", "destination cannot represent this name",
 "file keeps changing".
 
@@ -303,6 +308,9 @@ for inspection; undo a batch from one device; review permission and rename histo
 
 Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
 Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.
+Before it lands, the server must look a commit's operation ID up before it checks the commit's chunks, which
+today it does after: a retry of a commit it took, whose chunks were collected since, would be refused rather
+than answered.
 
 ## Sharing and access
 

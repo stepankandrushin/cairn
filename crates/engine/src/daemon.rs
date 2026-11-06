@@ -13,7 +13,7 @@
 //! requests that change no tree. Look now is an event like the watcher's; a pause stops it starting a
 //! sync until a resume, and outlives a restart, being kept in `.cairn`.
 
-use crate::client::Client;
+use crate::client::{Client, Retries};
 use crate::control::{Handler, Hub};
 use crate::fsops::Dir;
 use crate::root::{read_config, read_root_id, Busy};
@@ -49,9 +49,6 @@ const MAX_GAP: Duration = Duration::from_secs(30);
 const SHOW_WAIT: Duration = Duration::from_secs(2);
 /// With directories out of the watcher's reach, the safety net does more of the work.
 const DEGRADED_RECONCILE: Duration = Duration::from_secs(300);
-/// Idle this long past the pause after a sync, the daemon gives back the memory that sync freed. Not at
-/// once: a change that comes in the meantime finds it still there, which in a big tree is seconds.
-const IDLE_BEFORE_GIVING_BACK: Duration = Duration::from_secs(30);
 /// Below any reverse proxy's usual read timeout (nginx: 60 seconds).
 const FEED_WAIT: Duration = Duration::from_secs(25);
 const LOCK_ATTEMPTS: u32 = 5;
@@ -364,7 +361,7 @@ fn feed(
         }
         if client.is_none() {
             client = read_config(&path)
-                .and_then(|config| Client::new(&config))
+                .and_then(|config| Client::new(&config, Retries::Never))
                 .map_err(|e| set_down(Some(format!("{e:#}"))))
                 .ok();
             if client.is_none() {
@@ -696,8 +693,6 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
-    // When to give back what the last sync freed, if nothing has started another by then.
-    let mut give_back_at: Option<Instant> = None;
 
     loop {
         for note in hub.take_notes() {
@@ -731,9 +726,6 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             Some(_) => Duration::from_secs(3600),
             None => schedule.due().saturating_duration_since(Instant::now()),
         };
-        let wait = give_back_at.map_or(wait, |at| {
-            wait.min(at.saturating_duration_since(Instant::now()))
-        });
         match wake_rx.recv_timeout(wait) {
             Ok(wake) => {
                 schedule.note(wake, synced_head.load(Ordering::SeqCst));
@@ -768,13 +760,6 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                     }
                     continue;
                 }
-            }
-            Err(RecvTimeoutError::Timeout)
-                if give_back_at.is_some_and(|at| Instant::now() >= at) =>
-            {
-                give_back_memory();
-                give_back_at = None;
-                continue;
             }
             Err(RecvTimeoutError::Timeout)
                 if pause.get().is_some() || pause.get() != was_paused =>
@@ -885,9 +870,6 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         };
         schedule.gap_until = Instant::now() + (repeated * 2).clamp(MIN_GAP, MAX_GAP);
         schedule.covered = result.as_ref().ok().and_then(|r| r.agreed_since);
-        // What the sync held is free again, and goes back to the system once the daemon is idle,
-        // rather than staying this process's until the next sync.
-        give_back_at = Some(schedule.gap_until + IDLE_BEFORE_GIVING_BACK);
 
         status.syncs += 1;
         status.last_sync = now_secs();
@@ -945,6 +927,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         status.detail = Some(why.clone());
                     }
                 }
+                if report.retries > 0 {
+                    log(&format!(
+                        "tried requests again after the network failed them: {} time(s)",
+                        report.retries
+                    ));
+                }
                 if report.checked == Some(true) {
                     log(&format!(
                         "decided the full way as well, as every {} seconds: the incremental path agrees",
@@ -981,6 +969,10 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 walk_first = true;
             }
         }
+        // What the sync held, its report with it, is free again: back to the system now rather than this
+        // process's while it waits. A change that comes soon after costs the next sync a few page faults.
+        give_back_memory();
+        hit("daemon.gave_back");
         for line in lines.difference(&said) {
             log(line);
         }

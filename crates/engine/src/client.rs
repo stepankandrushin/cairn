@@ -1,5 +1,8 @@
-//! The HTTP client. Every call is safe to retry; the client does not retry on its own, since a
-//! later sync picks up from durable state.
+//! The HTTP client. Every call is safe to retry: a commit by its operation ID (the server answers a
+//! retry of one it took with the first answer), chunks by their hash, and the rest are reads. So a
+//! request the network failed in a way that says nothing about the request is tried again, over about
+//! a minute in a sync and a few seconds in a command a person waits on, each time said; past that the
+//! sync fails, and a later one picks up from durable state.
 
 use crate::root::Config;
 use anyhow::{anyhow, bail, Context, Result};
@@ -8,18 +11,26 @@ use cairn_protocol::wire::{
 };
 use cairn_protocol::Hash;
 use serde::{de::DeserializeOwned, Serialize};
-use std::sync::Mutex;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use ureq::tls::{RootCerts, TlsConfig};
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
-use ureq::Agent;
+use ureq::{Agent, Timeout};
 
 /// How long one lookup of the server's name serves. ureq looks the name up before every request,
 /// even one that goes over a connection it already holds, and a slow resolver then costs more than
 /// the request: one sync of one small file made 8 lookups, at 55 to 125 ms each. A minute bounds
 /// how long a server that moved is looked for at its old address.
 const NAME_TTL: Duration = Duration::from_secs(60);
+
+/// The server's name could not be looked up: a network not up yet, as on a laptop just woken, or a
+/// name that does not exist (yet). Tried again like any failure of the network.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot look up the server's name ({0})")]
+struct LookupFailed(ureq::Error);
 
 /// The resolver, with the last answer kept for [`NAME_TTL`]. A failed lookup is not kept.
 struct CachedResolver<R> {
@@ -50,7 +61,10 @@ impl<R: Resolver> Resolver for CachedResolver<R> {
                 return Ok(addrs.clone());
             }
         }
-        let addrs = self.inner.resolve(uri, config, timeout)?;
+        let addrs = self
+            .inner
+            .resolve(uri, config, timeout)
+            .map_err(|e| ureq::Error::Other(Box::new(LookupFailed(e))))?;
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((key, Instant::now(), addrs.clone()));
         Ok(addrs)
@@ -62,10 +76,186 @@ impl<R: Resolver> Resolver for CachedResolver<R> {
 #[error("the server's disk is full: nothing was lost; free space on the server and sync again")]
 pub struct ServerFull;
 
+/// How hard a client tries a request again that the network failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retries {
+    /// A sync, the command's or the daemon's: 0.5, 1, 2, 4, 8, 16 and 30 s, about a minute.
+    Sync,
+    /// A command a person waits on: 0.5, 1 and 2 s, so that a mistyped address fails in about 3.5 s.
+    Short,
+    /// Each request once: the daemon's feed, a loop that tries again on its own and whose failing says
+    /// the server is down.
+    Never,
+}
+
+impl Retries {
+    /// The waits before each new try, in half seconds. A harness build shortens the half second
+    /// (`client.retry_ms`).
+    fn waits(self) -> &'static [u32] {
+        match self {
+            Retries::Sync => &[1, 2, 4, 8, 16, 32, 60],
+            Retries::Short => &[1, 2, 4],
+            Retries::Never => &[],
+        }
+    }
+
+    fn span(self) -> &'static str {
+        match self {
+            Retries::Sync => "about a minute",
+            Retries::Short | Retries::Never => "a few seconds",
+        }
+    }
+}
+
+/// The most one request takes, its tries and the waits between them together, give or take a try
+/// under way: a server whose host drops every packet costs 30 s a connect.
+const MAX_REQUEST_TIME: Duration = Duration::from_secs(180);
+
+/// The wait before the next try, if there is one: the budget's next, unless it would take the request
+/// past `cap`.
+fn next_wait(
+    waits: &[u32],
+    tries: usize,
+    elapsed: Duration,
+    unit: Duration,
+    cap: Duration,
+) -> Option<Duration> {
+    let wait = unit * *waits.get(tries)?;
+    (elapsed + wait <= cap).then_some(wait)
+}
+
+/// ENOBUFS: the kernel had no memory for the socket's buffers. std gives it no kind of its own.
+#[cfg(target_os = "macos")]
+const ENOBUFS: i32 = 55;
+/// WSAENOBUFS.
+#[cfg(windows)]
+const ENOBUFS: i32 = 10055;
+#[cfg(not(any(target_os = "macos", windows)))]
+const ENOBUFS: i32 = 105;
+
+/// Where new tries are said. Unset, each try is, on standard error, for a person watching.
+static RETRY_LOG: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Say new tries in `log`, as the daemon does in its own: a request's first and its outcome alone, as
+/// a log is read later, and a line a try would fill it while a server is down. The first call decides.
+pub fn log_retries_with(log: fn(&str)) {
+    let _ = RETRY_LOG.set(log);
+}
+
+/// A new try: each one on standard error; in a log set by [`log_retries_with`], only the first.
+fn say_try(error: &anyhow::Error, wait: Duration, tries: usize, retries: Retries) {
+    match RETRY_LOG.get() {
+        Some(log) if tries == 1 => log(&format!(
+            "{error:#}; trying again for up to {}",
+            retries.span()
+        )),
+        Some(_) => {}
+        None => {
+            let _ = writeln!(
+                io::stderr(),
+                "{error:#}; trying again in {}, {tries} of {}",
+                seconds(wait),
+                retries.waits().len()
+            );
+        }
+    }
+}
+
+/// How a request that was tried again ended.
+fn say_outcome(line: &str) {
+    match RETRY_LOG.get() {
+        Some(log) => log(line),
+        None => {
+            let _ = writeln!(io::stderr(), "{line}");
+        }
+    }
+}
+
+/// A failure of the network that says nothing about the request: the kernel out of memory for a
+/// socket, a connection reset, aborted, refused, timed out or closed before the whole answer came, as a
+/// server restarting closes it, a network or host out of reach. A refusal, an answer that makes no
+/// sense, or anything else is the request's own, and a new try would not help.
+fn transient_io(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    e.raw_os_error() == Some(ENOBUFS)
+        || matches!(
+            e.kind(),
+            OutOfMemory
+                | ConnectionReset
+                | ConnectionAborted
+                | BrokenPipe
+                | TimedOut
+                | ConnectionRefused
+                | NetworkDown
+                | NetworkUnreachable
+                | HostUnreachable
+                | UnexpectedEof
+        )
+}
+
+/// As [`transient_io`], in ureq's terms, and a name that could not be looked up. ureq reports any
+/// ETIMEDOUT as a timeout of the step it was in, which is the kernel's unless it is one this client
+/// sets: the connect's 30 s is ETIMEDOUT's other face and is tried again, the 600 s wait for an answer
+/// is a server that is there and not answering, and is not.
+fn transient(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Io(e) => transient_io(e),
+        ureq::Error::Other(e) => e.is::<LookupFailed>(),
+        ureq::Error::HostNotFound => true,
+        ureq::Error::Timeout(t) => matches!(
+            t,
+            Timeout::Connect
+                | Timeout::SendRequest
+                | Timeout::Await100
+                | Timeout::SendBody
+                | Timeout::RecvBody
+                | Timeout::PerRead
+                | Timeout::PerWrite
+        ),
+        _ => false,
+    }
+}
+
+/// What a proxy says when the server behind it is down, restarting or slow: 502, 503, 504. Never a
+/// 4xx, which is about the request, or 507, the server's disk full.
+fn transient_status(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
+/// "0.5 s", "4 s".
+fn seconds(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms % 1000 == 0 {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{} s", ms as f64 / 1000.0)
+    }
+}
+
+/// One try of a request that did not get its answer.
+struct Failure {
+    error: anyhow::Error,
+    /// The network's failure, which says nothing about the request: worth another try.
+    transient: bool,
+}
+
+impl Failure {
+    fn of(what: &str, e: ureq::Error) -> Self {
+        Self {
+            transient: transient(&e),
+            error: anyhow::Error::new(e).context(format!("{what}: cannot reach the server")),
+        }
+    }
+}
+
 pub struct Client {
     agent: Agent,
     base: String,
     auth: String,
+    /// How hard a request the network failed is tried again.
+    retries: Retries,
+    /// How many times a request was tried again, for the sync's report.
+    retried: Arc<AtomicU64>,
 }
 
 const MAX_RESPONSE: u64 = 1 << 40;
@@ -85,7 +275,7 @@ fn host_is_loopback(url: &str) -> bool {
 }
 
 impl Client {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new(config: &Config, retries: Retries) -> Result<Self> {
         let url = &config.server;
         if url.starts_with("http://") {
             if !host_is_loopback(url) && !config.allow_http {
@@ -116,6 +306,8 @@ impl Client {
             agent,
             base: format!("{url}/v1/ns/{}", config.namespace),
             auth: format!("Bearer {}", config.token),
+            retries,
+            retried: Arc::new(AtomicU64::new(0)),
         };
         let info = client.info()?;
         if info.protocol != cairn_protocol::PROTOCOL_VERSION {
@@ -128,64 +320,155 @@ impl Client {
         Ok(client)
     }
 
-    fn read(&self, what: &str, mut resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+    /// Counts each new try of a request, from now on.
+    pub fn retried(&self) -> Arc<AtomicU64> {
+        self.retried.clone()
+    }
+
+    /// Send a request and read its whole answer, trying again while the network fails it in a way that
+    /// says nothing about the request. `point` names it for the harness's failpoints.
+    fn exchange(
+        &self,
+        what: &str,
+        point: &str,
+        send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Vec<u8>> {
+        let unit = Duration::from_millis(cairn_failpoint::tuned("client.retry_ms", 500));
+        let cap = Duration::from_millis(cairn_failpoint::tuned(
+            "client.request_ms",
+            MAX_REQUEST_TIME.as_millis() as u64,
+        ));
+        let started = Instant::now();
+        let mut tries = 0;
+        loop {
+            let failure = match self.once(what, point, &send) {
+                Ok(body) => {
+                    if tries > 0 {
+                        say_outcome(&format!(
+                            "{what}: answered on try {} after {:.1} s",
+                            tries + 1,
+                            started.elapsed().as_secs_f64()
+                        ));
+                    }
+                    return Ok(body);
+                }
+                Err(f) => f,
+            };
+            let wait = match failure.transient {
+                true => next_wait(self.retries.waits(), tries, started.elapsed(), unit, cap),
+                false => None,
+            };
+            let Some(wait) = wait else {
+                if tries == 0 {
+                    return Err(failure.error);
+                }
+                say_outcome(&format!(
+                    "{what}: gave up on try {} after {:.1} s",
+                    tries + 1,
+                    started.elapsed().as_secs_f64()
+                ));
+                if !failure.transient {
+                    return Err(failure.error);
+                }
+                // As a sync fails without new tries, saying how hard it tried.
+                return Err(anyhow!("{:#}; tried {} times", failure.error, tries + 1));
+            };
+            tries += 1;
+            self.retried.fetch_add(1, Ordering::SeqCst);
+            say_try(&failure.error, wait, tries, self.retries);
+            std::thread::sleep(wait);
+        }
+    }
+
+    fn once(
+        &self,
+        what: &str,
+        point: &str,
+        send: &impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Vec<u8>, Failure> {
+        cairn_failpoint::network(point, false).map_err(|e| Failure::of(what, e.into()))?;
+        let mut resp = send().map_err(|e| Failure::of(what, e))?;
         let status = resp.status().as_u16();
         let body = resp
             .body_mut()
             .with_config()
             .limit(MAX_RESPONSE)
             .read_to_vec()
-            .with_context(|| format!("{what}: reading the response"))?;
+            .map_err(|e| Failure {
+                transient: transient(&e),
+                error: anyhow::Error::new(e).context(format!("{what}: reading the response")),
+            })?;
+        // As if the connection were lost with the answer, which the server has sent all the same.
+        cairn_failpoint::network(point, true).map_err(|e| Failure {
+            transient: transient_io(&e),
+            error: anyhow::Error::new(ureq::Error::Io(e))
+                .context(format!("{what}: reading the response")),
+        })?;
+        let refused = |error: anyhow::Error| Failure {
+            error,
+            transient: transient_status(status),
+        };
         match status {
             200..=299 => Ok(body),
-            401 => bail!("{what}: the server refused the access token"),
-            507 => Err(anyhow!(ServerFull)),
-            other => bail!(
+            401 => Err(refused(anyhow!(
+                "{what}: the server refused the access token"
+            ))),
+            507 => Err(refused(anyhow!(ServerFull))),
+            other => Err(refused(anyhow!(
                 "{what}: server answered {other}: {}",
                 String::from_utf8_lossy(&body)
-            ),
+            ))),
         }
     }
 
-    fn get_json<T: DeserializeOwned>(&self, what: &str, path: &str) -> Result<T> {
-        let resp = self
-            .agent
-            .get(format!("{}{path}", self.base))
-            .header("Authorization", &self.auth)
-            .call()
-            .with_context(|| format!("{what}: cannot reach the server"))?;
-        Ok(serde_json::from_slice(&self.read(what, resp)?)?)
+    fn get_json<T: DeserializeOwned>(&self, what: &str, point: &str, path: &str) -> Result<T> {
+        let url = format!("{}{path}", self.base);
+        let body = self.exchange(what, point, || {
+            self.agent
+                .get(&url)
+                .header("Authorization", &self.auth)
+                .call()
+        })?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     fn post_bytes(
         &self,
         what: &str,
+        point: &str,
         path: &str,
         content_type: &str,
         body: &[u8],
     ) -> Result<Vec<u8>> {
-        let resp = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("Authorization", &self.auth)
-            .header("Content-Type", content_type)
-            .send(body)
-            .with_context(|| format!("{what}: cannot reach the server"))?;
-        self.read(what, resp)
+        let url = format!("{}{path}", self.base);
+        self.exchange(what, point, || {
+            self.agent
+                .post(&url)
+                .header("Authorization", &self.auth)
+                .header("Content-Type", content_type)
+                .send(body)
+        })
     }
 
     fn post_json<B: Serialize, T: DeserializeOwned>(
         &self,
         what: &str,
+        point: &str,
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let bytes = self.post_bytes(what, path, "application/json", &serde_json::to_vec(body)?)?;
+        let bytes = self.post_bytes(
+            what,
+            point,
+            path,
+            "application/json",
+            &serde_json::to_vec(body)?,
+        )?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub fn info(&self) -> Result<Info> {
-        self.get_json("server info", "/info")
+        self.get_json("server info", "client.info", "/info")
     }
 
     pub fn missing(&self, hashes: &[Hash]) -> Result<Vec<Hash>> {
@@ -193,6 +476,7 @@ impl Client {
         for batch in hashes.chunks(4096) {
             let resp: HashList = self.post_json(
                 "missing chunks",
+                "client.missing",
                 "/chunks/missing",
                 &HashList {
                     hashes: batch.to_vec(),
@@ -206,6 +490,7 @@ impl Client {
     pub fn upload(&self, frames: &[u8]) -> Result<()> {
         self.post_bytes(
             "uploading chunks",
+            "client.upload",
             "/chunks/upload",
             "application/octet-stream",
             frames,
@@ -217,6 +502,7 @@ impl Client {
     pub fn download(&self, hashes: &[Hash]) -> Result<Vec<(Hash, Vec<u8>)>> {
         let body = self.post_bytes(
             "downloading chunks",
+            "client.download",
             "/chunks/download",
             "application/json",
             &serde_json::to_vec(&HashList {
@@ -229,12 +515,13 @@ impl Client {
     }
 
     pub fn commit(&self, req: &CommitRequest) -> Result<CommitResponse> {
-        self.post_json("committing", "/commit", req)
+        self.post_json("committing", "client.commit", "/commit", req)
     }
 
     pub fn changes(&self, after: u64) -> Result<ChangesResponse> {
         self.get_json(
             "reading changes",
+            "client.changes",
             &format!("/changes?after={after}&limit=1000"),
         )
     }
@@ -247,33 +534,37 @@ impl Client {
             0 => "after=0&limit=0".to_string(),
             seq => format!("after={}&limit=1&ops=false", seq - 1),
         };
-        self.get_json("reading the journal", &format!("/changes?{query}"))
+        self.get_json(
+            "reading the journal",
+            "client.changes",
+            &format!("/changes?{query}"),
+        )
     }
 
     /// The head, once it is not `after` or `wait` has gone by. A plain request and answer, so it
     /// passes through any reverse proxy. Bounded here too: a connection a firewall silently dropped
     /// answers nothing, ever.
     pub fn wait_for_head(&self, after: u64, wait: Duration) -> Result<u64> {
-        let what = "waiting for changes";
-        let resp = self
-            .agent
-            .get(format!(
-                "{}/changes?after={after}&limit=0&wait={}",
-                self.base,
-                wait.as_secs()
-            ))
-            .config()
-            .timeout_recv_response(Some(wait + Duration::from_secs(15)))
-            .build()
-            .header("Authorization", &self.auth)
-            .call()
-            .with_context(|| format!("{what}: cannot reach the server"))?;
-        let answer: ChangesResponse = serde_json::from_slice(&self.read(what, resp)?)?;
+        let url = format!(
+            "{}/changes?after={after}&limit=0&wait={}",
+            self.base,
+            wait.as_secs()
+        );
+        let body = self.exchange("waiting for changes", "client.wait", || {
+            self.agent
+                .get(&url)
+                .config()
+                .timeout_recv_response(Some(wait + Duration::from_secs(15)))
+                .build()
+                .header("Authorization", &self.auth)
+                .call()
+        })?;
+        let answer: ChangesResponse = serde_json::from_slice(&body)?;
         Ok(answer.head)
     }
 
     pub fn conflicts(&self) -> Result<Vec<ConflictEntry>> {
-        self.get_json("reading conflicts", "/conflicts")
+        self.get_json("reading conflicts", "client.conflicts", "/conflicts")
     }
 }
 
@@ -344,12 +635,63 @@ mod tests {
         format!("http://{addr}")
     }
 
-    #[test]
-    fn download_refuses_a_valid_chunk_that_was_not_asked_for() {
-        let mut frames = Vec::new();
-        wire::write_frame(&mut frames, &Hash::of(b"other"), b"other");
-        let client = Client::new(&Config {
-            server: hostile_server(frames),
+    /// The connection closed with no answer, as by a server killed or restarting.
+    const CLOSE: u16 = 0;
+    /// The connection closed partway through the answer.
+    const CUT: u16 = 1;
+
+    /// A server, or a proxy before it, answering each request with the next of `script`, a status,
+    /// [`CLOSE`] or [`CUT`] (the last one from then on), and counting the requests.
+    fn scripted_server(script: Vec<u16>) -> (String, Arc<AtomicU64>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicU64::new(0));
+        let count = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let n = count.fetch_add(1, Ordering::SeqCst) as usize;
+                let status = script[n.min(script.len() - 1)];
+                if status == CLOSE {
+                    continue;
+                }
+                let body = match status {
+                    200 | CUT => format!(
+                        r#"{{"protocol":{},"server_version":"x","head":0}}"#,
+                        cairn_protocol::PROTOCOL_VERSION
+                    ),
+                    _ => "a proxy's page".to_string(),
+                };
+                let head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    if status == CUT { 200 } else { status },
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                let sent = if status == CUT {
+                    body.len() / 2
+                } else {
+                    body.len()
+                };
+                stream.write_all(&body.as_bytes()[..sent]).unwrap();
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn config(server: String) -> Config {
+        Config {
+            server,
             namespace: "default".into(),
             token: "t".into(),
             device: cairn_protocol::DeviceId::random(),
@@ -357,7 +699,207 @@ mod tests {
             policy: Default::default(),
             filenames: Default::default(),
             allow_http: false,
-        })
+        }
+    }
+
+    #[test]
+    fn a_proxy_whose_server_is_away_is_asked_again() {
+        let (url, seen) = scripted_server(vec![502, 503, 504, 200]);
+        let client = Client::new(&config(url), Retries::Sync).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+        assert_eq!(client.retried().load(Ordering::SeqCst), 3);
+    }
+
+    /// As a server restarting does: the connection closed before the answer, or partway through it.
+    #[test]
+    fn a_connection_closed_before_or_during_the_answer_is_tried_again() {
+        let (url, seen) = scripted_server(vec![CLOSE, CUT, 200]);
+        let client = Client::new(&config(url), Retries::Sync).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        assert_eq!(client.retried().load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_refusal_or_a_full_disk_is_not_asked_again() {
+        for status in [400, 401, 404, 409, 413, 500, 507] {
+            let (url, seen) = scripted_server(vec![status, 200]);
+            assert!(
+                Client::new(&config(url), Retries::Sync).is_err(),
+                "{status}"
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "{status}");
+        }
+    }
+
+    /// A command a person waits on: three tries more, over 3.5 s, then the error.
+    #[test]
+    fn a_command_tries_again_for_a_few_seconds() {
+        let (url, seen) = scripted_server(vec![503]);
+        let started = Instant::now();
+        let err = Client::new(&config(url), Retries::Short).err().unwrap();
+        let took = started.elapsed();
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+        assert!(format!("{err:#}").ends_with("; tried 4 times"), "{err:#}");
+        assert!(
+            took >= Duration::from_millis(3500) && took < Duration::from_secs(10),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn the_feed_asks_once() {
+        let (url, seen) = scripted_server(vec![503, 200]);
+        let err = Client::new(&config(url), Retries::Never).err().unwrap();
+        assert!(err.to_string().contains("503"), "{err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// A name that does not exist is looked up again, as a network not yet up after a laptop wakes
+    /// says the same of every name.
+    #[test]
+    fn a_name_that_cannot_be_looked_up_is_tried_again() {
+        let r = CachedResolver {
+            inner: DefaultResolver::default(),
+            last: Mutex::new(None),
+        };
+        let uri: ureq::http::Uri = "http://cairn-test.invalid:1/v1/info".parse().unwrap();
+        let err = r
+            .resolve(
+                &uri,
+                &ureq::config::Config::default(),
+                NextTimeout::default(),
+            )
+            .unwrap_err();
+        assert!(transient(&err), "{err}");
+        assert!(
+            err.to_string().contains("cannot look up the server's name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_failures_of_the_network_are_tried_again() {
+        use io::ErrorKind::*;
+        for kind in [
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+            TimedOut,
+            ConnectionRefused,
+            NetworkDown,
+            NetworkUnreachable,
+            HostUnreachable,
+            OutOfMemory,
+            UnexpectedEof,
+        ] {
+            assert!(transient_io(&io::Error::from(kind)), "{kind:?}");
+        }
+        assert!(transient_io(&io::Error::from_raw_os_error(ENOBUFS)));
+        // As the kernel numbers them, and as std reads each number.
+        #[cfg(target_os = "linux")]
+        for errno in [105, 12, 104, 103, 32, 110, 111, 100, 101, 113] {
+            assert!(
+                transient_io(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        for errno in [55, 12, 54, 53, 32, 60, 61, 50, 51, 65] {
+            assert!(
+                transient_io(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        #[cfg(windows)]
+        for errno in [10055, 10054, 10053, 10060, 10061, 10050, 10051, 10065] {
+            assert!(
+                transient_io(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        for kind in [InvalidData, PermissionDenied, NotFound, StorageFull] {
+            assert!(!transient_io(&io::Error::from(kind)), "{kind:?}");
+        }
+        assert!(transient(&ureq::Error::Timeout(Timeout::Connect)));
+        assert!(transient(&ureq::Error::Timeout(Timeout::SendBody)));
+        assert!(transient(&ureq::Error::HostNotFound));
+        assert!(transient(&ureq::Error::Other(Box::new(LookupFailed(
+            ureq::Error::HostNotFound
+        )))));
+        // The server is there, and has not answered in ten minutes.
+        assert!(!transient(&ureq::Error::Timeout(Timeout::RecvResponse)));
+        assert!(!transient(&ureq::Error::BodyExceedsLimit(1)));
+        assert!(!transient(&ureq::Error::Other("anything else".into())));
+        for status in [502, 503, 504] {
+            assert!(transient_status(status), "{status}");
+        }
+        for status in [200, 400, 401, 404, 409, 413, 429, 500, 501, 505, 507] {
+            assert!(!transient_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn the_waits_come_to_about_a_minute_in_a_sync_and_seconds_in_a_command() {
+        let half = Duration::from_millis(500);
+        let said =
+            |r: Retries| -> Vec<String> { r.waits().iter().map(|n| seconds(half * *n)).collect() };
+        assert_eq!(
+            said(Retries::Sync),
+            ["0.5 s", "1 s", "2 s", "4 s", "8 s", "16 s", "30 s"]
+        );
+        assert_eq!(said(Retries::Short), ["0.5 s", "1 s", "2 s"]);
+        assert!(said(Retries::Never).is_empty());
+        let total = |r: Retries| half * r.waits().iter().sum::<u32>();
+        assert_eq!(total(Retries::Sync), Duration::from_millis(61_500));
+        assert_eq!(total(Retries::Short), Duration::from_millis(3_500));
+    }
+
+    /// A host that drops every packet costs 30 s a connect: the request stops at about 3 minutes, its
+    /// tries and waits together, not past 5.
+    #[test]
+    fn a_request_stops_trying_at_about_three_minutes() {
+        let waits = Retries::Sync.waits();
+        let half = Duration::from_millis(500);
+        let mut elapsed = Duration::ZERO;
+        let mut tries = 0;
+        while let Some(wait) = next_wait(waits, tries, elapsed, half, MAX_REQUEST_TIME) {
+            // Each try a connect that times out.
+            elapsed += wait + Duration::from_secs(30);
+            tries += 1;
+        }
+        assert!(tries < waits.len(), "{tries}");
+        assert!(
+            elapsed <= MAX_REQUEST_TIME + Duration::from_secs(30),
+            "{elapsed:?}"
+        );
+        // A quick failure uses the whole budget.
+        let quick: Vec<_> = (0..waits.len())
+            .map(|t| next_wait(waits, t, Duration::from_secs(1), half, MAX_REQUEST_TIME))
+            .collect();
+        assert!(quick.iter().all(Option::is_some));
+        assert_eq!(
+            next_wait(waits, waits.len(), Duration::ZERO, half, MAX_REQUEST_TIME),
+            None
+        );
+    }
+
+    #[test]
+    fn download_refuses_a_valid_chunk_that_was_not_asked_for() {
+        let mut frames = Vec::new();
+        wire::write_frame(&mut frames, &Hash::of(b"other"), b"other");
+        let client = Client::new(
+            &Config {
+                server: hostile_server(frames),
+                namespace: "default".into(),
+                token: "t".into(),
+                device: cairn_protocol::DeviceId::random(),
+                device_name: "d".into(),
+                policy: Default::default(),
+                filenames: Default::default(),
+                allow_http: false,
+            },
+            Retries::Short,
+        )
         .unwrap();
         let err = client.download(&[Hash::of(b"wanted")]).unwrap_err();
         assert!(err.to_string().contains("asked for"), "{err}");

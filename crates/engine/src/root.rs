@@ -121,7 +121,7 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<u64> {
         filenames: FilenamePolicy::Faithful,
         allow_http: opts.allow_http,
     };
-    let head = crate::client::Client::new(&config)
+    let head = crate::client::Client::new(&config, crate::client::Retries::Short)
         .and_then(|c| c.info())
         .with_context(|| {
             format!(

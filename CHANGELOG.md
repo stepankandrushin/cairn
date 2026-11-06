@@ -7,6 +7,19 @@
 - On macOS the daemon woke and scanned for every write under a folder the rules leave out, such as a build
   folder: its watcher asked the rules about the written path itself, which a rule naming only the folder does not
   match. It now asks about each folder above it too, as on Windows; Linux never watches an excluded folder.
+- A sync stopped at the first error the network gave, however passing: a first upload of 842k entries from macOS
+  failed after 98 minutes on "No buffer space available (os error 55)", a moment's shortage of socket memory, and a
+  second run finished it. A request the network fails in a way that says nothing about the request (no socket
+  buffers or memory, a connection reset, aborted, refused, timed out or closed before the whole answer came, as a
+  server restarting closes it, a name that could not be looked up, a network or host out of reach, or 502, 503 or
+  504 from a proxy) is now tried again: after 0.5, 1, 2, 4, 8, 16 and 30 s in a sync, after 0.5, 1 and 2 s in any
+  other command, and for about three minutes at most however slow each try. The command says each try on its error
+  output, the daemon's log says a request's first new try and how it ended, and the sync's summary counts them;
+  past that the sync fails as before, and the next one delivers what it queued. A refusal (4xx), the server's disk
+  full (507), an answer that makes no sense, or a server that has not answered in ten minutes is never tried again.
+- On macOS, and on Linux in a build against glibc, the daemon held what a sync had used, up to that sync's peak, for
+  the pause after it and 30 s more: gigabytes for about a minute after a big tree's sync. It now gives it back as the
+  sync ends. The Linux release binaries did not hold it: musl gives freed memory back by itself.
 
 ## 0.1.4
 

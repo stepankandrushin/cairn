@@ -445,7 +445,8 @@ fn what_windows_does_not_hold_stays_stored() {
     a.synced();
     b.synced();
     let config = cairn_engine::root::open_config(&a.root).unwrap();
-    let client = cairn_engine::client::Client::new(&config).unwrap();
+    let client =
+        cairn_engine::client::Client::new(&config, cairn_engine::client::Retries::Short).unwrap();
     // The newest revision of what was made at `f`.
     let latest = || -> (ObjectId, RevisionId, RevisionBody) {
         let mut found: Option<(ObjectId, RevisionId, RevisionBody)> = None;

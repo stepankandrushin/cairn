@@ -1,7 +1,7 @@
 //! Restoring past state on the server: always a new commit with new revisions, so that a restore can
 //! be undone like anything else (invariant 7).
 
-use crate::client::Client;
+use crate::client::{Client, Retries};
 use crate::export::tree_at;
 use crate::merge::{conflict_name, in_git_dir};
 use crate::root::{Config, Root};
@@ -44,7 +44,7 @@ pub fn journal(client: &Client) -> Result<Vec<Change>> {
 
 /// The revisions of the object at `path` as of `at`.
 pub fn history(config: &Config, path: &[Name], at: Option<u64>) -> Result<Vec<HistoryEntry>> {
-    let client = Client::new(config)?;
+    let client = Client::new(config, Retries::Short)?;
     let (tree, seq) = tree_at(&client, at)?;
     let object = tree
         .resolve(path)
@@ -106,7 +106,7 @@ pub struct Conflict {
 /// The conflict inbox, with paths: the server keeps which copy holds whose competing version, and
 /// the journal says where each was made and where it is now.
 pub fn conflicts(config: &Config) -> Result<Vec<Conflict>> {
-    let client = Client::new(config)?;
+    let client = Client::new(config, Retries::Short)?;
     let entries = client.conflicts()?;
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -313,7 +313,7 @@ fn commit(client: &Client, root: &Root, ops: Vec<Op>) -> Result<RestoreOutcome> 
 
 /// Bring `path` back to its state as of sequence `at`, as a new commit. `cairn sync` then applies it.
 pub fn restore_at(root: &Root, path: &[Name], at: u64) -> Result<RestoreOutcome> {
-    let client = Client::new(&root.config)?;
+    let client = Client::new(&root.config, Retries::Short)?;
     let (then, seq) = tree_at(&client, Some(at))?;
     let (now, _) = tree_at(&client, None)?;
     let top = then
@@ -328,7 +328,7 @@ pub fn restore_revision(
     path: &[Name],
     revision: RevisionId,
 ) -> Result<RestoreOutcome> {
-    let client = Client::new(&root.config)?;
+    let client = Client::new(&root.config, Retries::Short)?;
     let (now, _) = tree_at(&client, None)?;
     let object = now.resolve(path).ok_or_else(|| {
         anyhow!(

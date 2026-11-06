@@ -5,5 +5,13 @@ fn main() -> std::process::ExitCode {
     if std::env::var_os("CAIRN_USER_DIR").is_none_or(|v| v.is_empty()) {
         std::env::set_var("CAIRN_USER_DIR", cairn_harness::user_dir());
     }
+    // A request the network failed is tried again after a millisecond, not half a second and up: a test
+    // whose server is down would otherwise wait a minute for the sync to fail. A test that tunes this
+    // itself keeps its own.
+    let tune = std::env::var("CAIRN_FP_TUNE").unwrap_or_default();
+    if !tune.split(',').any(|t| t.starts_with("client.retry_ms=")) {
+        let sep = if tune.is_empty() { "" } else { "," };
+        std::env::set_var("CAIRN_FP_TUNE", format!("{tune}{sep}client.retry_ms=1"));
+    }
     cairn_cli::run()
 }

@@ -1,7 +1,7 @@
 //! The `cairn` command-line client.
 
 use anyhow::{anyhow, bail, Context, Result};
-use cairn_engine::client::Client;
+use cairn_engine::client::{Client, Retries};
 use cairn_engine::daemon::DaemonOptions;
 use cairn_engine::root::{open_config, Busy, Paused};
 use cairn_engine::scan::display_path;
@@ -296,6 +296,12 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
             report.not_synced_here.len()
         );
     }
+    if report.retries > 0 {
+        outln!(
+            "tried requests again after the network failed them: {} time(s)",
+            report.retries
+        );
+    }
     match &report.outcome {
         SyncOutcome::Synced => {
             outln!(
@@ -566,11 +572,13 @@ fn run_inner() -> Result<u8> {
                 feed: !no_feed,
             };
             // Whoever reads this going away is no reason to stop syncing.
-            let say = |line: &str| {
+            let say: fn(&str) = |line: &str| {
                 let mut out = std::io::stdout();
                 let _ = writeln!(out, "{} {line}", date_time(now()));
                 let _ = out.flush();
             };
+            // Tries go in this log: a request's first new try and its outcome, not a line a try.
+            cairn_engine::client::log_retries_with(say);
             say(&format!("starting for {}", root.display()));
             cairn_engine::daemon::run(&root, &opts, &mut |line| say(line))?;
             Ok(EXIT_ERROR)
@@ -706,7 +714,7 @@ fn run_inner() -> Result<u8> {
             Ok(status_code(&report))
         }
         Command::Log { limit } => {
-            let client = Client::new(&open_config(&find_root(cli.root)?)?)?;
+            let client = Client::new(&open_config(&find_root(cli.root)?)?, Retries::Short)?;
             let changes = restore::journal(&client)?;
             let skip = limit.map_or(0, |n| changes.len().saturating_sub(n));
             for c in &changes[skip..] {

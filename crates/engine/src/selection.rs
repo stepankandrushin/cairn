@@ -10,7 +10,7 @@
 //! removed it because the server said so gets it back if the server changes its mind, and a file
 //! changed while it was excluded merges as new, keeping both versions if they differ.
 
-use crate::client::Client;
+use crate::client::{Client, Retries};
 use crate::fsops::{birth_mark, is_not_found, Dir, FileType, Stat};
 use crate::root::Root;
 use crate::state::Row;
@@ -617,7 +617,7 @@ fn store_excluded(root: &Root, excluded: &Excluded) -> Result<()> {
 
 /// The server's tree now.
 fn remote_tree(root: &Root) -> Result<Tree> {
-    let client = Client::new(&root.config)?;
+    let client = Client::new(&root.config, Retries::Short)?;
     let mut tree = root.state.load_base()?;
     let mut seq = root.state.cursor()?;
     crate::sync::fetch_changes(&client, &mut tree, &mut seq, &mut Default::default())?;

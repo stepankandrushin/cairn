@@ -1,7 +1,7 @@
 //! Writing a point in history into a separate folder, for inspection or an exact restore. Never
 //! touches the sync root or the server.
 
-use crate::client::Client;
+use crate::client::{Client, Retries};
 use crate::fsops::{self, AsFd, Dir, OwnedFd};
 use crate::metadata::{self, Accounts, ApplyPolicy};
 use crate::root::Config;
@@ -95,7 +95,7 @@ pub fn export(
     dest: &Path,
     policy: &ApplyPolicy,
 ) -> Result<(u64, Vec<Skip>)> {
-    let client = Client::new(config)?;
+    let client = Client::new(config, Retries::Short)?;
     let (tree, seq) = tree_at(&client, at)?;
     let top = tree
         .resolve(path)

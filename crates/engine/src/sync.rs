@@ -9,7 +9,7 @@ use crate::apply::{
     self, cur_from_identified, read_for_upload, recover, Applier, CurNode, NoteIntent,
     INTENT_ARRIVING, INTENT_COPY, INTENT_NOTE,
 };
-use crate::client::Client;
+use crate::client::{Client, Retries};
 use crate::identify::{identify, settle_arriving, Arriving, CopyIntent, Identified};
 use crate::merge::{merge, MergeInput, Plan, ReportKind, TNode};
 use crate::metadata::Accounts;
@@ -123,6 +123,8 @@ pub struct SyncReport {
     pub part: Option<(u64, u64, u64)>,
     /// For a sync that checked the incremental path against the full one: whether the two agreed.
     pub checked: Option<bool>,
+    /// How many times a request the network failed was tried again.
+    pub retries: u64,
 }
 
 impl SyncReport {
@@ -151,6 +153,7 @@ impl SyncReport {
             whole_because: None,
             part: None,
             checked: None,
+            retries: 0,
         }
     }
 }
@@ -1421,7 +1424,12 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             return Ok(report);
         }
     };
-    let client = Client::new(&root.config)?;
+    let client = Client::new(&root.config, Retries::Sync)?;
+    let retried = client.retried();
+    let counted = |mut report: SyncReport| {
+        report.retries = retried.load(std::sync::atomic::Ordering::SeqCst);
+        report
+    };
     let accounts = Accounts::load();
     // Read once, before anything is touched: a rule that cannot be read must stop the sync.
     let selection = Selection::load(&root)?;
@@ -1443,7 +1451,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     if let Some(fast) = fast {
         hit("sync.fast");
         if !crate::steady::oracle() {
-            return Ok(fast.report);
+            return Ok(counted(fast.report));
         }
         // Every failpoint stays live in it, so that a test stopping or killing a sync at a step the
         // fast path passes over still finds it.
@@ -1456,7 +1464,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             SyncReport::new(),
             generation,
         )?;
-        return crate::steady::compare(fast, full);
+        return crate::steady::compare(fast, full).map(counted);
     }
     let (report, _) = sync_full(
         root,
@@ -1467,7 +1475,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         report,
         generation,
     )?;
-    Ok(report)
+    Ok(counted(report))
 }
 
 /// The whole sync: every object scanned, identified, merged, applied and pushed, until both sides agree.
@@ -2924,7 +2932,7 @@ fn take_back_refused(req: &CommitRequest, rows: &mut BTreeMap<ObjectId, Row>) ->
 
 /// Fail plainly if the configured server is unreachable or refuses the token.
 pub fn check_server(root: &Root) -> Result<u64> {
-    let client = Client::new(&root.config)?;
+    let client = Client::new(&root.config, Retries::Short)?;
     Ok(client.info()?.head)
 }
 

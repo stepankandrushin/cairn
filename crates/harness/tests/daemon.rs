@@ -608,6 +608,118 @@ fn a_change_as_a_sync_ends_gets_a_sync_of_its_own() {
     wait_file(&db, b.path("written-as-it-ended"), b"x");
 }
 
+/// What a sync held goes back to the system as it ends, not after a pause: a big tree's sync peaks in
+/// gigabytes, which an idle daemon would otherwise hold until the pause and half a minute had passed.
+#[test]
+fn a_daemon_gives_memory_back_as_each_sync_ends() {
+    let (sb, _s, a, _b) = pair("d-give-back");
+    let steps = sb.path("steps");
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_LOG", steps.to_str().unwrap())],
+    );
+    let count = |name: &str| {
+        std::fs::read_to_string(&steps)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == name)
+            .count()
+    };
+    for round in 0..3 {
+        a.write(&format!("f{round}"), format!("round {round}"));
+        let log = da.log.clone();
+        wait_for("the file to be sent", &log, || {
+            da.state() == "synced"
+                && da.status()["recent"]
+                    .to_string()
+                    .contains(&format!("f{round}"))
+        });
+        da.wait_rest();
+        let synced = count("daemon.synced");
+        assert!(synced > round, "{}", da.log());
+        assert_eq!(
+            count("daemon.gave_back"),
+            synced,
+            "round {round}: {}",
+            da.log()
+        );
+    }
+}
+
+/// A request tried again is two lines in the daemon's log, not one a try: its first new try, naming the
+/// error, and how it ended, answered or given up.
+#[test]
+fn a_daemon_says_a_request_tried_again_in_two_lines() {
+    let enobufs = if cfg!(target_os = "macos") {
+        55
+    } else if cfg!(windows) {
+        10055
+    } else {
+        105
+    };
+    let lines = |log: &str, has: &str| log.lines().filter(|l| l.contains(has)).count();
+    let (_sb, _s, a, b) = pair("d-retry");
+
+    a.write("f", "sent on the third try");
+    let spec = format!("client.commit:{enobufs}:2");
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &[("CAIRN_FP_NET", &spec)]);
+    da.wait_state("synced");
+    let log = da.log();
+    drop(da);
+    b.synced();
+    assert_eq!(b.read("f"), b"sent on the third try");
+    assert_eq!(lines(&log, "trying again"), 1, "{log}");
+    assert!(
+        log.lines().any(|l| l.contains("committing: ")
+            && l.contains(&format!("(os error {enobufs})"))
+            && l.ends_with("; trying again for up to about a minute")),
+        "{log}"
+    );
+    assert_eq!(
+        lines(&log, "committing: answered on try 3 after "),
+        1,
+        "{log}"
+    );
+    assert_eq!(lines(&log, " of 7"), 0, "{log}");
+    assert!(
+        log.contains("tried requests again after the network failed them: 2 time(s)"),
+        "{log}"
+    );
+
+    // Past the budget: the first, the end, and the sync's error; the next sync delivers.
+    a.write("g", "sent by the next sync");
+    let spec = format!("client.commit:{enobufs}:8");
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &[("CAIRN_FP_NET", &spec)]);
+    let path = da.log.clone();
+    wait_for("the next sync to deliver", &path, || {
+        da.log().contains("error: ") && da.state() == "synced"
+    });
+    let log = da.log();
+    drop(da);
+    b.synced();
+    assert_eq!(b.read("g"), b"sent by the next sync");
+    assert_eq!(
+        lines(&log, "; trying again for up to about a minute"),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        lines(&log, "committing: gave up on try 8 after "),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        lines(
+            &log,
+            &format!("(os error {enobufs}); tried 8 times; trying again")
+        ),
+        1,
+        "{log}"
+    );
+    assert_eq!(lines(&log, " of 7"), 0, "{log}");
+}
+
 /// A `kill -9` at step after step of the daemon's life, and a new one taking over each time.
 #[test]
 fn a_daemon_killed_at_any_step_loses_nothing() {

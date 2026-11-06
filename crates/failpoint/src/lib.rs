@@ -16,6 +16,10 @@
 //!   cannot do what is asked, the way NTFS cannot swap two names. Not a step either.
 //! - `CAIRN_FP_TUNE=<name>=<n>[,...]`: `tuned` gives `n` for that name instead of its default, to
 //!   make a limit small enough for a test to cross. Not a step either.
+//! - `CAIRN_FP_NET=<name>:<errno>:<n>[:lost]`: `network` fails the next `n` requests at that point with
+//!   the raw OS error `errno`, as a kernel out of socket buffers or a reset connection does: before the
+//!   request goes out, or with `lost` once its answer is in, as a connection lost with the answer does.
+//!   Not a step either.
 
 use std::io;
 
@@ -94,6 +98,19 @@ pub fn unsupported(name: &str) -> bool {
     }
 }
 
+/// A request at this point, before it goes out (`answered` false) and once its answer is in (true):
+/// may fail it as the network fails one.
+#[inline]
+pub fn network(name: &str, answered: bool) -> io::Result<()> {
+    #[cfg(feature = "enabled")]
+    return imp::network(name, answered);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = (name, answered);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "enabled")]
 mod imp {
     use std::io::{self, Write};
@@ -101,6 +118,7 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static HITS: AtomicU64 = AtomicU64::new(0);
+    static NET_FAILED: AtomicU64 = AtomicU64::new(0);
 
     fn matches(spec: &str, name: &str, seq: u64) -> bool {
         match spec.parse::<u64>() {
@@ -201,6 +219,27 @@ mod imp {
             .filter_map(|pair| pair.split_once('='))
             .find(|(point, _)| *point == name)
             .and_then(|(_, n)| n.parse().ok())
+    }
+
+    pub fn network(name: &str, answered: bool) -> io::Result<()> {
+        let Ok(spec) = std::env::var("CAIRN_FP_NET") else {
+            return Ok(());
+        };
+        let mut parts = spec.split(':');
+        let (Some(point), Some(errno), Some(n)) = (parts.next(), parts.next(), parts.next()) else {
+            return Ok(());
+        };
+        let lost = parts.next() == Some("lost");
+        if point != name || lost != answered {
+            return Ok(());
+        }
+        let (Ok(errno), Ok(n)) = (errno.parse::<i32>(), n.parse::<u64>()) else {
+            return Ok(());
+        };
+        if NET_FAILED.fetch_add(1, Ordering::SeqCst) < n {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(())
     }
 
     pub fn deny(name: &str) -> io::Result<()> {

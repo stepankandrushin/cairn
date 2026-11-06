@@ -4,10 +4,6 @@ Self-hosted file sync with versioned history that keeps everything about your fi
 owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes. A central server keeps
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
-A cairn is a lasting stone marker that helps you find your way. The name reflects our aim: reliable
-storage and a history you can trace, keeping files safe and helping you find your way back to earlier
-versions.
-
 **Status: 0.1.1, early.** Linux only, one user. It has been through a harsh failure harness but has no long
 history on real data, so keep another copy of anything you put through it. The daemon is newer than the
 release and has run on no real tree yet. See
@@ -15,14 +11,40 @@ release and has run on no real tree yet. See
 
 ## Why
 
-| Commonly a pain | Here |
-|---|---|
-| A built-in list of names is never synced | No ignored names: `.git`, `node_modules` and `.venv` sync whole |
-| Symlinks skipped, modes and owners lost | Round-tripped exactly; `git status` is clean on the other machine |
-| One byte changed re-uploads the file | Content-defined chunks: only what changed moves |
-| Versions are full copies | Versions share chunks |
-| Conflicts surprise you | Three-way merge: both versions stay, with an inbox |
-| An unmounted disk reads as "delete everything" | Sync pauses and asks |
+Cairn focuses on preserving the whole filesystem and its history. This comparison covers desktop
+filesystem sync; metadata support depends on the operating system, filesystem and privileges.
+
+| Feature | Cairn | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
+|---|---|---|---|---|
+| Names excluded by default | None: `.git`, `node_modules` and `.venv` sync whole | Built-in exclusions for temporary and system files | Built-in exclusions for temporary and system files | Internal control and temporary files; user-defined ignore rules |
+| Symlinks | Preserved as links | Skipped | Targets copied instead of preserving links | Preserved, except on Windows |
+| Filesystem metadata | Modes, owners, xattrs, ACLs, hard links and sparse layout preserved | No full Unix metadata round-trip | Executable bit on Unix; not full modes or ownership | Modes; owners and xattrs opt-in; hard links not preserved |
+| Small edits to large files | Only new content-defined chunks transferred | Whole file uploaded again | Only new content-defined blocks transferred | Only changed fixed-size blocks transferred |
+| Version storage | Versions share chunks | Whole-file versions | Versions share blocks | Optional whole-file archives of changes received from peers; off by default |
+| Conflicts | Three-way merge; both versions kept, with an inbox | Local conflict copy; not uploaded by default | Both versions kept; one renamed as a conflict file | Both versions kept; one renamed as a conflict file |
+| Missing disks / mass deletion | Mount checks; sync pauses and asks | Confirmation before mass deletion | Confirmation above a deletion-count threshold | Sync stops if the folder's `.stfolder` marker is missing |
+
+[^nextcloud]: Nextcloud: [exclusions](https://github.com/nextcloud/desktop/blob/master/sync-exclude.lst),
+    [symlinks](https://docs.nextcloud.com/server/latest/user_manual/en/desktop/usage.html),
+    [metadata and delta-sync roadmap](https://github.com/nextcloud/desktop/issues/9636),
+    [versions](https://docs.nextcloud.com/server/latest/user_manual/en/files/version_control.html),
+    [conflicts](https://docs.nextcloud.com/server/latest/user_manual/en/desktop/conflicts.html),
+    [deletion confirmation](https://github.com/nextcloud/desktop/blob/master/src/gui/folder.cpp).
+[^seafile]: Seafile: [exclusions and symlink handling](https://github.com/haiwen/seafile/blob/master/daemon/repo-mgr.c),
+    [Unix modes](https://github.com/haiwen/seafile/blob/master/common/index/index.h),
+    [blocks and version storage](https://manual.seafile.com/14.0/develop/data_model/),
+    [conflicts](https://help.seafile.com/syncing_client/file_conflicts/),
+    [deletion confirmation](https://help.seafile.com/faq/#meaning-file-syncing-errors).
+[^syncthing]: Syncthing: [metadata and missing-folder protection](https://docs.syncthing.net/users/faq.html),
+    [blocks, conflicts and temporary files](https://docs.syncthing.net/users/syncing.html),
+    [ignore rules](https://docs.syncthing.net/users/ignoring.html),
+    [versioning](https://docs.syncthing.net/users/versioning.html).
+
+## Why the name Cairn?
+
+A cairn is a lasting stone marker that helps you find your way. The name reflects our aim: reliable
+storage and a history you can trace, keeping files safe and helping you find your way back to earlier
+versions.
 
 ## Promises
 

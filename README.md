@@ -4,6 +4,10 @@ Self-hosted file sync with versioned history that keeps everything about your fi
 owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes. A central server keeps
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
+A cairn is a lasting stone marker that helps you find your way. The name reflects our aim: reliable
+storage and a history you can trace, keeping files safe and helping you find your way back to earlier
+versions.
+
 **Status: 0.1.1, early.** Linux only, one user. It has been through a harsh failure harness but has no long
 history on real data, so keep another copy of anything you put through it. The daemon is newer than the
 release and has run on no real tree yet. See

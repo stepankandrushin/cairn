@@ -9,7 +9,7 @@ history on real data, so keep another copy of anything you put through it. The d
 release and has run on no real tree yet. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
 
-## Why
+## Cairn vs Nextcloud vs Seafile vs Syncthing
 
 Cairn focuses on preserving the whole filesystem and its history. This comparison covers desktop
 filesystem sync and the services needed to run it; metadata support depends on the operating system,

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.4
 
 **Fixed:**
 
@@ -35,6 +35,15 @@
   Where another device has added to the folder meanwhile, each sync says the copy here is in the way of the
   server's and to move it or `cairn include --merge` it, which merges it as new. A file with another name here
   cannot stay out without taking that name with it, and comes back in.
+
+**Known limits:**
+
+- The daemon checks the incremental path once a day by deciding a sync the whole way as well. That costs what a
+  whole-tree sync cost before: at about 840,000 entries, about a minute of one core and up to 8 GB, once a day.
+  This is estimated from 0.1.3's whole-tree numbers, not yet measured as a check.
+- While a copy kept out by `cairn exclude` or a rule exists, every sync goes the whole way.
+- A first sync of a big tree still takes hours per device over a slow path, most of it placing files one at a time.
+  Off Linux every placed file is still read back once.
 
 ## 0.1.3
 

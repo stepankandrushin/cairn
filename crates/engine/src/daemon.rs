@@ -62,8 +62,11 @@ const FEED_WAIT_RECOVERY: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
-    /// Between full syncs when nothing asks for one.
+    /// Between syncs when nothing asks for one, each with a scan of the whole tree.
     pub reconcile: Duration,
+    /// Between syncs that decide everything the full way as well, the check on the syncs that take
+    /// what changed alone: one is due this long after the last whose every decision was the full sync's.
+    pub full_sync: Duration,
     /// The longest wait before trying again after a failure, or while paused.
     pub retry: Duration,
     /// Watch the filesystem; without it, only the reconcile finds local changes.
@@ -76,6 +79,7 @@ impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
             reconcile: Duration::from_secs(3600),
+            full_sync: Duration::from_secs(86_400),
             retry: Duration::from_secs(60),
             watch: true,
             feed: true,
@@ -865,6 +869,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             path,
             &SyncOptions {
                 changed_here,
+                full_every: Some(opts.full_sync),
                 ..SyncOptions::default()
             },
         );
@@ -939,6 +944,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         status.state = "paused".into();
                         status.detail = Some(why.clone());
                     }
+                }
+                if report.checked == Some(true) {
+                    log(&format!(
+                        "decided the full way as well, as every {} seconds: the incremental path agrees",
+                        opts.full_sync.as_secs()
+                    ));
                 }
                 if report.commits > 0 || report.steps_applied > 0 {
                     let took = match (&report.whole_because, report.part) {

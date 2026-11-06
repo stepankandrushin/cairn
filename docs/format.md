@@ -65,6 +65,8 @@ the root.
   ignore         this device's rules, optional: never synced, and written only by a person
   lock           flock held while a sync runs
   daemon.json    what a running daemon last reported; for reading only, and never needed
+  full-checked   when a sync last ended with every decision the full sync's, in seconds since the
+                 epoch: the daemon's check on the incremental path is due a day after; never needed
   state.sqlite   WAL, synchronous=FULL
   stage/         entries lifted out for a moment, for swaps and cycles
   chunks/        downloads in progress, by hash, in slices of about 1 GiB, each chunk gone once the

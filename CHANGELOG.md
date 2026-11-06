@@ -22,7 +22,9 @@
   left it, which the state now keeps a compact record of, with triggers that mark whatever any version writes
   since. Its cost is the scan and what changed. Where the record cannot vouch for that, after an upgrade, a
   change of rules or configuration, a run that did not finish, or a change to a quarter of the tree, the sync
-  goes the whole way and says why.
+  goes the whole way and says why. Once a day the daemon decides every round the full way as well and takes
+  that answer, and anything the incremental round would have decided otherwise is said in its log as a
+  defect; `--full-sync-secs` sets how often.
 
 ## 0.1.3
 

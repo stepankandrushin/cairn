@@ -62,6 +62,26 @@ pub struct Root {
     _lock: File,
 }
 
+/// When a sync last ended with every decision the full sync's, in seconds since the epoch: one whose
+/// last round took the whole tree, or the daemon's check, every round of which the full way confirmed.
+/// Not in the state file, where a write would cost the next sync with nothing to do its shortcut.
+const FULL_CHECKED: &str = "full-checked";
+
+impl Root {
+    pub fn full_checked(&self) -> Option<i64> {
+        let path = self.path.join(name_path(STATE_DIR)).join(FULL_CHECKED);
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    pub fn set_full_checked(&self, secs: i64) -> Result<()> {
+        write_private(
+            &self.path.join(name_path(STATE_DIR)),
+            FULL_CHECKED,
+            secs.to_string().as_bytes(),
+        )
+    }
+}
+
 fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     let tmp = dir.join(format!("{name}.new"));
     let mut f = fsops::private_file(

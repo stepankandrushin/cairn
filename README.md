@@ -68,7 +68,9 @@ cairn pause                      # no sync starts until `cairn resume`, through 
 ```
 
 It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
-events can be lost. Its output says what it did and what it could not do, each thing once, and `cairn status`
+events can be lost. A sync takes what changed alone; once a day (`--full-sync-secs`) one decides everything the
+full way as well and takes that answer, and says in its output if the two differed, which would be a bug to
+report. Its output says what it did and what it could not do, each thing once, and `cairn status`
 keeps what this filesystem refused (a mode on a file another user owns, say) until it is put right. A paused or
 failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log`, `history`, `export`
 and `conflicts` only ask the server, so they answer during a sync too. It answers `cairn status` and the

@@ -1048,6 +1048,18 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
     }
 
     let digests = digests(nodes);
+    // A harness build can take a file of one name as the ledger has it, whatever the scan found, as a
+    // defect in what follows would: for the tests of the daemon's check on the incremental path.
+    let blind: Option<String> = cfg!(feature = "failpoints")
+        .then(|| std::env::var("CAIRN_FP_INCR_BLIND").ok())
+        .flatten();
+    let blind = |n: &Scanned| {
+        blind.as_ref().is_some_and(|b| {
+            n.paths
+                .iter()
+                .any(|p| p.last().is_some_and(|l| l.as_bytes() == b.as_bytes()))
+        })
+    };
     // Each node, the ledger's entry it is quietly, if it is.
     let quiet: Vec<Option<usize>> = par_map(nodes.len(), |i| {
         let n = &nodes[i];
@@ -1083,7 +1095,7 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
             // The digest holds the fingerprint too.
             _ => digests[i].is_some() && digests[i] == seen.digest,
         };
-        same.then_some(li)
+        (same || blind(n)).then_some(li)
     });
     let mut found = vec![false; b.ledger.len()];
     for li in quiet.iter().flatten() {
@@ -1707,12 +1719,25 @@ pub fn ledger_write(
             .chain(agreement.rows.keys().copied())
             .collect(),
     };
+    // A harness build can leave the entry of a file of one name as it was, as a defect here would: for
+    // the tests of the daemon's check on the incremental path.
+    let stale: Option<String> = cfg!(feature = "failpoints")
+        .then(|| std::env::var("CAIRN_FP_INCR_STALE").ok())
+        .flatten();
+    let stale = |e: &Entry| {
+        stale
+            .as_ref()
+            .is_some_and(|n| e.links.iter().any(|l| l.name.as_bytes() == n.as_bytes()))
+    };
     for id in ids {
         let verdict = agreement.verdict(id);
         match (verdict, held) {
             (Verdict::Put(e), None) => w.put.push((id, e.encode())),
             (Verdict::Drop, None) => {}
             (Verdict::Dirty, None) => w.dirty.push(id),
+            (Verdict::Put(e), Some((s, _, _))) if stale(&e) && s.ledger.contains(&id) => {
+                w.clean.push(id);
+            }
             (Verdict::Put(e), Some((s, _, dirty))) => {
                 if dirty.contains(&id) || s.ledger.entry(&id).as_ref() != Some(&e) {
                     w.put.push((id, e.encode()));

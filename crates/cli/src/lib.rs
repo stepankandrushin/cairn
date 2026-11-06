@@ -117,9 +117,14 @@ enum Command {
     },
     /// Keep this root in sync: watch it and the server, and sync whenever either changes.
     Daemon {
-        /// Seconds between full syncs when nothing asks for one: the safety net for missed events.
+        /// Seconds between syncs when nothing asks for one, each scanning the whole tree: the safety net
+        /// for missed events.
         #[arg(long, default_value_t = 3600)]
         reconcile_secs: u64,
+        /// Seconds between syncs that decide everything the full way as well, the check on syncs that
+        /// take what changed alone: anything one would have missed is taken then, and said as a defect.
+        #[arg(long, default_value_t = 86_400)]
+        full_sync_secs: u64,
         /// The longest wait in seconds before trying again after a failure, or while paused.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
@@ -547,6 +552,7 @@ fn run_inner() -> Result<u8> {
         ),
         Command::Daemon {
             reconcile_secs,
+            full_sync_secs,
             retry_secs,
             no_watch,
             no_feed,
@@ -554,6 +560,7 @@ fn run_inner() -> Result<u8> {
             let root = find_root(cli.root)?;
             let opts = DaemonOptions {
                 reconcile: Duration::from_secs(reconcile_secs.max(1)),
+                full_sync: Duration::from_secs(full_sync_secs.max(1)),
                 retry: Duration::from_secs(retry_secs.max(1)),
                 watch: !no_watch,
                 feed: !no_feed,

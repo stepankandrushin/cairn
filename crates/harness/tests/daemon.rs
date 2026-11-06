@@ -355,6 +355,148 @@ fn a_change_with_every_event_lost_is_found_by_the_reconcile() {
     drop(net);
 }
 
+/// The check on the syncs that take what changed alone: a change the incremental path misses, here by a
+/// failpoint standing for a defect in it, in a release build's way, stays missed by every such sync, and
+/// by every sync with nothing to do; the first sync the check is due for decides the full way as well,
+/// takes the full sync's answer, and says in the log that the incremental round would have missed it. A
+/// check that agrees says so, once.
+#[test]
+fn the_periodic_full_sync_takes_what_the_incremental_path_missed_and_says_so() {
+    let (_sb, _s, a, b) = pair("d-full-check");
+    // Apart, so that the one is no neighbour of the other. On Unix a folder, whose mode the scan reads
+    // nothing new for, so that a sync with nothing to do records it as it is; Windows holds no folder's
+    // mode, and there the read-only bit of a file.
+    if cfg!(unix) {
+        a.write("far/blind/inside", "first");
+    } else {
+        a.write("far/blind", "first");
+    }
+    a.write("near/seen", "first");
+    for d in [&a, &b, &a, &b] {
+        d.synced();
+    }
+    let blind = [
+        ("CAIRN_FP_INCR_ORACLE", "0"),
+        ("CAIRN_FP_INCR_BLIND", "blind"),
+    ];
+    let missed = |d: &Device| {
+        let p = std::fs::metadata(d.path("far/blind"))
+            .unwrap()
+            .permissions();
+        #[cfg(unix)]
+        return std::os::unix::fs::PermissionsExt::mode(&p) & 0o777 == 0o750;
+        #[cfg(not(unix))]
+        return p.readonly();
+    };
+    let db = Daemon::events_only(&b);
+    {
+        let da = Daemon::start_env(
+            &a,
+            &["--reconcile-secs", DAY, "--full-sync-secs", DAY],
+            &blind,
+        );
+        da.wait_state("synced");
+        chmod(&a.path("far/blind"), if cfg!(unix) { 0o750 } else { 0o444 });
+        a.write("near/seen", "edited");
+        wait_file(&db, b.path("near/seen"), b"edited");
+        da.wait_rest();
+        assert!(!missed(&b), "nothing missed it");
+        assert!(!da.log().contains("defect"), "{}", da.log());
+    }
+    // Nothing to do, as far as the incremental path can tell, so the next sync takes the shortcut of one
+    // with nothing to do: the check does not.
+    let steps = a.root.with_extension("steps-steady");
+    let path = steps.to_str().unwrap().to_string();
+    for _ in 0..2 {
+        let run = a.sync_env(&[blind[0], blind[1], ("CAIRN_FP_LOG", &path)]);
+        assert!(run.ok(), "{}", run.text());
+    }
+    #[cfg(unix)]
+    {
+        let hits = std::fs::read_to_string(&steps).unwrap_or_default();
+        assert!(hits.lines().any(|l| l == "sync.fast"), "{hits}");
+    }
+    std::thread::sleep(Duration::from_millis(1100));
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY, "--full-sync-secs", "1"],
+        &blind,
+    );
+    let log = da.log.clone();
+    wait_for("the mode to arrive", &log, || missed(&b));
+    wait_for("the sync to end", &log, || {
+        da.log().contains("looked at the whole tree")
+    });
+    let text = da.log();
+    assert!(
+        text.contains("event: a defect: the incremental path would have decided otherwise"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "looked at the whole tree: the incremental round would have decided otherwise"
+        ),
+        "{text}"
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    a.write("near/seen", "again");
+    wait_file(&db, b.path("near/seen"), b"again");
+    wait_for("a check that agrees", &log, || {
+        da.log().contains(
+            "decided the full way as well, as every 1 seconds: the incremental path agrees",
+        )
+    });
+    assert_eq!(
+        da.log().matches("event: a defect").count(),
+        1,
+        "{}",
+        da.log()
+    );
+}
+
+/// The same check after a finalize that leaves the ledger otherwise than a full one would, here by a
+/// failpoint that keeps one entry as it was: said as a defect, and the ledger goes, so that the next sync
+/// takes the whole tree and writes it again.
+#[test]
+fn a_check_whose_finalize_is_not_the_full_ones_drops_the_ledger_and_says_so() {
+    let (_sb, _s, a, b) = pair("d-full-check-finalize");
+    a.write("far/stale", "first");
+    a.write("near/seen", "first");
+    for d in [&a, &b, &a, &b] {
+        d.synced();
+    }
+    let env = [
+        ("CAIRN_FP_INCR_ORACLE", "0"),
+        ("CAIRN_FP_INCR_STALE", "stale"),
+    ];
+    std::thread::sleep(Duration::from_millis(1100));
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY, "--full-sync-secs", "1"],
+        &env,
+    );
+    let path = da.log.clone();
+    wait_for("the first check", &path, || {
+        da.log().contains("the incremental path agrees")
+    });
+    std::thread::sleep(Duration::from_millis(1100));
+    a.write("far/stale", "edited");
+    wait_for("the defect", &path, || da.log().contains("event: a defect"));
+    assert!(
+        da.log().contains("after an incremental finalize"),
+        "{}",
+        da.log()
+    );
+    a.write("near/seen", "edited");
+    wait_for("a sync of the whole tree", &path, || {
+        da.log()
+            .contains("looked at the whole tree: no full sync has agreed")
+    });
+    let db = Daemon::events_only(&b);
+    wait_file(&db, b.path("far/stale"), b"edited");
+    wait_file(&db, b.path("near/seen"), b"edited");
+}
+
 #[test]
 fn a_change_on_the_server_with_no_feed_is_found_by_the_reconcile() {
     let (_sb, _s, a, b) = pair("d-nofeed");

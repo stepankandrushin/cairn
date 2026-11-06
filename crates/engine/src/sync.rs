@@ -46,6 +46,29 @@ pub struct SyncOptions {
     pub dry_run: bool,
     /// Something changed under the root, by the watcher's word: no use looking for nothing to do.
     pub changed_here: bool,
+    /// The daemon's check on the incremental path: a sync this long after the last whose every decision
+    /// was the full sync's decides each round the full way as well and takes that answer, saying so loudly
+    /// wherever the incremental round would have decided otherwise.
+    pub full_every: Option<std::time::Duration>,
+}
+
+/// Whether this sync is to check the incremental path against the full one.
+fn full_check_due(root: &Root, opts: &SyncOptions) -> bool {
+    let Some(every) = opts.full_every else {
+        return false;
+    };
+    if opts.dry_run {
+        return false;
+    }
+    root.full_checked()
+        .is_none_or(|t| now_secs().saturating_sub(t) >= every.as_secs() as i64)
+}
+
+/// What a sync that checks the incremental path says where it would have decided otherwise.
+fn defect(what: &str) -> String {
+    format!(
+        "a defect: the incremental path would have decided otherwise than the full sync, whose answer this sync took ({what}); please report it, with this log"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +121,8 @@ pub struct SyncReport {
     /// For a sync whose rounds took what changed alone: the most objects one round decided about,
     /// the most it loaded with their neighbours, and how many the ledger holds.
     pub part: Option<(u64, u64, u64)>,
+    /// For a sync that checked the incremental path against the full one: whether the two agreed.
+    pub checked: Option<bool>,
 }
 
 impl SyncReport {
@@ -125,6 +150,7 @@ impl SyncReport {
             activity: Vec::new(),
             whole_because: None,
             part: None,
+            checked: None,
         }
     }
 }
@@ -1404,8 +1430,10 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         report.events.extend(recover(&mut root)?);
     }
     let generation = root.state.generation()?;
+    // The check is of what the incremental path decides, which a sync with nothing to do never asks.
+    let check = full_check_due(&root, opts);
     // A sync that sees what the last one with nothing to do saw has nothing to do either.
-    let fast = match !opts.dry_run && !opts.changed_here && report.events.is_empty() {
+    let fast = match !opts.dry_run && !opts.changed_here && !check && report.events.is_empty() {
         true => {
             crate::steady::try_fast(&mut root, &client, &accounts, &selection, opts, generation)
                 .unwrap_or(None)
@@ -1424,13 +1452,21 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             client,
             accounts,
             selection,
-            opts,
+            (opts, false),
             SyncReport::new(),
             generation,
         )?;
         return crate::steady::compare(fast, full);
     }
-    let (report, _) = sync_full(root, client, accounts, selection, opts, report, generation)?;
+    let (report, _) = sync_full(
+        root,
+        client,
+        accounts,
+        selection,
+        (opts, check),
+        report,
+        generation,
+    )?;
     Ok(report)
 }
 
@@ -1440,11 +1476,13 @@ fn sync_full(
     client: Client,
     accounts: Accounts,
     mut selection: Selection,
-    opts: &SyncOptions,
+    (opts, check): (&SyncOptions, bool),
     mut report: SyncReport,
     generation: Option<u64>,
 ) -> Result<(SyncReport, crate::steady::Trace)> {
     let mut trace = crate::steady::Trace::default();
+    // A check whose finalize was not what a full one leaves.
+    let mut unconfirmed = false;
     // What a record of a sync with nothing to do needs: that nothing came before the merge either.
     let recovered = !report.events.is_empty();
     let inputs = crate::steady::inputs(&root, &selection, opts);
@@ -1535,6 +1573,7 @@ fn sync_full(
                 &mut trace,
                 &mut round_work,
                 first,
+                check,
             )? {
                 Ok(r) => part = Some(r),
                 Err(why) => decline(&root, &mut session, &mut whole, &mut report, why)?,
@@ -1988,8 +2027,18 @@ fn sync_full(
             round_work += finalizing.elapsed();
             hit("sync.finalized");
             if let Some(o) = &p_oracle {
-                crate::incr::check_finalized(&root, o)?;
-                hit("sync.incr.finalize_confirmed");
+                match crate::incr::check_finalized(&root, o) {
+                    Ok(()) => hit("sync.incr.finalize_confirmed"),
+                    // What the finalize wrote is done; the ledger goes, so the next sync takes the whole
+                    // tree and writes it again.
+                    Err(e) if check => {
+                        report.events.push(defect(&format!("{e:#}")));
+                        report.checked = Some(false);
+                        root.state.forget_ledger()?;
+                        unconfirmed = true;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             report.agreed_since = Some(scanned.started);
             steady_round = report.rounds == 1 && !unstable && !recovered;
@@ -2085,6 +2134,15 @@ fn sync_full(
         SyncOutcome::Synced if retryable => SyncOutcome::Partial,
         other => other,
     };
+    // Every decision the full sync's: the last round took the whole tree, which covers whatever the
+    // rounds before it decided, or this was the check and every round agreed. Not on every sync the
+    // harness's oracle confirms, as the write would cost the next sync with nothing to do its shortcut.
+    if report.outcome == SyncOutcome::Synced
+        && !opts.dry_run
+        && (session.is_none() || (check && !unconfirmed))
+    {
+        root.set_full_checked(now_secs())?;
+    }
     report.repeated = loaded + round_work;
     // Nothing to do, and nothing written: the next sync that sees the same may say so at once.
     if let (true, Some(g), Some((scan, _))) = (steady_round, generation, trace.first) {
@@ -2216,10 +2274,11 @@ fn incremental_head(
     trace: &mut crate::steady::Trace,
     round_work: &mut std::time::Duration,
     first: bool,
+    check: bool,
 ) -> Result<std::result::Result<Ready, String>> {
     use crate::incr::{self, Before};
     // The state as the full sync would read it, for the oracle, before this round writes anything.
-    let snapshot = match incr::oracle() {
+    let snapshot = match incr::oracle() || check {
         true => Some((
             root.state.load_base()?,
             root.state.load_rows()?,
@@ -2506,12 +2565,33 @@ fn incremental_head(
                         .take(8)
                         .map(|id| c.explain(&before, id, &reach))
                         .collect();
+                    // The check a release build runs now and then takes the full sync's answer, said.
+                    if check {
+                        let mut what: String = diff
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if let Some((cut, _)) = what.char_indices().nth(400) {
+                            what.truncate(cut);
+                            what.push_str("...");
+                        }
+                        report.events.push(defect(&what));
+                        report.checked = Some(false);
+                        return Ok(Err(
+                            "the incremental round would have decided otherwise, which is a defect, said above".into(),
+                        ));
+                    }
                     bail!(
                         "the incremental round and the full one on the same scan, journal and state decide differently:\n{diff}\nwhat the round knew of what it left out:\n{}",
                         outside.join("\n")
                     );
                 }
                 hit("sync.incr.confirmed");
+                if check {
+                    report.checked.get_or_insert(true);
+                }
                 Some(incr::FullRound {
                     decisions: full.decisions,
                     remote: full.remote,

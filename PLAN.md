@@ -216,15 +216,21 @@ few hundred bytes an entry, and decodes the base and rows of the set alone. A ha
 incremental round the full way as well, on the same scan, journal and state, and fails the sync unless every
 decision is the same: the rows the scan was given, identification, the rows, the mass-delete check, twins,
 the plan, the operations, the local steps, what is out of view, and nothing at all outside the set; after a
-finalize, the base, rows and ledger must be what a full one leaves.
+finalize, the base, rows and ledger must be what a full one leaves. A release build has no such oracle, so
+the daemon runs it as a check, a day (`--full-sync-secs`) after the last sync whose every decision was the
+full sync's, one that ended taking the whole tree or the last check: where the two differ the round says so
+in the log as a defect and goes the whole way, and a finalize that is not what a full one leaves drops the
+ledger, so that the next sync takes the whole tree.
 
 **Deletes** are tombstones. A device back after the supported offline interval reconciles afresh
 before submitting old state, comparing against history, so deleted files do not come back.
 
 **The daemon** decides when to sync and nothing else: it runs the same state-based sync a person runs. An
 event from the watcher or the change feed only says "look", and says nothing about what to look at, so a
-lost event, a stale path or a missed folder delays a change and cannot lose one, and the full reconcile
-covers whatever both miss. A watch is always placed before the sync it leads to; the walk that places them
+lost event, a stale path or a missed folder delays a change and cannot lose one: the reconcile, a sync
+an hour whatever wakes it, scans the whole tree, and a sync a day decides every round the full way as well
+and takes that answer, so whatever both miss, and whatever a sync that carries a change would have missed,
+is taken within a day. A watch is always placed before the sync it leads to; the walk that places them
 holds one folder open for each level down, the daemon takes its hard limit on open files, and a folder it cannot
 watch is named. A wake for a change from before the scan the last sync agreed on is none, as that scan saw it, the
 sync's own writes included, and so is the feed's news of commits that sync took in. Change feed: a long-poll

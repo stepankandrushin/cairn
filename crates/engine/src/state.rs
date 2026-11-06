@@ -531,6 +531,16 @@ impl State {
     }
 
     /// The ledger, as stored: incr.rs reads the entries.
+    /// The ledger speaks for nothing until a full sync writes it again.
+    pub fn forget_ledger(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "BEGIN; DELETE FROM ledger_anchor; DELETE FROM ledger; DELETE FROM dirty; COMMIT;",
+            )
+            .context("forget the ledger")?;
+        Ok(())
+    }
+
     pub fn ledger_entries(&self) -> Result<Vec<(ObjectId, Vec<u8>)>> {
         let mut stmt = self.conn.prepare("SELECT object, entry FROM ledger")?;
         let rows = stmt.query_map([], |r| {

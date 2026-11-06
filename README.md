@@ -89,6 +89,18 @@ WantedBy=default.target
 On a big tree, the kernel's limit on watches may need raising (`fs.inotify.max_user_watches`); the daemon says
 so if it does, and until then those folders wait for the hourly sync.
 
+On Windows, Microsoft Defender's real-time protection scans the files the client opens, and on a tree of many
+small files that can be most of a first sync's time: one on a hard disk was read at under 2 MB/s, with Defender
+using about a hundred times the client's CPU. A process exclusion, set once from an administrator's PowerShell,
+spares it:
+
+```powershell
+Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn.exe"   # the path of the cairn.exe you run
+```
+
+Its cost: what the client writes into the tree is scanned only when another program opens it. `Get-MpPreference`
+lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
+
 ## Leaving things out
 
 Nothing is left out unless you say so. Rules go in `.cairn/ignore`, in `.gitignore` syntax, for this device

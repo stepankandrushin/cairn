@@ -24,7 +24,8 @@ filesystem and privileges.
 | RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
 | Implementation languages | **Rust** — CLI, daemon and server | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
 | Run without a separate database server or language runtime | ✅ Native binaries with embedded SQLite | ❌ PHP and a web server; usually a separate database | ❌ Server stack includes a database, cache and web services | ✅ Native binary; no central server required |
-| No built-in filename exclusions | ✅ `.git`, `node_modules` and `.venv` sync whole | ❌ Built-in exclusions for temporary and system files | ❌ Built-in exclusions for temporary and system files | ⚠️ Internal control and temporary files excluded; user-defined ignore rules |
+| Include `.git` directories by default[^exclusions] | ✅ Included | ✅ Included | ✅ Included | ✅ Included |
+| Sync `.DS_Store` and `Thumbs.db` by default[^exclusions] | ✅ Included | ❌ Excluded by default patterns | ❌ Excluded by built-in patterns | ✅ Included |
 | Preserve symlinks | ✅ Preserved as links | ❌ Skipped | ❌ Targets copied instead of preserving links | ⚠️ Preserved, except on Windows |
 | Preserve full filesystem metadata | ✅ Modes, owners, xattrs, ACLs, hard links and sparse layout | ❌ No full Unix metadata round-trip | ⚠️ Executable bit on Unix; not full modes or ownership | ⚠️ Modes; owners and xattrs opt-in; hard links not preserved |
 | Sync speed: avoid whole-file re-uploads[^performance] | ✅ Incremental scans; only new content-defined chunks transferred | ❌ Whole changed file uploaded again | ✅ Only new content-defined blocks transferred | ✅ Only changed fixed-size blocks transferred; downloads from peers in parallel |
@@ -32,6 +33,11 @@ filesystem and privileges.
 | Keep both sides of a conflict | ✅ Three-way merge; both versions kept, with an inbox | ⚠️ Local conflict copy; not uploaded by default | ✅ Both versions kept; one renamed as a conflict file | ✅ Both versions kept; one renamed as a conflict file |
 | Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
+[^exclusions]: `.git` is not a default filename exclusion in any of these tools. The filename rows
+    describe default rules; user-configured exclusions can change what syncs. Cairn also includes
+    `node_modules` and `.venv`, and does not apply a project's `.gitignore`. Its exclusions are opt-in
+    through `.cairn/ignore` or `cairn exclude`; its own root `.cairn/` directory and internal temporary
+    files are reserved and are not synced.
 [^macos-size]: Installed bundles measured on an Apple Silicon Mac on 2026-11-07:
     Cairn 0.1.5 — `Cairn.app` 9.1 MB + `Cairn Sync.app` 8.0 MB; Nextcloud 34.0.5 — `Nextcloud.app` 414.4 MB.
     Sizes sum regular-file bytes inside each bundle, excluding symlinks, with 1 MB = 1,000,000 bytes.
@@ -49,6 +55,7 @@ filesystem and privileges.
     Sync speed depends on file count, edit patterns, disk, network and settings; the speed row compares
     the work needed to transfer edits, not measured MB/s.
 [^cairn]: Cairn: [Rust workspace](Cargo.toml), [release packaging](scripts/release.sh),
+    [filename selection rules](crates/engine/src/selection.rs), [filename sync tests](crates/harness/tests/selection.rs),
     [streaming chunker](crates/engine/src/chunker.rs), [chunk uploads](crates/engine/src/sync.rs),
     [incremental sync](crates/engine/src/incr.rs), [SQLite storage](crates/store/src/sqlite.rs).
 [^nextcloud]: Nextcloud: [exclusions](https://github.com/nextcloud/desktop/blob/master/sync-exclude.lst),

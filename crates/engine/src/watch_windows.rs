@@ -1,6 +1,8 @@
-//! Telling the daemon that something under a root changed, on Windows. As with inotify and FSEvents,
-//! which paths does not matter: any event leads to a whole sync, whose scan is what decides what
-//! changed, so that a lost event or a wrong path here can only delay a change, never lose one.
+//! Telling the daemon that something under a root changed, on Windows, and where. As with inotify and
+//! FSEvents, the scan decides what changed: a daemon's sync lists the folders marked here and takes the
+//! rest from the last agreement (scope.rs), and a queue that overflowed, a name that cannot be read, or
+//! the root's watch failing or the root renamed or replaced is a loss of track, after which the next sync
+//! lists the whole tree. So a lost event or a wrong path here can only delay a change.
 //!
 //! `ReadDirectoryChangesW` watches a whole tree from one handle, so there is no walk, no limit on
 //! watches and no directory that could go unwatched. The first read is issued before `start` returns,
@@ -78,6 +80,8 @@ struct Inner {
     /// Files the last sync found still being written, by their printable paths: their writes wake
     /// nothing, as the daemon comes back for them anyway, though their creation or rename does.
     in_motion: HashSet<String>,
+    /// Where something happened, for the daemon's syncs.
+    marks: crate::scope::Shared,
 }
 
 fn load_rules(root: &Path) -> Rules {
@@ -103,12 +107,19 @@ impl Inner {
         if parts.first().map(Vec::as_slice) == Some(STATE_DIR) {
             // Everything else in there is the sync's own, and moves all the time.
             if parts.len() == 2 && parts[1] == IGNORE_FILE {
+                crate::scope::lock(&self.marks).lose();
                 self.rules = load_rules(&self.root);
                 return true;
             }
             return false;
         }
         let names: Result<Vec<Name>, _> = parts.into_iter().map(Name::new).collect();
+        // Where it happened, for the daemon's syncs, whatever decides below that it wakes nothing.
+        crate::scope::mark_rdcw(
+            &mut crate::scope::lock(&self.marks),
+            names.as_deref().ok(),
+            action,
+        );
         let Ok(names) = names else {
             return true;
         };
@@ -428,6 +439,7 @@ impl Watcher {
             root,
             wake: Box::new(wake),
             in_motion: HashSet::new(),
+            marks: crate::scope::Shared::default(),
         }));
         let shared = Arc::new(Shared {
             places: Mutex::new(places),
@@ -474,6 +486,15 @@ impl Watcher {
     }
 
     /// Folders that could not be watched: at most the one above the root, as the tree is watched whole.
+    /// Where something happened, for the daemon's syncs to list.
+    pub fn marks(&self) -> crate::scope::Shared {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .marks
+            .clone()
+    }
+
     pub fn missed(&self) -> Vec<String> {
         let places = self.shared.places.lock().unwrap_or_else(|e| e.into_inner());
         match (&places.above, &places.above_failed) {
@@ -572,6 +593,10 @@ fn watch(shared: &Shared, inner: &Mutex<Inner>) {
             hit("daemon.watch.read");
         }
         let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Changes were lost, or the root's watch is not where the root is now.
+        if overflow || wake {
+            crate::scope::lock(&inner.marks).lose();
+        }
         if overflow {
             hit("daemon.watch.overflow");
             inner.rules = load_rules(&inner.root);

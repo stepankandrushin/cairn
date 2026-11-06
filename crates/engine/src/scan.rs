@@ -11,8 +11,10 @@ use crate::root::aside_origin;
 use crate::state::{Fingerprint, Known};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
-use cairn_protocol::{Bytes, Content, Hash, Metadata, Name, Skip, SkipKind, Timestamp, STATE_DIR};
-use std::collections::{BTreeMap, HashMap};
+use cairn_protocol::{
+    Bytes, Content, Hash, Metadata, Name, ObjectId, Skip, SkipKind, Timestamp, STATE_DIR,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A write within this window of a read may leave the timestamps it read unchanged.
@@ -82,11 +84,17 @@ pub struct ScanResult {
     pub stopped: bool,
     /// When the walk began: whatever happened in the tree before this, it saw.
     pub started: Instant,
+    /// Nodes from here on were not read but taken from the last agreement, for a scan with a scope:
+    /// what it found in the folders it did not list.
+    pub vouched_from: usize,
+    /// The folders a scan with a scope listed; `None` for one that listed the whole tree.
+    pub listed: Option<BTreeSet<Vec<Name>>>,
 }
 
 impl ScanResult {
     /// The same scan, with only these of its nodes: what a round that takes part of the tree is given.
     pub fn with_nodes(&self, nodes: Vec<Scanned>) -> ScanResult {
+        let nodes_len = nodes.len();
         ScanResult {
             root: self.root.clone(),
             nodes,
@@ -104,8 +112,92 @@ impl ScanResult {
             excluded_ids: self.excluded_ids.clone(),
             stopped: self.stopped,
             started: self.started,
+            vouched_from: nodes_len,
+            listed: self.listed.clone(),
         }
     }
+
+    /// Whether node `i` was taken from the last agreement rather than read.
+    pub fn vouched(&self, i: usize) -> bool {
+        i >= self.vouched_from
+    }
+}
+
+/// The part of the tree a scan lists, when a daemon's watcher says where things changed (scope.rs): the
+/// root, the folders in `list`, and any folder on the way that is not as the last agreement found it.
+/// What every other folder holds is taken from that agreement, by `vouch`, after every node read.
+pub struct Scope<'a> {
+    pub list: &'a crate::scope::Folders,
+    pub vouch: &'a dyn Vouch,
+}
+
+/// The last agreement's word on the folders a scan does not list (incr.rs `Word`).
+pub trait Vouch: Sync {
+    /// The object the agreement had at this inode, under this name in the folder that is `parent`.
+    fn object_at(&self, parent: ObjectId, name: &Name, st: &Stat) -> Option<ObjectId>;
+    /// Whether this folder, just read but for what is under it, is as the agreement found it; if so,
+    /// the flags of what the agreement found under it are set.
+    fn quiet(&self, folder: ObjectId, node: &mut Scanned) -> bool;
+    /// Whether everything in this folder but the names in `except`, all the way down, is the
+    /// agreement's to vouch for, and the folder's own listing too.
+    fn takes_all_but(&self, folder: ObjectId, except: &BTreeSet<Name>) -> bool;
+    /// Whether the agreement had an entry of this name in this folder.
+    fn has_child(&self, folder: ObjectId, name: &Name) -> bool;
+    /// Everything in this folder but `except`, all the way down, as the agreement found it, at `path`:
+    /// but what is at an inode in `found`, which the scan read somewhere.
+    fn under(
+        &self,
+        folder: ObjectId,
+        path: &[Name],
+        except: &BTreeSet<Name>,
+        found: &HashSet<(u64, u64)>,
+        out: &mut Vec<Scanned>,
+    );
+    /// The paths the agreement had this inode at.
+    fn paths_of(&self, inode: (u64, u64)) -> Vec<Vec<Name>>;
+}
+
+/// The folders a scan lists, as a tree of names.
+#[derive(Default, Debug)]
+struct Trie {
+    list: bool,
+    whole: bool,
+    children: BTreeMap<Name, Trie>,
+}
+
+impl Trie {
+    fn of(list: &crate::scope::Folders) -> Trie {
+        let mut root = Trie {
+            list: true,
+            ..Trie::default()
+        };
+        for (path, whole) in list {
+            let mut at = &mut root;
+            for name in path {
+                at = at.children.entry(name.clone()).or_default();
+            }
+            at.list = true;
+            at.whole |= *whole;
+        }
+        root
+    }
+}
+
+/// Where a folder stands in a scan with a scope: its part of the list, whether all under it is to be
+/// listed, and the object the agreement had at it.
+#[derive(Clone, Copy)]
+struct At<'t> {
+    trie: Option<&'t Trie>,
+    whole: bool,
+    object: Option<ObjectId>,
+}
+
+impl At<'_> {
+    const WHOLE: At<'static> = At {
+        trie: None,
+        whole: true,
+        object: None,
+    };
 }
 
 pub struct ScanOptions<'a> {
@@ -121,6 +213,10 @@ pub struct ScanOptions<'a> {
     /// Stop instead of reading a file's content or removing a leftover: for a sync that expects to
     /// have nothing to do, which reads no file.
     pub probe: bool,
+    /// List only part of the tree, and take the rest from the last agreement.
+    pub scope: Option<&'a Scope<'a>>,
+    /// When the scan is to say it began, if before the call: when the scope it was given was taken.
+    pub started: Option<Instant>,
 }
 
 pub fn fingerprint(st: &Stat) -> Fingerprint {
@@ -194,6 +290,15 @@ struct Walk<'a> {
     solid: u64,
     excluded_ids: Vec<(u64, u64, Option<Timestamp>, bool)>,
     stopped: bool,
+    /// What a scan with a scope takes from the agreement once the walk is done: each folder's object,
+    /// path, and the names in it read here.
+    take: Vec<(ObjectId, Vec<Name>, BTreeSet<Name>)>,
+    listed: BTreeSet<Vec<Name>>,
+    /// Folders taken from the agreement with something excluded under them, for the folders above.
+    hidden_excluded: usize,
+    /// A name the scope gave is in a folder listed under another form, as a filesystem that ignores
+    /// case finds it: the scope cannot be matched to the tree, and the whole tree is listed instead.
+    scope_missed: bool,
 }
 
 /// What was moved aside by a killed run, if it can be someone's only copy of something: not while another
@@ -250,8 +355,11 @@ impl Walk<'_> {
     }
 
     /// Returns whether the directory could be listed.
-    fn walk_dir(&mut self, dir: &Dir, path: &mut Vec<Name>, st_mnt: u64) -> bool {
+    fn walk_dir(&mut self, dir: &Dir, path: &mut Vec<Name>, st_mnt: u64, at: At<'_>) -> bool {
         hit("scan.dir");
+        if self.opts.scope.is_some() {
+            self.listed.insert(path.clone());
+        }
         let is_root = path.is_empty();
         let listed = dir.stat_self().and_then(|st| Ok((st, dir.list()?)));
         let (st, names) = match listed {
@@ -302,6 +410,13 @@ impl Walk<'_> {
                 Err(e) => self.skip(path, SkipKind::ReadError, Some(e.to_string())),
             }
         }
+        if let (Some(t), false) = (at.trie, at.whole) {
+            for name in t.children.keys() {
+                if !entries.contains(name) && dir.stat(name.as_bytes()).is_ok() {
+                    self.scope_missed = true;
+                }
+            }
+        }
         // Removing a temporary moved this directory's own timestamps.
         let st = if removed_temp {
             dir.stat_self().unwrap_or(st)
@@ -315,13 +430,13 @@ impl Walk<'_> {
                 break;
             }
             path.push(name);
-            self.entry(dir, path, st_mnt);
+            self.entry(dir, path, st_mnt, at);
             path.pop();
         }
         true
     }
 
-    fn entry(&mut self, dir: &Dir, path: &mut Vec<Name>, parent_mnt: u64) {
+    fn entry(&mut self, dir: &Dir, path: &mut Vec<Name>, parent_mnt: u64, at: At<'_>) {
         let name = path.last().expect("an entry has a name").clone();
         let raw = name.as_bytes();
         self.current_inode = None;
@@ -350,7 +465,7 @@ impl Walk<'_> {
         }
         match st.file_type {
             FileType::RegularFile => self.file(dir, path, st),
-            FileType::Directory => self.subdir(dir, path, st),
+            FileType::Directory => self.subdir(dir, path, st, at),
             FileType::Symlink => self.symlink(dir, path, st),
             FileType::Fifo => self.skip(path, SkipKind::Fifo, None),
             FileType::Socket => self.skip(path, SkipKind::Socket, None),
@@ -590,14 +705,161 @@ impl Walk<'_> {
         }
     }
 
-    fn subdir(&mut self, dir: &Dir, path: &mut Vec<Name>, st: Stat) {
+    /// A folder, in a scan with a scope: listed if the scope says so or it is not as the agreement left
+    /// it, gone through without listing on the way to one listed below it, and otherwise taken whole
+    /// from the agreement.
+    fn subdir(&mut self, dir: &Dir, path: &mut Vec<Name>, st: Stat, parent: At<'_>) {
+        let Some(scope) = self.opts.scope else {
+            return self.listed_subdir(dir, path, st, At::WHOLE);
+        };
+        if parent.whole {
+            return self.listed_subdir(dir, path, st, At::WHOLE);
+        }
+        let name = path.last().expect("an entry has a name").clone();
+        let object = parent
+            .object
+            .and_then(|p| scope.vouch.object_at(p, &name, &st));
+        let trie = parent.trie.and_then(|t| t.children.get(&name));
+        let listed = At {
+            trie,
+            whole: trie.is_some_and(|t| t.whole),
+            object,
+        };
+        match trie {
+            Some(t) if t.list || t.whole => self.listed_subdir(dir, path, st, listed),
+            Some(t) => {
+                if !self.through(dir, path, &st, t, object) {
+                    self.listed_subdir(dir, path, st, listed);
+                }
+            }
+            None => {
+                if !self.taken(dir, path, &st, object) {
+                    self.listed_subdir(dir, path, st, listed);
+                }
+            }
+        }
+    }
+
+    /// A folder's own node as the agreement had it, read now, if it is as the agreement found it and
+    /// `except` and what is under the rest are the agreement's to vouch for.
+    fn as_agreed(
+        &self,
+        dir: &Dir,
+        path: &[Name],
+        st: &Stat,
+        object: Option<ObjectId>,
+        except: &BTreeSet<Name>,
+    ) -> Option<(ObjectId, Scanned)> {
+        let scope = self.opts.scope?;
+        let x = object?;
+        if !scope.vouch.takes_all_but(x, except) {
+            return None;
+        }
+        let raw = path.last()?.as_bytes();
+        let mut problems = Vec::new();
+        let metadata = capture(
+            dir,
+            raw,
+            st,
+            self.opts.accounts,
+            self.precision_ns,
+            &mut problems,
+        );
+        if !problems.is_empty() {
+            return None;
+        }
+        let mut node = Scanned {
+            paths: vec![path.to_vec()],
+            fp: fingerprint(st),
+            racy: false,
+            content: Content::Dir,
+            metadata,
+            metadata_incomplete: false,
+            holds_excluded: false,
+            only_excluded: false,
+        };
+        scope.vouch.quiet(x, &mut node).then_some((x, node))
+    }
+
+    /// The node of a folder taken from the agreement, counted as a walk of it would count it.
+    fn keep_agreed(&mut self, x: ObjectId, node: Scanned, except: BTreeSet<Name>) {
+        if node.holds_excluded {
+            self.hidden_excluded += 1;
+        }
+        if !node.only_excluded {
+            self.solid += 1;
+        }
+        let path = node.paths[0].clone();
+        self.nodes.push(node);
+        self.take.push((x, path, except));
+    }
+
+    /// A folder outside the scope, taken from the agreement if it is as the agreement left it.
+    fn taken(&mut self, dir: &Dir, path: &[Name], st: &Stat, object: Option<ObjectId>) -> bool {
+        let Some((x, node)) = self.as_agreed(dir, path, st, object, &BTreeSet::new()) else {
+            return false;
+        };
+        self.keep_agreed(x, node, BTreeSet::new());
+        true
+    }
+
+    /// A folder above some the scope lists: each of those gone into, without listing this one, if it is
+    /// as the agreement left it and so is everything else in it, which is taken from the agreement.
+    fn through(
+        &mut self,
+        dir: &Dir,
+        path: &mut Vec<Name>,
+        st: &Stat,
+        t: &Trie,
+        object: Option<ObjectId>,
+    ) -> bool {
+        let Some(scope) = self.opts.scope else {
+            return false;
+        };
+        let except: BTreeSet<Name> = t.children.keys().cloned().collect();
+        let Some((x, node)) = self.as_agreed(dir, path, st, object, &except) else {
+            return false;
+        };
+        if !except.iter().all(|n| scope.vouch.has_child(x, n)) {
+            return false;
+        }
+        let raw = path.last().expect("an entry has a name").clone();
+        let Ok(child) = dir.open_dir(raw.as_bytes()) else {
+            return false;
+        };
+        // Each folder on the way down is one the agreement had, and still a folder.
+        for name in &except {
+            if !child
+                .stat(name.as_bytes())
+                .is_ok_and(|s| s.file_type == FileType::Directory)
+            {
+                return false;
+            }
+        }
+        hit("scan.dir.through");
+        let at = At {
+            trie: Some(t),
+            whole: false,
+            object: Some(x),
+        };
+        for name in &except {
+            path.push(name.clone());
+            self.entry(&child, path, st.mnt_id, at);
+            path.pop();
+        }
+        self.keep_agreed(x, node, except);
+        true
+    }
+
+    fn listed_subdir(&mut self, dir: &Dir, path: &mut Vec<Name>, st: Stat, at: At<'_>) {
         let raw = path.last().expect("an entry has a name").clone();
         let raw = raw.as_bytes();
         match dir.open_dir(raw) {
             Ok(child) => {
-                let (excluded_before, solid_before) = (self.excluded.len(), self.solid);
-                let listed = self.walk_dir(&child, path, st.mnt_id);
-                let holds_excluded = self.excluded.len() > excluded_before;
+                let (excluded_before, solid_before) =
+                    (self.excluded.len() + self.hidden_excluded, self.solid);
+                let listed = self.walk_dir(&child, path, st.mnt_id, at);
+                let holds_excluded = self.excluded.len() + self.hidden_excluded > excluded_before;
                 let only_excluded = holds_excluded && listed && self.solid == solid_before;
                 // An empty directory is as real as a file, to whatever holds it.
                 if !only_excluded && self.solid == solid_before {
@@ -665,7 +927,7 @@ impl Walk<'_> {
 }
 
 pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
-    let started = Instant::now();
+    let started = opts.started.unwrap_or_else(Instant::now);
     let precision_ns = root.fstype_precision_ns();
     let mut walk = Walk {
         opts,
@@ -686,13 +948,44 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         solid: 0,
         excluded_ids: Vec::new(),
         stopped: false,
+        take: Vec::new(),
+        listed: BTreeSet::new(),
+        hidden_excluded: 0,
+        scope_missed: false,
     };
     let st = root.stat_self()?;
     let mut path = Vec::new();
-    walk.walk_dir(root, &mut path, st.mnt_id);
+    let trie = opts.scope.map(|s| Trie::of(s.list));
+    let at = match &trie {
+        Some(t) => At {
+            trie: Some(t),
+            whole: false,
+            object: Some(ObjectId::ROOT),
+        },
+        None => At::WHOLE,
+    };
+    walk.walk_dir(root, &mut path, st.mnt_id, at);
+    if walk.scope_missed {
+        hit("scan.scope_missed");
+        let whole = ScanOptions {
+            scope: None,
+            started: Some(started),
+            ..*opts
+        };
+        return scan(root, &whole);
+    }
     hit("scan.done");
     // A probe that stopped says nothing more, and is not worth the second look.
     let unstable = !walk.stopped && !walk.dirs_unchanged(root);
+    let vouched_from = walk.nodes.len();
+    if let Some(scope) = opts.scope {
+        let found: HashSet<(u64, u64)> = walk.nodes.iter().map(|n| (n.fp.dev, n.fp.ino)).collect();
+        for (x, path, except) in std::mem::take(&mut walk.take) {
+            scope
+                .vouch
+                .under(x, &path, &except, &found, &mut walk.nodes);
+        }
+    }
 
     let st = root.stat_self()?;
     let mut problems = Vec::new();
@@ -723,5 +1016,52 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         excluded_ids: walk.excluded_ids,
         stopped: walk.stopped,
         started,
+        vouched_from,
+        listed: opts.scope.map(|_| walk.listed),
     })
+}
+
+/// A scan with a scope, given again the folders its first walk found an inode read here had been in at
+/// the agreement and did not list, as when something moved there or a name was linked to it with no
+/// event from where it was: so that what the agreement had there is read too, not taken.
+pub fn scan_scoped(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
+    let Some(scope) = opts.scope else {
+        return scan(root, opts);
+    };
+    let mut list = scope.list.clone();
+    let mut result = scan(root, opts)?;
+    for _ in 0..2 {
+        let Some(listed) = &result.listed else {
+            return Ok(result);
+        };
+        let mut more = Vec::new();
+        for n in &result.nodes[..result.vouched_from] {
+            for p in scope.vouch.paths_of((n.fp.dev, n.fp.ino)) {
+                if n.paths.contains(&p) {
+                    continue;
+                }
+                if let Some((_, folder)) = p.split_last() {
+                    if !listed.contains(folder) && !list.contains_key(folder) {
+                        more.push(folder.to_vec());
+                    }
+                }
+            }
+        }
+        if more.is_empty() {
+            return Ok(result);
+        }
+        for f in more {
+            list.insert(f, false);
+        }
+        let again = Scope {
+            list: &list,
+            vouch: scope.vouch,
+        };
+        let opts = ScanOptions {
+            scope: Some(&again),
+            ..*opts
+        };
+        result = scan(root, &opts)?;
+    }
+    Ok(result)
 }

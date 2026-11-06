@@ -736,6 +736,8 @@ mod tests {
             excluded_ids: Vec::new(),
             stopped: false,
             started: std::time::Instant::now(),
+            vouched_from: usize::MAX,
+            listed: None,
         }
     }
 

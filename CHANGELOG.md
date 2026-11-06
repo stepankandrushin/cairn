@@ -57,6 +57,20 @@
   listed, reopened each folder from the root, a level at a time. On Linux it now opens each in one `openat2` that
   refuses any symlink on the way, and compares the inode as well as the times: on a tree of 27,550 folders a walk's
   opens, dups and closes fall from 325,476 to 165,374.
+- A daemon's every sync walked the whole tree, the ones that take what changed alone too: a stat of every entry
+  and a listing of every folder, then a second pass that reopened each folder from the root, 15 to 30 s a round
+  on a Mac with 472k entries and 46 to 83 s on a Windows HDD, so rounds rarely fitted between another device's
+  commits. The watcher now marks the folder each event was in, and a daemon's round on what changed alone lists
+  those, the folders of whatever the state marks as written since or the journal names, and the folders above
+  them, and takes everything else from the last agreement. Beside a device committing every 2 s, a daemon on a
+  tree of 227,551 entries now lists 3 folders in each sync's 2 rounds, some 260 stats where it made 620,000, and
+  keeps up, 28 syncs for 33 commits at 1.1 s of CPU each where it managed 16 at 2.3 s; slowed to 1.5 s a round
+  beside a commit a second, it agrees every time, where it gave up after 12 rounds. Whatever the watcher may have
+  missed, an overflowed queue, dropped events, a watch that ended, a rules file saved, sends the next sync to the
+  whole tree, and so does every sync while a folder is not watched or the watcher has stopped, the daemon's first,
+  the hourly reconcile and the daily check; an event the kernel never sends, as for a write through a mapping,
+  waits for those. The daemon's "synced to" line now says how many rounds the sync took, how long its scans took, and
+  how many folders it listed.
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
   24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
   window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the

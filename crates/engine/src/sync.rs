@@ -61,7 +61,14 @@ pub struct SyncOptions {
     /// was the full sync's sets the ledger it keeps against what the state says, object by object, and
     /// takes up, saying so loudly, whatever the ledger vouched for that the state does not.
     pub full_every: Option<std::time::Duration>,
+    /// The daemon's watcher, where it can say where things changed since the last agreement: each round
+    /// on the incremental path then lists those folders and what the round itself must see, and takes
+    /// the rest from the ledger (scope.rs).
+    pub scope: Option<crate::scope::Source>,
 }
+
+/// Times a round's scope is widened, to what its decisions reach, before it lists the whole tree.
+const SCOPE_WIDENINGS: u32 = 4;
 
 /// Whether this sync is to check the ledger against the state.
 fn full_check_due(root: &Root, opts: &SyncOptions) -> bool {
@@ -136,6 +143,9 @@ pub struct SyncReport {
     pub part: Option<(u64, u64, u64)>,
     /// For a sync that checked the ledger against the state: whether the two agreed.
     pub checked: Option<bool>,
+    /// The folders the last round listed, where its scan had a scope, by their printable paths; `None`
+    /// where it listed the whole tree. What was skipped elsewhere it did not see again.
+    pub looked_in: Option<Vec<String>>,
     /// How many times a request the network failed was tried again.
     pub retries: u64,
 }
@@ -167,6 +177,7 @@ impl SyncReport {
             rebuilt_because: None,
             part: None,
             checked: None,
+            looked_in: None,
             retries: 0,
         }
     }
@@ -320,6 +331,7 @@ fn scan_stable(
     date: &str,
     events: &mut Vec<String>,
     kept_edits: &mut u64,
+    scope: Option<(&crate::scan::Scope<'_>, std::time::Instant)>,
 ) -> Result<Option<ScanResult>> {
     let prefix = root.temp_prefix();
     let on_its_way: Vec<(Content, Vec<Name>)> = root
@@ -339,6 +351,12 @@ fn scan_stable(
         arriving: &on_its_way,
         excluded,
         probe: false,
+        scope: scope.map(|(s, _)| s),
+        started: scope.map(|(_, t)| t),
+    };
+    let scan = |dir: &crate::fsops::Dir, opts: &ScanOptions<'_>| match opts.scope {
+        Some(_) => crate::scan::scan_scoped(dir, opts),
+        None => scan(dir, opts),
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
     let mut rescued = Vec::new();
@@ -1469,12 +1487,16 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         }
         // Every failpoint stays live in it, so that a test stopping or killing a sync at a step the
         // fast path passes over still finds it.
+        let unscoped = SyncOptions {
+            scope: None,
+            ..opts.clone()
+        };
         let full = sync_full(
             root,
             client,
             accounts,
             selection,
-            (opts, false),
+            (&unscoped, false),
             SyncReport::new(),
             generation,
         )?;
@@ -1554,6 +1576,10 @@ fn sync_full(
         ..Seen::default()
     };
     let mut journal = Journal::Head;
+    // What rounds' decisions reached past what their scopes listed, listed from then on.
+    let mut widened = crate::scope::Folders::new();
+    let mut scope_widenings = 0;
+    let mut scope = opts.scope.clone();
     let finish = loop {
         report.rounds += 1;
         round_work = std::time::Duration::ZERO;
@@ -1609,6 +1635,7 @@ fn sync_full(
                 &mut round_work,
                 first,
                 (check, again),
+                (scope.as_ref(), &widened),
             )? {
                 Ok(r) => {
                     part = Some(r);
@@ -1616,6 +1643,18 @@ fn sync_full(
                 }
                 Err(Declined::Again) if !again => {
                     again = true;
+                    continue;
+                }
+                Err(Declined::Widen(more)) => {
+                    if scope_widenings < SCOPE_WIDENINGS {
+                        scope_widenings += 1;
+                        for (path, whole) in more {
+                            *widened.entry(path).or_insert(false) |= whole;
+                        }
+                    } else {
+                        // Past this, the whole tree costs less than more rounds of widening.
+                        scope = None;
+                    }
                     continue;
                 }
                 Err(Declined::Rebuild(why)) if s.rebuilt.is_none() => {
@@ -1673,8 +1712,13 @@ fn sync_full(
             unstable = r.unstable;
             seen_now = r.seen;
             retryable = r.retryable;
+            report.looked_in = scanned
+                .listed
+                .as_ref()
+                .map(|l| l.iter().map(|p| crate::scan::display_path(p)).collect());
             thinking = std::time::Instant::now();
         } else {
+            report.looked_in = None;
             let Some(Whole {
                 base: w_base,
                 rows: w_rows,
@@ -1726,6 +1770,7 @@ fn sync_full(
                     &date,
                     &mut report.events,
                     &mut report.conflicts,
+                    None,
                 )?
                 .ok_or_else(|| anyhow!("a scan given the whole tree came back without one"))?
             };
@@ -2333,6 +2378,8 @@ enum Declined {
     /// The check found what the ledger vouched for and should not have, which is now marked as
     /// written since: the round again, with a new scan that reads it as the state says.
     Again,
+    /// The round's decisions reach folders its scope did not list: the round again, listing these too.
+    Widen(crate::scope::Folders),
 }
 
 /// A round on what changed alone, up to the merge: the scan, then the part of the tree the ledger cannot
@@ -2353,6 +2400,7 @@ fn incremental_head(
     round_work: &mut std::time::Duration,
     first: bool,
     (check, again): (bool, bool),
+    (scope, widened): (Option<&crate::scope::Source>, &crate::scope::Folders),
 ) -> Result<std::result::Result<Ready, Declined>> {
     use crate::incr::{self, Before};
     // The state as the full sync would read it, for the oracle, before this round writes anything.
@@ -2409,6 +2457,31 @@ fn incremental_head(
         skeleton = Some((sk, vis));
     }
 
+    // What this sync's own earlier rounds marked: read as the full round reads them, and decided here.
+    let intents: Vec<CopyIntent> = root
+        .state
+        .intents::<CopyIntent>(INTENT_COPY)?
+        .into_iter()
+        .map(|(_, i)| i)
+        .collect();
+    let arriving_marks: BTreeMap<ObjectId, Arriving> = root
+        .state
+        .intents::<Arriving>(INTENT_ARRIVING)?
+        .into_iter()
+        .map(|(_, a)| (a.object, a))
+        .collect();
+    let mut marked: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut marked_inodes: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for i in &intents {
+        marked.insert(i.copy);
+        marked.insert(i.conflict_of.object);
+        marked_inodes.insert((i.dev, i.ino));
+    }
+    marked.extend(arriving_marks.keys().copied());
+    for (_, n) in root.state.intents::<NoteIntent>(INTENT_NOTE)? {
+        marked.insert(n.object);
+    }
+    let checking = check && session.rebuilt.is_none();
     let scan_started = std::time::Instant::now();
     let scanned = {
         let before = Before {
@@ -2424,6 +2497,50 @@ fn incremental_head(
             Some(g) => glanced(g, &purged),
             None => before.scan_rows(),
         };
+        // Where the watcher saw something, and what this round must see besides; the rest of the tree
+        // as the ledger has it. Not for a rebuild, which reads every row, nor for the check, which is
+        // there to find what the bookkeeping missed.
+        let marks = match (scope, rebuilding || checking) {
+            (Some(source), false) => source.take(),
+            _ => None,
+        };
+        let named: BTreeSet<ObjectId> = selection
+            .unheld
+            .iter()
+            .map(|u| u.object)
+            .chain(marked.iter().copied())
+            .chain(
+                session
+                    .anchor
+                    .reserved
+                    .iter()
+                    .filter_map(|l| session.ledger.children_named(&l.parent, &l.name)),
+            )
+            .collect();
+        let word = marks
+            .as_ref()
+            .map(|_| incr::Word::new(&before, &named, !selection.rules.is_empty()));
+        let list: Option<crate::scope::Folders> = marks.map(|mut list| {
+            let mut add = |path: &Vec<Name>, whole: bool| {
+                *list.entry(path.clone()).or_insert(false) |= whole;
+            };
+            for (p, w) in word.iter().flat_map(|w| w.folders.iter()).chain(widened) {
+                add(p, *w);
+            }
+            for l in &session.anchor.reserved {
+                if let Some(path) = word.as_ref().and_then(|w| w.path(&l.parent)) {
+                    add(&path, false);
+                }
+            }
+            list
+        });
+        let scoped = match (&list, &word) {
+            (Some(list), Some(word)) => Some(crate::scan::Scope { list, vouch: word }),
+            _ => None,
+        };
+        if scoped.is_some() {
+            hit("sync.scoped");
+        }
         let scanned = scan_stable(
             root,
             &known,
@@ -2434,6 +2551,7 @@ fn incremental_head(
             date,
             &mut report.events,
             &mut report.conflicts,
+            scoped.as_ref().map(|s| (s, scan_started)),
         )?;
         let Some(scanned) = scanned else {
             return Ok(Err(Declined::Whole(
@@ -2442,7 +2560,8 @@ fn incremental_head(
         };
         report.scan_time += scan_started.elapsed();
         *round_work += scan_started.elapsed();
-        if first {
+        // A scan that took part of the tree from the ledger is no record of the tree.
+        if first && scanned.listed.is_none() {
             trace.first = Some((crate::steady::digest(&scanned, &known), seq));
         }
         scanned
@@ -2509,31 +2628,6 @@ fn incremental_head(
     released.extend(scanned.new_manifests.iter().map(|(h, _)| *h));
     let unstable = scanned.unstable;
 
-    // What this sync's own earlier rounds marked: read as the full round reads them, and decided here.
-    let intents: Vec<CopyIntent> = root
-        .state
-        .intents::<CopyIntent>(INTENT_COPY)?
-        .into_iter()
-        .map(|(_, i)| i)
-        .collect();
-    let arriving_marks: BTreeMap<ObjectId, Arriving> = root
-        .state
-        .intents::<Arriving>(INTENT_ARRIVING)?
-        .into_iter()
-        .map(|(_, a)| (a.object, a))
-        .collect();
-    let mut marked: BTreeSet<ObjectId> = BTreeSet::new();
-    let mut marked_inodes: BTreeSet<(u64, u64)> = BTreeSet::new();
-    for i in &intents {
-        marked.insert(i.copy);
-        marked.insert(i.conflict_of.object);
-        marked_inodes.insert((i.dev, i.ino));
-    }
-    marked.extend(arriving_marks.keys().copied());
-    for (_, n) in root.state.intents::<NoteIntent>(INTENT_NOTE)? {
-        marked.insert(n.object);
-    }
-
     let mut c = incr::classify(&before, &scanned);
     for (i, n) in scanned.nodes.iter().enumerate() {
         if c.quiet[i] && marked_inodes.contains(&(n.fp.dev, n.fp.ino)) {
@@ -2574,11 +2668,14 @@ fn incremental_head(
     // The check of the ledger kept: the state's own word on each object it vouches for, set against it.
     // In a harness build on every round whose ledger was not rebuilt just now, where any difference is a
     // failure; in the daemon's check, a defect said in the log, and the round again with what the
-    // ledger missed taken as written since.
-    let checking = check && session.rebuilt.is_none();
+    // ledger missed taken as written since. Not of what the scan took from the ledger itself.
     if checking || (incr::oracle() && !rebuilding) {
-        let skip =
-            |id: &ObjectId| *id == ObjectId::ROOT || c.seeds.contains(id) || unheld.contains(id);
+        let skip = |id: &ObjectId| {
+            *id == ObjectId::ROOT
+                || c.seeds.contains(id)
+                || unheld.contains(id)
+                || c.node_of.get(id).is_some_and(|&i| scanned.vouched(i))
+        };
         let places = crate::rebuild::Places {
             nodes: &scanned.nodes,
             dir_at: &c.dir_at,
@@ -2628,6 +2725,36 @@ fn incremental_head(
                 "{} objects changed or are next to a change, more than taking the whole tree costs",
                 reach.all.len()
             ))));
+        }
+        // Nothing the round loads may be the ledger's word alone, and every folder whose every name it
+        // looks at must have been listed: otherwise the round again, listing those too.
+        if let Some(listed) = &scanned.listed {
+            let mut demand = crate::scope::Folders::new();
+            for &i in &reach.nodes {
+                if scanned.vouched(i) {
+                    for p in &scanned.nodes[i].paths {
+                        if let Some((_, folder)) = p.split_last() {
+                            demand.insert(folder.to_vec(), false);
+                        }
+                    }
+                }
+            }
+            for o in &reach.opened {
+                let path = match *o == ObjectId::ROOT {
+                    true => Some(Vec::new()),
+                    false => c
+                        .node_of
+                        .get(o)
+                        .and_then(|&i| scanned.nodes[i].paths.first().cloned()),
+                };
+                if let Some(path) = path.filter(|p| !listed.contains(p)) {
+                    demand.insert(path, false);
+                }
+            }
+            if !demand.is_empty() {
+                hit("sync.scope.widened");
+                return Ok(Err(Declined::Widen(demand)));
+            }
         }
         let world = match incr::world(root, &before, &scanned, &reach)? {
             Ok(w) => w,
@@ -2752,7 +2879,7 @@ fn incremental_head(
                     root,
                     (sbase, srows, ssel),
                     &session.journal.ops,
-                    &scanned,
+                    (&scanned, &session.ledger),
                     &known,
                     (&intents, &arriving_marks, accounts),
                     landed,
@@ -2889,7 +3016,7 @@ fn oracle_full(
     root: &Root,
     (base, rows0, sel0): (&Tree, &BTreeMap<ObjectId, Row>, &Selection),
     journal: &[Op],
-    scanned: &ScanResult,
+    (scanned, ledger): (&ScanResult, &crate::incr::Ledger),
     known: &HashMap<(u64, u64), Known>,
     (intents, arriving0, accounts): (&[CopyIntent], &BTreeMap<ObjectId, Arriving>, &Accounts),
     landed: &BTreeSet<OpId>,
@@ -2920,6 +3047,23 @@ fn oracle_full(
         _ => false,
     };
     let mut nodes = scanned.nodes.clone();
+    // What the scan took from the ledger, by inode: the state's metadata for it, as a scan that read it
+    // would have found it, and the ledger's digest for it, which nothing read again.
+    let mut vouched: HashSet<(u64, u64)> = HashSet::new();
+    let rows_by_inode: HashMap<(u64, u64), &Row> = match scanned.vouched_from < nodes.len() {
+        true => rows0.values().map(|r| ((r.fp.dev, r.fp.ino), r)).collect(),
+        false => HashMap::new(),
+    };
+    for (i, n) in nodes.iter_mut().enumerate() {
+        if !scanned.vouched(i) {
+            continue;
+        }
+        let key = (n.fp.dev, n.fp.ino);
+        vouched.insert(key);
+        if let Some(row) = rows_by_inode.get(&key) {
+            n.metadata = row.scan.clone();
+        }
+    }
     for n in nodes.iter_mut() {
         let key = (n.fp.dev, n.fp.ino);
         if !same(known.get(&key), by_inode.get(&key)) {
@@ -3003,7 +3147,16 @@ fn oracle_full(
         moving: moving_with_excluded(&plan, &identified, &scanned.excluded),
         reserved: view.hidden.reserved.clone(),
     };
-    let seen = crate::incr::seen_of(&identified.scanned);
+    let mut seen = crate::incr::seen_of(&identified.scanned);
+    for (id, n) in &identified.scanned {
+        if vouched.contains(&(n.fp.dev, n.fp.ino)) {
+            if let (Some(d), Some(s)) = (seen.get_mut(id), ledger.seen_of(id)) {
+                if d.is_some() {
+                    *d = s.digest;
+                }
+            }
+        }
+    }
     let visible = view.remote.into_owned();
     Ok(OracleFull {
         decisions,

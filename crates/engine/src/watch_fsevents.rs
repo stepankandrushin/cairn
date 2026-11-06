@@ -1,6 +1,8 @@
-//! Telling the daemon that something under a root changed, on macOS. As with inotify, which paths does
-//! not matter: any event leads to a whole sync, whose scan is what decides what changed, so that a lost
-//! event or a wrong path here can only delay a change, never lose one.
+//! Telling the daemon that something under a root changed, on macOS, and where. As with inotify, the
+//! scan decides what changed: a daemon's sync lists the folders marked here and takes the rest from the
+//! last agreement (scope.rs), and a stream that dropped events, says to look at a folder whole, changed
+//! above the root or saw a mount, or an event whose path is not under the root's, is a loss of track, after
+//! which the next sync lists the whole tree. So a lost event or a wrong path here can only delay a change.
 //!
 //! FSEvents watches a whole tree from one stream, so there is no walk, no limit on watches and no
 //! directory that could go unwatched. It holds no descriptor in the root either. The stream starts
@@ -113,6 +115,8 @@ struct Inner {
     /// Files the last sync found still being written, by their printable paths: their writes wake
     /// nothing, as the daemon comes back for them anyway. FSEvents says nothing of a close.
     in_motion: HashSet<String>,
+    /// Where something happened, for the daemon's syncs.
+    marks: crate::scope::Shared,
 }
 
 fn load_rules(root: &Path) -> Rules {
@@ -127,6 +131,22 @@ fn load_rules(root: &Path) -> Rules {
 impl Inner {
     /// Whether this event means a sync. A name that cannot be understood does: the scan decides.
     fn matters(&mut self, path: &[u8], flags: u32) -> bool {
+        // Where it happened, for the daemon's syncs, whatever decides below that it wakes nothing. Not
+        // the state folder, which is the sync's own.
+        let rel: Option<Vec<Name>> = Path::new(std::ffi::OsStr::from_bytes(path))
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(|rel| {
+                rel.iter()
+                    .map(|p| Name::new(p.as_bytes().to_vec()).ok())
+                    .collect()
+            });
+        if rel
+            .as_ref()
+            .is_none_or(|r| r.first().map(|n| n.as_bytes()) != Some(STATE_DIR))
+        {
+            crate::scope::mark_fsevent(&mut crate::scope::lock(&self.marks), rel.as_deref(), flags);
+        }
         let dropped = EVENT_MUST_SCAN
             | EVENT_USER_DROPPED
             | EVENT_KERNEL_DROPPED
@@ -206,6 +226,7 @@ impl Watcher {
             root: real.clone(),
             wake: Box::new(wake),
             in_motion: HashSet::new(),
+            marks: crate::scope::Shared::default(),
         }));
         let refused = || std::io::Error::other("FSEvents refused the stream");
         let bytes = real.as_os_str().as_bytes();
@@ -279,6 +300,15 @@ impl Watcher {
     /// Folders that could not be watched: none, as the tree is watched whole.
     pub fn missed(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Where something happened, for the daemon's syncs to list.
+    pub fn marks(&self) -> crate::scope::Shared {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .marks
+            .clone()
     }
 
     pub fn counts(&self) -> WatchCounts {

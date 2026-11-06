@@ -56,7 +56,7 @@ These outrank features and speed; each has failure tests.
 | Chunking | FastCDC (average ~1-4 MB), BLAKE3, optional Zstd | Inserting bytes mid-file changes only nearby chunks |
 | Transport | HTTPS: batched idempotent operations plus a persistent change feed | Passes through any reverse proxy and still gives instant push; QUIC only if measurements later ask for it |
 | Linux watcher | inotify as the baseline, fanotify with `FAN_REPORT_FID` when privileged | The daemon runs without root, and fanotify's mount and filesystem marks need `CAP_SYS_ADMIN` |
-| Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: events can be lost, the scan is the safety net |
+| Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: a sync lists where events were, so a lost event waits for the reconcile's scan of the whole tree, the safety net |
 | Web UI | TypeScript + Svelte, static build embedded in the binary | Thin client of the same API; stays out of the server's hot path |
 | Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with. On macOS the tray and the daemon are each a signed app bundle, Cairn.app and Cairn Sync.app | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed. A bundle is how macOS names a background program and shows its icon, and one signature across builds keeps its permissions through upgrades |
 | Updates | Each daemon asks its release's feed about once an hour and installs a newer release itself, `cairn` and the tray beside it, restarting into it between syncs; a person can also ask, by `cairn update now` or in the tray, or set it to only notify, or off. What it installs is an Ed25519-signed list of every file's size and SHA-256, and on macOS also a bundle signed by the team of the one it replaces. The server is not among them | A fix reaches every device within the hour, and nobody stays on an old version by forgetting. No permission is asked again: macOS keeps them for the signing team, which Developer ID gives every release, and Windows by path. A key of the project's own rather than an OS certificate is what is trusted, so Linux is covered alike, and a build from source updates from nobody's releases but its builder's. The server goes first by hand, because a client takes a release on a new protocol only once its server speaks it |
@@ -191,7 +191,7 @@ build, the configuration and the rules; and the tree, by a digest of its scan. A
 again, by a scan that stops before it would read a file, would decide the same, so it stops there, before the base
 is loaded; anything else, and it runs in full. A harness build runs both and compares them.
 
-**A sync that carries a change** costs what changed, and the scan. An agreement decided nothing about any
+**A sync that carries a change** costs what changed, and in the daemon its scan does too. An agreement decided nothing about any
 object, and the merge looks at little besides the object itself, so an object whose own state and whose
 neighbours' are as they were at an agreement is decided about as it was then: not at all. The state keeps a
 ledger of the last agreement, per live object of the base: its kind and entries, and what the scan saw, the
@@ -254,11 +254,24 @@ harness's oracle to find, on its trees, and no longer the daemon's on every devi
 before submitting old state, comparing against history, so deleted files do not come back.
 
 **The daemon** decides when to sync and nothing else: it runs the same state-based sync a person runs. An
-event from the watcher or the change feed only says "look", and says nothing about what to look at, so a
-lost event, a stale path or a missed folder delays a change and cannot lose one: the reconcile, a sync
-an hour whatever wakes it, scans the whole tree, and a sync a day checks the ledger the syncs that carry a
-change rest on against the state and takes up whatever it vouched for wrongly, so whatever both miss, and
-whatever a ledger gone wrong would have hidden, is taken within a day. A watch is always placed before the sync it leads to; the walk that places them
+event from the change feed only says "look". One from the watcher also marks the folder it was in, stamped when
+read, and a folder made or moved in whole; a round on what changed alone then lists the folders marked since the
+scan the last agreement in this process rests on began, the folders of whatever the state marks as written
+since, the journal or a mark names, and what holds a hard link, and the folders above them, gone through
+without listing where each is as the ledger has it; every other folder's entries it takes from the ledger, and
+a folder found otherwise than the ledger has it is listed after all. Nothing a round decides about or loads
+beside it is the ledger's word alone, and every folder whose every name it looks at was listed: otherwise it
+goes again listing those too, up to four times, then lists the whole tree. Whatever the watcher cannot place or
+may have missed, an overflowed queue, dropped events, FSEvents' must-scan, a root moved, a rules file saved, a
+watch that died with its folder still there, is a loss of track: no narrowing stands on anything before it, and
+the next sync lists the whole tree. So does every sync while a folder is not watched or the watcher has stopped,
+the daemon's first, the reconcile, and the check. A lost event the kernel says nothing of, as for a write
+through a mapping, delays a change and cannot lose one: the reconcile, a sync an hour whatever wakes it, scans
+the whole tree, and a sync a day checks the ledger the syncs that carry a change rest on against the state and
+takes up whatever it vouched for wrongly, so whatever both miss, and whatever a ledger gone wrong would have
+hidden, is taken within a day; and an apply checks what it replaces on disk, not in the scan, so what nobody
+saw change is kept beside what arrives. What a sync that listed part of the tree did not see again of what
+was skipped elsewhere, the daemon keeps showing. A watch is always placed before the sync it leads to; the walk that places them
 holds one folder open for each level down, the daemon takes its hard limit on open files, and a folder it cannot
 watch is named. A wake for a change from before the scan the last sync agreed on is none, as that scan saw it, the
 sync's own writes included, and so is the feed's news of commits that sync took in. Change feed: a long-poll

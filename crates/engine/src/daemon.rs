@@ -573,6 +573,21 @@ fn note_not_applied(
     status.not_applied = kept.iter().take(MAX_NOT_APPLIED).cloned().collect();
 }
 
+/// A sync that listed only some folders saw nothing of what was skipped elsewhere: what the last one
+/// said of those stands, but what may have settled since, which the sync after it looks at again.
+fn carry_skips(report: &mut SyncReport, last: &[cairn_protocol::Skip]) {
+    let Some(looked) = &report.looked_in else {
+        return;
+    };
+    let looked: BTreeSet<&str> = looked.iter().map(String::as_str).collect();
+    for s in last {
+        let folder = s.path.rsplit_once('/').map_or("", |(f, _)| f);
+        if !looked.contains(folder) && !s.kind.retryable() && !report.skips.contains(s) {
+            report.skips.push(s.clone());
+        }
+    }
+}
+
 fn report_lines(report: &SyncReport) -> BTreeSet<String> {
     let mut lines = BTreeSet::new();
     for e in &report.events {
@@ -730,6 +745,10 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
+    // When the scan began that the last agreement in this process rests on: the watcher's marks since
+    // then are where anything can have changed, if it can be trusted (scope.rs).
+    let mut agreed_at: Option<Instant> = None;
+    let mut last_skips: Vec<cairn_protocol::Skip> = Vec::new();
 
     loop {
         for note in hub.take_notes() {
@@ -895,6 +914,21 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 w.walk_all();
             }
         }
+        // The folders marked since the last agreement, where nothing can have been missed: a watcher
+        // still reading, every folder watched, not the reconcile, and not the first sync, which places
+        // the watches. Otherwise the whole tree.
+        let scope = match (&watcher, agreed_at) {
+            (Some(w), Some(since)) if !reconcile && !walk_first => {
+                let counts = w.counts();
+                (!counts.stopped && counts.unwatched == 0 && !counts.limit_reached).then(|| {
+                    crate::scope::Source {
+                        marks: w.marks(),
+                        since,
+                    }
+                })
+            }
+            _ => None,
+        };
         status.waiting = None;
         // To the local API only: writing the file twice a sync would be for nobody.
         status.syncing = true;
@@ -906,6 +940,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             &SyncOptions {
                 changed_here,
                 full_every: Some(opts.full_sync),
+                scope,
                 ..SyncOptions::default()
             },
         );
@@ -928,9 +963,17 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         status.last_sync = now_secs();
         let mut lines = BTreeSet::new();
         match result {
-            Ok(report) => {
+            Ok(mut report) => {
                 last_error = None;
                 walk_first = false;
+                if let Some(t) = report.agreed_since {
+                    agreed_at = Some(t);
+                    if let Some(w) = &watcher {
+                        crate::scope::lock(&w.marks()).prune(t);
+                    }
+                }
+                carry_skips(&mut report, &last_skips);
+                last_skips.clone_from(&report.skips);
                 if !report.activity.is_empty() {
                     let mut recent: Vec<_> = report.activity.iter().rev().cloned().collect();
                     recent.append(&mut status.recent);
@@ -999,9 +1042,14 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         }
                         _ => String::new(),
                     };
+                    let looked = match &report.looked_in {
+                        Some(folders) => format!(", listed {} folder(s)", folders.len()),
+                        None => String::new(),
+                    };
                     log(&format!(
-                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s){took}",
-                        report.head, report.steps_applied, report.commits, report.bytes_uploaded, report.conflicts
+                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s){took}{looked}, in {} round(s), scans {:.1} s",
+                        report.head, report.steps_applied, report.commits, report.bytes_uploaded, report.conflicts,
+                        report.rounds, report.scan_time.as_secs_f64()
                     ));
                 }
             }
@@ -1038,12 +1086,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 counts.unwatched
             ));
         } else if counts.stopped && !said_counts.stopped {
-            log("the watcher has stopped: changes here are found only by the full sync");
+            log("the watcher has stopped: changes here are found only by the full sync, and every sync looks at the whole tree");
         } else if counts.unwatched > 0 && said_counts.unwatched == 0 {
             let missed = watcher.as_ref().map(Watcher::missed).unwrap_or_default();
             let more = counts.unwatched.saturating_sub(missed.len());
             log(&format!(
-                "{} folders could not be watched, so changes in them wait for a full sync: {}{}",
+                "{} folders could not be watched, so changes in them wait for a full sync, and every sync looks at the whole tree: {}{}",
                 counts.unwatched,
                 missed.join(", "),
                 if more > 0 {

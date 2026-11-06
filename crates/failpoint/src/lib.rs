@@ -25,6 +25,10 @@
 //!   Not a step either.
 //! - `CAIRN_FP_VERSION=<version>`: `version` gives it in place of the build's own, so that a test's
 //!   binary takes itself for an older one and has a release to update to. Not a step either.
+//! - `CAIRN_FP_UNWATCHED=<name>`: `unwatchable` says yes for a folder of that name, as the kernel
+//!   refuses a watch past its limit. Not a step either.
+//! - `CAIRN_FP_LOST_EVENT=<name>`: `event_lost` says yes for an event about an entry of that name, as
+//!   a write through a mapping sends none. Not a step either.
 
 use std::io;
 
@@ -113,6 +117,31 @@ pub fn network(name: &str, answered: bool) -> io::Result<()> {
     {
         let _ = (name, answered);
         Ok(())
+    }
+}
+
+/// Whether a watcher is to fail to watch a folder of this name, as one past the kernel's limit does.
+#[inline]
+pub fn unwatchable(name: &[u8]) -> bool {
+    #[cfg(feature = "enabled")]
+    return imp::named("CAIRN_FP_UNWATCHED", name);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Whether a watcher is to lose an event about an entry of this name, saying nothing, as no event comes
+/// of a write through a mapping.
+#[inline]
+pub fn event_lost(name: &[u8]) -> bool {
+    #[cfg(feature = "enabled")]
+    return imp::named("CAIRN_FP_LOST_EVENT", name);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = name;
+        false
     }
 }
 
@@ -265,6 +294,17 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn named(var: &str, name: &[u8]) -> bool {
+        std::env::var_os(var)
+            .is_some_and(|v| std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str()) == name)
+    }
+
+    #[cfg(windows)]
+    pub fn named(var: &str, name: &[u8]) -> bool {
+        std::env::var(var).is_ok_and(|v| v.as_bytes() == name)
     }
 
     pub fn unsupported(name: &str) -> bool {

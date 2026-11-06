@@ -404,6 +404,8 @@ pub fn try_fast(
         arriving: &[],
         excluded: &excluded,
         probe: true,
+        scope: None,
+        started: None,
     };
     let scan_started = Instant::now();
     let result = scan(&root.dir, &opts)?;

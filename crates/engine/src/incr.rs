@@ -977,6 +977,285 @@ impl Journal {
     }
 }
 
+/// The ledger's word on what a scan with a scope does not list (scan.rs `Vouch`): what the agreement found
+/// there, for every folder that nothing marked as written since, nothing in the journal or a mark names,
+/// and that holds nothing such.
+pub struct Word<'a> {
+    b: &'a Before<'a>,
+    /// Not the ledger's to vouch for: written since, named by the journal or a mark, at more than one
+    /// name, or at an inode another entry has.
+    not_vouched: HashSet<ObjectId>,
+    /// Folders whose own listing a round reads: one any of those has or had an entry in, or one the
+    /// journal puts something in or takes something from.
+    open_here: HashSet<ObjectId>,
+    /// Those, and every folder above them.
+    above: HashSet<ObjectId>,
+    /// The folders to list for them, by path, and whether all under each.
+    pub folders: crate::scope::Folders,
+}
+
+impl<'a> Word<'a> {
+    /// `named` is what besides the journal and the marks of written since a round takes up: marks of
+    /// this sync's own, names this filesystem cannot hold, and what a decision fell on.
+    pub fn new(b: &'a Before<'a>, named: &BTreeSet<ObjectId>, rules: bool) -> Self {
+        // A harness build can leave all of this to the rounds' widening, which must find it alone.
+        if cairn_failpoint::unsupported("sync.scope.ahead") {
+            return Word {
+                b,
+                not_vouched: HashSet::new(),
+                open_here: HashSet::new(),
+                above: HashSet::new(),
+                folders: crate::scope::Folders::new(),
+            };
+        }
+        let l = b.ledger;
+        let mut not_vouched: HashSet<ObjectId> = HashSet::new();
+        not_vouched.extend(b.dirty.iter().copied());
+        not_vouched.extend(b.journal.touched.iter().copied());
+        not_vouched.extend(named.iter().copied());
+        for i in 0..l.len() {
+            let shared = l.seen[i]
+                .as_ref()
+                .is_some_and(|s| l.shares_inode(&(s.fp.dev, s.fp.ino)));
+            if l.link_count(i) > 1 || shared {
+                not_vouched.insert(l.ids[i]);
+            }
+        }
+        let mut open_here: HashSet<ObjectId> = HashSet::new();
+        let mut whole: HashSet<ObjectId> = HashSet::new();
+        for x in &not_vouched {
+            for p in b.base_links(x).iter().map(|l| l.parent) {
+                open_here.insert(p);
+            }
+            for link in l.links_of(x).unwrap_or_default() {
+                open_here.insert(link.parent);
+            }
+            if let Some(links) = b.journal.links.get(x) {
+                open_here.extend(links.iter().map(|l| l.parent));
+            }
+            if let Some(row) = b.dirty_rows.get(x) {
+                open_here.extend(row.held.iter().flatten().map(|l| l.parent));
+                if let Some(s) = &row.synced {
+                    open_here.extend(s.links.iter().map(|l| l.parent));
+                }
+            }
+            // A folder a round decides about has every name in it looked at, and one the journal moves,
+            // with rules by path, everything under it.
+            if b.kind(x) == Some(ObjectKind::Dir) {
+                open_here.insert(*x);
+                if rules && b.journal.moved.contains(x) {
+                    whole.insert(*x);
+                }
+            }
+        }
+        open_here.extend(b.journal.into.keys().copied());
+        open_here.insert(ObjectId::ROOT);
+        let mut above: HashSet<ObjectId> = HashSet::new();
+        let mut folders = crate::scope::Folders::new();
+        let mut w = Word {
+            b,
+            not_vouched,
+            open_here: HashSet::new(),
+            above: HashSet::new(),
+            folders: crate::scope::Folders::new(),
+        };
+        for p in &open_here {
+            let mut at = Some(*p);
+            let mut steps = 0;
+            while let Some(x) = at {
+                if !above.insert(x) || x == ObjectId::ROOT || steps > 4096 {
+                    break;
+                }
+                at = w.parent_of(&x);
+                steps += 1;
+            }
+            if let Some(path) = w.path_of(p) {
+                folders.insert(path, whole.contains(p));
+            }
+        }
+        w.open_here = open_here;
+        w.above = above;
+        w.folders = folders;
+        w
+    }
+
+    /// The one folder a folder is in: the base's, where something wrote it since, else the ledger's.
+    fn parent_of(&self, x: &ObjectId) -> Option<ObjectId> {
+        let links = self.b.base_links(x);
+        match links.as_slice() {
+            [one] => Some(one.parent),
+            _ => None,
+        }
+    }
+
+    /// Where a folder is here, as the agreement had it, or as the base has it where something wrote it
+    /// since: `None` if it is not here to be listed.
+    fn path_of(&self, x: &ObjectId) -> Option<Vec<Name>> {
+        let mut out = Vec::new();
+        let mut at = *x;
+        for _ in 0..4096 {
+            if at == ObjectId::ROOT {
+                out.reverse();
+                return Some(out);
+            }
+            let links = match self.b.ledger.links_of(&at) {
+                Some(l) if !self.b.is_dirty(&at) => l,
+                _ => self.b.base_links(&at),
+            };
+            let [one] = links.as_slice() else {
+                return None;
+            };
+            out.push(one.name.clone());
+            at = one.parent;
+        }
+        None
+    }
+
+    fn vouched(&self, x: &ObjectId) -> bool {
+        !self.not_vouched.contains(x) && !self.above.contains(x)
+    }
+
+    /// Where a folder is here, for a scope.
+    pub fn path(&self, x: &ObjectId) -> Option<Vec<Name>> {
+        self.path_of(x)
+    }
+}
+
+impl crate::scan::Vouch for Word<'_> {
+    fn object_at(
+        &self,
+        parent: ObjectId,
+        name: &Name,
+        st: &crate::fsops::Stat,
+    ) -> Option<ObjectId> {
+        let l = self.b.ledger;
+        l.at_inode(&(st.dev, st.ino)).find(|x| {
+            l.find(x).is_some_and(|i| {
+                l.raw_links(i)
+                    .any(|(p, n)| p == parent && n == name.as_bytes())
+            })
+        })
+    }
+
+    fn quiet(&self, folder: ObjectId, node: &mut Scanned) -> bool {
+        let l = self.b.ledger;
+        if self.b.is_dirty(&folder) || self.b.journal.touched.contains(&folder) {
+            return false;
+        }
+        let Some(li) = l.find(&folder) else {
+            return false;
+        };
+        let Some(seen) = l.seen[li].as_ref() else {
+            return false;
+        };
+        let key = (node.fp.dev, node.fp.ino);
+        if l.kinds[li] != ObjectKind::Dir
+            || (seen.fp.dev, seen.fp.ino) != key
+            || l.at_inode(&key).count() != 1
+            || l.link_count(li) != 1
+        {
+            return false;
+        }
+        // What is under it is the agreement's, so whatever was excluded there then still is: the one
+        // reading of the flags that gives the agreement's digest is the walk's.
+        for (holds, only) in [(false, false), (true, false), (true, true)] {
+            node.holds_excluded = holds;
+            node.only_excluded = only;
+            if Some(digest(node)) == seen.digest {
+                return true;
+            }
+        }
+        node.holds_excluded = false;
+        node.only_excluded = false;
+        false
+    }
+
+    fn takes_all_but(&self, folder: ObjectId, except: &BTreeSet<Name>) -> bool {
+        if self.open_here.contains(&folder) || self.not_vouched.contains(&folder) {
+            return false;
+        }
+        let l = self.b.ledger;
+        for i in l.child_indices(&folder) {
+            let x = l.ids[i];
+            let named = l
+                .raw_links(i)
+                .filter(|(p, _)| *p == folder)
+                .all(|(_, n)| except.iter().any(|e| e.as_bytes() == n));
+            if !named && !self.vouched(&x) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_child(&self, folder: ObjectId, name: &Name) -> bool {
+        self.b.ledger.children_named(&folder, name).is_some()
+    }
+
+    fn under(
+        &self,
+        folder: ObjectId,
+        path: &[Name],
+        except: &BTreeSet<Name>,
+        found: &HashSet<(u64, u64)>,
+        out: &mut Vec<Scanned>,
+    ) {
+        let l = self.b.ledger;
+        let mut stack: Vec<(ObjectId, Vec<Name>, bool)> = vec![(folder, path.to_vec(), true)];
+        while let Some((f, at, top)) = stack.pop() {
+            for i in l.child_indices(&f) {
+                let Some(seen) = l.seen[i].as_ref() else {
+                    continue;
+                };
+                for (p, n) in l.raw_links(i) {
+                    if p != f {
+                        continue;
+                    }
+                    let Ok(name) = Name::new(n.to_vec()) else {
+                        continue;
+                    };
+                    if top && except.contains(&name) {
+                        continue;
+                    }
+                    if found.contains(&(seen.fp.dev, seen.fp.ino)) {
+                        continue;
+                    }
+                    let mut p = at.clone();
+                    p.push(name);
+                    if l.kinds[i] == ObjectKind::Dir {
+                        stack.push((l.ids[i], p.clone(), false));
+                    }
+                    let known = seen.known();
+                    out.push(Scanned {
+                        paths: vec![p],
+                        fp: seen.fp.clone(),
+                        racy: false,
+                        content: seen.content.clone(),
+                        metadata: known.scan.cloned().unwrap_or_default(),
+                        metadata_incomplete: false,
+                        holds_excluded: false,
+                        only_excluded: false,
+                    });
+                }
+            }
+        }
+    }
+
+    fn paths_of(&self, inode: (u64, u64)) -> Vec<Vec<Name>> {
+        let l = self.b.ledger;
+        let mut out = Vec::new();
+        for x in l.at_inode(&inode) {
+            for link in l.links_of(&x).unwrap_or_default() {
+                if let Some(mut p) = self.path_of(&link.parent) {
+                    p.push(link.name);
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Where the root stands among a scan's nodes.
 const ROOT_NODE: usize = usize::MAX;
 
@@ -1267,7 +1546,10 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
         }
     }
 
-    let digests = digests(nodes);
+    // Nodes taken from the agreement were not read: their digests are the agreement's.
+    let read = scan.vouched_from.min(nodes.len());
+    let mut digests = digests(&nodes[..read]);
+    digests.resize(nodes.len(), None);
     // A harness build can take a file of one name as the ledger has it, whatever the scan found, as a
     // defect in what follows would: for the tests of the daemon's check on the incremental path.
     let blind: Option<String> = cfg!(feature = "failpoints")
@@ -1312,6 +1594,7 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
         }
         let same = match n.content {
             Content::File { .. } => seen.known().vouches_for(&n.fp) && n.content == seen.content,
+            _ if scan.vouched(i) => true,
             // The digest holds the fingerprint too.
             _ => digests[i].is_some() && digests[i] == seen.digest,
         };
@@ -1550,7 +1833,8 @@ pub struct Reach {
     pub all: BTreeSet<ObjectId>,
     /// The scan's nodes for them, and every node the ledger does not account for.
     pub nodes: BTreeSet<usize>,
-    opened: HashSet<ObjectId>,
+    /// Every folder whose every name the round looks at.
+    pub opened: HashSet<ObjectId>,
     above: HashSet<ObjectId>,
     core_work: Vec<ObjectId>,
     work: Vec<ObjectId>,
@@ -2503,6 +2787,8 @@ mod tests {
             excluded_ids: Vec::new(),
             stopped: false,
             started: std::time::Instant::now(),
+            vouched_from: usize::MAX,
+            listed: None,
         }
     }
 

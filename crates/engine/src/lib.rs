@@ -18,6 +18,7 @@ pub mod restore;
 pub mod root;
 pub mod scan;
 pub mod schedule;
+pub mod scope;
 pub mod selection;
 pub mod state;
 pub mod steady;

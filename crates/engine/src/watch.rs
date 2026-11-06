@@ -1,6 +1,9 @@
-//! Telling the daemon that something under a root changed. Which paths does not matter: any event
-//! leads to a whole sync, whose scan is what decides what changed, so that a lost event, a missed
-//! directory or a wrong path here can only delay a change, never lose one.
+//! Telling the daemon that something under a root changed, and in which folders. The scan decides what
+//! changed: a daemon's sync lists the folders marked here and takes the rest from the last agreement
+//! (scope.rs), and whatever this cannot place or may have missed, an overflow above all, it says, and the
+//! sync after it lists the whole tree. A folder that cannot be watched, or a watcher that has stopped,
+//! has every sync list the whole tree. So a lost event the kernel says nothing of, as a write through a
+//! mapping sends none, waits for the reconcile, within the hour, and can only delay a change.
 //!
 //! inotify watches one directory at a time. The order that keeps this honest is watch first, sync
 //! after: a directory is watched before the wake that follows its creation, so whatever was written
@@ -71,6 +74,10 @@ struct Inner {
     in_motion: HashSet<String>,
     /// The first folders that could not be watched, each with why.
     missed: Vec<String>,
+    /// Where something happened, for the daemon's syncs.
+    marks: crate::scope::Shared,
+    /// Watches whose folder was deleted, whose end is no news.
+    deleted: HashSet<i32>,
 }
 
 /// A folder being walked, with the subfolders of it still to go.
@@ -93,13 +100,22 @@ impl Inner {
     /// Through the descriptor, which was opened refusing symlinks, so a directory swapped for a link
     /// a moment ago cannot put a watch somewhere else.
     fn add_watch(&mut self, dir: &Dir, path: &[Name], seen: &mut HashSet<i32>) {
+        if path
+            .last()
+            .is_some_and(|n| cairn_failpoint::unwatchable(n.as_bytes()))
+        {
+            return self.missed(path, "refused by the harness, as past the kernel's limit");
+        }
         let proc = format!(
             "/proc/self/fd/{}",
             rustix::fd::AsRawFd::as_raw_fd(&dir.fd())
         );
         match inotify::add_watch(&self.inotify, proc.as_str(), dir_mask()) {
             Ok(wd) => {
-                self.paths.insert(wd, path.to_vec());
+                // A folder watched only now may have changed while it was not.
+                if self.paths.insert(wd, path.to_vec()).as_deref() != Some(path) {
+                    crate::scope::lock(&self.marks).mark(path, false);
+                }
                 seen.insert(wd);
             }
             Err(Errno::NOSPC) => {
@@ -235,22 +251,39 @@ struct Batch {
 
 impl Inner {
     fn event(&mut self, wd: i32, flags: ReadFlags, name: Option<&[u8]>, batch: &mut Batch) {
+        let marks = self.marks.clone();
+        let mut marks = crate::scope::lock(&marks);
         if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
             // Events are gone, and with them possibly the news of new directories.
             hit("daemon.watch.overflow");
+            marks.lose();
             batch.walk_all = true;
             batch.wake = true;
             return;
         }
         if Some(wd) == self.state_watch {
             if name == Some(IGNORE_FILE) {
+                marks.lose();
                 batch.walk_all = true;
                 batch.wake = true;
             }
             return;
         }
         if flags.contains(ReadFlags::IGNORED) {
-            let was_root = self.paths.remove(&wd).is_some_and(|p| p.is_empty());
+            let gone = self.paths.remove(&wd);
+            let was_root = gone.as_ref().is_some_and(|p| p.is_empty());
+            let deleted = self.deleted.remove(&wd);
+            match &gone {
+                // A walk took it off, as its folder had gone from the tree.
+                None => {}
+                Some(p) if deleted && !p.is_empty() => marks.mark_entry(p, false),
+                // A watch that ended with its folder still there: nothing more comes from it, and
+                // what came before may be missing too. Watched again by a walk.
+                Some(_) => {
+                    marks.lose();
+                    batch.walk_all = true;
+                }
+            }
             self.counts.watched = self.paths.len();
             batch.wake |= was_root;
             return;
@@ -261,25 +294,49 @@ impl Inner {
         if flags.intersects(ReadFlags::UNMOUNT | ReadFlags::DELETE_SELF | ReadFlags::MOVE_SELF) {
             // A moved directory's path is stale, as is everything's under it. If it was the root,
             // the sync this leads to is what tells a person.
+            if path.is_empty() || flags.contains(ReadFlags::UNMOUNT) {
+                marks.lose();
+            } else {
+                marks.mark_entry(&path, false);
+            }
+            if flags.contains(ReadFlags::DELETE_SELF) {
+                self.deleted.insert(wd);
+            }
             batch.walk_all |= flags.contains(ReadFlags::MOVE_SELF);
             batch.wake |= path.is_empty();
             return;
         }
         let Some(raw) = name else {
+            // The folder itself, as for a change of its metadata.
+            marks.mark_entry(&path, false);
+            marks.mark(&path, false);
             batch.wake = true;
             return;
         };
+        if cairn_failpoint::event_lost(raw) {
+            return;
+        }
         if path.is_empty() && raw == STATE_DIR {
             batch.wake = true;
             return;
         }
         let Ok(name) = Name::new(raw.to_vec()) else {
+            marks.lose();
             batch.wake = true;
             return;
         };
+        let is_dir = flags.contains(ReadFlags::ISDIR);
+        // The folder it is in, whatever the rules say of it: a sync that lists that folder sees it as a
+        // scan of the whole tree would, rules and all. A folder made or moved in is new all through.
+        marks.mark(&path, false);
+        if is_dir && flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
+            let mut at = path.clone();
+            at.push(name.clone());
+            marks.mark(&at, true);
+        }
+        drop(marks);
         let mut at = path;
         at.push(name);
-        let is_dir = flags.contains(ReadFlags::ISDIR);
         // A busy log file that is ignored must not keep the daemon scanning.
         if self.rules.excludes(&at, is_dir) {
             return;
@@ -323,6 +380,8 @@ impl Watcher {
             stopped: false,
             in_motion: HashSet::new(),
             missed: Vec::new(),
+            marks: crate::scope::Shared::default(),
+            deleted: HashSet::new(),
         }));
         let shared = inner.clone();
         std::thread::spawn(move || read_events(reader, shared, wake));
@@ -343,6 +402,11 @@ impl Watcher {
     /// The first folders that could not be watched, each with why.
     pub fn missed(&self) -> Vec<String> {
         self.lock().missed.clone()
+    }
+
+    /// Where something happened, for the daemon's syncs to list.
+    pub fn marks(&self) -> crate::scope::Shared {
+        self.lock().marks.clone()
     }
 
     pub fn counts(&self) -> WatchCounts {
@@ -366,10 +430,16 @@ fn read_events(fd: OwnedFd, inner: Arc<Mutex<Inner>>, wake: impl Fn()) {
     loop {
         if drained {
             let mut fds = [PollFd::from_borrowed_fd(fd.as_fd(), PollFlags::IN)];
-            match poll(&mut fds, None) {
-                Ok(_) | Err(Errno::INTR) => {}
-                Err(_) => {
-                    inner.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
+            let polled = poll(&mut fds, None);
+            // A harness build can have the reader fail here, as one that can read no more does.
+            let died = cairn_failpoint::unsupported("daemon.watch.reader");
+            match polled {
+                Ok(_) | Err(Errno::INTR) if !died => {}
+                _ => {
+                    let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    inner.stopped = true;
+                    crate::scope::lock(&inner.marks).lose();
+                    drop(inner);
                     wake();
                     return;
                 }

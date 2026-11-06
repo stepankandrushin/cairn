@@ -350,6 +350,18 @@ pub struct State {
     conn: Connection,
 }
 
+/// The page cache of a state's connection, in KiB.
+const STATE_CACHE_KIB: i64 = 32 * 1024;
+
+/// What a transaction writes, in the order of the table's keys: each page is then dirtied once, and
+/// written once, however far the transaction outgrows the page cache. In the order given, as random as
+/// object IDs are, a page goes to the WAL again each time it is dirtied again after a spill.
+fn in_key_order<T, K: Ord + ?Sized>(items: &[T], key: impl Fn(&T) -> &K) -> Vec<&T> {
+    let mut out: Vec<&T> = items.iter().collect();
+    out.sort_by(|a, b| key(a).cmp(key(b)));
+    out
+}
+
 const KEY_CURSOR: &str = "cursor";
 const KEY_CURSOR_OP: &str = "cursor_op";
 pub const KEY_ROOT_ID: &str = "root_id";
@@ -364,6 +376,14 @@ impl State {
         // On macOS that needs this too, or SQLite's fsync stops at the drive's cache. Elsewhere a no-op.
         conn.pragma_update(None, "fullfsync", "ON")?;
         conn.pragma_update(None, "checkpoint_fullfsync", "ON")?;
+        // Every statement on a table with triggers keeps a journal of the pages it touches, to undo it
+        // alone. A few pages each, but in a temporary file, from the first that passes 64 KiB, for the
+        // rest of the transaction: a join wrote its state several times over into those.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // Pages held between steps, in KiB: enough for the inner pages of a state of millions of entries,
+        // so a lookup costs a leaf and not a walk from the top, and for what one transaction dirties in
+        // key order before it spills. Taken only as pages are read; the default is 2 MiB.
+        conn.pragma_update(None, "cache_size", -STATE_CACHE_KIB)?;
         let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > MIGRATIONS.len() {
             bail!("this root's state is schema {version}, newer than this binary: upgrade cairn");
@@ -480,7 +500,7 @@ impl State {
         let tx = self.conn.transaction()?;
         {
             let mut mark = tx.prepare_cached("INSERT OR IGNORE INTO dirty (object) VALUES (?1)")?;
-            for id in objects {
+            for id in in_key_order(objects, |id| id) {
                 mark.execute([id.0])?;
             }
         }
@@ -702,7 +722,7 @@ impl State {
         let tx = self.conn.transaction()?;
         {
             let mut del = tx.prepare_cached("DELETE FROM manifests WHERE hash = ?1")?;
-            for h in hashes {
+            for h in in_key_order(hashes, |h| h) {
                 del.execute([h.0])?;
             }
         }
@@ -832,7 +852,7 @@ impl State {
         {
             let mut put =
                 tx.prepare_cached("INSERT OR IGNORE INTO manifests (hash, bytes) VALUES (?1, ?2)")?;
-            for (h, b) in manifests {
+            for (h, b) in in_key_order(manifests, |(h, _)| h) {
                 put.execute(params![h.0, b])?;
             }
         }
@@ -913,7 +933,7 @@ impl State {
         put_rows(&tx, rows, &[])?;
         {
             let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
-            for key in marks {
+            for key in in_key_order(marks, |k| k.as_str()) {
                 del.execute([key])?;
             }
         }
@@ -955,7 +975,7 @@ impl State {
             let mut put = tx.prepare_cached(
                 "INSERT INTO intents (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             )?;
-            for (key, value) in marks {
+            for (key, value) in in_key_order(marks, |(k, _)| k.as_str()) {
                 put.execute(params![key, serde_json::to_string(value)?])?;
             }
         }
@@ -993,7 +1013,7 @@ impl State {
         put_rows(&tx, changed, &[])?;
         {
             let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
-            for key in marks {
+            for key in in_key_order(marks, |k| k.as_str()) {
                 del.execute([key])?;
             }
         }
@@ -1078,12 +1098,12 @@ fn put_rows(
         let mut put = tx.prepare_cached(
             "INSERT INTO rows (object, row) VALUES (?1, ?2) ON CONFLICT (object) DO UPDATE SET row = excluded.row",
         )?;
-        for (id, row) in changed {
+        for (id, row) in in_key_order(changed, |(id, _)| id) {
             put.execute(params![id.0, serde_json::to_string(row)?])?;
         }
     }
     let mut del = tx.prepare_cached("DELETE FROM rows WHERE object = ?1")?;
-    for id in gone {
+    for id in in_key_order(gone, |id| id) {
         del.execute([id.0])?;
     }
     Ok(())
@@ -1345,6 +1365,63 @@ mod tests {
                 (&l.fp, l.racy, &l.content, l.incomplete)
             );
         }
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What this thread has written, through any file: SQLite writes from the thread that calls it, so
+    /// tests running beside this one do not count.
+    #[cfg(target_os = "linux")]
+    fn written_by_this_thread() -> u64 {
+        let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+        io.lines()
+            .find_map(|l| l.strip_prefix("wchar: "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    }
+
+    /// Every row of a big tree written in one transaction, then every one of them again, as a join does
+    /// in several of its passes: about the state's own size each time, and not dozens of times that.
+    /// With the statement journals that every statement on a table with triggers keeps in temporary
+    /// files, and rows in the order given into a page cache of 2 MiB, which sent a page to the WAL again
+    /// each time it was dirtied again, this wrote 29 times what it left (3.6 GB for 125 MB).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_transaction_over_every_row_writes_about_the_state_once() {
+        let (dir, mut state) = fresh();
+        let ids: Vec<ObjectId> = (0..50_000).map(|_| ObjectId::random()).collect();
+        let rows = |pass: u64| -> Vec<(ObjectId, Row)> {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let mut r = row(pass * 1_000_000 + i as u64);
+                    r.content = Content::File {
+                        manifest: Hash(rand::random()),
+                        size: i as u64,
+                    };
+                    // About 800 bytes of JSON a row, as the rows of a tree of small files take.
+                    let pad = "x".repeat(345 + (i * 7) % 250);
+                    r.scan
+                        .unknown
+                        .insert("pad".into(), serde_json::Value::String(pad));
+                    (*id, r)
+                })
+                .collect()
+        };
+        let before = written_by_this_thread();
+        for pass in 0..2 {
+            let rows = rows(pass);
+            let list: Vec<(ObjectId, &Row)> = rows.iter().map(|(id, r)| (*id, r)).collect();
+            state.store_rows(&list, &[]).unwrap();
+        }
+        let written = written_by_this_thread() - before;
+        let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |m| m.len());
+        let left = size("state.sqlite") + size("state.sqlite-wal");
+        assert!(
+            written < 4 * left,
+            "wrote {written} bytes for a state of {left}: {:.1} times",
+            written as f64 / left as f64
+        );
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }

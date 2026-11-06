@@ -3019,8 +3019,11 @@ fn mark_synced(
             | Op::Link { object, .. }
             | Op::Unlink { object, .. }
             | Op::Move { object, .. }
-            | Op::Update { object, .. }
-            | Op::Note { object, .. } => *object,
+            | Op::Update { object, .. } => *object,
+            // A note changes neither the body nor the entries: nothing this device shares is ahead of
+            // anything for it, and its row stays as it is, which a join's notes would rewrite by the
+            // hundred thousand, 20,000 to a commit.
+            Op::Note { .. } => continue,
         });
     }
     let mut out = Vec::new();

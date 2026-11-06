@@ -29,6 +29,12 @@
 
 **Fixed:**
 
+- A device joining a big tree wrote its state many times over: a Windows device on an HDD joining 468k entries
+  wrote 70.7 GB in the first round for a state of 3 GB, for 15 MB of files it lacked. Each statement on a table
+  with triggers kept its journal in a temporary file, and rows went in at random keys through a page cache of
+  2 MiB, which sent each page to the WAL again each time it was dirtied again. The journals are now in memory,
+  every write goes in the order of the table's keys, the page cache is 32 MiB, and a note in a commit no longer
+  rewrites the row of what it is about. A join of 40,000 files on Linux writes 1.2 GB where it wrote 7.6 GB.
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
   24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
   window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the

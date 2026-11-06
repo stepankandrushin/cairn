@@ -38,9 +38,12 @@
 
 **Known limits:**
 
-- The daemon checks the incremental path once a day by deciding a sync the whole way as well. That costs what a
-  whole-tree sync cost before: at about 840,000 entries, about a minute of one core and up to 8 GB, once a day.
-  This is estimated from 0.1.3's whole-tree numbers, not yet measured as a check.
+- The daemon checks the incremental path once a day by deciding a sync the whole way as well, and holds both
+  decisions at once: at about 840,000 entries, measured after the release, about 82 s and a peak of 17.4 GB,
+  once a day. Not for a tree that size on a machine with less memory; a later release bounds it.
+- A first sync, and the first sync after an upgrade, hold the whole tree in memory: at about 840,000 entries,
+  9.2 GB for a first upload and 7.5 GB after an upgrade. On macOS one such upload failed once with "No buffer
+  space available" and finished when run again.
 - While a copy kept out by `cairn exclude` or a rule exists, every sync goes the whole way.
 - A first sync of a big tree still takes hours per device over a slow path, most of it placing files one at a time.
   Off Linux every placed file is still read back once.

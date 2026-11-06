@@ -12,35 +12,60 @@ release and has run on no real tree yet. See
 ## Why
 
 Cairn focuses on preserving the whole filesystem and its history. This comparison covers desktop
-filesystem sync; metadata support depends on the operating system, filesystem and privileges.
+filesystem sync and the services needed to run it; metadata support depends on the operating system,
+filesystem and privileges.
 
 ✅ Supported · ⚠️ Partial or conditional support · ❌ Not supported
 
-| Feature | **Cairn** | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
+| Feature | **Cairn**[^cairn] | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
 |---|---|---|---|---|
+| Application download size (Linux x86-64)[^downloads] | **6.3 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
+| RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
+| Implementation languages | **Rust** — CLI, daemon and server | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
+| Run without a separate database server or language runtime | ✅ Native binaries with embedded SQLite | ❌ PHP and a web server; usually a separate database | ❌ Server stack includes a database, cache and web services | ✅ Native binary; no central server required |
 | No built-in filename exclusions | ✅ `.git`, `node_modules` and `.venv` sync whole | ❌ Built-in exclusions for temporary and system files | ❌ Built-in exclusions for temporary and system files | ⚠️ Internal control and temporary files excluded; user-defined ignore rules |
 | Preserve symlinks | ✅ Preserved as links | ❌ Skipped | ❌ Targets copied instead of preserving links | ⚠️ Preserved, except on Windows |
 | Preserve full filesystem metadata | ✅ Modes, owners, xattrs, ACLs, hard links and sparse layout | ❌ No full Unix metadata round-trip | ⚠️ Executable bit on Unix; not full modes or ownership | ⚠️ Modes; owners and xattrs opt-in; hard links not preserved |
-| Transfer only changed chunks | ✅ Content-defined chunks | ❌ Whole file uploaded again | ✅ Content-defined blocks | ✅ Fixed-size blocks |
+| Sync speed: avoid whole-file re-uploads[^performance] | ✅ Incremental scans; only new content-defined chunks transferred | ❌ Whole changed file uploaded again | ✅ Only new content-defined blocks transferred | ✅ Only changed fixed-size blocks transferred; downloads from peers in parallel |
 | Versions share chunks | ✅ Shared chunks | ❌ Whole-file versions | ✅ Shared blocks | ❌ Whole-file archives of changes received from peers; off by default |
 | Keep both sides of a conflict | ✅ Three-way merge; both versions kept, with an inbox | ⚠️ Local conflict copy; not uploaded by default | ✅ Both versions kept; one renamed as a conflict file | ✅ Both versions kept; one renamed as a conflict file |
 | Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
+[^downloads]: Download sizes checked on 2026-11-07: [Cairn 0.1.5](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.5),
+    [Nextcloud Desktop 35.0.3](https://download.nextcloud.com/desktop/releases/Linux/),
+    [Seafile Client 9.0.22](https://github.com/haiwen/seafile-client/releases/tag/v9.0.22),
+    [Syncthing 2.1.7](https://github.com/syncthing/syncthing/releases/tag/v2.1.7).
+    Archives are `.tar.gz`; AppImages bundle desktop or CLI dependencies. These packages contain different
+    components, and their download sizes are not installed sizes. Cairn's archive does not include its tray.
+[^performance]: RAM entries describe implementation behavior or upstream requirements, not measured
+    consumption on the same workload. Cairn has no published RAM or comparative throughput benchmark.
+    Sync speed depends on file count, edit patterns, disk, network and settings; the speed row compares
+    the work needed to transfer edits, not measured MB/s.
+[^cairn]: Cairn: [Rust workspace](Cargo.toml), [release packaging](scripts/release.sh),
+    [streaming chunker](crates/engine/src/chunker.rs), [chunk uploads](crates/engine/src/sync.rs),
+    [incremental sync](crates/engine/src/incr.rs), [SQLite storage](crates/store/src/sqlite.rs).
 [^nextcloud]: Nextcloud: [exclusions](https://github.com/nextcloud/desktop/blob/master/sync-exclude.lst),
     [symlinks](https://docs.nextcloud.com/server/latest/user_manual/en/desktop/usage.html),
     [metadata and delta-sync roadmap](https://github.com/nextcloud/desktop/issues/9636),
     [versions](https://docs.nextcloud.com/server/latest/user_manual/en/files/version_control.html),
     [conflicts](https://docs.nextcloud.com/server/latest/user_manual/en/desktop/conflicts.html),
-    [deletion confirmation](https://github.com/nextcloud/desktop/blob/master/src/gui/folder.cpp).
+    [deletion confirmation](https://github.com/nextcloud/desktop/blob/master/src/gui/folder.cpp),
+    [server requirements](https://docs.nextcloud.com/server/stable/admin_manual/installation/system_requirements.html),
+    [desktop source](https://github.com/nextcloud/desktop), [server source](https://github.com/nextcloud/server).
 [^seafile]: Seafile: [exclusions and symlink handling](https://github.com/haiwen/seafile/blob/master/daemon/repo-mgr.c),
     [Unix modes](https://github.com/haiwen/seafile/blob/master/common/index/index.h),
     [blocks and version storage](https://manual.seafile.com/14.0/develop/data_model/),
     [conflicts](https://help.seafile.com/syncing_client/file_conflicts/),
-    [deletion confirmation](https://help.seafile.com/faq/#meaning-file-syncing-errors).
+    [deletion confirmation](https://help.seafile.com/faq/#meaning-file-syncing-errors),
+    [server requirements](https://manual.seafile.com/14.0/setup/system_requirements/),
+    [sync engine source](https://github.com/haiwen/seafile), [desktop source](https://github.com/haiwen/seafile-client),
+    [server source](https://github.com/haiwen/seafile-server), [web UI source](https://github.com/haiwen/seahub).
 [^syncthing]: Syncthing: [metadata and missing-folder protection](https://docs.syncthing.net/users/faq.html),
     [blocks, conflicts and temporary files](https://docs.syncthing.net/users/syncing.html),
     [ignore rules](https://docs.syncthing.net/users/ignoring.html),
-    [versioning](https://docs.syncthing.net/users/versioning.html).
+    [versioning](https://docs.syncthing.net/users/versioning.html),
+    [memory and performance tuning](https://docs.syncthing.net/users/tuning.html),
+    [source](https://github.com/syncthing/syncthing).
 
 ## Why the name Cairn?
 

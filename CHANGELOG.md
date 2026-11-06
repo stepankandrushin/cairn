@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5
 
 **Fixed:**
 
@@ -35,6 +35,16 @@
   folders looked at 137,000 entries and held 3.4 GB. A rewrite takes no name, so a sync now looks at the file and
   the folders above it, unless the file changed on both sides: those 1,000 now look at 3,300 entries and hold
   1.1 GB, and one edit 83 entries where it looked at 9,159.
+
+**Known limits:**
+
+- A first sync holds the whole tree in memory: at about 840,000 entries, 9.2 GB for a first upload and 9.1 GB for
+  a first download. A later release bounds it.
+- Every other sync, the daily check and the first sync after an upgrade included, peaks at about 0.9 to 1.2 GB at
+  that size. A later release brings it down further. Not measured on Windows.
+- While a copy kept out by `cairn exclude` exists, every sync goes the whole way.
+- A first sync of a big tree still takes hours per device over a slow path, most of it placing files one at a time.
+  Off Linux every placed file is still read back once.
 
 ## 0.1.4
 

@@ -35,6 +35,17 @@
   2 MiB, which sent each page to the WAL again each time it was dirtied again. The journals are now in memory,
   every write goes in the order of the table's keys, the page cache is 32 MiB, and a note in a commit no longer
   rewrites the row of what it is about. A join of 40,000 files on Linux writes 1.2 GB where it wrote 7.6 GB.
+- A join then read every file again: the sync set the server's mode or mtime on each, which counted as a change
+  that only a read could vouch for, and Windows reports a fixed mode, so there every file looked changed, though
+  most were not touched at all: 190 GB read again on that device, an hour. A file the sync left as the scan found
+  it now keeps its record's word, and on Linux one whose metadata it set is watched from before its check against
+  the scan, for any write, open, writer's close or later change of metadata, with a writer that had it open all
+  along found by the lease the kernel refuses: none of the 40,000 is read again, and the join writes 0.84 GB. What
+  a scan or an upload reads of a file is the first the cache gives up (Windows), or leaves it at once (Linux), so a
+  scan of a tree bigger than memory no longer pushes the state out, whose every step then waited on the disk.
+- An edit that landed on a file in the moment a sync set its metadata, between the check and the record, was
+  taken, mtime and all, for what the sync had set: the content went up, but its mtime read as the pair of the
+  server's and never did, and the devices kept different times. It is now the next round's to take up.
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
   24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
   window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the

@@ -139,9 +139,15 @@ slice at a time, each gone once the files that take it are written, so a first d
 free and not twice that, and one that would not fit is refused before anything moves. On a local Linux
 filesystem a placed file is watched (inotify) from its last write until a later write would move its
 timestamps, so its record vouches for it with no read back unless the watch saw it written to or its metadata
-changed. A watch holds nobody back: a program that saves a file the moment it arrives waits for nothing,
-whatever the sync is doing, and its save is read by the next scan. A lease would make that save wait until
-the sync gave it up, which a sync blocked in an fsync or stopped cannot.
+changed. A file whose metadata alone a sync sets, as a join does to every file whose mode differs, is watched
+too, from before its check against the scan: a write, an open, which any new writer makes, a writer's close,
+and once the sync's own change is made any change of metadata, mean a read, and so does a read lease refused
+when asked for a moment, which shows a writer that had it open all along, mapped perhaps, whose writes no watch
+sees. Anywhere, one the apply left as the scan found it keeps its record's word, and one that moved besides
+what the sync set is no step done: an edit in that moment is the next round's, its mtime not taken for the pair
+of the server's. A watch holds nobody back: a program that saves a file the moment it arrives waits for
+nothing, whatever the sync is doing, and its save is read by the next scan. A lease would make that save wait
+until the sync gave it up, which a sync blocked in an fsync or stopped cannot.
 
 **Three-way merge per object** (base, local, remote). It is state-based: each round works from what is on
 disk and what the journal says, so a crash only means the next run finds some of the work done. What was

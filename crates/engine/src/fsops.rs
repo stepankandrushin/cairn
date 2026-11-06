@@ -408,7 +408,36 @@ impl WriteWatch {
     /// Watch the file behind `fd`, which this process opened refusing symlinks. `None` on a filesystem
     /// another kernel may write through, or past the limit on watches.
     pub fn watch(&mut self, fd: BorrowedFd<'_>) -> Option<i32> {
-        use rustix::fs::inotify::{self, WatchFlags};
+        use rustix::fs::inotify::WatchFlags;
+        self.add(
+            fd,
+            WatchFlags::MODIFY | WatchFlags::ATTRIB | WatchFlags::CLOSE_WRITE,
+        )
+    }
+
+    /// Watch the file behind `fd` for what could write to it, before this process changes its metadata:
+    /// a write, an open, which any new writer makes, and a writer's close. A change of its metadata is
+    /// this process's own until `and_metadata`.
+    pub fn watch_writes(&mut self, fd: BorrowedFd<'_>) -> Option<i32> {
+        use rustix::fs::inotify::WatchFlags;
+        self.add(
+            fd,
+            WatchFlags::MODIFY | WatchFlags::OPEN | WatchFlags::CLOSE_WRITE,
+        )
+    }
+
+    /// Once this process has changed the metadata of the file of `wd` (behind `fd`): any change of it
+    /// from here on is someone else's, and counts. False if that could not be watched.
+    pub fn and_metadata(&mut self, fd: BorrowedFd<'_>, wd: i32) -> bool {
+        use rustix::fs::inotify::WatchFlags;
+        // The same inode's watch, its mask replaced: the same descriptor, or something went wrong.
+        let mask =
+            WatchFlags::MODIFY | WatchFlags::OPEN | WatchFlags::CLOSE_WRITE | WatchFlags::ATTRIB;
+        self.add(fd, mask) == Some(wd)
+    }
+
+    fn add(&mut self, fd: BorrowedFd<'_>, mask: rustix::fs::inotify::WatchFlags) -> Option<i32> {
+        use rustix::fs::inotify;
         // Local filesystems: ext2 to 4, XFS, Btrfs, tmpfs, F2FS, bcachefs, ZFS.
         const LOCAL: [i64; 7] = [
             0xEF53,
@@ -424,12 +453,11 @@ impl WriteWatch {
             return None;
         }
         let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        let mask = WatchFlags::MODIFY | WatchFlags::ATTRIB | WatchFlags::CLOSE_WRITE;
         inotify::add_watch(&self.fd, path.as_str(), mask).ok()
     }
 
-    /// Whether nothing was written to the file of `wd`, its metadata changed, or a writer of it closed,
-    /// since it was watched.
+    /// Whether nothing was written to the file of `wd`, its metadata changed, it was opened, or a
+    /// writer of it closed, since it was watched for that.
     pub fn untouched(&mut self, wd: i32) -> bool {
         self.read();
         !self.overflowed && !self.touched.contains(&wd)
@@ -451,9 +479,12 @@ impl WriteWatch {
                     let flags = event.events();
                     if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
                         self.overflowed = true;
-                    } else if flags
-                        .intersects(ReadFlags::MODIFY | ReadFlags::ATTRIB | ReadFlags::CLOSE_WRITE)
-                    {
+                    } else if flags.intersects(
+                        ReadFlags::MODIFY
+                            | ReadFlags::ATTRIB
+                            | ReadFlags::CLOSE_WRITE
+                            | ReadFlags::OPEN,
+                    ) {
                         self.touched.insert(event.wd());
                     }
                 }
@@ -481,6 +512,14 @@ impl WriteWatch {
 
     pub fn watch(&mut self, _: BorrowedFd<'_>) -> Option<i32> {
         None
+    }
+
+    pub fn watch_writes(&mut self, _: BorrowedFd<'_>) -> Option<i32> {
+        None
+    }
+
+    pub fn and_metadata(&mut self, _: BorrowedFd<'_>, _: i32) -> bool {
+        false
     }
 
     pub fn untouched(&mut self, _: i32) -> bool {
@@ -662,6 +701,15 @@ impl Dir {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )?)
+    }
+
+    /// As `open_read`, for a file read through once, as a scan reads one to hash it or an upload one
+    /// of its chunks: what it reads is let go of with `read_once_done`.
+    pub fn open_read_once(&self, name: &[u8]) -> io::Result<OwnedFd> {
+        let fd = self.open_read(name)?;
+        #[cfg(target_os = "linux")]
+        let _ = fs::fadvise(&fd, 0, None, fs::Advice::Sequential);
+        Ok(fd)
     }
 
     /// Create a new file, refusing anything already there.
@@ -858,11 +906,31 @@ impl Dir {
     }
 
     pub fn set_mtime(&self, name: &[u8], mtime: Timestamp) -> io::Result<()> {
-        let times = Timestamps {
-            last_access: Timespec {
+        // With the access time as it is, and not left out: the mtime alone reads to inotify as a write
+        // (IN_MODIFY), and a run that watches a file for writes would take its own change for one.
+        #[cfg(target_os = "linux")]
+        let last_access = match fs::statx(
+            &self.0,
+            os(name),
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::ATIME,
+        ) {
+            Ok(s) if s.stx_mask & StatxFlags::ATIME.bits() != 0 => Timespec {
+                tv_sec: s.stx_atime.tv_sec,
+                tv_nsec: i64::from(s.stx_atime.tv_nsec) as _,
+            },
+            _ => Timespec {
                 tv_sec: 0,
                 tv_nsec: fs::UTIME_OMIT,
             },
+        };
+        #[cfg(not(target_os = "linux"))]
+        let last_access = Timespec {
+            tv_sec: 0,
+            tv_nsec: fs::UTIME_OMIT,
+        };
+        let times = Timestamps {
+            last_access,
             last_modification: Timespec {
                 tv_sec: mtime.sec,
                 tv_nsec: i64::from(mtime.nsec) as _,
@@ -886,6 +954,19 @@ impl Dir {
             _ => 1,
         }
     }
+}
+
+/// Done with these bytes of a file opened with `open_read_once`. On Linux its clean pages leave the
+/// cache at once: a scan that reads a tree bigger than memory would otherwise push out what is read
+/// again and again, the state above all, whose every step then waits on the disk. Pages still to be
+/// written, or mapped by a program, stay.
+pub fn read_once_done(fd: BorrowedFd<'_>, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    if let Some(len) = std::num::NonZeroU64::new(len) {
+        let _ = fs::fadvise(fd, offset, Some(len), fs::Advice::DontNeed);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (fd, offset, len);
 }
 
 /// Keep going on interrupts; a short positional read is otherwise a real end of data.

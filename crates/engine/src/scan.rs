@@ -134,13 +134,13 @@ pub fn fingerprint(st: &Stat) -> Fingerprint {
     }
 }
 
-fn now_ns() -> i128 {
+pub(crate) fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i128)
 }
 
-fn ns(t: Timestamp) -> i128 {
+pub(crate) fn ns(t: Timestamp) -> i128 {
     i128::from(t.sec) * 1_000_000_000 + i128::from(t.nsec)
 }
 
@@ -424,7 +424,7 @@ impl Walk<'_> {
         for attempt in 0..READ_ATTEMPTS {
             let settling = dir.stat(raw).unwrap_or_else(|_| st.clone());
             wait_until_stable(&settling);
-            let fd = match dir.open_read(raw) {
+            let fd = match dir.open_read_once(raw) {
                 Ok(fd) => fd,
                 Err(e) if is_permission(&e) => {
                     self.forget_link(&st);
@@ -472,7 +472,9 @@ impl Walk<'_> {
                 return;
             }
             hit("scan.file.reading");
-            let manifest = match manifest_of(&fd, before.size) {
+            let read = manifest_of(&fd, before.size);
+            crate::fsops::read_once_done(fd.as_fd(), 0, before.size);
+            let manifest = match read {
                 Ok(m) => m,
                 Err(e) => {
                     // A file shrinking under the read ends the read early: that is a change, not damage.

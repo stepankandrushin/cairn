@@ -100,6 +100,26 @@ const ROWS_A_TRANSACTION: u64 = 4_096;
 /// they are. A watch holds nobody back: it only notes what is done to the file meanwhile.
 const WATCHED_AT_ONCE: usize = 64;
 
+/// How far a filesystem may put a time from the one it was asked to set, past what it says of its
+/// precision: FAT keeps two seconds, ext3 and HFS+ one.
+const COARSEST_MTIME_NS: i128 = 2_000_000_000;
+
+/// Files whose metadata this run sets in place, watched at once, each until a later write could no longer
+/// leave its timestamps as they are: a watch each, and no descriptor. Past this many the run waits for
+/// the oldest, a tenth of a second at the most, rather than take more of this user's watches, which
+/// a daemon's own watch on its folders draws on too.
+const META_WATCHED_AT_ONCE: usize = 4_096;
+
+/// A file whose metadata this run set, its content left as the scan found it: watched for anything
+/// that could write to it from before it was checked against the scan, and for any change of its
+/// metadata from just after this run's own.
+struct MetaWatched {
+    id: ObjectId,
+    wd: i32,
+    /// What it was once this run had set its metadata.
+    wrote: Fingerprint,
+}
+
 /// A file placed by this run, watched from its last write here: while the watch has seen nothing, nobody
 /// has written to it or changed its metadata.
 struct Watched {
@@ -289,6 +309,8 @@ pub struct Applier<'a> {
     temp_watch: Option<(OwnedFd, i32, Fingerprint)>,
     /// Files placed by this run, still watched, oldest first.
     watched: VecDeque<Watched>,
+    /// Files whose metadata this run set, still watched, oldest first.
+    meta_watched: VecDeque<MetaWatched>,
     /// Files nothing opened to write between this run writing them and the moment a later write would
     /// have moved their timestamps: what is there is what was written, while the fingerprint holds.
     vouched: HashMap<ObjectId, Fingerprint>,
@@ -341,6 +363,7 @@ impl<'a> Applier<'a> {
             writes: fsops::WriteWatch::new(),
             temp_watch: None,
             watched: VecDeque::new(),
+            meta_watched: VecDeque::new(),
             vouched: HashMap::new(),
         }
     }
@@ -460,6 +483,46 @@ impl<'a> Applier<'a> {
                 }
             }
         }
+    }
+
+    /// After this run set an entry's metadata in place: still what the scan found, of the same size, and
+    /// with the mtime it had unless this run set that, or near what it set. One that moved besides is an
+    /// edit made in the moment before, which the record must not take for what this run did: its mtime
+    /// would read as the pair of the server's, and never go up. The look that says so, which the record
+    /// then starts from.
+    fn still_as_set(
+        &self,
+        cur: &CurNode,
+        dir: &Dir,
+        name: &[u8],
+        want: &Metadata,
+    ) -> Result<Option<fsops::Stat>, StepError> {
+        let Some(fp) = cur.fp.as_ref() else {
+            return Ok(None);
+        };
+        let now = match dir.stat(name) {
+            Ok(now) => now,
+            Err(e) if is_not_found(&e) => return Err(e.into()),
+            // Whatever this is, the record of it says so.
+            Err(_) => return Ok(None),
+        };
+        // The mtime as it was, unless this run set it, or a record, which may move it where a resource
+        // fork is one. Set, it is what this filesystem keeps of the time asked for, which may be coarser
+        // than it says, or as it was if it could not be set; an edit puts the present there.
+        let mtime_set = cur.apply_from.mtime != want.mtime;
+        let mtime_ok = if mtime_set {
+            let off = (crate::scan::ns(now.mtime) - crate::scan::ns(want.mtime)).abs();
+            off <= COARSEST_MTIME_NS + i128::from(self.root.dir.fstype_precision_ns())
+                || now.mtime == fp.mtime
+        } else {
+            now.mtime == fp.mtime || cur.apply_from.records != want.records
+        };
+        if now.ino != fp.ino || now.size != fp.size || !mtime_ok {
+            return Err(StepError::Changed(
+                "the file changed during this sync".into(),
+            ));
+        }
+        Ok(Some(now))
     }
 
     /// After this run set a file's metadata itself: everything may have moved.
@@ -811,6 +874,101 @@ impl<'a> Applier<'a> {
             self.watched.push_back(Watched { id, fd, wd, wrote });
         }
         self.settle_watches(false);
+    }
+
+    /// Before this run sets the metadata of a file whose content stays: a watch on what could write to
+    /// it, armed before the file is checked against the scan. The scan's fingerprint vouched for its
+    /// content, so a write before the watch shows in that check; once armed, a write, a writer's close
+    /// or a new writer's open shows in the watch; and a writer that had it open all along, which a write
+    /// through a shared mapping would not show to the watch and whose timestamps this run's own change
+    /// then overwrites, is found here, as Linux grants a read lease only when nobody has the file open
+    /// to write. `None` where any of that cannot be had: the file is then read again by the next scan.
+    fn arm_meta_watch(
+        &mut self,
+        id: ObjectId,
+        dir: &Dir,
+        name: &[u8],
+        cur: &CurNode,
+    ) -> Option<(OwnedFd, i32)> {
+        if cur.kind != ObjectKind::File {
+            return None;
+        }
+        let scanned = cur.fp.as_ref()?;
+        // The scan read or vouched for this content at this fingerprint, and not too close to a write.
+        let row = self.rows.get(&id)?;
+        if row.content != cur.content || !row.known().vouches_for(scanned) {
+            return None;
+        }
+        let writes = self.writes.as_mut()?;
+        let fd = dir.open_read(name).ok()?;
+        let wd = writes.watch_writes(fd.as_fd())?;
+        let as_scanned = fsops::fstat(fd.as_fd()).is_ok_and(|st| fingerprint(&st) == *scanned);
+        if as_scanned && fsops::open_for_writing(fd.as_fd()) == Some(false) {
+            return Some((fd, wd));
+        }
+        writes.forget(wd);
+        None
+    }
+
+    /// Once this run has set the metadata of what `arm_meta_watch` armed: from here on a change of it is
+    /// someone else's too. What it is then, and the watch, which needs no descriptor any more.
+    fn watch_meta_after(&mut self, fd: OwnedFd, wd: i32) -> Option<(i32, Fingerprint)> {
+        let writes = self.writes.as_mut()?;
+        match fsops::fstat(fd.as_fd()) {
+            Ok(st) if writes.and_metadata(fd.as_fd(), wd) => Some((wd, fingerprint(&st))),
+            _ => {
+                writes.forget(wd);
+                None
+            }
+        }
+    }
+
+    /// Watched until it settles.
+    fn keep_watching_meta(&mut self, id: ObjectId, wd: i32, wrote: Fingerprint) {
+        self.meta_watched.push_back(MetaWatched { id, wd, wrote });
+        self.settle_meta_watches(false);
+    }
+
+    fn forget_watch(&mut self, wd: i32) {
+        if let Some(writes) = self.writes.as_mut() {
+            writes.forget(wd);
+        }
+    }
+
+    /// Stop watching files whose metadata this run set: each whose change is old enough that a later
+    /// write would move its timestamps, and, with `all`, every one, waiting out what is left of that for
+    /// the last. A file the watch saw nothing done to holds the content the scan vouched for, and its
+    /// row may say so without a read.
+    fn settle_meta_watches(&mut self, all: bool) {
+        let precision = i128::from(self.root.dir.fstype_precision_ns());
+        let window = i128::from(cairn_failpoint::tuned(
+            "apply.watch_window_ns",
+            RACY_WINDOW_NS as u64,
+        ));
+        while let Some(front) = self.meta_watched.front() {
+            let settles = crate::scan::ns(front.wrote.ctime) + window + precision;
+            let wait = settles - crate::scan::now_ns();
+            if wait > 0 {
+                if !all && self.meta_watched.len() <= META_WATCHED_AT_ONCE {
+                    return;
+                }
+                // Never longer than the window: a time ahead of this clock settles nothing.
+                let wait = wait.min(window + precision);
+                std::thread::sleep(std::time::Duration::from_nanos(wait as u64));
+            }
+            let file = self.meta_watched.pop_front().expect("there is a front");
+            let Some(writes) = self.writes.as_mut() else {
+                continue;
+            };
+            // Looked at once settled: anything after the look moves its timestamps from `wrote`.
+            let settled =
+                crate::scan::now_ns() >= crate::scan::ns(file.wrote.ctime) + window + precision;
+            let untouched = writes.untouched(file.wd);
+            writes.forget(file.wd);
+            if settled && untouched {
+                self.vouched.insert(file.id, file.wrote);
+            }
+        }
     }
 
     fn fetch_batch(client: &Client, cache: &Dir, hashes: &[Hash]) -> Result<(), StepError> {
@@ -1472,18 +1630,49 @@ impl<'a> Applier<'a> {
                 let display = step_path(&self.cur, &link);
                 let applied = (|| -> Result<(), StepError> {
                     let (dir, name) = self.locate(&link)?;
-                    self.check_fp(*id, &dir, &name)?;
-                    check("apply.meta")?;
-                    self.apply_meta(
-                        &dir,
-                        &name,
-                        cur.kind,
-                        &t.body.metadata,
-                        Some(&cur.apply_from),
-                        &display,
-                    )?;
-                    hit("apply.meta.done");
-                    self.reset_fp(*id, &dir, &name);
+                    let armed = self.arm_meta_watch(*id, &dir, &name, &cur);
+                    let set = (|| -> Result<(), StepError> {
+                        self.check_fp(*id, &dir, &name)?;
+                        check("apply.meta")?;
+                        self.apply_meta(
+                            &dir,
+                            &name,
+                            cur.kind,
+                            &t.body.metadata,
+                            Some(&cur.apply_from),
+                            &display,
+                        )
+                    })();
+                    let watched = match armed {
+                        Some((fd, wd)) if set.is_ok() => self.watch_meta_after(fd, wd),
+                        Some((_, wd)) => {
+                            self.forget_watch(wd);
+                            None
+                        }
+                        None => None,
+                    };
+                    let done = set.and_then(|()| {
+                        hit("apply.meta.done");
+                        self.still_as_set(&cur, &dir, &name, &t.body.metadata)
+                    });
+                    let now = match (done, watched) {
+                        (Ok(now), Some((wd, wrote))) => {
+                            self.keep_watching_meta(*id, wd, wrote);
+                            now
+                        }
+                        (Ok(now), None) => now,
+                        (Err(e), watched) => {
+                            if let Some((wd, _)) = watched {
+                                self.forget_watch(wd);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    // What this run set, as that look found it: nothing in between to take for its own.
+                    match (now, self.cur.get_mut(id)) {
+                        (Some(st), Some(n)) => n.fp = Some(fingerprint(&st)),
+                        _ => self.reset_fp(*id, &dir, &name),
+                    }
                     Ok(())
                 })();
                 match applied {
@@ -1659,12 +1848,18 @@ impl<'a> Applier<'a> {
             folder_time: None,
         });
         let old = self.rows.get(&id);
+        let fp = fingerprint(&st);
+        // As the scan found it, by a fingerprint that vouched for this content: nothing this run did moved
+        // it, and nothing else did either, so it still vouches, as the next scan would find.
+        let as_scanned =
+            old.is_some_and(|o| o.content == cur.content && o.known().vouches_for(&fp));
         let row = Row {
-            fp: fingerprint(&st),
             // Only a scan, which reads the file, may vouch that a fingerprint means this content, or
             // this run, for a file its watch saw nothing done to from its write until a later write would
-            // show: an edit since the rename would otherwise be recorded as the content just written.
-            racy: self.vouched.get(&id) != Some(&fingerprint(&st)),
+            // show: an edit since the rename would otherwise be recorded as the content just written. The
+            // same for a file whose metadata it set, from before its check against the scan.
+            racy: !as_scanned && self.vouched.get(&id) != Some(&fp),
+            fp,
             content: cur.content.clone(),
             incomplete: !problems.is_empty(),
             scan,
@@ -2043,6 +2238,7 @@ impl<'a> Applier<'a> {
         // disk does not have, and the old file would read as a local revert.
         self.sync_touched_dirs()?;
         self.settle_watches(true);
+        self.settle_meta_watches(true);
         hit("apply.dirs.synced");
         self.store_placed_files(plan)?;
         self.store_moved(plan)?;
@@ -2496,11 +2692,13 @@ pub fn read_for_upload(
     let Ok(dir) = root.dir.open_path(parents.iter()) else {
         return Ok(None);
     };
-    let Ok(fd) = dir.open_read(name.as_bytes()) else {
+    let Ok(fd) = dir.open_read_once(name.as_bytes()) else {
         return Ok(None);
     };
     let mut buf = vec![0u8; chunk.len as usize];
-    if fsops::read_exact_at(fd.as_fd(), &mut buf, offset).is_err() || Hash::of(&buf) != chunk.hash {
+    let read = fsops::read_exact_at(fd.as_fd(), &mut buf, offset);
+    fsops::read_once_done(fd.as_fd(), offset, u64::from(chunk.len));
+    if read.is_err() || Hash::of(&buf) != chunk.hash {
         return Ok(None);
     }
     Ok(Some(buf))

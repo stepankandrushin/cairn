@@ -167,6 +167,91 @@ fn a_join_too_big_for_one_commit_logs_every_loser() {
     assert_eq!(notes, FILES * (1 + CLASHES));
 }
 
+fn steps(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// A device joining with the same bytes, as a dry run has read them, the same mtimes and other modes,
+/// as a device on another umask has them: the sync sets the server's mode on every file and reads none
+/// of them again. Each read again was a second pass over the whole tree, an hour on an HDD for a
+/// tree of 178 GiB. With half the mtimes cut to whole seconds, as a tool that copied them leaves them, it
+/// sets those too. Where a watch on each file, from before it is checked against the scan until a later
+/// write would show, vouches that nothing wrote to it (Linux), nothing is read again either way; where
+/// none can (macOS), what the sync changed is; and Windows, whose modes the server's are already, reads
+/// again only the files whose mtime it set.
+#[test]
+fn a_join_reads_again_only_what_its_apply_changed() {
+    const FILES: usize = 2_000;
+    for cut in [false, true] {
+        let (sb, server, a) = seed("join-reread");
+        let path = |i: usize| format!("d{}/f{i}", i % 40);
+        // Within the second, to 100 ns, which NTFS keeps.
+        let mtime = |i: usize| {
+            (
+                1_780_000_000 + i as i64,
+                (i as i64 * 7_919 % 9_999_999 + 1) * 100,
+            )
+        };
+        for i in 0..FILES {
+            a.write(&path(i), format!("file {i} of the tree"));
+            chmod(&a.path(&path(i)), 0o664);
+            let (sec, nsec) = mtime(i);
+            set_mtime(&a.path(&path(i)), sec, nsec);
+        }
+        for d in 0..40 {
+            chmod(&a.path(&format!("d{d}")), 0o775);
+        }
+        a.synced();
+
+        let b = Device::new(&sb, &server, "b");
+        for i in 0..FILES {
+            b.write(&path(i), format!("file {i} of the tree"));
+            chmod(&b.path(&path(i)), 0o644);
+            let (sec, nsec) = mtime(i);
+            set_mtime(
+                &b.path(&path(i)),
+                sec,
+                if cut && i % 2 == 0 { 0 } else { nsec },
+            );
+        }
+        // Older than the dry run's look by more than a write's window, so that its rows vouch.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        b.cairn(&["sync", "--dry-run"]).expect_ok();
+        let log = sb.path("steps");
+        let run = b.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())]);
+        assert!(run.ok(), "{}", run.text());
+        let reads = steps(&log)
+            .iter()
+            .filter(|s| *s == "scan.file.reading")
+            .count();
+        let most = if cfg!(target_os = "linux") {
+            0
+        } else if cfg!(windows) {
+            if cut {
+                FILES / 2
+            } else {
+                0
+            }
+        } else {
+            FILES
+        };
+        assert!(
+            reads <= most,
+            "cut {cut}: {reads} files read again, at most {most} expected: {}",
+            run.text()
+        );
+        // And the tree is the server's, modes and times.
+        let p = converge(&[&a, &b]);
+        let e = &p.entries[path(0).as_bytes()];
+        assert_eq!(e.mtime, mtime(0), "cut {cut}");
+        assert_eq!(mode_of(&b.path(&path(0))), mode_of(&a.path(&path(0))));
+    }
+}
+
 /// The server holds one file under several names, and this device has a separate copy at each, as a
 /// tool that does not sync hard links leaves them: the same bytes are no conflict, and the names
 /// become links of one file here too, with what each copy had of its own. Only a copy with something

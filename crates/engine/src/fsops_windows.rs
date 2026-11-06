@@ -134,6 +134,7 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
 const OPT_DIRECTORY: u32 = 0x1;
+const OPT_SEQUENTIAL_ONLY: u32 = 0x4;
 const OPT_SYNCHRONOUS: u32 = 0x20;
 const OPT_NON_DIRECTORY: u32 = 0x40;
 const OPT_OPEN_REPARSE_POINT: u32 = 0x20_0000;
@@ -1012,6 +1013,14 @@ impl WriteWatch {
         None
     }
 
+    pub fn watch_writes(&mut self, _: BorrowedFd<'_>) -> Option<i32> {
+        None
+    }
+
+    pub fn and_metadata(&mut self, _: BorrowedFd<'_>, _: i32) -> bool {
+        false
+    }
+
     pub fn untouched(&mut self, _: i32) -> bool {
         false
     }
@@ -1211,7 +1220,19 @@ impl Dir {
 
     /// Open a regular file for reading, sharing everything. A link is refused, not read.
     pub fn open_read(&self, name: &[u8]) -> io::Result<OwnedFd> {
-        let handle = self.open(&lookup_name(name)?, FILE_GENERIC_READ, OPT_NON_DIRECTORY)?;
+        self.open_read_with(name, OPT_NON_DIRECTORY)
+    }
+
+    /// As `open_read`, for a file read through once, as a scan reads one to hash it or an upload one
+    /// of its chunks: `FILE_SEQUENTIAL_ONLY`, `FILE_FLAG_SEQUENTIAL_SCAN` as `CreateFileW` has it, after
+    /// which the cache manager gives its pages up first. A scan reading a tree bigger than memory would
+    /// otherwise push out what is read again and again, the state above all.
+    pub fn open_read_once(&self, name: &[u8]) -> io::Result<OwnedFd> {
+        self.open_read_with(name, OPT_NON_DIRECTORY | OPT_SEQUENTIAL_ONLY)
+    }
+
+    fn open_read_with(&self, name: &[u8], options: u32) -> io::Result<OwnedFd> {
+        let handle = self.open(&lookup_name(name)?, FILE_GENERIC_READ, options)?;
         let tag = tag_info(handle.as_handle())?;
         if is_link(tag.FileAttributes, tag.ReparseTag) {
             return Err(error(ERROR_STOPPED_ON_SYMLINK));
@@ -1414,6 +1435,9 @@ impl Dir {
         })
     }
 }
+
+/// Done with these bytes of a file opened with `open_read_once`: here its open said so already.
+pub fn read_once_done(_: BorrowedFd<'_>, _: u64, _: u64) {}
 
 /// Keep going until the buffer is full; a short positional read is otherwise a real end of data.
 pub fn read_exact_at(fd: BorrowedFd<'_>, buf: &mut [u8], mut offset: u64) -> io::Result<()> {

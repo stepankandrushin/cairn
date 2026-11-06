@@ -762,6 +762,218 @@ fn an_edit_between_the_watch_and_the_record_is_sent() {
     assert_eq!(a.read("f"), edited, "the edit on b went up");
 }
 
+// --- Metadata set in place: not read back either ---
+
+/// What a device's change of metadata alone sets here: the mode, on Unix, and the mtime.
+fn set_on(a: &Device, mode: bool, name: &str) {
+    if mode {
+        chmod(&a.path(name), 0o640);
+    } else {
+        set_mtime(&a.path(name), 1_700_000_000, 123_400);
+    }
+}
+
+fn metadata_kinds() -> Vec<bool> {
+    if cfg!(unix) {
+        vec![true, false]
+    } else {
+        vec![false]
+    }
+}
+
+/// Linux only: elsewhere no watch is had, and a file whose metadata a sync set is read again, as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_set_in_place_is_not_read_again() {
+    for mode in metadata_kinds() {
+        let sb = Sandbox::on_disk("meta-not-read-again");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        many_files(&a, 20);
+        a.synced();
+        b.synced();
+        // Long enough after b wrote them that its records vouch.
+        std::thread::sleep(Duration::from_millis(300));
+        for i in 0..20 {
+            set_on(&a, mode, &format!("d{}/f{i}", i % 5));
+        }
+        a.synced();
+        let log = sb.path("steps");
+        b.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())])
+            .expect_ok();
+        let first = steps(&log);
+        assert_eq!(count(&first, "apply.meta.done"), 20, "mode {mode}");
+        assert_eq!(count(&first, "scan.file.reading"), 0, "mode {mode}");
+        let log = sb.path("steps-2");
+        b.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())])
+            .expect_ok();
+        assert_eq!(count(&steps(&log), "scan.file.reading"), 0, "mode {mode}");
+        converge(&[&a, &b]);
+    }
+}
+
+/// A file whose metadata alone comes from the server, edited in the gaps of the sync that sets it:
+/// between its scan and the apply, after the apply checked it against the scan and before its metadata
+/// is set, just after, and once its watch has settled. An edit that keeps the size and the mtime is
+/// told from the content the scan vouched for only by a watch from before the check, or a read, as the
+/// sync's own change then moves the ctime as the edit did: it is not taken for that content, and goes
+/// up. A plain edit moves the mtime, which, unless the sync set it, must not be taken for the pair of
+/// the server's: it goes up too.
+#[test]
+fn an_edit_while_a_files_metadata_is_set_is_sent() {
+    for (mode, keep_time, point) in metadata_kinds().into_iter().flat_map(|mode| {
+        [true, false].into_iter().flat_map(move |keep_time| {
+            [
+                "sync.identified",
+                "apply.meta",
+                "apply.meta.done",
+                "apply.dirs.synced",
+            ]
+            .into_iter()
+            .map(move |point| (mode, keep_time, point))
+        })
+    }) {
+        let context = format!("mode {mode}, keeping the mtime {keep_time}, edited at {point}");
+        let sb = Sandbox::on_disk("edit-while-meta");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        a.write("f", token::make(1, 5000));
+        a.write("other", "o");
+        a.synced();
+        b.synced();
+        std::thread::sleep(Duration::from_millis(300));
+        set_on(&a, mode, "f");
+        a.synced();
+        let run = sync_with_gap(
+            &sb,
+            &b,
+            point,
+            // The watch settles at once, so that an edit at the last point comes after it.
+            &[("CAIRN_FP_TUNE", "apply.watch_window_ns=0")],
+            || {
+                // Past the tick of the last change, as the window the watch waits out would be.
+                std::thread::sleep(Duration::from_millis(50));
+                if keep_time {
+                    edit_keeping_size_and_time(&b.path("f"));
+                } else {
+                    std::fs::write(b.path("f"), token::make(2, 5000)).unwrap();
+                }
+            },
+        );
+        let edited = b.read("f");
+        assert_ne!(edited, token::make(1, 5000), "{context}");
+        let mtime = mtime_of(&b.path("f"));
+        // Whatever the gap made of it, the trees settle on the edit, and on each side's metadata.
+        converge(&[&a, &b]);
+        assert_eq!(a.read("f"), edited, "{context}: {}", run.text());
+        if mode {
+            assert_eq!(mode_of(&a.path("f")) & 0o777, 0o640, "{context}");
+        }
+        if !keep_time {
+            assert_eq!(
+                mtime_of(&a.path("f")),
+                mtime,
+                "{context}: the edit's time went up"
+            );
+        }
+    }
+}
+
+/// A shared writable mapping of a file, in this process, from before the sync.
+#[cfg(target_os = "linux")]
+struct Mapping {
+    at: *mut u8,
+    len: usize,
+    _file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl Mapping {
+    fn new(path: &Path, len: usize) -> Self {
+        use std::os::fd::AsRawFd;
+        extern "C" {
+            fn mmap(
+                addr: *mut std::ffi::c_void,
+                len: usize,
+                prot: std::ffi::c_int,
+                flags: std::ffi::c_int,
+                fd: std::ffi::c_int,
+                offset: i64,
+            ) -> *mut std::ffi::c_void;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        // PROT_READ | PROT_WRITE, MAP_SHARED.
+        // SAFETY: a new mapping of an open file, of no more than its length.
+        let at = unsafe { mmap(std::ptr::null_mut(), len, 3, 1, file.as_raw_fd(), 0) };
+        assert_ne!(at as isize, -1, "mmap: {}", std::io::Error::last_os_error());
+        Self {
+            at: at.cast(),
+            len,
+            _file: file,
+        }
+    }
+
+    /// A write through the mapping: no system call, so nothing a watch sees.
+    fn write(&self, data: &[u8]) {
+        assert!(data.len() <= self.len);
+        // SAFETY: within the mapping, which lives as long as `self`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.at, data.len()) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        extern "C" {
+            fn munmap(addr: *mut std::ffi::c_void, len: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: the mapping made in `new`, unmapped once.
+        unsafe { munmap(self.at.cast(), self.len) };
+    }
+}
+
+/// A program that has had the file mapped to write since before the sync writes through the mapping
+/// while the sync sets the file's mode and mtime: no system call, so no watch sees the write, and the
+/// sync's own change then puts the mtime and ctime past it. The file is read again all the same, as Linux
+/// grants no read lease on a file someone has open to write, and the edit goes up once the program lets go
+/// of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_through_a_mapping_held_from_before_the_sync_is_sent() {
+    let sb = Sandbox::on_disk("mapped-while-meta");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    a.write("f", token::make(1, 8192));
+    a.write("other", "o");
+    a.synced();
+    b.synced();
+    let map = Mapping::new(&b.path("f"), 8192);
+    chmod(&a.path("f"), 0o640);
+    set_mtime(&a.path("f"), 1_700_000_000, 123_400);
+    a.synced();
+    // Older than the window in which a file open to write reads as being written, so that the scan
+    // takes it as it is.
+    std::thread::sleep(Duration::from_millis(2_300));
+    let edit = b"edited through a mapping";
+    let run = sync_with_gap(&sb, &b, "apply.meta", &[], || map.write(edit));
+    // While it is held, the sync may leave the file for later; let go of, it goes up.
+    drop(map);
+    converge(&[&a, &b]);
+    assert!(
+        a.read("f").starts_with(edit),
+        "the edit through the mapping went up: {}",
+        run.text()
+    );
+    assert_eq!(mode_of(&a.path("f")) & 0o777, 0o640);
+}
+
 // --- A new device reads a big journal in several answers ---
 
 #[test]

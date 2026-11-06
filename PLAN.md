@@ -21,7 +21,7 @@ Windows, Linux and macOS have different filesystem semantics.
 | Symlinks skipped; modes, owners and xattrs lost | First-class metadata, round-tripped by every client |
 | A built-in list of names is never synced | No built-in list of names: a project tree syncs whole |
 | Conflicted copies that surprise | Three-way merge, explicit conflict inbox |
-| Fragile upgrades, app bloat | One binary, embedded migrations, no plugin system |
+| Fragile upgrades, app bloat | One binary, embedded migrations, clients that install signed updates themselves, no plugin system |
 
 Kept from Nextcloud: self-hosting, a server as the source of truth, version history and trash, users
 and groups, shared folders, expiring public links, selective sync, on-demand files, previews, a web
@@ -59,6 +59,7 @@ These outrank features and speed; each has failure tests.
 | Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: events can be lost, the scan is the safety net |
 | Web UI | TypeScript + Svelte, static build embedded in the binary | Thin client of the same API; stays out of the server's hot path |
 | Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with. On macOS the tray and the daemon are each a signed app bundle, Cairn.app and Cairn Sync.app | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed. A bundle is how macOS names a background program and shows its icon, and one signature across builds keeps its permissions through upgrades |
+| Updates | Each daemon asks its release's feed about once an hour and installs a newer release itself, `cairn` and the tray beside it, restarting into it between syncs; a person can also ask, by `cairn update now` or in the tray, or set it to only notify, or off. What it installs is an Ed25519-signed list of every file's size and SHA-256, and on macOS also a bundle signed by the team of the one it replaces. The server is not among them | A fix reaches every device within the hour, and nobody stays on an old version by forgetting. No permission is asked again: macOS keeps them for the signing team, which Developer ID gives every release, and Windows by path. A key of the project's own rather than an OS certificate is what is trusted, so Linux is covered alike, and a build from source updates from nobody's releases but its builder's. The server goes first by hand, because a client takes a release on a new protocol only once its server speaks it |
 | Mobile | Swift/SwiftUI and Kotlin, Rust core through uniffi | Native file-provider and background-task integration |
 | Deployment | One binary + storage (+ PostgreSQL at scale) | No fleet of supporting services |
 
@@ -347,7 +348,10 @@ the default.
 
 ## Operations
 
-- One static binary, embedded migrations: upgrade by replacing the binary and restarting.
+- One static binary, embedded migrations. Clients update themselves (docs/protocol.md, "Updates"): the new program
+  checked and run once, put in place by a rename with the one before kept, and a version on which a daemon keeps
+  dying before a sync taken back by itself; a kill at any step leaves a whole program. The server is upgraded by
+  a person replacing its binary and restarting, before any client takes a release on a new protocol.
 - Backup: snapshot the metadata DB, rsync the append-only chunk directory.
 - A built-in `fsck` checks every chunk hash and every manifest reference.
 - WebDAV is an optional gateway module for legacy tools, never the sync protocol.
@@ -365,7 +369,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
-| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts |
+| 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3's devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. Installers wait here |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |
 | 9 | WebDAV gateway, Nextcloud importer (files, versions, trash), E2EE, LAN/P2P transfers | |
 

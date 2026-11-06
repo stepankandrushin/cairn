@@ -21,7 +21,7 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   with a failure test (crash, full disk, lost event, missing mount).
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
-  Windows, and the tray on them, are the exceptions, at the owner's asking, to test in milestone 3's run.
+  Windows, the tray on them, and updates are the exceptions, at the owner's asking, for milestone 3's run.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
 
@@ -30,7 +30,9 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
 - PLAN.md — the design and build order; before any design or code work.
 - docs/protocol.md, docs/format.md — the wire and on-disk formats; before changing either.
 - scripts/ci.sh — everything that must pass before a commit; on the real disk in /var/tmp, since tmpfs hid
-  a bug; about 30 minutes with GitHub's `CAIRN_SEEDS=200`. scripts/release.sh — a release.
+  a bug; about 30 minutes with GitHub's `CAIRN_SEEDS=200`. scripts/release.sh — a release, with
+  release-macos.sh and release-windows.ps1 for those platforms, and release-update.sh for the signed
+  update.json every installed copy checks before it updates itself (docs/protocol.md, "Updates").
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.
 - crates/harness/tests/ — the failure tests. A failing seed reproduces with `CAIRN_SEED=n`, and its log
   and kept directory say what happened: trust the oracle until a trace proves it wrong. They run on

@@ -4,6 +4,19 @@
 
 **Added:**
 
+- Updates. Each daemon asks its release's feed about once an hour and installs a newer release itself, `cairn` and
+  the tray beside it, and each restarts into it, a daemon between syncs, so a release reaches every device within
+  the hour with no permission asked again. `cairn update` says what is installed and what the feed offers; `cairn
+  update now` installs at once and waits for the daemons; `cairn update auto|notify|off` sets how (the tray's
+  Settings tab too, with an Update now button and the menu saying when one is available); `cairn update rollback`
+  goes back. Only a release signed with the project's own Ed25519 key is installed, each file checked by its size
+  and SHA-256, and on macOS a bundle signed by the team of the one it replaces. The new program must run and say
+  its version before it is put in place, by a rename, with the one before kept; a kill or a full disk at any step
+  leaves a whole program, and a version on which a daemon keeps dying before it syncs is taken back by itself. A
+  release on a newer protocol waits until the server speaks it; the server is never updated by itself. A build of
+  one's own updates from nobody's releases unless it names a feed and keys of its own. `cairn-release` makes the
+  key and signs a release's `update.json`; scripts/release-macos.sh, release-windows.ps1 and release-update.sh
+  build, sign and describe the macOS and Windows halves. This release is the last to be installed by hand.
 - On macOS the daemon can run from its own app bundle, Cairn Sync.app, which `tray/macos/bundle.sh` makes around the
   `cairn` binary, so that System Settings shows it as Cairn Sync with its icon, in Login Items and in the privacy
   lists, where it was a bare `cairn` with the generic executable's tile; the Local Network prompt names it and says

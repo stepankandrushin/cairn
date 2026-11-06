@@ -23,6 +23,7 @@ pub mod state;
 pub mod steady;
 pub mod sync;
 pub mod twins;
+pub mod update;
 #[cfg_attr(target_os = "macos", path = "watch_fsevents.rs")]
 #[cfg_attr(windows, path = "watch_windows.rs")]
 pub mod watch;

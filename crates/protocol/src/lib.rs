@@ -9,6 +9,7 @@ pub mod name;
 pub mod ops;
 pub mod skip;
 pub mod tree;
+pub mod update;
 pub mod wire;
 
 pub use ids::{DeviceId, Hash, ObjectId, OpId, RevisionId};

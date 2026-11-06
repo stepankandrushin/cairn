@@ -13,6 +13,7 @@ mod link;
 mod model;
 mod registry;
 mod settings;
+mod update;
 
 use cairn_protocol::local::{registry_path, user_dir, Direction, Reply, Request};
 use hub::{Link, RootView};
@@ -41,6 +42,8 @@ const USAGE: &str =
   --login on   start the tray at login (off: no longer)";
 
 fn main() -> ExitCode {
+    // What this program's file is, to tell later that an update has replaced it.
+    update::remember_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
@@ -125,10 +128,20 @@ fn single() -> std::io::Result<Option<Option<std::fs::File>>> {
         .truncate(false)
         .write(true)
         .open(dir.join("tray.lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(Some(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    // Started by a tray restarting into a new version, which holds this until it has exited.
+    let restarted = std::env::var_os(update::RESTARTED).is_some();
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(Some(file))),
+            Err(std::fs::TryLockError::WouldBlock)
+                if restarted && start.elapsed() < Duration::from_secs(15) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
 }
 
@@ -203,6 +216,43 @@ fn probe(with_conflicts: bool) -> ExitCode {
     }
     let worst = worst.unwrap_or(model::Light::NotRunning);
     say!("tray icon: {}", worst.word());
+    let policy = update::policy().unwrap_or_else(|e| {
+        say!("updates: {e}");
+        Default::default()
+    });
+    match update::status() {
+        Ok(Some(st)) => {
+            let mut line = format!(
+                "updates: {}, tray {}, last asked {}",
+                policy.name(),
+                env!("CARGO_PKG_VERSION"),
+                if st.checked > 0 {
+                    model::when(st.checked)
+                } else {
+                    "never".into()
+                }
+            );
+            if let Some(v) = &st.latest {
+                line += &format!(", latest {v}");
+            }
+            say!("{line}");
+            if let Some(v) = &st.available {
+                say!(
+                    "  {v} is available: {}",
+                    st.waits.as_deref().unwrap_or("not installed")
+                );
+            }
+            if let Some(e) = &st.error {
+                say!("  could not update: {e}");
+            }
+        }
+        Ok(None) => say!(
+            "updates: {}, tray {}, never asked",
+            policy.name(),
+            env!("CARGO_PKG_VERSION")
+        ),
+        Err(e) => say!("updates: {e}"),
+    }
     ExitCode::SUCCESS
 }
 

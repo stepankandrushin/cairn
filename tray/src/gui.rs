@@ -8,6 +8,7 @@ use crate::link;
 use crate::model::{self, Light, Problem};
 use crate::settings::{self, Clock};
 use cairn_protocol::local::{Activity, Request};
+use cairn_protocol::update::Policy;
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -35,7 +36,9 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             forget,
             open_folder,
             open_server,
-            set_clock
+            set_clock,
+            set_update_policy,
+            update_now
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -80,6 +83,8 @@ struct MenuModel {
     problems: usize,
     conflicts: usize,
     login: bool,
+    /// A release that is out and not installed here.
+    update: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +134,10 @@ fn menu_model(s: &State) -> MenuModel {
         conflicts: s.roots.iter().filter_map(model::open_conflicts).sum(),
         roots,
         login: actions::login::enabled(),
+        update: crate::update::status()
+            .ok()
+            .flatten()
+            .and_then(|s| s.available),
     }
 }
 
@@ -137,8 +146,19 @@ fn menu_model(s: &State) -> MenuModel {
 fn refresh(app: AppHandle, tray: TrayIcon) {
     let mut version = 0;
     let mut shown: Option<MenuModel> = None;
+    let mut restarting = false;
     loop {
         version = hub().wait_past(version, Duration::from_secs(2));
+        // Once: a restart that fails is said, and this tray goes on as it is.
+        if !restarting && crate::update::replaced() {
+            restarting = true;
+            crate::log("this tray's program has been replaced, by an update or by hand: starting the new one");
+            let e = crate::update::restart();
+            crate::log(&e);
+            hub().notice(format!(
+                "A new version of the tray is installed, and {e}: quit and start it again"
+            ));
+        }
         let m = menu_model(&hub().snapshot());
         if shown.as_ref() == Some(&m) {
             continue;
@@ -265,6 +285,15 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
         None::<&str>,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    if let Some(v) = &m.update {
+        menu.append(&MenuItem::with_id(
+            app,
+            "settings",
+            format!("Cairn {v} is available…"),
+            true,
+            None::<&str>,
+        )?)?;
+    }
     menu.append(&MenuItem::with_id(
         app,
         "settings",
@@ -389,7 +418,55 @@ struct UiState {
     /// Why `tray.json` could not be read, so its defaults are in use.
     settings_error: Option<String>,
     settings_path: Option<String>,
+    update: UiUpdate,
     roots: Vec<UiRoot>,
+}
+
+/// What the updater last wrote, and how updates are set.
+#[derive(Serialize)]
+struct UiUpdate {
+    policy: Option<Policy>,
+    tray_version: &'static str,
+    checked_when: Option<String>,
+    latest: Option<String>,
+    available: Option<String>,
+    waits: Option<String>,
+    installed: Option<String>,
+    installed_when: Option<String>,
+    error: Option<String>,
+    error_when: Option<String>,
+    rejected: Vec<String>,
+    /// Why the settings or the updater's state could not be read.
+    problem: Option<String>,
+    /// A daemon is running to ask.
+    can_ask: bool,
+}
+
+fn ui_update(s: &State) -> UiUpdate {
+    let (policy, policy_problem) = match crate::update::policy() {
+        Ok(p) => (Some(p), None),
+        Err(e) => (None, Some(e)),
+    };
+    let (st, state_problem) = match crate::update::status() {
+        Ok(st) => (st.unwrap_or_default(), None),
+        Err(e) => (Default::default(), Some(e)),
+    };
+    let when = |t: i64| (t > 0).then(|| model::when(t));
+    UiUpdate {
+        policy,
+        tray_version: env!("CARGO_PKG_VERSION"),
+        checked_when: when(st.checked),
+        latest: st.latest,
+        available: st.available,
+        waits: st.waits,
+        installed: st.installed,
+        installed_when: when(st.installed_at),
+        error_when: st.error.as_ref().and_then(|_| when(st.error_since)),
+        error: st.error,
+        rejected: st.rejected,
+        problem: policy_problem.or(state_problem),
+        can_ask: s.roots.iter().any(|r| matches!(r.link, Link::Up(_))),
+    }
 }
 
 #[derive(Serialize)]
@@ -446,6 +523,7 @@ async fn snapshot() -> UiState {
     let s = hub().snapshot();
     let now = model::now_secs();
     let light = worst(&s, now);
+    let update = ui_update(&s);
     let roots = s
         .roots
         .iter()
@@ -527,6 +605,7 @@ async fn snapshot() -> UiState {
         clock: settings::clock(),
         settings_error: settings::error(),
         settings_path: settings::path().map(|p| p.display().to_string()),
+        update,
         roots,
     }
 }
@@ -581,6 +660,40 @@ async fn open_folder(root_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_server(root_id: String) -> Result<(), String> {
     blocking(move || open_server_of(&root_id)).await
+}
+
+/// For every program of this user here: the daemons' updater reads it.
+#[tauri::command]
+async fn set_update_policy(policy: Policy) -> Result<(), String> {
+    blocking(move || crate::update::set_policy(policy)).await
+}
+
+/// Asks the first daemon that answers: there is one updater for all of them.
+#[tauri::command]
+async fn update_now() -> Result<String, String> {
+    blocking(move || {
+        let s = hub().snapshot();
+        let up: Vec<_> = s
+            .roots
+            .iter()
+            .filter(|r| matches!(r.link, Link::Up(_)))
+            .map(|r| r.entry.root_id.clone())
+            .collect();
+        if up.is_empty() {
+            return Err("no daemon is running here to update from: `cairn update now` does it".into());
+        }
+        let mut last = String::new();
+        for id in up {
+            match link::tell(&id, Request::UpdateNow) {
+                Ok(()) => {
+                    return Ok("Asked: the daemons and the tray restart into a new version as it is installed, and this tab says how it went".into())
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(format!("no daemon took it: {last}"))
+    })
+    .await
 }
 
 /// The window's next snapshot shows the new clock; the menu's next redraw, within two seconds, too.

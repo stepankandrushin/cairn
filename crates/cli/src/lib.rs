@@ -181,7 +181,7 @@ enum Command {
     /// Send one request of the local API to this root's daemon and print what it answers, one JSON
     /// object per line: what the tray sees.
     Ask {
-        /// status, subscribe, sync_now, pause, resume or conflicts.
+        /// status, subscribe, sync_now, pause, resume, conflicts or update_now.
         request: String,
     },
     /// The change journal, newest last.
@@ -232,6 +232,60 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// This device's Cairn and its updates: by default each daemon asks the feed every hour or so and
+    /// installs a new release, `cairn` and the tray beside it, restarting into it between syncs.
+    Update {
+        #[command(subcommand)]
+        what: Option<UpdateCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// What is installed here, how updates are set, and what the feed offered when last asked. The
+    /// default.
+    Status {
+        /// As JSON, the protocol crate's type.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the feed now and say what it offers. Installs nothing.
+    Check {
+        #[command(flatten)]
+        feed: FeedArgs,
+    },
+    /// Ask the feed and install what it offers now, whatever the setting, a version taken back too.
+    /// Then wait for each running daemon here to restart on it; the tray restarts by itself.
+    Now {
+        #[command(flatten)]
+        feed: FeedArgs,
+        /// Install a release on another protocol even though not every server here is known to speak
+        /// it, which their clients then refuse until they do.
+        #[arg(long)]
+        any_protocol: bool,
+        /// Do not wait for the daemons.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Install each new release as it comes, and restart into it: the default.
+    Auto,
+    /// Only say that a new release is there, here and in the tray; `cairn update now` installs it.
+    Notify,
+    /// Never ask the feed. `cairn update now` still installs.
+    Off,
+    /// Put back the version from before the last update, which is then not installed again unless
+    /// asked for by `cairn update now`.
+    Rollback,
+}
+
+#[derive(clap::Args)]
+struct FeedArgs {
+    /// Another feed, for this run only: the URL or path of an update.json, to try a release first.
+    #[arg(long)]
+    feed: Option<String>,
+    /// A key that feed is signed with, base64, in place of the build's; may be given more than once.
+    #[arg(long = "key")]
+    keys: Vec<String>,
 }
 
 fn find_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -581,9 +635,14 @@ fn run_inner() -> Result<u8> {
             };
             // Tries go in this log: a request's first new try and its outcome, not a line a try.
             cairn_engine::client::log_retries_with(say);
-            say(&format!("starting for {}", root.display()));
+            say(&format!(
+                "starting for {}, version {}",
+                root.display(),
+                cairn_engine::update::running_version()
+            ));
             cairn_engine::daemon::run(&root, &opts, &mut |line| say(line))?;
-            Ok(EXIT_ERROR)
+            // This program was replaced: the new one, in this process where the system allows.
+            Err(cairn_engine::update::restart())
         }
         Command::Exclude { path, remove_local } => {
             let root_path = find_root(cli.root)?;
@@ -837,7 +896,7 @@ fn run_inner() -> Result<u8> {
             let request: Request =
                 serde_json::from_value(serde_json::json!({ "op": request.replace('-', "_") }))
                     .map_err(|_| {
-                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume or conflicts")
+                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts or update_now")
                     })?;
             let root_id = cairn_engine::root::read_root_id(&root_path)
                 .with_context(|| format!("{} is not a sync root", root_path.display()))?;
@@ -858,6 +917,9 @@ fn run_inner() -> Result<u8> {
                 }
             }
             Ok(code)
+        }
+        Command::Update { what } => {
+            update_command(what.unwrap_or(UpdateCommand::Status { json: false }))
         }
         Command::Conflicts { all } => {
             let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;
@@ -897,6 +959,210 @@ fn run_inner() -> Result<u8> {
     }
 }
 
+fn update_command(what: UpdateCommand) -> Result<u8> {
+    use cairn_engine::update::{self, Options, Outcome};
+    use cairn_protocol::update::Policy;
+    let mut say = |line: &str| outln!("{line}");
+    match what {
+        UpdateCommand::Status { json } => {
+            let status = update::status()?;
+            if json {
+                json_line(&status)?;
+                return Ok(EXIT_OK);
+            }
+            for p in update::programs()? {
+                let v = update::installed_version(&p).unwrap_or_else(|e| format!("({e:#})"));
+                outln!("{} {v}: {}", p.name, p.path.display());
+            }
+            let settings = update::settings()?;
+            match update::feed(&settings) {
+                Some(f) => outln!("updates: {}, from {f}", status.policy.name()),
+                None => outln!(
+                    "updates: {}, but this build names no feed and the settings none, so nothing updates it",
+                    status.policy.name()
+                ),
+            }
+            if status.checked > 0 {
+                outln!(
+                    "last asked: {}, latest {}",
+                    date_time(status.checked),
+                    status.latest.as_deref().unwrap_or("?")
+                );
+            } else {
+                outln!("last asked: never");
+            }
+            if let Some(v) = &status.available {
+                outln!(
+                    "available: {v}, not installed: {}",
+                    status
+                        .waits
+                        .as_deref()
+                        .unwrap_or("`cairn update now` installs it")
+                );
+            } else if let Some(w) = &status.waits {
+                outln!("{w}");
+            }
+            if let Some(v) = &status.installed {
+                outln!(
+                    "installed: {v} at {}; each program restarts into it, a daemon between syncs",
+                    date_time(status.installed_at)
+                );
+            }
+            if let Some(e) = &status.error {
+                outln!("error since {}: {e}", date_time(status.error_since));
+            }
+            if !status.rejected.is_empty() {
+                outln!(
+                    "taken back here, not installed again unless asked: {}",
+                    status.rejected.join(", ")
+                );
+            }
+            for v in registry::views()? {
+                if let Some(d) = &v.daemon {
+                    let version = if d.version.is_empty() {
+                        "a version from before 0.1.1"
+                    } else {
+                        &d.version
+                    };
+                    outln!("daemon for {}: {version}", v.root.path.display());
+                }
+            }
+            Ok(EXIT_OK)
+        }
+        UpdateCommand::Check { feed } => {
+            let (outcome, status) = update::run(
+                &Options {
+                    asked: true,
+                    install: false,
+                    feed: feed.feed,
+                    keys: feed.keys,
+                    ..Options::default()
+                },
+                &mut say,
+            )?;
+            report_update(&outcome, &status)
+        }
+        UpdateCommand::Now {
+            feed,
+            any_protocol,
+            no_wait,
+        } => {
+            // Before: a daemon restarting into the new version answers nobody for a moment.
+            let running: Vec<RootEntry> = registry::views()
+                .map(|views| {
+                    views
+                        .into_iter()
+                        .filter(|v| v.daemon.is_some())
+                        .map(|v| v.root)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (outcome, status) = update::run(
+                &Options {
+                    asked: true,
+                    install: true,
+                    any_protocol,
+                    feed: feed.feed,
+                    keys: feed.keys,
+                },
+                &mut say,
+            )?;
+            let code = report_update(&outcome, &status)?;
+            if let Outcome::Installed(v) = &outcome {
+                if !no_wait {
+                    wait_for_daemons(&running, v);
+                }
+            }
+            Ok(code)
+        }
+        UpdateCommand::Auto | UpdateCommand::Notify | UpdateCommand::Off => {
+            let policy = match what {
+                UpdateCommand::Auto => Policy::Auto,
+                UpdateCommand::Notify => Policy::Notify,
+                _ => Policy::Off,
+            };
+            update::set_policy(policy)?;
+            outln!(
+                "updates: {}",
+                match policy {
+                    Policy::Auto => "auto: each new release is installed as it comes",
+                    Policy::Notify =>
+                        "notify: a new release is shown, and installed by `cairn update now`",
+                    Policy::Off => "off: the feed is not asked; `cairn update now` still installs",
+                }
+            );
+            Ok(EXIT_OK)
+        }
+        UpdateCommand::Rollback => {
+            let to = update::rollback("taken back by a person", &mut say)?;
+            outln!("back to {to}: each program restarts into it, a daemon between syncs");
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+fn report_update(
+    outcome: &cairn_engine::update::Outcome,
+    status: &cairn_protocol::update::Status,
+) -> Result<u8> {
+    use cairn_engine::update::Outcome;
+    match outcome {
+        Outcome::NoFeed => bail!(
+            "this build names no feed to update from, and the settings none: --feed names one"
+        ),
+        Outcome::Busy => bail!("another update is still running here"),
+        Outcome::UpToDate(v) => {
+            outln!("up to date: the latest release is {v}");
+            Ok(EXIT_OK)
+        }
+        Outcome::Waits(v) => {
+            outln!(
+                "{v} is not installed: {}",
+                status.waits.as_deref().unwrap_or("it waits")
+            );
+            Ok(EXIT_PARTIAL)
+        }
+        Outcome::Installed(v) => {
+            outln!("installed {v}");
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+/// Until each daemon running here says it runs `version`, or a while has passed: a daemon restarts
+/// within seconds when idle, and after the sync it is in otherwise.
+fn wait_for_daemons(running: &[RootEntry], version: &str) {
+    const WAIT: Duration = Duration::from_secs(90);
+    let start = std::time::Instant::now();
+    for root in running {
+        let path = root.path.display().to_string();
+        let mut last = String::new();
+        loop {
+            match control::status_of(&root.path, &root.root_id) {
+                Some(s) if s.version == version => {
+                    outln!("daemon for {path}: restarted on {version}");
+                    break;
+                }
+                Some(s) => last = s.version,
+                None => {}
+            }
+            if start.elapsed() > WAIT {
+                outln!(
+                    "daemon for {path}: still {} after {} s; it restarts after the sync it is in",
+                    if last.is_empty() {
+                        "not answering"
+                    } else {
+                        &last
+                    },
+                    WAIT.as_secs()
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
 fn status_code(report: &cairn_engine::SyncReport) -> u8 {
     match report.outcome {
         SyncOutcome::Paused(_) => EXIT_PAUSED,
@@ -906,6 +1172,8 @@ fn status_code(report: &cairn_engine::SyncReport) -> u8 {
 
 /// The whole client program; `main` of the release binary and of the harness's build.
 pub fn run() -> ExitCode {
+    // What this program's file is now, to tell later that an update has replaced it.
+    cairn_engine::update::remember_start();
     match run_inner() {
         Ok(code) => ExitCode::from(code),
         Err(e) => {

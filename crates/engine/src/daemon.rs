@@ -9,9 +9,13 @@
 //!
 //! A kill at any moment is the crash `sync()` already recovers from, so no signal is handled.
 //!
-//! It also serves the local API (control.rs) to `cairn status` and the tray: its status, and three
+//! It also serves the local API (control.rs) to `cairn status` and the tray: its status, and the
 //! requests that change no tree. Look now is an event like the watcher's; a pause stops it starting a
-//! sync until a resume, and outlives a restart, being kept in `.cairn`.
+//! sync until a resume, and outlives a restart, being kept in `.cairn`; update now asks the updater.
+//!
+//! And it keeps its programs up to date (update.rs): a thread asks the feed every hour or so, and when
+//! this program has been replaced, by that or by a person, [`run`] returns between syncs for the daemon
+//! to start again on the new one.
 
 use crate::client::{Client, Retries};
 use crate::control::{Handler, Hub};
@@ -297,9 +301,23 @@ fn open_conflicts(root: &Path) -> Result<Vec<OpenConflict>> {
 }
 
 /// What the local API may ask of this daemon beyond its status.
-fn handler(root: &Path, pause: &Arc<Pause>, wake: &Sender<Wake>) -> Arc<Handler> {
-    let (root, pause, wake) = (root.to_path_buf(), pause.clone(), wake.clone());
+fn handler(
+    root: &Path,
+    pause: &Arc<Pause>,
+    wake: &Sender<Wake>,
+    updater: &Arc<crate::update::Worker>,
+) -> Arc<Handler> {
+    let (root, pause, wake, updater) = (
+        root.to_path_buf(),
+        pause.clone(),
+        wake.clone(),
+        updater.clone(),
+    );
     Arc::new(move |request: Request| match request {
+        Request::UpdateNow => {
+            updater.nudge();
+            Reply::Done
+        }
         Request::SyncNow => {
             if pause.get().is_some() {
                 return Reply::Error {
@@ -628,7 +646,16 @@ fn give_back_memory() {
 }
 
 /// Run until the process ends. Comes back only for what no retry would cure.
+/// Keep this root in sync until something fails that a restart is needed for, which is an error, or
+/// this program has been replaced, when it returns `Ok` between syncs, for the caller to start the new
+/// one (`update::restart`).
 pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Result<()> {
+    // A version just installed that keeps dying here before a sync is taken back, and this restarts
+    // into the one before.
+    if let Some(line) = crate::update::daemon_starting(path, log) {
+        log(&line);
+        return Ok(());
+    }
     let (wake_tx, wake_rx) = channel();
     let synced_head = Arc::new(AtomicU64::new(0));
     let feed_down = Arc::new(Mutex::new(None::<String>));
@@ -636,6 +663,13 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let hub = {
         let tx = wake_tx.clone();
         Arc::new(Hub::new(&Status::default(), move || {
+            let _ = tx.send(Wake::Control);
+        }))
+    };
+
+    let updater = {
+        let tx = wake_tx.clone();
+        Arc::new(crate::update::Worker::start(move || {
             let _ = tx.send(Wake::Control);
         }))
     };
@@ -684,8 +718,9 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut status = Status {
         pid: std::process::id(),
         root: std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::update::running_version(),
         recent: previous_recent(path),
+        update: updater.status(),
         ..Status::default()
     };
     let mut was_paused: Option<i64> = None;
@@ -699,6 +734,20 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     loop {
         for note in hub.take_notes() {
             log(&note);
+        }
+        for note in updater.take_notes() {
+            log(&note);
+        }
+        // Between syncs, as always here.
+        if updater.replaced() {
+            log("this program has been replaced, by an update or by hand: restarting into the new one");
+            return Ok(());
+        }
+        updater.waited();
+        let update = updater.status();
+        if update != status.update {
+            status.update = update;
+            show(path, &status, &hub);
         }
         let paused = pause.get();
         if paused != was_paused {
@@ -808,7 +857,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                                 crate::control::serve(
                                     listener,
                                     hub.clone(),
-                                    handler(path, &pause, &wake_tx),
+                                    handler(path, &pause, &wake_tx, &updater),
                                 );
                             }
                             Err(e) => log(&format!(
@@ -861,6 +910,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             },
         );
         hit("daemon.synced");
+        // Got through a sync, whatever it found: a version just installed works.
+        updater.synced();
         // What a sync with nothing to do takes: loading the state, the scan, the merge. The rest of a
         // long one was moving data, which the next does not do again. Twice that keeps a tree that never
         // rests from keeping the daemon busy more than a third of the time, and a change after a big

@@ -276,6 +276,25 @@ fn host_is_loopback(url: &str) -> bool {
 
 impl Client {
     pub fn new(config: &Config, retries: Retries) -> Result<Self> {
+        let client = Self::unchecked(config, retries)?;
+        let info = client.info()?;
+        if info.protocol != cairn_protocol::PROTOCOL_VERSION {
+            bail!(
+                "the server speaks protocol {}, this client {}: upgrade whichever is older",
+                info.protocol,
+                cairn_protocol::PROTOCOL_VERSION
+            );
+        }
+        Ok(client)
+    }
+
+    /// The protocol the server speaks, whichever it is: for the updater, which takes a release on
+    /// another protocol only once the server speaks that one.
+    pub fn server_protocol(config: &Config) -> Result<u32> {
+        Ok(Self::unchecked(config, Retries::Short)?.info()?.protocol)
+    }
+
+    fn unchecked(config: &Config, retries: Retries) -> Result<Self> {
         let url = &config.server;
         if url.starts_with("http://") {
             if !host_is_loopback(url) && !config.allow_http {
@@ -309,14 +328,6 @@ impl Client {
             retries,
             retried: Arc::new(AtomicU64::new(0)),
         };
-        let info = client.info()?;
-        if info.protocol != cairn_protocol::PROTOCOL_VERSION {
-            bail!(
-                "the server speaks protocol {}, this client {}: upgrade whichever is older",
-                info.protocol,
-                cairn_protocol::PROTOCOL_VERSION
-            );
-        }
         Ok(client)
     }
 

@@ -272,13 +272,52 @@ function drawSettings() {
       onclick: async () => { await call('set_clock', { clock: value }); await tick(); draw(true); },
     }, state.clock === value ? { checked: '' } : {})),
     label, el('span', { class: 'meta' }, example));
-  return [el('div', { class: 'card' },
+  return [drawUpdates(), el('div', { class: 'card' },
     el('h2', {}, 'Clock'),
     el('div', { class: 'choices' },
       choice('24h', '24-hour', '16:52'),
       choice('12h', '12-hour', '4:52 PM')),
     state.settings_error ? el('div', { class: 'todo' }, state.settings_error + '; the defaults are in use until a choice here writes it anew.') : null,
     state.settings_path ? el('div', { class: 'meta' }, 'Kept in ' + state.settings_path) : null)];
+}
+
+// One updater for every daemon of this user here and the tray beside them: what it last found, and how
+// it is set. Update now asks a daemon, which installs whatever the setting.
+function drawUpdates() {
+  const u = state.update;
+  const choice = (value, label, about) => el('label', { class: 'choice' },
+    el('input', Object.assign({
+      type: 'radio', name: 'updates', value,
+      onclick: async () => { await call('set_update_policy', { policy: value }); await tick(); draw(true); },
+    }, u.policy === value ? { checked: '' } : {})),
+    label, el('span', { class: 'meta' }, about));
+  const versions = [...new Set(state.roots.filter((r) => r.up && r.version).map((r) => r.version))];
+  const lines = [
+    el('div', { class: 'meta' }, 'This tray ' + u.tray_version
+      + (versions.length ? '; daemons ' + versions.join(', ') : '')),
+    u.checked_when
+      ? el('div', { class: 'meta' }, 'Last asked ' + u.checked_when + (u.latest ? ': the latest is ' + u.latest : ''))
+      : el('div', { class: 'meta' }, 'Not asked yet'),
+  ];
+  if (u.available) lines.push(el('div', { class: 'todo' }, u.available + ' is available' + (u.waits ? ': ' + u.waits : '')));
+  else if (u.waits) lines.push(el('div', { class: 'meta' }, u.waits));
+  if (u.installed && u.installed_when) lines.push(el('div', { class: 'meta' }, u.installed + ' installed ' + u.installed_when));
+  if (u.error) lines.push(el('div', { class: 'todo' }, 'Could not update' + (u.error_when ? ' since ' + u.error_when : '') + ': ' + u.error));
+  if (u.rejected.length) lines.push(el('div', { class: 'meta' }, 'Taken back here, not installed again unless asked: ' + u.rejected.join(', ')));
+  if (u.problem) lines.push(el('div', { class: 'todo' }, u.problem));
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Updates'),
+    el('div', { class: 'choices' },
+      choice('auto', 'Automatic', 'install each release as it comes'),
+      choice('notify', 'Notify only', 'show it here and in the menu'),
+      choice('off', 'Off', 'never ask')),
+    ...lines,
+    el('div', { class: 'buttons' },
+      el('button', {
+        class: 'act', disabled: !u.can_ask,
+        title: u.can_ask ? '' : 'No daemon is running here to ask',
+        onclick: async () => { await call('update_now', {}); await tick(); draw(true); },
+      }, 'Update now')));
 }
 
 setInterval(tick, 1000);

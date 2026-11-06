@@ -15,8 +15,11 @@
 # where an ad-hoc build is a new program each time. Over SSH, unlock the login keychain in the same
 # connection first.
 #
+# With CAIRN_NOTARIZE=1, as scripts/release-macos.sh sets it, the signature is one Apple notarizes: the
+# hardened runtime and a secure timestamp, which needs the network. A Developer ID is what installs on any Mac.
+#
 # Install a bundle by moving the new one into place, never by copying over the binary of a running one:
-# macOS kills what starts from a signed binary changed in place.
+# macOS kills what starts from a signed binary changed in place. `cairn update` does just that.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=$1
@@ -62,6 +65,11 @@ else
     echo "bundle.sh: no actool (Xcode), so the icon is the plain $icns.icns, on a gray tile at small sizes"
 fi
 cp "$binary" "$app/Contents/MacOS/$exe"
-codesign --force --sign "${CAIRN_SIGN:--}" --timestamp=none "$app"
+if [[ ${CAIRN_NOTARIZE-} == 1 ]]; then
+    codesign --force --sign "${CAIRN_SIGN:?CAIRN_NOTARIZE needs CAIRN_SIGN, a Developer ID}" --options runtime \
+        --timestamp "$app"
+else
+    codesign --force --sign "${CAIRN_SIGN:--}" --timestamp=none "$app"
+fi
 codesign --verify --strict "$app"
 echo "$app: $exe $version, signed by ${CAIRN_SIGN:-ad hoc}"

@@ -221,6 +221,8 @@ fn answer(stream: impl std::io::Read + Write, shared: &Shared) {
                 open: conflicts(&shared.root),
             },
         ),
+        // A mock has no updater: the tray's button only has to be taken.
+        Request::UpdateNow => send(out, &Reply::Done),
     }
 }
 

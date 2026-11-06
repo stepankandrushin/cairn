@@ -195,6 +195,7 @@ name = "cairn-engine"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "cairn-failpoint",
  "cairn-protocol",
@@ -203,6 +204,7 @@ dependencies = [
  "ignore",
  "libc",
  "rand",
+ "ring",
  "rusqlite",
  "rustix",
  "serde",
@@ -221,12 +223,15 @@ name = "cairn-harness"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cairn-cli",
  "cairn-engine",
  "cairn-failpoint",
  "cairn-protocol",
  "cairn-server",
+ "hex",
  "rand",
+ "ring",
  "rusqlite",
  "rustix",
  "serde_json",
@@ -244,6 +249,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "cairn-release"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "cairn-protocol",
+ "clap",
+ "hex",
+ "ring",
+ "serde_json",
 ]
 
 [[package]]

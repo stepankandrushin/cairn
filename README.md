@@ -200,6 +200,36 @@ works). macOS asks once, "Allow "Cairn Sync" to find devices on local networks?"
 connection fails with "No route to host", and nothing syncs, though nothing is lost. A server reached through a
 router, not on the Mac's own network, needs no permission.
 
+## Updates
+
+A release build keeps itself up to date. Each daemon asks its release's feed about once an hour, and when there
+is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
+it between syncs; the tray installed beside `cairn` is updated with it and restarts too. No permission is asked
+again: macOS keeps them for a signature by the same team, which every release has, and Windows by the path, which
+does not change.
+
+```sh
+cairn update                     # what is installed, how updates are set, what the feed offered last
+cairn update now                 # check and install now, whatever the setting, then wait for the daemons
+cairn update check               # only say what there is
+cairn update notify              # only say a new release is there, here and in the tray; `auto` (the default) or `off`
+cairn update rollback            # back to the version before, which is then not installed again unless asked
+```
+
+The tray's Settings tab has the same choice and an Update now button. What it installs is only ever what the
+release's own key signed: every file's size and SHA-256 are in a signed `update.json`, and on macOS the new bundle
+must also be signed by the team of the one it replaces. A kill or a full disk at any step leaves the old program
+or the new one in place, whole; the one before is kept beside it in `.cairn-update`, and a version on which a
+daemon keeps dying before it gets through a sync is taken back by itself. A release on a newer protocol waits until
+the server speaks it, so upgrade the server first: it is never updated by itself. Where the program's folder is
+not yours to write, as for a `/usr/local/bin` owned by root, `cairn update` says so, and `sudo cairn update now`
+installs it; the daemons restart into it.
+
+A build of your own names no feed and is never updated by anyone's releases. To update it from releases of your
+own, build with `CAIRN_UPDATE_FEED` (the URL of your `update.json`) and `CAIRN_UPDATE_KEYS` (your public keys), or
+name them in `update-settings.json` beside the registry of roots (`feed`, `keys`); `cairn-release` (crates/release)
+makes the key and signs the file, and docs/protocol.md has its format.
+
 ## Leaving things out
 
 Nothing is left out unless you say so. Rules go in `.cairn/ignore`, in `.gitignore` syntax, for this device

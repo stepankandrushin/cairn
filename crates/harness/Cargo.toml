@@ -22,7 +22,10 @@ cairn-engine = { workspace = true, features = ["failpoints"] }
 cairn-protocol.workspace = true
 cairn-failpoint.workspace = true
 anyhow.workspace = true
+base64.workspace = true
+hex.workspace = true
 rand.workspace = true
+ring = "0.17"
 serde_json.workspace = true
 rusqlite.workspace = true
 

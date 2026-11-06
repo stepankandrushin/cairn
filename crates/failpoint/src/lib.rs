@@ -20,6 +20,8 @@
 //!   the raw OS error `errno`, as a kernel out of socket buffers or a reset connection does: before the
 //!   request goes out, or with `lost` once its answer is in, as a connection lost with the answer does.
 //!   Not a step either.
+//! - `CAIRN_FP_VERSION=<version>`: `version` gives it in place of the build's own, so that a test's
+//!   binary takes itself for an older one and has a release to update to. Not a step either.
 
 use std::io;
 
@@ -109,6 +111,29 @@ pub fn network(name: &str, answered: bool) -> io::Result<()> {
         let _ = (name, answered);
         Ok(())
     }
+}
+
+/// The version this program takes itself for: its build's, or the one a test gives it.
+#[inline]
+pub fn version(built: &str) -> String {
+    #[cfg(feature = "enabled")]
+    if let Some(v) = std::env::var("CAIRN_FP_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        return v;
+    }
+    built.to_string()
+}
+
+/// What a program that starts another to check it, or to become it, does not pass on: the version a
+/// test made it take itself for is its own, not the other's.
+#[inline]
+pub fn not_passed_on() -> &'static [&'static str] {
+    #[cfg(feature = "enabled")]
+    return &["CAIRN_FP_VERSION"];
+    #[cfg(not(feature = "enabled"))]
+    &[]
 }
 
 #[cfg(feature = "enabled")]

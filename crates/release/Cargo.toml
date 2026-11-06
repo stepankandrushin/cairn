@@ -1,0 +1,21 @@
+[package]
+name = "cairn-release"
+description = "Signs a Cairn release's update.json, which installed programs check before they update."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cairn-release"
+path = "src/main.rs"
+
+[dependencies]
+cairn-protocol.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+ring = "0.17"
+serde_json.workspace = true

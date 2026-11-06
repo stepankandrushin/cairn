@@ -91,6 +91,10 @@ pub struct DaemonStatus {
     /// The daemon's version, `CARGO_PKG_VERSION`.
     #[serde(default)]
     pub version: String,
+    /// What this device's updater knows: the same for every daemon of this user here, as there is one
+    /// updater. `None` from a daemon from before updates.
+    #[serde(default)]
+    pub update: Option<crate::update::Status>,
 }
 
 pub const MAX_NOT_APPLIED: usize = 200;
@@ -156,6 +160,10 @@ pub enum Request {
     Resume,
     /// The open conflicts, from the server's inbox, with where their copies are on this device.
     Conflicts,
+    /// Ask the feed now and install what it offers, whatever the policy: `done` at once, and the
+    /// status's `update` says how it went. Every program updated restarts into the new version, this
+    /// daemon too, between syncs.
+    UpdateNow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -101,6 +101,15 @@ Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn.exe"   # t
 Its cost: what the client writes into the tree is scanned only when another program opens it. `Get-MpPreference`
 lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
 
+On macOS 15 and later, a daemon that launchd starts as a user agent needs the Local Network permission to reach a
+server on the same local network (one started from Terminal or SSH does not, which is why `cairn sync` there
+works). macOS asks once, "Allow "cairn" to find devices on local networks?"; until someone answers, every
+connection fails with "No route to host", and nothing syncs, though nothing is lost. The answer is kept for that
+code signature: an ad-hoc signed build is a new program to macOS at each upgrade and asks again, while builds
+signed with the same Apple-issued certificate and identifier keep it (`codesign -f -s "<your certificate>" -i
+<identifier> ~/.local/bin/cairn`). A server reached through a router, not on the Mac's own network, needs no
+permission.
+
 ## Leaving things out
 
 Nothing is left out unless you say so. Rules go in `.cairn/ignore`, in `.gitignore` syntax, for this device

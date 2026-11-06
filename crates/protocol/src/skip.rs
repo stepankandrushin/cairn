@@ -88,7 +88,7 @@ impl SkipKind {
                 "the server and other devices keep it, and it comes here once renamed there or the name in its way here is gone; read it with `cairn export`"
             }
             SkipKind::ExcludedInTheWay => {
-                "move what is here, or change the rule, and the server's will come"
+                "move what is here, and the server's comes; or bring it in, by `cairn include --merge` for a copy `cairn status` lists as left here, or by changing the rule"
             }
             SkipKind::ReadError => "check the disk, then sync again",
             SkipKind::SameNameOnServer => {

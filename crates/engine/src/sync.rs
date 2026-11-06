@@ -1869,6 +1869,7 @@ fn sync_full(
             &root,
             &scanned.excluded,
             &folders_moving(&plan, &identified),
+            rows,
         );
         if !kept_out.is_empty() {
             selection.store(&root)?;

@@ -470,6 +470,55 @@ fn a_rule_by_path_deep_in_a_folder_moved_elsewhere_keeps_out_what_it_left_out() 
     assert!(!b.exists("d2/e/g/cache"));
 }
 
+/// A cycle of moves undone here takes a folder this device held, put where its rule matches by the move
+/// that is undone, from under the rule: the round that keeps it out by inode has its record, which then
+/// does not bring it back into view, where it would go the way the server's went. The same the full way.
+#[test]
+fn a_folder_a_cycle_of_moves_takes_from_under_its_rule_stays_here_either_way() {
+    for incremental in [true, false] {
+        let (_sb, _s, a, b) = pair("incr-rule-cycle");
+        everything(&a);
+        a.write("fill/x/y/cache/data", "cached");
+        a.write("fill/x/y/kept", "in view");
+        std::fs::write(b.path(".cairn/ignore"), "/d/fill/x/y/cache/\n").unwrap();
+        for d in [&a, &b, &a, &b] {
+            d.synced();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        b.synced();
+        std::fs::rename(a.path("d"), a.path("fill/d")).unwrap();
+        a.synced();
+        std::fs::rename(b.path("fill"), b.path("d/fill")).unwrap();
+        let env: &[(&str, &str)] = if incremental {
+            &[]
+        } else {
+            &[("CAIRN_FP_INCR", "0")]
+        };
+        let (run, steps) = logged(&b, env);
+        assert!(run.ok(), "{}", run.text());
+        if incremental {
+            assert!(took(&steps, "sync.incr.confirmed"), "{steps:?}");
+        } else {
+            assert!(!took(&steps, "sync.incr.round"), "{steps:?}");
+        }
+        assert!(
+            run.stdout
+                .contains("d/fill/x/y/cache: its folder is moving"),
+            "{}",
+            run.text()
+        );
+        assert_eq!(b.read("fill/x/y/cache/data"), b"cached", "{incremental}");
+        let status = b.cairn(&["status"]);
+        assert!(
+            status
+                .stdout
+                .contains("left here when it was excluded: fill/x/y/cache;"),
+            "{incremental}: {}",
+            status.text()
+        );
+    }
+}
+
 /// The mass-delete check counts what a round left out as there, as it is: a folder of ten of sixty
 /// files gone is no mass delete, though it is most of what the round looked at, and most of the tree is,
 /// as for the full sync.

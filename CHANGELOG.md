@@ -25,6 +25,16 @@
   goes the whole way and says why. Once a day the daemon decides every round the full way as well and takes
   that answer, and anything the incremental round would have decided otherwise is said in its log as a
   defect; `--full-sync-secs` sets how often.
+- A folder that a rule in `.cairn/ignore` left out could leave this device's disk while the sync said it stayed
+  out. It took one this device had synced, put where the rule matches by a move here, and a sync that undid that
+  move, as one does when another device's move would make a cycle with it. Out from under its rule, the folder was
+  brought back into view by this device's own record of it, and went the way the server's had, deleted by that
+  move as anything moved into an excluded path is, but for what had been edited in it, which went up. What was
+  kept out was recorded for an inode that no longer existed, and `cairn status` listed it at a path that had gone.
+  It now stays here, out of view and listed where it is, until `cairn include --merge`, and the same for a file.
+  Where another device has added to the folder meanwhile, each sync says the copy here is in the way of the
+  server's and to move it or `cairn include --merge` it, which merges it as new. A file with another name here
+  cannot stay out without taking that name with it, and comes back in.
 
 ## 0.1.3
 

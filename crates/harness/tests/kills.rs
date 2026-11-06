@@ -1734,6 +1734,27 @@ const SCENARIOS: &[Scenario] = &[
         after: nothing,
     },
     Scenario {
+        name: "a cycle of moves undone, from under a rule deep in it",
+        base: |a, b| {
+            b.write(".cairn/ignore", "/d/fill/x/y/cache/\n");
+            write_many(
+                a,
+                &[
+                    ("d/f", "f"),
+                    ("fill/x/y/cache/data", "cached"),
+                    ("fill/x/y/cache/z/deeper", "deeper"),
+                    ("fill/x/y/kept", "kept"),
+                ],
+            );
+        },
+        elsewhere: |a| fs::rename(a.path("d"), a.path("fill/d")).unwrap(),
+        here: |b| {
+            fs::rename(b.path("fill"), b.path("d/fill")).unwrap();
+            b.write("d/fill/x/y/cache/data", "edited here");
+        },
+        after: nothing,
+    },
+    Scenario {
         name: "conflict then edited again",
         base: |a, _| write_many(a, &[("x", "v1"), ("k", "k")]),
         elsewhere: |a| a.write("x", "v2-a"),

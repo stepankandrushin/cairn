@@ -126,6 +126,11 @@ pub struct KeptCopy {
     pub btime: Option<Timestamp>,
     /// Where it was last seen.
     pub path: Vec<Name>,
+    /// The object this device held here, when a sync kept the copy out by moving it from under its
+    /// rule: until the sync that agrees on that drops its record, the record is the copy's own, and
+    /// does not make the copy something this device syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was: Option<ObjectId>,
 }
 
 impl KeptCopy {
@@ -291,9 +296,17 @@ fn held_only(base: &Tree, rows: &BTreeMap<ObjectId, Row>) -> Option<Tree> {
 /// Whether this inode is an object this device has a record of. A birth time that differs proves the
 /// number was reused.
 fn is_known(rows: &BTreeMap<ObjectId, Row>, st: &Stat) -> bool {
-    rows.values().any(|r| {
-        (r.fp.dev, r.fp.ino, birth_mark(r.fp.btime)) == (st.dev, st.ino, birth_mark(st.btime))
-    })
+    is_known_but(rows, st, None)
+}
+
+/// The same, but for the record of one object.
+fn is_known_but(rows: &BTreeMap<ObjectId, Row>, st: &Stat, but: Option<ObjectId>) -> bool {
+    rows.iter()
+        .any(|(id, r)| but != Some(*id) && is_its_record(r, st))
+}
+
+fn is_its_record(row: &Row, st: &Stat) -> bool {
+    (row.fp.dev, row.fp.ino, birth_mark(row.fp.btime)) == (st.dev, st.ino, birth_mark(st.btime))
 }
 
 impl Selection {
@@ -365,15 +378,19 @@ impl Selection {
         if self.copies.is_empty() {
             return false;
         }
+        // What a sync kept out of what this device held is read as gone from here, as it was when the
+        // rule still covered it, by its own record too: that goes once the sync agrees.
+        let own = self.copies.iter().find(|c| c.is(st)).and_then(|c| c.was);
+        let other = |id: &ObjectId| rows.contains_key(id) && own != Some(*id);
         // A name this device holds is not a copy's, whatever is at it now: leaving that out would read
         // what is held as deleted. It has a record if it came from the server in a sync not finished.
-        let held = |tree: &Tree| tree.resolve(path).is_some_and(|id| rows.contains_key(&id));
+        let held = |tree: &Tree| tree.resolve(path).is_some_and(|id| other(&id));
         if held(&view.base) || held(&view.remote) {
             return false;
         }
         // Known, it has become something this device syncs, by a move onto a held name, say, and a
         // record of the copy it once was means nothing now.
-        let found = if is_known(rows, st) {
+        let found = if is_known_but(rows, st, own) {
             None
         } else if let Some(i) = self.copies.iter().position(|c| c.is(st)) {
             Some((i, true))
@@ -424,12 +441,15 @@ impl Selection {
 
     /// What a rule leaves out in a folder this sync is about to move, where the rule will not match
     /// it: nobody here chose that, so it stays out by inode, as a copy left by `cairn exclude` does.
-    /// Returns the paths, whose records are not durable until `store`.
+    /// So does what this device held there, which its record would otherwise bring back into view
+    /// where the move takes it, but for a file with another name here, which by inode would take that
+    /// name out of view too. Returns the paths, whose records are not durable until `store`.
     pub fn keep_out_what_moves(
         &mut self,
         root: &Root,
         excluded: &[Vec<Name>],
         moving: &BTreeMap<Vec<Name>, Vec<Name>>,
+        rows: &BTreeMap<ObjectId, Row>,
     ) -> Vec<Vec<Name>> {
         let mut kept = Vec::new();
         for path in excluded {
@@ -451,11 +471,19 @@ impl Selection {
             {
                 continue;
             }
+            let was = rows
+                .iter()
+                .find(|(_, r)| is_its_record(r, &st))
+                .map(|(id, _)| *id);
+            if was.is_some() && !is_dir && st.nlink > 1 {
+                continue;
+            }
             let mut copy = KeptCopy {
                 dev: 0,
                 ino: 0,
                 btime: None,
                 path: Vec::new(),
+                was,
             };
             copy.follow(path, &st);
             self.copies.push(copy);
@@ -631,6 +659,20 @@ fn holds_any(dir: &Dir, inodes: &HashSet<(u64, u64, Option<Timestamp>)>) -> Resu
     Ok(false)
 }
 
+/// Every inode in this folder, at any depth.
+fn inodes_in(dir: &Dir, out: &mut HashSet<(u64, u64, Option<Timestamp>)>) -> Result<()> {
+    for name in dir.list()? {
+        let Some(st) = dir.try_stat(&name)? else {
+            continue;
+        };
+        out.insert((st.dev, st.ino, birth_mark(st.btime)));
+        if st.file_type == FileType::Directory {
+            inodes_in(&dir.open_dir(&name)?, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Stop syncing a path on the server. Unless `remove_local`, the copy here stops being looked at and
 /// stays until someone deletes it, which then means nothing to the server. Either way, what this device
 /// has no record of stays out at that path from now on.
@@ -685,6 +727,7 @@ pub fn exclude(root: &mut Root, path: &[Name], remove_local: bool) -> Result<()>
         ino: 0,
         btime: None,
         path: path.to_vec(),
+        was: None,
     };
     if !remove_local {
         // No claim on them from now on, or a delete of the copy here would read as a real one when
@@ -729,6 +772,30 @@ pub fn include(root: &mut Root, path: &[Name], merge: bool) -> Result<()> {
             && !merge
         {
             bail!("a copy from when this was excluded is at that path, and nothing was changed. Merging it uploads whatever differs from the server, including what has been deleted there since, and keeps both versions of what changed: to do that, pass --merge. Otherwise delete or move it first");
+        }
+        // A copy a sync kept out of what this device held still has the records of what is in it until a
+        // sync agrees, and one the server's is in the way of never does: they go first, or it would merge
+        // as what was held, and what the server has deleted since would go from here, edited or not.
+        // Dying in between leaves the copy out, with nothing to vouch for it.
+        if let Some(st) = here
+            .as_ref()
+            .filter(|st| excluded.copies[i].was.is_some() && excluded.copies[i].is(st))
+        {
+            let mut inodes = HashSet::from([(st.dev, st.ino, birth_mark(st.btime))]);
+            if st.file_type == FileType::Directory {
+                let (name, parents) = path.split_last().expect("not the root");
+                let dir = root
+                    .dir
+                    .open_path(parents.iter())?
+                    .open_dir(name.as_bytes())?;
+                inodes_in(&dir, &mut inodes)?;
+            }
+            let gone: Vec<ObjectId> = rows
+                .iter()
+                .filter(|(_, r)| inodes.contains(&(r.fp.dev, r.fp.ino, birth_mark(r.fp.btime))))
+                .map(|(id, _)| *id)
+                .collect();
+            root.state.store_rows(&[], &gone)?;
         }
         // With nothing at that path, a copy may only have moved away: it stays out, wherever it is.
         if here.is_none() && excluded.copies[i].ino != 0 {

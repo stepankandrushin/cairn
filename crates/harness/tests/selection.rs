@@ -2304,6 +2304,160 @@ fn a_kill_as_a_sync_moves_the_folder_does_not_let_what_a_rule_covers_go_up() {
     assert_eq!(b.read("renamed/key"), b"TOP-SECRET");
 }
 
+/// Two devices move two folders each into the other, and the sync here undoes this device's move. That
+/// move had put a synced folder where a rule leaves it out, a delete of it for everyone as any `mv` into
+/// an excluded path is, and undoing it takes the folder from under the rule. So it stays out by inode,
+/// and this device's record of the folder, from before, must not bring it back into view, where it went
+/// the way the server's had: off this disk, with a kept copy for an inode that was gone. A file the same.
+#[test]
+fn a_folder_a_rule_leaves_out_stays_here_as_a_cycle_of_moves_is_undone() {
+    let (sb, server, a, b) = pair("sel-rule-cycle");
+    for i in 0..12 {
+        a.write(&format!("fill/{i}"), "p");
+    }
+    a.write("d/f2", "beside");
+    a.write("fill/x/y/cache/data", "cached");
+    a.write("fill/x/y/cache/z/deeper", "deeper");
+    a.write("fill/x/y/note", "a file");
+    a.write("fill/x/y/kept", "in view");
+    a.synced();
+    b.synced();
+    rules(&b, "/d/fill/x/y/cache/\n/d/fill/x/y/note\n");
+    std::fs::rename(a.path("d"), a.path("fill/d")).unwrap();
+    a.synced();
+    std::fs::rename(b.path("fill"), b.path("d/fill")).unwrap();
+    b.write("d/fill/x/y/cache/data", "edited here");
+    let run = b.synced();
+    assert!(
+        run.stdout.contains("cycle")
+            && run
+                .stdout
+                .contains("d/fill/x/y/cache: its folder is moving"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(b.read("fill/x/y/cache/data"), b"edited here");
+    assert_eq!(b.read("fill/x/y/cache/z/deeper"), b"deeper");
+    assert_eq!(b.read("fill/x/y/note"), b"a file");
+    assert_eq!(b.read("fill/d/f2"), b"beside");
+    let status = b.cairn(&["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("left here when it was excluded: fill/x/y/cache;")
+            && status
+                .stdout
+                .contains("left here when it was excluded: fill/x/y/note;")
+            && !status.stdout.contains("d/fill/x/y/"),
+        "{}",
+        status.text()
+    );
+
+    // Nothing comes or goes for it later, and nothing of it went up, the edit least of all.
+    let run = b.synced();
+    assert!(
+        run.stdout.contains(" 0 steps applied here, 0 commits"),
+        "{}",
+        run.text()
+    );
+    a.synced();
+    let there = on_server(&sb, &server, "probe");
+    assert!(
+        !there
+            .iter()
+            .any(|n| n.contains("cache") || n.contains("note")),
+        "{there:?}"
+    );
+    assert!(
+        there.contains("fill/x/y/kept") && there.contains("fill/d/f2"),
+        "{there:?}"
+    );
+    assert_eq!(b.read("fill/x/y/cache/data"), b"edited here");
+
+    // A person can bring it in.
+    b.cairn(&["include", "--merge", "fill/x/y/cache"])
+        .expect_ok();
+    b.cairn(&["include", "--merge", "fill/x/y/note"])
+        .expect_ok();
+    b.synced();
+    a.synced();
+    assert_eq!(a.read("fill/x/y/cache/data"), b"edited here");
+    assert_eq!(a.read("fill/x/y/note"), b"a file");
+    assert_eq!(a.read("fill/x/y/cache/z/deeper"), b"deeper");
+}
+
+/// The same where the other device has added to the folder meanwhile: the merge keeps the server's for
+/// that, and the copy here is in its way. Each sync says so and what to do, and the copy stays, until a
+/// person brings the two together.
+#[test]
+fn a_folder_kept_out_as_a_cycle_of_moves_is_undone_waits_for_what_the_server_added_to_it() {
+    let (_sb, _s, a, b) = pair("sel-rule-cycle-added");
+    for i in 0..12 {
+        a.write(&format!("fill/{i}"), "p");
+    }
+    a.write("d/f2", "beside");
+    a.write("fill/x/y/cache/data", "cached");
+    a.synced();
+    b.synced();
+    rules(&b, "/d/fill/x/y/cache/\n");
+    std::fs::rename(a.path("d"), a.path("fill/d")).unwrap();
+    a.write("fill/x/y/cache/new", "from a");
+    a.synced();
+    std::fs::rename(b.path("fill"), b.path("d/fill")).unwrap();
+    for _ in 0..2 {
+        let run = b.sync();
+        assert_eq!(run.code, Some(3), "{}", run.text());
+        assert!(
+            run.text()
+                .contains("fill/x/y/cache: something this device excludes is at that name")
+                && run.text().contains("`cairn include --merge`"),
+            "{}",
+            run.text()
+        );
+        assert_eq!(b.read("fill/x/y/cache/data"), b"cached");
+    }
+    b.cairn(&["include", "--merge", "fill/x/y/cache"])
+        .expect_ok();
+    b.synced();
+    a.synced();
+    for d in [&a, &b] {
+        assert_eq!(d.read("fill/x/y/cache/data"), b"cached");
+        assert_eq!(d.read("fill/x/y/cache/new"), b"from a");
+    }
+}
+
+/// The same for a file with another name in view: by inode, that name would go out of view too, and read
+/// as deleted for everyone. It cannot stay out, and comes back in as it was.
+#[test]
+fn a_file_a_rule_leaves_out_with_another_name_comes_back_as_a_cycle_of_moves_is_undone() {
+    let (_sb, _s, a, b) = pair("sel-rule-cycle-link");
+    for i in 0..12 {
+        a.write(&format!("fill/{i}"), "p");
+    }
+    a.write("d/f2", "beside");
+    a.write("fill/x/y/secret", "linked");
+    std::fs::hard_link(a.path("fill/x/y/secret"), a.path("fill/other")).unwrap();
+    a.synced();
+    b.synced();
+    rules(&b, "/d/fill/x/y/secret\n");
+    std::fs::rename(a.path("d"), a.path("fill/d")).unwrap();
+    a.synced();
+    std::fs::rename(b.path("fill"), b.path("d/fill")).unwrap();
+    let run = b.synced();
+    assert!(
+        run.stdout.contains("cycle") && !run.stdout.contains("stays out"),
+        "{}",
+        run.text()
+    );
+    b.synced();
+    a.synced();
+    for d in [&a, &b] {
+        assert_eq!(d.read("fill/other"), b"linked");
+        assert_eq!(d.read("fill/x/y/secret"), b"linked");
+        assert_eq!(nlink(&d.path("fill/other")), 2);
+    }
+}
+
 /// A rule that still matches where the folder goes needs no record, and lifting it brings the file in.
 #[test]
 fn a_folder_moved_by_a_sync_leaves_a_rule_that_still_matches_as_it_was() {

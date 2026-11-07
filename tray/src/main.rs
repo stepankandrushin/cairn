@@ -80,6 +80,11 @@ fn main() -> ExitCode {
 
 #[cfg(feature = "gui")]
 fn tray(open: Option<&str>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if update::in_an_older_process() {
+        log("this tray was started in the process of an older one, which macOS's menu bar gives no icon: starting as a new process");
+        log(&update::restart());
+    }
     // One tray per user: a second start finds the first holding this.
     let _lock = match single() {
         Ok(Some(lock)) => lock,

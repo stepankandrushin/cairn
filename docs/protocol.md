@@ -223,4 +223,6 @@ restarts into the new one between syncs: on Unix in the same process, by exec, a
 for the loop that runs it to start it again. A daemon that starts more than three times for one root on a version
 just installed without getting through a sync, or running an hour, takes the version back as `cairn update
 rollback` does: the previous program put back, the version added to `rejected`. The tray, too, restarts once its
-program has been replaced.
+program has been replaced, but never by exec on macOS, whose menu bar gives a program exec'd in another's process
+no icon: under its LaunchAgent it exits with 75 for launchd to start it again, and otherwise starts a new process
+and exits. A tray that an older one exec'd there (one before 0.1.9) does the same as it starts.

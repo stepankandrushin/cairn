@@ -59,15 +59,39 @@ pub fn replaced() -> bool {
     }
 }
 
-/// Start the program now at this one's path, with the same arguments: on Unix in this process, as
-/// launchd, which keeps the tray running, sees nothing end; on Windows as a new process, after which
-/// this one exits. Returns only if it could not.
+/// The exit status by which a tray under its LaunchAgent asks launchd to start it again: the agent
+/// keeps it running after any exit but a successful one.
+#[cfg(target_os = "macos")]
+const RESTART: i32 = 75;
+
+/// Start the program now at this one's path, with the same arguments, after which this one exits. On
+/// Windows and macOS as a new process: macOS's menu bar knows a tray by the process it began as, and
+/// gives a program exec'd in that process no icon for as long as it runs. On macOS under its
+/// LaunchAgent by exiting with `RESTART`, for launchd to start it; on Linux in this process, by
+/// exec. Returns only if it could not.
 pub fn restart() -> String {
     let Some(Some((path, _))) = START.get() else {
         return "cannot tell where the tray is, to start it again".into();
     };
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os("XPC_SERVICE_NAME").is_some_and(|v| v == crate::actions::login::LABEL) {
+            std::process::exit(RESTART);
+        }
+        // Its own process group, which a launchd job's end does not take with it.
+        match std::process::Command::new(path)
+            .args(&args)
+            .env(RESTARTED, "1")
+            .process_group(0)
+            .spawn()
+        {
+            Ok(_) => std::process::exit(0),
+            Err(e) => format!("cannot start {} again: {e}", path.display()),
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(path).args(&args).exec();
@@ -88,6 +112,43 @@ pub fn restart() -> String {
             Err(e) => format!("cannot start {} again: {e}", path.display()),
         }
     }
+}
+
+/// Whether this program was put in place after its process began: an older tray exec'd it there, as
+/// trays before 0.1.9 did on macOS when an update replaced them, which leaves it with no icon. An
+/// exec is the only way a process runs a file newer than itself, as a file's change time cannot be
+/// set back.
+#[cfg(target_os = "macos")]
+pub fn in_an_older_process() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::Duration;
+    let Some(Some((path, _))) = START.get() else {
+        return false;
+    };
+    let Ok(m) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a proc_bsdinfo, and `size` its size.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return false;
+    }
+    let began = Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000);
+    let put = Duration::new(
+        m.ctime().max(0) as u64,
+        m.ctime_nsec().clamp(0, 999_999_999) as u32,
+    );
+    put > began
 }
 
 /// What the updater last wrote: `None` if it never has.

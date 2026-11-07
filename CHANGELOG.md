@@ -16,6 +16,11 @@
 
 **Fixed:**
 
+- On macOS the tray's icon went from the menu bar once an update replaced the tray, and stayed gone while it ran:
+  the tray started its new program in its own process, by exec, and the menu bar of macOS 26 and later gives a
+  program exec'd in another's process no icon. It now starts again as a new process, under its LaunchAgent by
+  exiting for launchd to start it. A tray that an older one exec'd does the same as it starts, so the update to
+  this version brings the icon back by itself.
 - A sync on a hard disk sat for up to a quarter of an hour in "loading what this device knows", and as long again
   in its first round. SQLite reads the state a page at a time, in the order of each table's keys, which in a state
   that syncs have rewritten is all over the file; the daemon holds nothing between syncs, so once the system's

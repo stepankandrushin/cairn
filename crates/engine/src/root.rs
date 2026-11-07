@@ -259,15 +259,27 @@ impl Root {
             hex::encode(rand::random::<[u8; 8]>())
         )
         .into_bytes();
-        let mut keep = original.len().min(NAME_MAX.saturating_sub(name.len()));
-        if let Ok(text) = std::str::from_utf8(original) {
-            while !text.is_char_boundary(keep) {
-                keep -= 1;
-            }
-        }
-        name.extend_from_slice(&original[..keep]);
+        let kept = name_start(original, NAME_MAX.saturating_sub(name.len()));
+        name.extend_from_slice(kept);
         name
     }
+}
+
+/// As much of `name` as fits in `room` bytes: cut where a character ends, and never just after a dot
+/// or a space, as Windows refuses a name that ends in one, and so would refuse the temporary.
+fn name_start(name: &[u8], room: usize) -> &[u8] {
+    let mut keep = name.len().min(room);
+    if let Ok(text) = std::str::from_utf8(name) {
+        while !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+    }
+    if keep < name.len() {
+        while keep > 0 && matches!(name[keep - 1], b'.' | b' ') {
+            keep -= 1;
+        }
+    }
+    &name[..keep]
 }
 
 const ASIDE: &str = "aside-";
@@ -279,4 +291,38 @@ const NAME_MAX: usize = 143;
 pub fn aside_origin(rest: &[u8]) -> Option<&[u8]> {
     let rest = rest.strip_prefix(ASIDE.as_bytes())?;
     Some(rest.get(17..).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cut_name_ends_where_a_character_does_and_never_in_a_dot_or_a_space() {
+        // A device's aside prefix is 67 bytes, leaving 76 of NAME_MAX, which cut a name of 75 bytes and
+        // `.md` just after its dot: Windows refused that temporary, and the file never took its new
+        // version there.
+        let n = [vec![b'n'; 74], b"e.md".to_vec()].concat();
+        let n = n.as_slice();
+        let prefix = format!(".cairn-tmp-{}-{ASIDE}{}-", "0".repeat(32), "0".repeat(16));
+        assert_eq!(prefix.len(), 67);
+        let kept = name_start(n, NAME_MAX - prefix.len());
+        assert_eq!(kept, &n[..n.len() - 3]);
+        assert!(kept.ends_with(b"ne"));
+        assert_eq!(name_start(n, 200), n);
+        assert_eq!(name_start(b"a. . b", 5), b"a");
+        assert_eq!(name_start(b". .x", 3), b"");
+        // A name kept whole is kept as it is, which another filesystem may allow.
+        assert_eq!(name_start(b"x.", 9), b"x.");
+        assert_eq!(name_start("ab\u{e9}.c".as_bytes(), 3), b"ab");
+        assert_eq!(
+            name_start("ab\u{e9}.c".as_bytes(), 5),
+            "ab\u{e9}".as_bytes()
+        );
+        for room in 0..=n.len() {
+            let k = name_start(n, room);
+            assert!(k.len() <= room && n.starts_with(k));
+            assert!(!k.ends_with(b".") && !k.ends_with(b" "), "{room}");
+        }
+    }
 }

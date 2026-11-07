@@ -1408,8 +1408,13 @@ impl<'a> Applier<'a> {
             let _ = self.root.state.drop_intent(&relink_key);
             return Err(e.into());
         }
-        // Nothing can be at a random name, and not every filesystem can promise that.
-        dir.rename_over(&tmp, &dir, &aside)?;
+        // Nothing can be at a random name, and not every filesystem can promise that. Refused, the
+        // download is not left beside the file: nothing has moved yet.
+        if let Err(e) = dir.rename_over(&tmp, &dir, &aside) {
+            let _ = dir.unlink(&tmp);
+            let _ = self.root.state.drop_intent(&relink_key);
+            return Err(e.into());
+        }
         hit("apply.replace.aside");
         if swap(self.root, &dir, &aside, &name)? {
             hit("apply.replace.swapped");

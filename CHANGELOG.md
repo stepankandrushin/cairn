@@ -16,6 +16,13 @@
 
 **Fixed:**
 
+- On Windows a file with a long name, 77 bytes or more, could stay at an old version for good, and could not be
+  deleted there either, failing every sync with "destination cannot represent this (The filename, directory
+  name, or volume label syntax is incorrect. (os error 123))". The temporary name it is moved aside under carries
+  the start of its own name, cut to fit, and where the cut fell just after a dot or a space Windows refused it.
+  The cut now never ends in one. Each attempt also left its download beside the file, a leftover that sends the
+  next sync through the whole tree to settle it rather than only what changed: on a large tree on a hard disk,
+  18 minutes to over an hour and a half a sync. A download refused there is now removed at once.
 - A file the system refuses this device is held as it was, said by name, and never sent as a delete or a change,
   to read on one device or to write on another: an access list, another program holding it, a program that guards
   files, a failing disk. Reads were held already; now a refused write says "waiting for permission" with the

@@ -867,6 +867,31 @@ fn a_conflict_on_a_name_with_a_very_long_extension_keeps_both() {
     has_version(&p, b"from b");
 }
 
+/// A file moved aside to be replaced or deleted gets a temporary name with the start of its own, cut to
+/// fit: cut just after a dot, Windows refused the temporary, and the file there never took a new
+/// version nor went. This name's dots are where any device's cut falls.
+#[test]
+fn a_long_name_cut_at_a_dot_is_replaced_and_deleted() {
+    let (_sb, _s, a, b) = pair("cut-dot");
+    let name = format!("a{}b.md", ".".repeat(120));
+    for i in 0..3 {
+        a.write(&format!("other{i}"), "stays");
+    }
+    a.write(&name, "first");
+    a.synced();
+    b.synced();
+    assert_eq!(b.read(&name), b"first");
+    a.write(&name, "second");
+    a.synced();
+    let run = b.synced();
+    assert_eq!(b.read(&name), b"second", "{}", run.text());
+    std::fs::remove_file(a.path(&name)).unwrap();
+    a.synced();
+    let run = b.synced();
+    assert!(!b.path(&name).exists(), "{}", run.text());
+    converge(&[&a, &b]);
+}
+
 /// Invariant 4: what was queued goes out, even if the file has moved on by the next run. Merging
 /// would reach the same tree without it, but that version would be missing from history.
 #[test]

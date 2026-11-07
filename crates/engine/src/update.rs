@@ -1444,7 +1444,8 @@ mod tests {
         );
         assert_eq!(resolve(feed, "https://x/y"), "https://x/y");
         assert_eq!(resolve("/srv/dist/update.json", "a"), "/srv/dist/a");
-        assert_eq!(resolve("/srv/dist/update.json", "/abs/a"), "/abs/a");
+        let abs = if cfg!(windows) { r"C:\abs\a" } else { "/abs/a" };
+        assert_eq!(resolve("/srv/dist/update.json", abs), abs);
     }
 
     #[test]

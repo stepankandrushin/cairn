@@ -2759,7 +2759,9 @@ mod tests {
                 _ => ids[path[path.len() - 2]],
             };
             let content = if dir { Content::Dir } else { file() };
-            let node = scanned(path, fp(ino), content.clone());
+            // As a scan and this build's records have one: on Windows with no birth time.
+            let fp = fp(ino).current();
+            let node = scanned(path, fp.clone(), content.clone());
             entries.push((
                 ids[n],
                 Entry {
@@ -2769,7 +2771,7 @@ mod tests {
                         name: name(path[path.len() - 1]),
                     }],
                     seen: Some(Seen {
-                        fp: fp(ino),
+                        fp,
                         content,
                         digest: dir.then(|| digest(&node)),
                     }),

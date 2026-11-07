@@ -78,6 +78,8 @@ fn a_state_of_version_1_is_moved_by_the_next_sync_and_holds_the_same() {
         "{:?}",
         p.names()
     );
+    assert_eq!(a.read("d1/f1"), b"edited on b");
+    #[cfg(unix)]
     assert_eq!(a.read("hard"), b"edited on b");
 }
 

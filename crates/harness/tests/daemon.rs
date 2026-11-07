@@ -13,8 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DAY: &str = "86400";
-/// Long enough for a loaded machine, far shorter than any reconcile in these tests.
-const SOON: Duration = Duration::from_secs(30);
+/// Long enough for a loaded machine, far shorter than any reconcile in these tests. Longer on Windows,
+/// which takes about 2 s to refuse a connection to a port nothing listens on, so 16.5 s for a sync's
+/// tries against a server that is down.
+const SOON: Duration = Duration::from_secs(if cfg!(windows) { 90 } else { 30 });
 
 struct Daemon {
     child: Child,
@@ -966,7 +968,10 @@ fn a_server_going_away_and_coming_back_loses_nothing_and_needs_no_reconcile() {
     server.restart();
     wait_file(&db, b.path("during"), b"written while the server was down");
     da.wait_state("synced");
-    assert!(da.status()["feed_down"].is_null(), "{}", da.status());
+    // The feed comes back on its own tries, which may still be waiting out one made while it was down.
+    wait_for("the feed to be back", &log, || {
+        da.status()["feed_down"].is_null()
+    });
     b.write("after", "after");
     wait_file(&da, a.path("after"), b"after");
 }

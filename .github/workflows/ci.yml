@@ -15,9 +15,12 @@ jobs:
       - run: sudo apt-get install -y musl-tools
       # Ubuntu's AppArmor forbids the unprivileged namespaces that the real full-disk test needs.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # A test that cannot run here fails instead of skipping: libtest hides a skip's line, so a change
+      # of image would otherwise leave tests that never ran showing as passed.
       - run: bash scripts/ci.sh
         env:
           CAIRN_SEEDS: "200"
+          CAIRN_NO_SKIP: "1"
       - run: rustup target add x86_64-unknown-linux-musl
       # Only that a release builds, static and without build paths: its binary is thrown away, so it
       # needs no feed to update from.

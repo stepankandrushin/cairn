@@ -43,3 +43,14 @@ pub fn is_disk_full(err: &anyhow::Error) -> bool {
             .is_some_and(fsops::is_disk_full)
     })
 }
+
+/// A unit test that cannot run here, for `why`: it says so and passes, and the caller returns. Where
+/// `CAIRN_NO_SKIP` is set, as in GitHub's CI, it fails instead, as the harness's `skip` does.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn skip(why: &str) {
+    if std::env::var_os("CAIRN_NO_SKIP").is_some_and(|v| !v.is_empty() && v != "0") {
+        panic!("{why}, and CAIRN_NO_SKIP says every test must run here");
+    }
+    eprintln!("{why}: skipped");
+}

@@ -546,41 +546,12 @@ fn a_download_in_slices_killed_at_every_step_loses_nothing() {
     });
 }
 
-/// Re-run this test binary inside a namespace with `dir` mounted as a small tmpfs.
-fn in_namespace(test: &str, dir: &Path, megabytes: u32) -> Option<bool> {
-    use std::process::Command;
-    let exe = std::env::current_exe().unwrap();
-    let inner = format!(
-        "mount -t tmpfs -o size={megabytes}m tmpfs '{}' && CAIRN_INNER='{}' exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
-        dir.display(),
-        dir.display(),
-        exe.display(),
-    );
-    let probe = Command::new("unshare").args(["-Urm", "true"]).output();
-    if !probe.is_ok_and(|o| o.status.success()) {
-        eprintln!("no unprivileged namespaces here: skipped");
-        return None;
-    }
-    let out = Command::new("unshare")
-        .args(["-Urm", "sh", "-c", &inner])
-        .output()
-        .unwrap();
-    if !out.status.success() {
-        eprintln!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Some(out.status.success())
-}
-
 #[test]
 fn a_download_bigger_than_its_cache_needs_about_its_own_size_free() {
     let sb = Sandbox::on_disk("room");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace("inner_room", &dir, 96) {
+    if let Some(ok) = in_namespace("inner_room", Some((&dir, "size=96m"))) {
         assert!(ok, "see the output above");
     }
 }

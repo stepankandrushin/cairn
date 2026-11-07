@@ -249,7 +249,7 @@ fn every_kind_of_change_reaches_the_other_device_by_itself() {
 #[test]
 fn a_git_working_tree_stays_clean_with_daemons_running() {
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("git is not installed: skipped");
+        skip("git is not installed");
         return;
     }
     let (_sb, _s, a, b) = pair("d-git");
@@ -628,7 +628,7 @@ fn an_overflow_of_the_event_queue_loses_nothing() {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(16384);
     if max > 100_000 {
-        eprintln!("the queue here takes {max} events: skipped");
+        skip(&format!("the queue here takes {max} events"));
         return;
     }
     let (sb, _s, a, b) = pair("d-overflow");
@@ -1706,29 +1706,11 @@ impl StrippingProxy {
 
 /// Run one `inner_` test below in a private user and mount namespace.
 #[cfg(unix)]
-fn in_namespace(test: &str) {
-    let probe = Command::new("unshare").args(["-Urm", "true"]).output();
-    if !probe.is_ok_and(|o| o.status.success()) {
-        eprintln!("no unprivileged namespaces here: skipped");
-        return;
+#[track_caller]
+fn namespaced(test: &str) {
+    if let Some(ok) = in_namespace(test, None) {
+        assert!(ok, "see the output above");
     }
-    let exe = std::env::current_exe().unwrap();
-    let out = Command::new("unshare")
-        .args(["-Urm", "sh", "-c"])
-        .arg(format!(
-            "exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
-            exe.display()
-        ))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[cfg(unix)]
@@ -1772,7 +1754,7 @@ fn device_at(server: &Server, root: &Path, name: &str) -> Device {
 #[cfg(unix)]
 #[test]
 fn a_bind_mount_going_away_is_found_by_the_reconcile_and_coming_back_resumes() {
-    in_namespace("inner_bind_mount");
+    namespaced("inner_bind_mount");
 }
 
 #[cfg(unix)]
@@ -1840,7 +1822,7 @@ fn inner_bind_mount() {
 #[cfg(unix)]
 #[test]
 fn a_filesystem_unmounted_pauses_at_once_and_a_remount_resumes_with_watches() {
-    in_namespace("inner_real_unmount");
+    namespaced("inner_real_unmount");
 }
 
 #[cfg(unix)]

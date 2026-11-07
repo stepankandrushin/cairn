@@ -937,6 +937,80 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Set to 1 by GitHub's CI (.github/workflows/ci.yml), where every test must run.
+pub const NO_SKIP: &str = "CAIRN_NO_SKIP";
+
+/// Whether `NO_SKIP` is set here, to anything but empty or 0.
+pub fn no_skip() -> bool {
+    std::env::var_os(NO_SKIP).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// This test cannot run here, for `why`: on a contributor's machine it says so and passes, and the
+/// caller returns. Where `NO_SKIP` is set it fails instead. libtest hides a passing test's output, so a
+/// skip in CI would read as a pass of a test that never ran.
+#[track_caller]
+pub fn skip(why: &str) {
+    if no_skip() {
+        panic!("{why}, and {NO_SKIP} says every test must run here");
+    }
+    eprintln!("{why}: skipped");
+}
+
+/// For a test that needs a permission refused: as root none is, so it skips, and this says true.
+#[track_caller]
+pub fn skip_as_root() -> bool {
+    let root = is_root();
+    if root {
+        skip("root is refused nothing, and this test needs a refusal");
+    }
+    root
+}
+
+/// Re-runs the `#[ignore]`d test `test` of this test binary in a private user and mount namespace, after
+/// mounting a tmpfs with `options` on `dir` when `tmpfs` is given, with `CAIRN_INNER` naming `dir`. None,
+/// after `skip`, where this user may not make the namespace: Ubuntu's AppArmor forbids it by default, which
+/// GitHub's workflow turns off. Otherwise whether the inner test passed, with its output printed when it
+/// did not.
+#[track_caller]
+pub fn in_namespace(test: &str, tmpfs: Option<(&Path, &str)>) -> Option<bool> {
+    match Command::new("unshare").args(["-Urm", "true"]).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr);
+            skip(&format!(
+                "no unprivileged namespaces here: `unshare -Urm true` exited with {}: {}",
+                o.status,
+                said.trim()
+            ));
+            return None;
+        }
+        Err(e) => {
+            skip(&format!("no unprivileged namespaces here: unshare: {e}"));
+            return None;
+        }
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut script = String::new();
+    let mut cmd = Command::new("unshare");
+    if let Some((dir, options)) = tmpfs {
+        script = format!("mount -t tmpfs -o {options} tmpfs '{}' && ", dir.display());
+        cmd.env("CAIRN_INNER", dir);
+    }
+    script += &format!(
+        "exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
+        exe.display()
+    );
+    let out = cmd.args(["-Urm", "sh", "-c", &script]).output().unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Some(out.status.success())
+}
+
 /// Self-checking file content: a half-written file cannot pass for a whole one, and each version is
 /// unique, so "this version survived" is a plain search.
 pub mod token {

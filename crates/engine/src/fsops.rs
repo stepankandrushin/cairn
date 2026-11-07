@@ -1059,7 +1059,7 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let read = std::fs::File::open(&path).unwrap();
         let Some(idle) = open_for_writing(read.as_fd()) else {
-            eprintln!("this filesystem cannot say: skipped");
+            crate::skip("this filesystem cannot say whether a file is open for writing");
             return;
         };
         assert!(!idle);

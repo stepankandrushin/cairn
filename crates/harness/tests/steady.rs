@@ -570,7 +570,7 @@ fn the_daemon_raises_its_soft_limit_on_open_files_to_the_hard_one() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_that_cannot_be_watched_is_named() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, _b) = pair("steady-unwatched");

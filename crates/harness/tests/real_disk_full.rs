@@ -1,43 +1,15 @@
 //! A real full disk, not an injected one: a size-limited tmpfs in a private user and mount namespace.
-//! Skipped where unprivileged namespaces are forbidden; the injected matrix still runs there. Not
-//! built on Windows, which has neither.
+//! Skipped where unprivileged namespaces are forbidden, except in CI (`common::skip`); the injected
+//! matrix still runs there. Not built on Windows, which has neither.
 #![cfg(unix)]
 
 mod common;
 use common::*;
 use std::process::Command;
 
-/// Re-run this test binary inside a namespace with `dir` mounted as a small tmpfs.
-fn in_namespace(test: &str, dir: &std::path::Path, megabytes: u32) -> Option<bool> {
-    in_namespace_with(test, dir, &format!("size={megabytes}m"))
-}
-
-/// The same, with the tmpfs's own options.
-fn in_namespace_with(test: &str, dir: &std::path::Path, options: &str) -> Option<bool> {
-    let exe = std::env::current_exe().unwrap();
-    let inner = format!(
-        "mount -t tmpfs -o {options} tmpfs '{}' && CAIRN_INNER='{}' exec '{}' --exact {test} --ignored --nocapture --test-threads=1",
-        dir.display(),
-        dir.display(),
-        exe.display(),
-    );
-    let probe = Command::new("unshare").args(["-Urm", "true"]).output();
-    if !probe.is_ok_and(|o| o.status.success()) {
-        eprintln!("no unprivileged namespaces here: skipped");
-        return None;
-    }
-    let out = Command::new("unshare")
-        .args(["-Urm", "sh", "-c", &inner])
-        .output()
-        .unwrap();
-    if !out.status.success() {
-        eprintln!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Some(out.status.success())
+/// Re-run this test binary's `test` inside a namespace with `dir` mounted as a small tmpfs.
+fn on_small_disk(test: &str, dir: &std::path::Path, megabytes: u32) -> Option<bool> {
+    in_namespace(test, Some((dir, &format!("size={megabytes}m"))))
 }
 
 fn inner_dir() -> std::path::PathBuf {
@@ -64,7 +36,7 @@ fn a_client_disk_filling_up_loses_nothing() {
     let sb = Sandbox::on_disk("full-client");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace("inner_client_disk", &dir, SMALL_DISK_MB) {
+    if let Some(ok) = on_small_disk("inner_client_disk", &dir, SMALL_DISK_MB) {
         assert!(ok, "see the output above");
     }
 }
@@ -145,7 +117,7 @@ fn a_server_disk_filling_up_refuses_commits_and_loses_nothing() {
     let sb = Sandbox::on_disk("full-server");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace("inner_server_disk", &dir, SMALL_DISK_MB) {
+    if let Some(ok) = on_small_disk("inner_server_disk", &dir, SMALL_DISK_MB) {
         assert!(ok, "see the output above");
     }
 }
@@ -192,7 +164,10 @@ fn a_disk_with_no_room_to_ask_what_arrived_stops_and_then_pushes_the_change() {
     let sb = Sandbox::on_disk("full-probe");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace_with("inner_no_room_to_ask", &dir, "size=64m,nr_inodes=400") {
+    if let Some(ok) = in_namespace(
+        "inner_no_room_to_ask",
+        Some((&dir, "size=64m,nr_inodes=400")),
+    ) {
         assert!(ok, "see the output above");
     }
 }
@@ -295,10 +270,9 @@ fn an_xattr_the_disk_has_no_room_for_stays_on_every_device() {
     let sb = Sandbox::on_disk("full-xattr");
     let dir = sb.path("small");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace_with(
+    if let Some(ok) = in_namespace(
         "inner_xattr_on_a_full_disk",
-        &dir,
-        "size=24m,nr_inodes=3000",
+        Some((&dir, "size=24m,nr_inodes=3000")),
     ) {
         assert!(ok, "see the output above");
     }
@@ -324,7 +298,7 @@ fn inner_xattr_on_a_full_disk() {
     b.synced();
     let xattrs = |d: &Device| Picture::of(&d.root).entries[b"x".as_slice()].xattrs.clone();
     if xattrs(&b).is_empty() {
-        eprintln!("no user xattrs on this tmpfs: skipped");
+        skip("no user xattrs on this tmpfs");
         return;
     }
     a.write("x", "v2");
@@ -379,7 +353,7 @@ fn nothing_is_written_into_a_filesystem_mounted_in_the_tree() {
     let sb = Sandbox::on_disk("mount-in-tree");
     let dir = sb.path("unused");
     std::fs::create_dir(&dir).unwrap();
-    if let Some(ok) = in_namespace_with("inner_mount_in_the_tree", &dir, "size=1m") {
+    if let Some(ok) = in_namespace("inner_mount_in_the_tree", Some((&dir, "size=1m"))) {
         assert!(ok, "see the output above");
     }
 }
@@ -431,4 +405,69 @@ fn inner_mount_in_the_tree() {
     b.synced();
     assert_eq!(b.read("m/x"), b"into the mount");
     assert_eq!(b.read("m/k"), b"k");
+}
+
+/// Where unprivileged namespaces are forbidden the tests above skip, but not in CI: there `NO_SKIP`
+/// turns the skip into a failure that names what was missing. An `unshare` that refuses, first on PATH,
+/// stands for a runner image that confines namespaces in a way the workflow's sysctl does not undo.
+#[test]
+fn a_skip_fails_where_every_test_must_run() {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert!(no_skip(), "GitHub's CI must set {NO_SKIP}=1");
+    }
+    let sb = Sandbox::on_disk("no-skip");
+    let bin = sb.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let unshare = bin.join("unshare");
+    std::fs::write(
+        &unshare,
+        "#!/bin/sh\necho 'unshare: write failed /proc/self/uid_map: Operation not permitted' >&2\nexit 1\n",
+    )
+    .unwrap();
+    chmod(&unshare, 0o755);
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let outer = |no_skip: Option<&str>| {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "a_client_disk_filling_up_loses_nothing",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("PATH", &path)
+        .env_remove(NO_SKIP);
+        if let Some(v) = no_skip {
+            cmd.env(NO_SKIP, v);
+        }
+        let out = cmd.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+
+    let (ok, text) = outer(Some("1"));
+    assert!(!ok, "{text}");
+    assert!(text.contains("1 failed"), "{text}");
+    assert!(
+        text.contains("no unprivileged namespaces here")
+            && text.contains("Operation not permitted")
+            && text.contains("CAIRN_NO_SKIP says every test must run here"),
+        "{text}"
+    );
+
+    // On a contributor's machine, it says so and passes.
+    for no_skip in [None, Some(""), Some("0")] {
+        let (ok, text) = outer(no_skip);
+        assert!(ok, "{no_skip:?}: {text}");
+        assert!(text.contains("1 passed"), "{no_skip:?}: {text}");
+        assert!(
+            text.contains("no unprivileged namespaces here")
+                && text.contains("Operation not permitted")
+                && text.contains(": skipped"),
+            "{no_skip:?}: {text}"
+        );
+    }
 }

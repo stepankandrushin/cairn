@@ -933,7 +933,7 @@ fn a_restore_holds_while_another_device_cannot_finish_its_sync() {
 /// Given up, then the removal failed because the folder could not be read: still held, not new.
 #[test]
 fn a_delete_elsewhere_stands_after_a_folder_was_briefly_unreadable_here() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("sel-unreadable");
@@ -1315,8 +1315,11 @@ fn a_regenerated_copy_on_a_reused_inode_stays_out() {
     let old = inode(&a.path("old.txt"));
     std::fs::remove_file(a.path("old.txt")).unwrap();
     std::fs::remove_file(a.path("conf.local")).unwrap();
-    // Until the number comes back, as it soon does on ext4.
+    // Until the number comes back, as it soon does on ext4. Each miss is kept until the end: removed at
+    // once, its number would be the next one's, and conf.local's number, freed too, would come back
+    // every time.
     let mut reused = false;
+    let mut made = Vec::new();
     for i in 0..2000 {
         let tmp = a.path(&format!("tmp{i}"));
         std::fs::write(&tmp, "API_KEY=secret").unwrap();
@@ -1325,10 +1328,13 @@ fn a_regenerated_copy_on_a_reused_inode_stays_out() {
             reused = true;
             break;
         }
-        std::fs::remove_file(&tmp).unwrap();
+        made.push(tmp);
+    }
+    for tmp in made {
+        std::fs::remove_file(tmp).unwrap();
     }
     if !reused {
-        eprintln!("the inode number did not come back on this filesystem: skipped");
+        skip("the inode number did not come back on this filesystem");
         return;
     }
     let run = a.synced();
@@ -1931,7 +1937,7 @@ fn an_edit_elsewhere_while_one_name_of_a_hard_link_is_hidden_is_not_rewound() {
 
 #[test]
 fn a_rule_file_that_cannot_be_read_stops_the_sync() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (sb, server, a, _b) = pair("sel-unreadable-rules");

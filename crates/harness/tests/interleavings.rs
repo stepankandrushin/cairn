@@ -111,7 +111,7 @@ fn a_delete_that_has_not_seen_an_edit_does_not_remove_it() {
 
 #[test]
 fn a_file_that_could_not_be_written_is_not_recorded_as_written() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("not-written");
@@ -156,7 +156,7 @@ fn a_local_edit_during_an_apply_that_also_links_is_not_overwritten() {
 
 #[test]
 fn what_cannot_be_read_right_after_a_push_does_not_revert_it() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("carried-revert");
@@ -185,7 +185,7 @@ fn what_cannot_be_read_right_after_a_push_does_not_revert_it() {
 
 #[test]
 fn a_remote_edit_is_not_reverted_by_a_file_being_written_here() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("carried-remote");
@@ -210,7 +210,7 @@ fn a_remote_edit_is_not_reverted_by_a_file_being_written_here() {
 
 #[test]
 fn a_moved_file_that_cannot_be_read_is_not_a_delete() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("moved-unreadable");
@@ -522,7 +522,7 @@ fn an_edit_that_has_not_seen_a_delete_survives_it() {
 
 #[test]
 fn children_of_a_pushed_directory_that_cannot_be_read_are_not_deleted() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("unlisted-pushed");
@@ -544,7 +544,7 @@ fn children_of_a_pushed_directory_that_cannot_be_read_are_not_deleted() {
 #[cfg(unix)]
 #[test]
 fn a_crash_while_updating_a_hard_link_in_a_read_only_directory_does_not_split_it() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("relink-readonly");
@@ -598,7 +598,7 @@ fn a_damaged_chunk_on_the_server_is_replaced_by_the_next_upload_of_it() {
 
 #[test]
 fn a_new_directory_that_cannot_be_read_waits_without_blocking_anything_else() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("new-unreadable");
@@ -688,7 +688,7 @@ fn a_parent_swapped_for_a_symlink_before_apply_opens_it_does_not_redirect_it() {
 /// the base moved past what the disk held, and the old file then read as an edit on top of it.
 #[test]
 fn the_base_does_not_move_past_what_could_not_be_read() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("base-past-disk");
@@ -711,7 +711,7 @@ fn the_base_does_not_move_past_what_could_not_be_read() {
 
 #[test]
 fn the_base_does_not_move_past_what_could_not_be_read_with_an_edit_too() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     let (_sb, _s, a, b) = pair("base-past-disk-edit");
@@ -959,7 +959,7 @@ fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
         std::fs::remove_file(path).unwrap();
     }
     if !reused {
-        eprintln!("this filesystem did not reuse the inode number: nothing was tested");
+        skip("this filesystem did not reuse the inode number");
         return;
     }
 

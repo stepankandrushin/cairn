@@ -414,8 +414,8 @@ fn what_cannot_be_synced_is_named_with_a_reason_and_an_action() {
 
 #[test]
 fn an_unreadable_file_is_reported_and_not_deleted() {
-    if is_root() {
-        return; // root reads everything
+    if skip_as_root() {
+        return;
     }
     let sb = Sandbox::on_disk("unreadable");
     let server = Server::start(sb.path("server"));

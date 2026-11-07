@@ -1332,6 +1332,7 @@ fn what_this_device_does_not_hold_is_no_change_after_a_kill() {
 fn what_this_filesystem_does_not_hold_is_no_change_after_a_kill() {
     let shm = std::path::Path::new("/dev/shm");
     if !shm.is_dir() {
+        skip("there is no /dev/shm here to set beside the disk");
         return;
     }
     let big = vec![b'v'; 20_000];
@@ -1414,7 +1415,7 @@ fn an_edit_caught_by_a_killed_swap_on_a_hard_link_keeps_the_names_one_file() {
 #[cfg(unix)]
 #[test]
 fn an_edit_on_two_temporaries_one_read_only_is_kept() {
-    if is_root() {
+    if skip_as_root() {
         return;
     }
     for _ in 0..20 {

@@ -323,7 +323,7 @@ fn an_edit_lost_in_an_overflow_is_found_by_the_next_sync() {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(16384);
     if max > 100_000 {
-        eprintln!("the queue here takes {max} events: skipped");
+        skip(&format!("the queue here takes {max} events"));
         return;
     }
     let (sb, _s, a, b) = pair("scope-overflow");

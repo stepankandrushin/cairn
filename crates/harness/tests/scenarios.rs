@@ -1145,7 +1145,7 @@ fn plain_http_beyond_loopback_is_refused() {
 #[test]
 fn a_git_working_tree_comes_out_clean_on_the_other_side() {
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("git is not installed: skipped");
+        skip("git is not installed");
         return;
     }
     let (_sb, _s, a, b) = pair("git");
@@ -1214,7 +1214,7 @@ fn a_git_working_tree_comes_out_clean_on_the_other_side() {
 #[test]
 fn commits_made_at_once_on_two_machines_become_two_branches() {
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("git is not installed: skipped");
+        skip("git is not installed");
         return;
     }
     let (_sb, _s, a, b) = pair("git-race");

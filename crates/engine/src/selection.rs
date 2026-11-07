@@ -960,7 +960,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cairn-rules-{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         if git(&dir, &["init", "-q"], "").is_none() {
-            eprintln!("no git here: skipped");
+            crate::skip("git is not installed");
             return;
         }
         let rule_sets: &[&str] = &[

@@ -5,11 +5,13 @@ versioned history, and clients that sync a real filesystem without losing anythi
 modes, owners, xattrs, hard links, sparse files, filename bytes). Files only: no groupware, no app
 platform.
 
-**Status: 0.1.1 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
-CLI and, since then, a daemon; the same on macOS and Windows, ahead of milestone 7 and not in CI. The architecture, the decisions and their reasons,
+**Status: 0.1.6 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
+CLI and a daemon; the same on macOS and Windows with a tray, ahead of milestone 7 and not in CI; each
+installed copy updates itself from signed releases. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md: read it before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3's code and failure tests are in; what
-it still needs is its exit criterion, weeks on real trees, on trees and machines the owner chooses.
+it still needs is its exit criterion, weeks on real trees with no silent loss, a run begun in November 2026
+on the owner's own trees and machines.
 
 ## Rules
 
@@ -24,6 +26,11 @@ it still needs is its exit criterion, weeks on real trees, on trees and machines
   Windows, the tray on them, and updates are the exceptions, at the owner's asking, for milestone 3's run.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
+- **The status lines say what is true now**: README.md's status, this file's, and, in the maintainer's
+  checkout, the top of agents/deployment/README.md (the root, its devices and trees, what runs where, the
+  checker). A commit that makes one false (a release, a platform, CI, a root or device added or retired, a
+  service renamed or stopped) rewrites it in that same commit; before ending any task, read them against
+  what the task changed. Rewrite what went stale rather than adding a newer line beside it.
 
 ## Docs
 

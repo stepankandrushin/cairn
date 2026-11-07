@@ -11,7 +11,7 @@
     <key>CFBundleShortVersionString</key><string>VERSION</string>
     <key>CFBundleVersion</key><string>VERSION</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
-    <key>LSUIElement</key><true/>
+    <key>LSBackgroundOnly</key><true/>
     <key>NSLocalNetworkUsageDescription</key><string>Cairn Sync reaches your Cairn server to sync your files.</string>
 </dict>
 </plist>

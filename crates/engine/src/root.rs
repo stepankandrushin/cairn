@@ -8,6 +8,7 @@ use crate::fsops::{self, name_path, Dir};
 use crate::metadata::ApplyPolicy;
 use crate::state::{State, KEY_ROOT_ID};
 use anyhow::{bail, Context, Result};
+use cairn_failpoint::hit;
 use cairn_protocol::{DeviceId, FilenamePolicy, STATE_DIR};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -180,6 +181,16 @@ pub fn open_config(path: &Path) -> Result<Config> {
 
 impl Root {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    /// As `open`, for a sync, which reads most of the state: the state's file is read through first,
+    /// in the file's order, as `state::warm` says.
+    pub fn open_to_sync(path: &Path) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, warm: bool) -> Result<Self> {
         let dir =
             Dir::open_root(path).with_context(|| format!("open sync root {}", path.display()))?;
         let state_path = path.join(name_path(STATE_DIR));
@@ -190,6 +201,10 @@ impl Root {
         let lock = File::create(state_path.join("lock"))?;
         if !matches!(fsops::try_lock(&lock), Ok(true)) {
             return Err(Busy(path.display().to_string()).into());
+        }
+        if warm {
+            crate::state::warm(&state_path.join("state.sqlite"));
+            hit("root.warmed");
         }
         let state = State::open(&state_path.join("state.sqlite"))?;
         if state.get(KEY_ROOT_ID)?.as_deref() != Some(marker.trim()) {

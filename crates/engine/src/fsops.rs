@@ -893,12 +893,25 @@ impl Dir {
     }
 
     pub fn set_xattr(&self, name: &[u8], key: &[u8], value: &[u8]) -> io::Result<()> {
-        Ok(fs::lsetxattr(
+        fs::lsetxattr(
             self.proc_entry(name)?,
             os(key),
             value,
             fs::XattrFlags::empty(),
-        )?)
+        )?;
+        // For the harness: as macOS does on writing a resource fork, the file's other stream.
+        if cairn_failpoint::unsupported("fs.xattr.keeps_mtime") {
+            let now = Timespec {
+                tv_sec: 0,
+                tv_nsec: fs::UTIME_NOW,
+            };
+            let times = Timestamps {
+                last_access: now,
+                last_modification: now,
+            };
+            fs::utimensat(&self.0, os(name), &times, AtFlags::SYMLINK_NOFOLLOW)?;
+        }
+        Ok(())
     }
 
     pub fn remove_xattr(&self, name: &[u8], key: &[u8]) -> io::Result<()> {

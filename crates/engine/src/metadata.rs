@@ -458,6 +458,8 @@ pub fn apply_unless_full(
 
     let empty = BTreeMap::new();
     let current_records = current.map_or(&empty, |c| &c.records);
+    // Whether a record was written or removed, which may have moved the mtime.
+    let mut records_written = false;
     for (key, value) in &want.records {
         if key.ns != NS_XATTR || !policy.allows_xattr(&key.name.0) {
             continue;
@@ -467,6 +469,7 @@ pub fn apply_unless_full(
         if same && !(owner_applied && is_capability) {
             continue;
         }
+        records_written = true;
         if let Err(e) = dir.set_xattr(name, &key.name.0, &value.0) {
             note(
                 &format!("xattr {}", cairn_protocol::name::display_bytes(&key.name.0)),
@@ -477,6 +480,7 @@ pub fn apply_unless_full(
     for key in current_records.keys() {
         if key.ns == NS_XATTR && policy.allows_xattr(&key.name.0) && !want.records.contains_key(key)
         {
+            records_written = true;
             match dir.remove_xattr(name, &key.name.0) {
                 Ok(()) => {}
                 // Stored but never applied here: already absent, which is what was asked for.
@@ -504,8 +508,10 @@ pub fn apply_unless_full(
         }
     }
 
-    // Times last: everything above moves ctime, and a write to a directory moves its mtime.
-    if current.is_none_or(|c| c.mtime != want.mtime) {
+    // Times last: everything above moves ctime, and a write to a directory moves its mtime. So may a
+    // record: on macOS a resource fork is the file's other stream, and writing it moves the mtime to
+    // the present. After one the time is set even where it was right before, or the moved one stays.
+    if records_written || current.is_none_or(|c| c.mtime != want.mtime) {
         if let Err(e) = dir.set_mtime(name, want.mtime) {
             note("mtime", e);
         }

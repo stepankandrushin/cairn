@@ -145,7 +145,8 @@ and once the sync's own change is made any change of metadata, mean a read, and 
 when asked for a moment, which shows a writer that had it open all along, mapped perhaps, whose writes no watch
 sees. Anywhere, one the apply left as the scan found it keeps its record's word, and one that moved besides
 what the sync set is no step done: an edit in that moment is the next round's, its mtime not taken for the pair
-of the server's. A watch holds nobody back: a program that saves a file the moment it arrives waits for
+of the server's. The mtime is set last, and set again after any record written, as writing a resource fork,
+the file's other stream on macOS, moves it. A watch holds nobody back: a program that saves a file the moment it arrives waits for
 nothing, whatever the sync is doing, and its save is read by the next scan. A lease would make that save wait
 until the sync gave it up, which a sync blocked in an fsync or stopped cannot.
 

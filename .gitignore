@@ -6,3 +6,6 @@ next-prompts/
 
 # The agent harness's own state
 .pi/
+
+# Downloads kept beside their notes in sources/ (binaries; the .md gives the URL and sha256)
+sources/**/*.zip

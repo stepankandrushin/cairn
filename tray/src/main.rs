@@ -34,8 +34,8 @@ macro_rules! say {
 const USAGE: &str =
     "usage: cairn-tray [--open TAB | --probe [--conflicts] | --login on|off | --version]
   (none)       the tray icon, its menu and window
-  --open TAB   the same, with its window open at status, recent, problems, conflicts or
-               settings
+  --open TAB   the same, with its window open at status, recent, problems, conflicts,
+               deleted or settings
   --probe      print, with no window, what the tray would show for each root; exit 2 if the
                registry of roots cannot be read. With --conflicts, the open conflicts too, which
                has the server replay its journal
@@ -68,7 +68,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         [] => tray(None),
-        ["--open", tab @ ("status" | "recent" | "problems" | "conflicts" | "settings")] => {
+        ["--open", tab @ ("status" | "recent" | "problems" | "conflicts" | "deleted" | "settings")] => {
             tray(Some(tab))
         }
         _ => {

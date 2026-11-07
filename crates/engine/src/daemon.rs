@@ -27,7 +27,7 @@ use crate::sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 use crate::watch::{WatchCounts, Watcher};
 use anyhow::{bail, Result};
 use cairn_failpoint::hit;
-use cairn_protocol::local::{OpenConflict, Reply, Request, MAX_RECENT};
+use cairn_protocol::local::{OpenConflict, Reply, Request, DEFAULT_DELETED_DAYS, MAX_RECENT};
 use cairn_protocol::SkipKind;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -442,14 +442,69 @@ fn handler(
     pause: &Arc<Pause>,
     wake: &Sender<Wake>,
     updater: &Arc<crate::update::Worker>,
+    hub: &Arc<Hub>,
 ) -> Arc<Handler> {
-    let (root, pause, wake, updater) = (
+    let (root, pause, wake, updater, hub) = (
         root.to_path_buf(),
         pause.clone(),
         wake.clone(),
         updater.clone(),
+        Arc::downgrade(hub),
     );
+    let deleted = crate::deleted::Cache::new();
     Arc::new(move |request: Request| match request {
+        Request::Deleted { days } => {
+            let since = crate::deleted::days_ago(days.unwrap_or(DEFAULT_DELETED_DAYS));
+            let listed = read_config(&root).and_then(|config| {
+                deleted.with(&config, |index, _| Ok((index.head, index.list(since))))
+            });
+            match listed {
+                Ok((head, list)) => Reply::Deleted {
+                    head,
+                    items: list.iter().map(|d| d.item()).collect(),
+                },
+                Err(e) => Reply::Error {
+                    text: format!("cannot list what was deleted: {e:#}"),
+                },
+            }
+        }
+        Request::Undelete { ids } => {
+            let done = crate::deleted::parse_ids(&ids).and_then(|ids| {
+                let config = read_config(&root)?;
+                deleted.with(&config, |index, config| {
+                    crate::deleted::undelete(config, index, &ids)
+                })
+            });
+            match done {
+                Ok(outcome) => {
+                    if !outcome.seqs.is_empty() {
+                        // Paused, it waits like any change on the server.
+                        if pause.get().is_none() {
+                            let _ = wake.send(Wake::Local(Instant::now()));
+                        }
+                        if let Some(hub) = hub.upgrade() {
+                            hub.note(format!(
+                                "brought back {} deleted item(s) as sequence(s) {:?}, as asked",
+                                outcome.items.len(),
+                                outcome.seqs
+                            ));
+                        }
+                    }
+                    Reply::Undeleted {
+                        seqs: outcome.seqs,
+                        items: outcome.items.iter().map(|u| u.item()).collect(),
+                        already: outcome
+                            .already
+                            .iter()
+                            .map(|(_, p)| display_path(p))
+                            .collect(),
+                    }
+                }
+                Err(e) => Reply::Error {
+                    text: format!("nothing was brought back: {e:#}"),
+                },
+            }
+        }
         Request::UpdateNow => {
             updater.nudge();
             Reply::Done
@@ -1020,7 +1075,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                                 crate::control::serve(
                                     listener,
                                     hub.clone(),
-                                    handler(path, &pause, &wake_tx, &updater),
+                                    handler(path, &pause, &wake_tx, &updater, &hub),
                                 );
                             }
                             Err(e) => log(&format!(

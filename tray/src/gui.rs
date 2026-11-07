@@ -7,8 +7,9 @@ use crate::icon;
 use crate::link;
 use crate::model::{self, Light, Problem};
 use crate::settings::{self, Clock};
-use cairn_protocol::local::{Activity, Request};
+use cairn_protocol::local::{self as local_api, Activity, DeletedItem, Reply, Request};
 use cairn_protocol::update::Policy;
+use cairn_protocol::ObjectKind;
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -33,6 +34,8 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             act,
             refresh_conflicts,
             conflict,
+            deleted,
+            undelete,
             forget,
             open_folder,
             open_server,
@@ -284,6 +287,13 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "deleted",
+        "Recently deleted…",
+        true,
+        None::<&str>,
+    )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     if let Some(v) = &m.update {
         menu.append(&MenuItem::with_id(
@@ -325,7 +335,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
     let (what, root) = (what.to_string(), root.to_string());
     match what.as_str() {
         "quit" => app.exit(0),
-        "recent" | "problems" | "conflicts" | "settings" => show_window(app, &what),
+        "recent" | "problems" | "conflicts" | "deleted" | "settings" => show_window(app, &what),
         "login" => {
             let on = !actions::login::enabled();
             if let Err(e) = actions::login::set(on) {
@@ -643,6 +653,106 @@ async fn conflict(root_id: String, seq: u64, what: String) -> Result<String, Str
         let action = ConflictAction::parse(&what).ok_or(format!("no such action: {what}"))?;
         actions::conflict(hub(), &root_id, seq, action)
     })
+    .await
+}
+
+/// What the daemon lists as deleted, and when it said so.
+#[derive(Serialize)]
+struct UiDeletedList {
+    at: i64,
+    at_when: String,
+    head: u64,
+    items: Vec<UiDeleted>,
+}
+
+#[derive(Serialize)]
+struct UiDeleted {
+    #[serde(flatten)]
+    item: DeletedItem,
+    when: String,
+    /// "4.2 MiB", or for a folder "12 files, 4.2 MiB".
+    size: String,
+}
+
+/// A daemon reads the server's history to answer, all of it the first time: as long as that takes.
+const DELETED_WAIT: Duration = Duration::from_secs(600);
+
+#[tauri::command]
+async fn deleted(root_id: String, days: u32) -> Result<UiDeletedList, String> {
+    blocking(move || {
+        match link::ask(
+            &root_id,
+            Request::Deleted { days: Some(days) },
+            DELETED_WAIT,
+        ) {
+            Ok(Reply::Deleted { head, items }) => {
+                let at = model::now_secs();
+                Ok(UiDeletedList {
+                    at,
+                    at_when: model::when(at),
+                    head,
+                    items: items
+                        .into_iter()
+                        .map(|item| UiDeleted {
+                            when: model::when(item.time),
+                            size: match item.kind {
+                                ObjectKind::Dir => format!(
+                                    "{} file{}, {}",
+                                    item.files,
+                                    if item.files == 1 { "" } else { "s" },
+                                    local_api::bytes(item.bytes)
+                                ),
+                                ObjectKind::Symlink => "a symlink".into(),
+                                ObjectKind::File => local_api::bytes(item.bytes),
+                            },
+                            item,
+                        })
+                        .collect(),
+                })
+            }
+            Ok(Reply::Error { text }) => Err(text),
+            Ok(other) => Err(format!("the daemon answered {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
+/// Brings these back through the daemon, which then syncs; says what came back and where.
+#[tauri::command]
+async fn undelete(root_id: String, ids: Vec<String>) -> Result<String, String> {
+    blocking(
+        move || match link::ask(&root_id, Request::Undelete { ids }, DELETED_WAIT) {
+            Ok(Reply::Undeleted { items, already, .. }) => {
+                let mut lines = Vec::new();
+                if items.len() > 3 {
+                    lines.push(format!("Brought back {} items.", items.len()));
+                }
+                for u in &items {
+                    if u.renamed {
+                        lines.push(format!(
+                            "{} is back as {}, as its name is taken now.",
+                            u.was, u.path
+                        ));
+                    } else if items.len() <= 3 {
+                        lines.push(format!("{} is back.", u.path));
+                    }
+                }
+                if !already.is_empty() {
+                    lines.push(format!("Not deleted any more: {}.", already.join(", ")));
+                }
+                match items.len() {
+                    0 => {}
+                    1 => lines.push("Each device gets it with its next sync.".into()),
+                    _ => lines.push("Each device gets them with its next sync.".into()),
+                }
+                Ok(lines.join(" "))
+            }
+            Ok(Reply::Error { text }) => Err(text),
+            Ok(other) => Err(format!("the daemon answered {other:?}")),
+            Err(e) => Err(e.to_string()),
+        },
+    )
     .await
 }
 

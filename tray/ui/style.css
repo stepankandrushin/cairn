@@ -55,3 +55,14 @@ td.p { word-break: break-all; }
 .choices { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .choice { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .choice .meta { margin-left: 2px; }
+#deleted-bar { display: flex; gap: 8px; align-items: center; padding: 10px 16px 0; }
+#deleted-bar[hidden] { display: none; }
+#deleted-search { flex: 1; min-width: 120px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+                  background: var(--card); color: var(--text); font: inherit; }
+#deleted-days { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--button);
+                color: var(--text); font: inherit; }
+td.pick { width: 1%; padding-top: 5px; }
+td.what { word-break: break-all; }
+td.what .meta { word-break: normal; }
+td.go { width: 1%; white-space: nowrap; text-align: right; }
+.note { color: var(--muted); font-size: 12px; margin-top: 10px; }

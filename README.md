@@ -108,6 +108,8 @@ cairn history hello.txt
 cairn restore hello.txt --at 1
 cairn export --at 1 /tmp/as-it-was               # into a new folder; changes nothing else
 cairn conflicts                                  # the copies kept, until each is deleted, renamed or moved
+cairn deleted                                    # what was deleted in the last 30 days, each with its ID
+cairn undelete <ID>                              # bring it back as it was, beside anything now at its name
 ```
 
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with

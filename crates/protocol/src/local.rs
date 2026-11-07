@@ -365,7 +365,21 @@ pub enum Request {
     /// status's `update` says how it went. Every program updated restarts into the new version, this
     /// daemon too, between syncs.
     UpdateNow,
+    /// What was deleted in the last `days` days, [`DEFAULT_DELETED_DAYS`] if not said, and is still
+    /// deleted: [`Reply::Deleted`]. The daemon reads the server's journal for it, all of it the first
+    /// time and then what is new, so a first answer can take a while.
+    Deleted {
+        #[serde(default)]
+        days: Option<u32>,
+    },
+    /// Bring back what [`Reply::Deleted`] listed, by its `id`, as new commits: [`Reply::Undeleted`],
+    /// and then a sync, which brings it here.
+    Undelete {
+        ids: Vec<String>,
+    },
 }
+
+pub const DEFAULT_DELETED_DAYS: u32 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
@@ -375,6 +389,19 @@ pub enum Reply {
     Done,
     Conflicts {
         open: Vec<OpenConflict>,
+    },
+    /// Newest first: a folder once, with what was deleted with it.
+    Deleted {
+        /// The journal's sequence the list is as of.
+        head: u64,
+        items: Vec<DeletedItem>,
+    },
+    Undeleted {
+        /// The commits made, in order: one unless it was too large for one.
+        seqs: Vec<u64>,
+        items: Vec<UndeletedItem>,
+        /// Asked for but not deleted now, each where it is, relative to the root.
+        already: Vec<String>,
     },
     Error {
         text: String,
@@ -393,6 +420,41 @@ pub struct OpenConflict {
     /// Both relative to the root, as `cairn conflicts` prints them, for when a path above is `None`.
     pub copy_display: String,
     pub original_display: Option<String>,
+}
+
+/// Something deleted and still deleted, from the server's history: a file, or a folder with what was
+/// deleted with it. `cairn deleted --json` prints the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedItem {
+    /// What [`Request::Undelete`] and `cairn undelete` take: the object's ID.
+    pub id: String,
+    /// The commit that deleted it, and when, by which device.
+    pub seq: u64,
+    pub time: Secs,
+    pub device_name: String,
+    /// Relative to the root: in its folder as that is now, or as it was if that is deleted too.
+    pub path: String,
+    pub kind: crate::ObjectKind,
+    /// A file's size; for a folder, the bytes of the files deleted with it.
+    pub bytes: u64,
+    /// For a folder, how many files were deleted with it.
+    pub files: u64,
+    /// The folder it was in is deleted too, and comes back with it, empty of anything else.
+    pub folder_gone: bool,
+}
+
+/// One thing brought back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndeletedItem {
+    pub id: String,
+    /// Where it is now, relative to the root.
+    pub path: String,
+    /// Where it was when deleted, which is where it is unless `renamed`.
+    pub was: String,
+    /// Its name had been taken since, so it is back beside what has it now, under a restored name.
+    pub renamed: bool,
+    /// What came back with it, itself and any folder above it included.
+    pub objects: u64,
 }
 
 /// Where a daemon listens, for the root with this ID.

@@ -2755,3 +2755,70 @@ fn the_daemon_moves_a_state_of_an_older_layout_and_goes_on_syncing() {
     wait_file(&d, b.path("after"), b"a change after it");
     assert_eq!(d.log().matches("moved the state").count(), 1, "{}", d.log());
 }
+
+/// The tray's "Recently deleted": the daemon lists what another device deleted, the same after a
+/// restart, and brings it back when asked, then syncs it here and everywhere.
+#[test]
+fn a_daemon_lists_what_was_deleted_across_a_restart_and_brings_it_back() {
+    let (_sb, _s, a, b) = pair("daemon-deleted");
+    a.write("keep", "k");
+    a.write("d/f", "deleted elsewhere");
+    a.synced();
+    let mut db = Daemon::events_only(&b);
+    wait_file(&db, b.path("d/f"), b"deleted elsewhere");
+    std::fs::remove_dir_all(a.path("d")).unwrap();
+    a.synced();
+    wait_gone(&db, b.path("d"));
+
+    let ask = |request: &str| -> serde_json::Value {
+        let run = b.cairn(&["ask", request]).expect_ok();
+        serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| panic!("{e}: {}", run.text()))
+    };
+    let first = ask("deleted");
+    assert_eq!(first["reply"], "deleted", "{first}");
+    let items = first["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{first}");
+    assert_eq!(items[0]["path"], "d");
+    assert_eq!(items[0]["device_name"], "a");
+    assert_eq!(items[0]["files"], 1);
+
+    db.kill();
+    let db = Daemon::events_only(&b);
+    // The file the killed daemon left says synced too: the new one's answer is what tells.
+    let pid = db.child.id();
+    wait_for("the new daemon to answer", &db.log, || {
+        let run = b.cairn(&["ask", "status"]);
+        run.ok()
+            && serde_json::from_str::<serde_json::Value>(run.stdout.trim())
+                .is_ok_and(|v| v["pid"] == pid && v["state"] == "synced")
+    });
+    let again = ask(r#"{"op":"deleted","days":7}"#);
+    assert_eq!(again["items"], first["items"], "the same after a restart");
+
+    let id = items[0]["id"].as_str().unwrap();
+    let done = ask(&format!(r#"{{"op":"undelete","ids":["{id}"]}}"#));
+    assert_eq!(done["reply"], "undeleted", "{done}");
+    assert_eq!(done["items"][0]["path"], "d");
+    assert_eq!(done["items"][0]["renamed"], false);
+    assert_eq!(done["seqs"].as_array().unwrap().len(), 1);
+    wait_file(&db, b.path("d/f"), b"deleted elsewhere");
+    assert!(
+        wait_log(&db, "brought back 1 deleted item(s)"),
+        "{}",
+        db.log()
+    );
+    assert_eq!(ask("deleted")["items"], serde_json::json!([]));
+    a.synced();
+    assert_eq!(a.read("d/f"), b"deleted elsewhere");
+}
+
+fn wait_log(d: &Daemon, text: &str) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < SOON {
+        if d.log().contains(text) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    false
+}

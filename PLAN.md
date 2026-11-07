@@ -359,6 +359,17 @@ copies turn up inside `.git`, and `git status` on the other machine is clean.
 Restore a file revision; a directory as of a sequence number; deleted files; into a separate folder
 for inspection; undo a batch from one device; review permission and rename history.
 
+Deleted files are where a person looks for what is gone, whatever took it: another device, a script, or an
+antivirus that removed a file on one device, which to every sync tool is a delete like any other and reaches
+every device. So the tray's "Recently deleted", `cairn deleted` and `cairn undelete` list what is still
+deleted and bring it back, with no code for any antivirus. A folder is listed once, with what one device
+deleted in it within 10 minutes before. Bringing it back links each object to the entry it last had, as
+itself with what it last held: nothing is reverted, nothing replaced, and a name taken since gets a restored
+copy's name beside what has it. One commit, so a kill leaves nothing or all of it. Until the server keeps
+a trash of its own (milestone 4), the client reads it from the journal, into an index of every object's
+kind, size and entries without their bodies, a fraction of a replayed tree's memory; a daemon keeps it
+ten minutes after the last request, taking only what is new to answer the next.
+
 Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
 Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.
 Before it lands, the server must look a commit's operation ID up before it checks the commit's chunks, which
@@ -401,7 +412,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 1 | Chunk store, manifests, journal; a one-shot CLI that syncs one Linux folder with full metadata and three-way merge, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
 | 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
-| 4 | History and trash API, retention, GC | GC under load never removes a reachable chunk |
+| 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal until this API holds it | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3's devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. Installers wait here |

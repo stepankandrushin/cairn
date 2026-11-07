@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Added:**
+
+- Recently deleted, in the tray and as `cairn deleted` and `cairn undelete`: what is deleted and still deleted, from
+  the server's history, newest first, with when, by which device, its size, and for a folder how many files went
+  with it, listed once. Restore brings it back on every device as it was when deleted, a folder with what was
+  deleted in it, replacing nothing: where its name has been taken since, it comes back beside it under a restored
+  copy's name. It is one commit, so a kill leaves nothing or all of it. The tray's tab has a search, a choice of
+  7, 30 or 90 days, ticks and Restore selected, and draws 200 at a time. It is where a file an antivirus removed
+  is found too, as that is a delete to every device, and it needs nothing of any antivirus. On a tree of 2.66
+  million journal operations, the list takes 8 s and 234 MB, where `cairn history` takes 20 s and 1.7 GB; a
+  daemon keeps its index for 10 minutes, so what follows takes only what is new.
+
 **Fixed:**
 
 - A sync on a hard disk sat for up to a quarter of an hour in "loading what this device knows", and as long again

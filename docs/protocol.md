@@ -149,6 +149,20 @@ over.
 | `pause`, `resume` | `done` once kept in `.cairn/paused`, so a pause outlives a kill; while paused no sync starts, the state is `paused` and `paused_since` is set, and on resume a full sync runs at once |
 | `conflicts` | `conflicts { open }`, each with its copy and the version it competes with as paths on this device when they are here. It replays the journal, so it is asked when a person looks, not polled |
 | `update_now` | `done` at once: the daemon's updater asks the feed and installs what it offers whatever the policy (Updates, below), and the status's `update` says how it went |
+| `deleted { days }` | `deleted { head, items }`: what was deleted in the last `days` (30 if not given) and is still deleted, newest first, each `{ id, seq, time, device_name, path, kind, bytes, files, folder_gone }`. A folder is listed once, with `files` and `bytes` of what went with it, and what it held is not listed apart. The daemon replays the journal into an index of every object's kind, size and entries, with no bodies, keeps it for 10 minutes after the last request and takes only what is new to answer the next |
+| `undelete { ids }` | `undeleted { seqs, items, already }`, then a sync: each item `{ id, path, was, renamed, objects }`. `already` names what was asked for but is not deleted now. `error` if nothing came back |
+
+**Deleted, and brought back.** A delete is the unlink that leaves an object with no entry. The server keeps its
+last state, and `link` brings it back as itself, so `undelete` sends only `link`s: each object goes back
+to the entry it last had, with what it last held, and nothing is reverted or replaced. A folder brings back
+what one device deleted in it within 10 minutes before deleting it, as one sync's commits do however many
+they take. A deleted folder above it comes back holding only what was asked for. A name taken since gets
+the name a restore gives, `name (conflict restored seq N).ext`, beside what has it now. One commit holds
+it all, so a kill leaves nothing or all of it; a restore over 100,000 operations or 48 MiB goes in several,
+each leaving a valid tree with every folder before what is in it. A commit refused because something
+changed is planned again from the journal once, and then reported. `cairn deleted` and `cairn undelete`
+do the same without a daemon, and `cairn ask` sends any request as JSON:
+`cairn ask '{"op":"undelete","ids":["..."]}'`.
 
 A malformed request gets an `error { text }`. The status adds only fields with defaults, so a reader of
 an older file keeps working: `recent` lists the last 100 changes the daemon sent (`up`) or applied

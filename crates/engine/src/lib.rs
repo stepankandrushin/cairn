@@ -5,6 +5,7 @@ pub mod chunker;
 pub mod client;
 pub mod control;
 pub mod daemon;
+pub mod deleted;
 pub mod export;
 #[cfg_attr(windows, path = "fsops_windows.rs")]
 pub mod fsops;

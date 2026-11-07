@@ -14,10 +14,21 @@
     <button data-tab="recent">Recent activity</button>
     <button data-tab="problems">Problems</button>
     <button data-tab="conflicts">Conflicts</button>
+    <button data-tab="deleted">Recently deleted</button>
     <button data-tab="settings">Settings</button>
   </nav>
 </header>
 <div id="notice" hidden><span id="notice-text"></span><button id="notice-close" title="Close">×</button></div>
+<!-- Outside what is drawn anew, so that typing in the search keeps its place. -->
+<div id="deleted-bar" hidden>
+  <input id="deleted-search" type="search" placeholder="Search by name or folder" autocomplete="off" spellcheck="false">
+  <select id="deleted-days">
+    <option value="7">Last 7 days</option>
+    <option value="30" selected>Last 30 days</option>
+    <option value="90">Last 90 days</option>
+  </select>
+  <button id="deleted-refresh" class="act">Refresh</button>
+</div>
 <main id="content"></main>
 <script src="app.js"></script>
 </body>

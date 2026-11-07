@@ -13,6 +13,17 @@ const confirming = new Set();
 // Conflicts and roots with an action under way, so their buttons wait.
 const busy = new Set();
 let conflictsAskedAt = 0;
+// Recently deleted, per root: its daemon's last answer. Asked for only when the tab opens, the period
+// changes, Refresh is pressed or something was brought back, as each first answer has the daemon read
+// the server's whole history. Kept apart from the snapshot, which comes every second.
+const deleted = {};
+let deletedDays = 30;
+let deletedQuery = '';
+let deletedShown = 200;
+let deletedVersion = 0;
+let deletedToken = 0;
+// "rootId/id" of what is ticked.
+const picked = new Set();
 
 function el(tag, attrs, ...children) {
   const e = document.createElement(tag);
@@ -42,8 +53,45 @@ for (const b of document.querySelectorAll('#tabs button')) {
 function setTab(t) {
   tab = t;
   if (t === 'conflicts') askConflicts();
+  if (t === 'deleted') askDeleted(false);
   draw(true);
 }
+
+function askDeleted(force, only) {
+  if (!state) return;
+  for (const r of state.roots.filter((r) => r.up && (!only || r.root_id === only))) {
+    const cur = deleted[r.root_id];
+    // A recent answer for the same period does, unless asked again.
+    if (!force && cur && (cur.loading || (cur.days === deletedDays && Date.now() - cur.asked < 60000))) continue;
+    const token = ++deletedToken;
+    const days = deletedDays;
+    deleted[r.root_id] = { ...(cur || {}), loading: true, days, token, asked: Date.now() };
+    deletedVersion++;
+    invoke('deleted', { rootId: r.root_id, days })
+      .then((list) => {
+        if (deleted[r.root_id].token === token) deleted[r.root_id] = { loading: false, days, token, asked: Date.now(), list };
+      })
+      .catch((e) => {
+        if (deleted[r.root_id].token === token) {
+          deleted[r.root_id] = { ...deleted[r.root_id], loading: false, error: String(e) };
+        }
+      })
+      .finally(() => { deletedVersion++; draw(true); });
+  }
+}
+
+document.getElementById('deleted-search').addEventListener('input', (e) => {
+  deletedQuery = e.target.value.trim().toLowerCase();
+  deletedShown = 200;
+  draw(true);
+});
+document.getElementById('deleted-days').addEventListener('change', (e) => {
+  deletedDays = Number(e.target.value);
+  picked.clear();
+  askDeleted(true);
+  draw(true);
+});
+document.getElementById('deleted-refresh').addEventListener('click', () => { askDeleted(true); draw(true); });
 
 // Each answer has the server replay its journal, so only when a person opens the tab or acts, and not
 // twice within a few seconds of clicking.
@@ -96,14 +144,22 @@ function counts() {
 }
 
 const TABS = {
-  status: 'Status', recent: 'Recent activity', problems: 'Problems', conflicts: 'Conflicts', settings: 'Settings',
+  status: 'Status', recent: 'Recent activity', problems: 'Problems', conflicts: 'Conflicts',
+  deleted: 'Recently deleted', settings: 'Settings',
 };
 
 function draw(force) {
   if (!state) return;
-  const key = JSON.stringify([tab, { ...state, now: 0 }, [...confirming], [...busy]]);
+  // The deleted list can be long: drawn again only when it, the roots or a choice changes, not with
+  // every snapshot.
+  const key = tab === 'deleted'
+    ? JSON.stringify([tab, state.light, state.roots.map((r) => [r.root_id, r.name, r.path, r.light, r.up,
+      r.problems.length, r.conflicts && r.conflicts.open.length]), deletedVersion, deletedQuery, deletedShown,
+    [...picked], [...busy]])
+    : JSON.stringify([tab, { ...state, now: 0 }, [...confirming], [...busy]]);
   if (!force && key === drawn) return;
   drawn = key;
+  document.getElementById('deleted-bar').hidden = tab !== 'deleted';
   const { problems, conflicts } = counts();
   document.getElementById('overall-dot').className = 'dot ' + state.light;
   document.getElementById('overall-text').textContent =
@@ -116,7 +172,8 @@ function draw(force) {
   }
   const main = document.getElementById('content');
   const body = {
-    status: drawStatus, recent: drawRecent, problems: drawProblems, conflicts: drawConflicts, settings: drawSettings,
+    status: drawStatus, recent: drawRecent, problems: drawProblems, conflicts: drawConflicts,
+    deleted: drawDeleted, settings: drawSettings,
   }[tab]();
   main.replaceChildren(...body);
 }
@@ -260,6 +317,91 @@ function drawConflicts() {
     return el('div', { class: 'card' }, title(r),
       r.conflicts && !r.conflicts.error ? el('div', { class: 'meta' }, 'listed at ' + r.conflicts.at_when) : null,
       body);
+  });
+}
+
+function matches(item) {
+  if (!deletedQuery) return true;
+  return item.path.toLowerCase().includes(deletedQuery) || item.device_name.toLowerCase().includes(deletedQuery);
+}
+
+// Brings these back through the daemon, which says where they came back; then the list is asked anew.
+async function undelete(r, ids) {
+  const k = `${r.root_id}/undelete`;
+  busy.add(k);
+  draw(true);
+  await call('undelete', { rootId: r.root_id, ids });
+  busy.delete(k);
+  for (const id of ids) picked.delete(`${r.root_id}/${id}`);
+  askDeleted(true, r.root_id);
+  draw(true);
+}
+
+function drawDeleted() {
+  if (state.roots.length === 0) return noRoots();
+  return state.roots.map((r) => {
+    const d = deleted[r.root_id];
+    const waiting = busy.has(`${r.root_id}/undelete`);
+    let body;
+    let head = null;
+    if (!r.up) body = el('div', { class: 'empty' }, 'Its daemon is not running, so what was deleted cannot be listed.');
+    else if (!d || (d.loading && !d.list)) {
+      body = el('div', { class: 'empty' },
+        'Asking its daemon, which reads the server\'s history for it: the first time can take a minute.');
+    } else if (!d.list) body = el('div', { class: 'empty' }, 'Cannot list it: ' + d.error);
+    else {
+      const all = d.list.items.filter(matches);
+      const shown = all.slice(0, deletedShown);
+      const mine = d.list.items.filter((i) => picked.has(`${r.root_id}/${i.id}`)).map((i) => i.id);
+      head = el('div', { class: 'meta' },
+        `${d.list.items.length} deleted in the last ${d.days} days`
+        + (deletedQuery ? `, ${all.length} matching` : '')
+        + ` · listed at ${d.list.at_when}` + (d.loading ? ' · asking again…' : '')
+        + (d.error ? ' · could not list it again: ' + d.error : ''));
+      if (d.list.items.length === 0) body = el('div', { class: 'empty' }, 'Nothing to restore.');
+      else if (all.length === 0) body = el('div', { class: 'empty' }, 'Nothing deleted matches.');
+      else {
+        body = [
+          el('div', { class: 'buttons' },
+            el('button', { class: 'act', disabled: waiting || mine.length === 0, onclick: () => undelete(r, mine) },
+              mine.length ? `Restore selected (${mine.length})` : 'Restore selected'),
+            el('button', {
+              class: 'act', disabled: waiting,
+              onclick: () => { for (const i of shown) picked.add(`${r.root_id}/${i.id}`); draw(true); },
+            }, 'Select all shown'),
+            mine.length ? el('button', {
+              class: 'act', disabled: waiting,
+              onclick: () => { for (const id of mine) picked.delete(`${r.root_id}/${id}`); draw(true); },
+            }, 'Clear selection') : null),
+          el('table', {}, shown.map((i) => {
+            const k = `${r.root_id}/${i.id}`;
+            const box = el('input', Object.assign({
+              type: 'checkbox', title: 'Select',
+              onclick: (e) => { if (e.target.checked) picked.add(k); else picked.delete(k); draw(true); },
+            }, picked.has(k) ? { checked: '' } : {}));
+            return el('tr', {},
+              el('td', { class: 'pick' }, box),
+              el('td', { class: 'what' },
+                el('div', {}, i.kind === 'dir' ? i.path + '/' : i.path),
+                el('div', { class: 'meta' },
+                  `${i.size} · deleted ${i.when} by ${i.device_name}`
+                  + (i.folder_gone ? ' · its folder is deleted too and comes back with it' : ''))),
+              el('td', { class: 'go' },
+                el('button', { class: 'act', disabled: waiting, onclick: () => undelete(r, [i.id]) }, 'Restore')));
+          })),
+          all.length > shown.length
+            ? el('div', { class: 'buttons' },
+              el('button', { class: 'act', onclick: () => { deletedShown += 200; draw(true); } },
+                `Show more (${all.length - shown.length} not shown)`))
+            : null,
+        ];
+      }
+    }
+    return el('div', { class: 'card' }, title(r), head, body,
+      el('div', { class: 'note' },
+        'Restore brings it back on every device as it was when deleted. Nothing is replaced: where its name is '
+        + 'taken now, it comes back beside it under another. If an antivirus removed it, it may remove it again '
+        + 'once it is back here; tell the antivirus to allow it.'));
   });
 }
 

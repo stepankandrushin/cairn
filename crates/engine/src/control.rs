@@ -83,7 +83,8 @@ impl Hub {
         self.notes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn note(&self, text: String) {
+    /// A line for the daemon's log, which it writes on its next round.
+    pub fn note(&self, text: String) {
         self.lock_notes().push(text);
         (self.wake)();
     }

@@ -6,12 +6,12 @@ use cairn_engine::daemon::DaemonOptions;
 use cairn_engine::root::{open_config, Busy, Paused};
 use cairn_engine::scan::display_path;
 use cairn_engine::state::Compaction;
-use cairn_engine::{control, registry, restore, selection};
+use cairn_engine::{control, deleted, registry, restore, selection};
 use cairn_engine::{
     init_root, sync, ApplyPolicy, InitOptions, OwnerPolicy, Root, SyncOptions, SyncOutcome,
 };
-use cairn_protocol::local::{Reply, Request, RootEntry, RootView};
-use cairn_protocol::{Name, RevisionId};
+use cairn_protocol::local::{self, Reply, Request, RootEntry, RootView};
+use cairn_protocol::{Name, ObjectKind, RevisionId};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -185,7 +185,8 @@ enum Command {
     /// Send one request of the local API to this root's daemon and print what it answers, one JSON
     /// object per line: what the tray sees.
     Ask {
-        /// status, subscribe, sync_now, pause, resume, conflicts or update_now.
+        /// status, subscribe, sync_now, pause, resume, conflicts, deleted or update_now; or a whole
+        /// request as JSON, as `{"op":"undelete","ids":["..."]}`.
         request: String,
     },
     /// The change journal, newest last.
@@ -235,6 +236,25 @@ enum Command {
         /// Also those dealt with.
         #[arg(long)]
         all: bool,
+    },
+    /// What was deleted and is still deleted, newest first, from the server's history: a folder once,
+    /// with what was deleted with it. Each line ends with the ID `cairn undelete` takes.
+    Deleted {
+        /// Only what was deleted in the last N days.
+        #[arg(long, default_value_t = cairn_protocol::local::DEFAULT_DELETED_DAYS)]
+        days: u32,
+        /// One JSON object per line, as the local API gives them to the tray.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bring back what `cairn deleted` lists, by its ID, as it was when deleted: a folder with what was
+    /// deleted with it. Nothing is replaced: where a name has been taken since, it comes back beside it
+    /// under a restored name. Then syncs, unless --no-sync.
+    Undelete {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long)]
+        no_sync: bool,
     },
     /// This device's Cairn and its updates: by default each daemon asks the feed every hour or so and
     /// installs a new release, `cairn` and the tray beside it, restarting into it between syncs.
@@ -938,17 +958,29 @@ fn run_inner() -> Result<u8> {
         }
         Command::Ask { request } => {
             let root_path = find_root(cli.root)?;
-            let request: Request =
+            // A whole request as JSON, for one that takes more than its name.
+            let request: Request = if request.trim_start().starts_with('{') {
+                serde_json::from_str(&request)
+                    .map_err(|e| anyhow!("{request} is not a request: {e}"))?
+            } else {
                 serde_json::from_value(serde_json::json!({ "op": request.replace('-', "_") }))
                     .map_err(|_| {
-                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts or update_now")
-                    })?;
+                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts, deleted or update_now, or one as JSON")
+                    })?
+            };
             let root_id = cairn_engine::root::read_root_id(&root_path)
                 .with_context(|| format!("{} is not a sync root", root_path.display()))?;
             let mut c =
                 control::Client::connect(&root_id).map_err(|e| not_asked(&root_path, &e))?;
-            // A subscription lasts until the daemon or this program ends.
-            let wait = (request != Request::Subscribe).then_some(control::IO_WAIT);
+            // A subscription lasts until the daemon or this program ends; what has the daemon read the
+            // server's journal takes as long as that does.
+            let wait = match request {
+                Request::Subscribe => None,
+                Request::Conflicts | Request::Deleted { .. } | Request::Undelete { .. } => {
+                    Some(Duration::from_secs(600))
+                }
+                _ => Some(control::IO_WAIT),
+            };
             c.set_wait(wait)?;
             c.send(&request)?;
             let mut code = EXIT_OK;
@@ -965,6 +997,77 @@ fn run_inner() -> Result<u8> {
         }
         Command::Update { what } => {
             update_command(what.unwrap_or(UpdateCommand::Status { json: false }))
+        }
+        Command::Deleted { days, json } => {
+            let index = deleted::index(&open_config(&find_root(cli.root)?)?)?;
+            let list = index.list(deleted::days_ago(days));
+            for d in &list {
+                if json {
+                    json_line(&d.item())?;
+                    continue;
+                }
+                let what = match d.kind {
+                    ObjectKind::Dir => format!(
+                        "{} file{}, {}",
+                        d.files,
+                        if d.files == 1 { "" } else { "s" },
+                        local::bytes(d.bytes)
+                    ),
+                    ObjectKind::Symlink => "symlink".into(),
+                    ObjectKind::File => local::bytes(d.bytes),
+                };
+                let slash = if d.kind == ObjectKind::Dir { "/" } else { "" };
+                let folder = if d.folder_gone {
+                    "  (its folder too)"
+                } else {
+                    ""
+                };
+                outln!(
+                    "{:>8}  {}  {:<16} {what:>22}  {}{slash}{folder}  {}",
+                    d.seq,
+                    date_time(d.time),
+                    d.device_name,
+                    display_path(&d.path),
+                    d.object
+                );
+            }
+            if !json && list.is_empty() {
+                outln!("nothing was deleted in the last {days} days that is still deleted");
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Undelete { ids, no_sync } => {
+            let root_path = find_root(cli.root)?;
+            let ids = deleted::parse_ids(&ids)?;
+            let config = open_config(&root_path)?;
+            let mut index = deleted::index(&config)?;
+            let outcome = deleted::undelete(&config, &mut index, &ids)?;
+            for (_, p) in &outcome.already {
+                outln!("{} is not deleted", display_path(p));
+            }
+            for u in &outcome.items {
+                if u.renamed {
+                    outln!(
+                        "brought back {} as {}, as its name is taken now ({} object(s))",
+                        display_path(&u.was),
+                        display_path(&u.path),
+                        u.objects
+                    );
+                } else {
+                    outln!(
+                        "brought back {} ({} object(s))",
+                        display_path(&u.path),
+                        u.objects
+                    );
+                }
+            }
+            if let Some(last) = outcome.seqs.last() {
+                outln!("as sequence {last}");
+            }
+            if no_sync || outcome.seqs.is_empty() {
+                return Ok(EXIT_OK);
+            }
+            run_sync(&root_path, SyncOptions::default())
         }
         Command::Conflicts { all } => {
             let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;

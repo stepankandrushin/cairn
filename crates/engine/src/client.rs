@@ -522,6 +522,7 @@ impl Client {
         )?;
         let frames = wire::read_frames(&body).context("downloading chunks")?;
         check_answer(hashes, &frames)?;
+        crate::progress::downloaded(frames.iter().map(|(_, d)| d.len() as u64).sum());
         Ok(frames.into_iter().map(|(h, d)| (h, d.to_vec())).collect())
     }
 

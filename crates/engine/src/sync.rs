@@ -20,7 +20,7 @@ use crate::selection::Selection;
 use crate::state::{Known, Row, Synced};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
-use cairn_protocol::local::{Activity, Change, Direction};
+use cairn_protocol::local::{Activity, Change, Direction, Phase};
 use cairn_protocol::wire::{self, CommitRequest, CommitResponse, MAX_CHUNK_BATCH_BYTES};
 use cairn_protocol::{
     ChunkRef, ConflictOf, Content, Hash, Link, Manifest, Name, ObjectId, ObjectKind, Op, OpId,
@@ -65,6 +65,9 @@ pub struct SyncOptions {
     /// on the incremental path then lists those folders and what the round itself must see, and takes
     /// the rest from the ledger (scope.rs).
     pub scope: Option<crate::scope::Source>,
+    /// Where this sync counts what it does as it goes, for the daemon to show while it runs. Without
+    /// one, the sync counts only for its report.
+    pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
 }
 
 /// Times a round's scope is widened, to what its decisions reach, before it lists the whole tree.
@@ -148,6 +151,9 @@ pub struct SyncReport {
     pub looked_in: Option<Vec<String>>,
     /// How many times a request the network failed was tried again.
     pub retries: u64,
+    /// The files this sync read to hash them, and their bytes.
+    pub files_read: u64,
+    pub bytes_read: u64,
 }
 
 impl SyncReport {
@@ -179,6 +185,8 @@ impl SyncReport {
             checked: None,
             looked_in: None,
             retries: 0,
+            files_read: 0,
+            bytes_read: 0,
         }
     }
 }
@@ -260,6 +268,7 @@ fn fetch_ops(
     loop {
         let resp = client.changes(*seq)?;
         for change in &resp.changes {
+            crate::progress::done(change.ops.len() as u64);
             for op in &change.ops {
                 each(op, change.op_id).map_err(|e| {
                     anyhow!(
@@ -359,6 +368,7 @@ fn scan_stable(
         None => scan(dir, opts),
     };
     let mut result = scan(&root.dir, &opts).context("scanning the root")?;
+    crate::progress::phase(Phase::Deciding);
     let mut rescued = Vec::new();
     let Some((rows, trees)) = whole else {
         // Leftovers, and what was on its way into a folder left out here, are the whole tree's to see.
@@ -940,15 +950,30 @@ fn upload(
         }
     }
 
+    crate::progress::phase(Phase::Uploading);
+    crate::progress::total(missing.len() as u64);
+    crate::progress::to_upload(
+        missing
+            .iter()
+            .map(|h| match (manifests.get(h), sources.get(h)) {
+                (Some(m), _) => m.len() as u64,
+                (None, Some((_, _, c))) => u64::from(c.len),
+                (None, None) => 0,
+            })
+            .sum(),
+    );
     let (mut chunks, mut bytes) = (0u64, 0u64);
     let mut frames = Vec::new();
     let mut in_frames = 0;
-    let flush = |frames: &mut Vec<u8>| -> Result<()> {
+    let mut in_bytes = 0u64;
+    let flush = |frames: &mut Vec<u8>, in_frames: u64, in_bytes: u64| -> Result<()> {
         if !frames.is_empty() {
             check("sync.upload.send")?;
             client.upload(frames)?;
             hit("sync.upload.sent");
             frames.clear();
+            crate::progress::done(in_frames);
+            crate::progress::uploaded(in_bytes);
         }
         Ok(())
     };
@@ -969,15 +994,17 @@ fn upload(
         if frames.len() + data.len() + 36 > MAX_CHUNK_BATCH_BYTES
             || in_frames >= MAX_CHUNKS_A_REQUEST
         {
-            flush(&mut frames)?;
+            flush(&mut frames, in_frames as u64, in_bytes)?;
             in_frames = 0;
+            in_bytes = 0;
         }
         wire::write_frame(&mut frames, hash, &data);
         in_frames += 1;
+        in_bytes += data.len() as u64;
         chunks += 1;
         bytes += data.len() as u64;
     }
-    flush(&mut frames)?;
+    flush(&mut frames, in_frames as u64, in_bytes)?;
     Ok(Upload::Done { chunks, bytes })
 }
 
@@ -1438,7 +1465,15 @@ fn describe_op(op: &Op) -> String {
 
 /// Sync one root once. A full disk is said as such, wherever it shows.
 pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
-    sync_once(path, opts).map_err(|e| {
+    let progress = opts.progress.clone().unwrap_or_default();
+    let installed = crate::progress::install(progress.clone());
+    let result = sync_once(path, opts);
+    drop(installed);
+    let result = result.map(|mut report| {
+        (report.files_read, report.bytes_read) = progress.files_read();
+        report
+    });
+    result.map_err(|e| {
         if crate::is_disk_full(&e) && !format!("{e:#}").contains("this disk is full") {
             e.context("this disk is full: free space and sync again")
         } else {
@@ -1582,6 +1617,7 @@ fn sync_full(
     let mut scope = opts.scope.clone();
     let finish = loop {
         report.rounds += 1;
+        crate::progress::round(report.rounds);
         round_work = std::time::Duration::ZERO;
         if report.rounds > MAX_ROUNDS {
             report.events.push(format!(
@@ -1590,6 +1626,7 @@ fn sync_full(
             break SyncOutcome::Partial;
         }
         hit("sync.round");
+        crate::progress::phase(Phase::Journal);
         match (journal, &mut session, &mut whole) {
             (Journal::Pinned, _, _) => hit("sync.round.pinned"),
             (Journal::Head, Some(s), _) => {
@@ -1982,6 +2019,7 @@ fn sync_full(
         drop(identified);
         let arriving = down_activity(&cur, &plan);
         let applying = std::time::Instant::now();
+        crate::progress::phase(Phase::Applying);
         let (outcome, cur) =
             Applier::new(&mut root, Some(&client), &accounts, cur, rows, &view.remote)
                 .run(&plan)?;
@@ -2098,6 +2136,7 @@ fn sync_full(
             };
             drop(view);
             let finalizing = std::time::Instant::now();
+            crate::progress::phase(Phase::Recording);
             let part = match held {
                 Some((all, dirty)) => Some((
                     session
@@ -2145,7 +2184,9 @@ fn sync_full(
         let mut landed: Tree = view.remote.clone().into_owned();
         // Nothing went up: the next round looks again against the same sequence.
         journal = Journal::Pinned;
-        for ops in commits(ops) {
+        let batches = commits(ops);
+        let batch_count = batches.len() as u64;
+        for (sent, ops) in batches.into_iter().enumerate() {
             match upload(&client, &root, &cur, &ops)? {
                 Upload::FileChanged => {
                     retryable = true;
@@ -2183,7 +2224,11 @@ fn sync_full(
                 .collect();
             root.state.enqueue(&req, &list, &delivered)?;
             hit("sync.enqueued");
+            crate::progress::phase(Phase::Committing);
+            crate::progress::total(batch_count);
+            crate::progress::set_done(sent as u64);
             let resp = client.commit(&req)?;
+            crate::progress::set_done(sent as u64 + 1);
             hit("sync.committed");
             // Before the commit leaves the queue, so that dying here costs nothing.
             if matches!(resp, CommitResponse::Rejected { .. }) {

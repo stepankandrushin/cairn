@@ -126,7 +126,10 @@ pub fn headline(view: &RootView, now: Secs) -> String {
             Some(t) => format!("paused by you since {}", when(t)),
             None => format!("paused: {}", detail(&s.detail, "it waits for a person")),
         },
-        _ if light(view, now) == Light::Syncing => "syncing".into(),
+        _ if light(view, now) == Light::Syncing => match s.progress.as_ref().filter(|_| s.syncing) {
+            Some(p) => format!("syncing: {}", p.brief(now)),
+            None => "syncing".into(),
+        },
         "partial" => format!("partly synced: {}", detail(&s.detail, "some changes wait")),
         _ => match &s.waiting {
             Some(w) => format!("changes wait until {}: {}", when(w.until), w.why),

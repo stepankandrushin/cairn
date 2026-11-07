@@ -440,6 +440,7 @@ impl Walk<'_> {
         let name = path.last().expect("an entry has a name").clone();
         let raw = name.as_bytes();
         self.current_inode = None;
+        crate::progress::entry();
         let st = match dir.stat(raw) {
             Ok(st) => st,
             Err(e) if is_not_found(&e) => {
@@ -590,8 +591,10 @@ impl Walk<'_> {
                 self.stopped = true;
                 return;
             }
+            crate::progress::reading(&display_path(path), before.size);
             hit("scan.file.reading");
             let read = manifest_of(&fd, before.size);
+            crate::progress::read_done();
             crate::fsops::read_once_done(fd.as_fd(), 0, before.size);
             let manifest = match read {
                 Ok(m) => m,
@@ -928,6 +931,10 @@ impl Walk<'_> {
 
 pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
     let started = opts.started.unwrap_or_else(Instant::now);
+    crate::progress::scanning(match opts.scope {
+        None => opts.rows.len() as u64,
+        Some(_) => 0,
+    });
     let precision_ns = root.fstype_precision_ns();
     let mut walk = Walk {
         opts,

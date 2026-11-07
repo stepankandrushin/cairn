@@ -230,6 +230,7 @@ dependencies = [
  "cairn-protocol",
  "cairn-server",
  "hex",
+ "libc",
  "rand",
  "ring",
  "rusqlite",

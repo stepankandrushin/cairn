@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- A sync on a hard disk sat for up to a quarter of an hour in "loading what this device knows", and as long again
+  in its first round. SQLite reads the state a page at a time, in the order of each table's keys, which in a state
+  that syncs have rewritten is all over the file; the daemon holds nothing between syncs, so once the system's
+  cache had dropped the file, every page was a seek: a Windows PC whose tree is on a hard disk read it 4 KiB at a
+  time, 166 reads a second. A sync now reads the state's file through once as it starts, in the file's order and
+  in pieces of a MiB, so the disk goes at its sequential rate and what follows finds it cached. On Linux, with a
+  state of 40,000 files joined and rewritten four times (256 MB) dropped from the cache, a sync after a rule changed read it
+  in 244 reads in one sequential run before loading, where loading had taken 5,311 reads at 4,329 places and its
+  first round another 14,541 at 7,461; a sync with nothing to do, 10,616 at 6,605. A state over a quarter of the
+  machine's memory, which the cache would not keep, is read as before.
+
 ## 0.1.8
 
 **Fixed:**

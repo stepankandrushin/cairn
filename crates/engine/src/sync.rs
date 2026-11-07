@@ -1484,7 +1484,7 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
 
 fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let mut report = SyncReport::new();
-    let mut root = match Root::open(path) {
+    let mut root = match Root::open_to_sync(path) {
         Ok(r) => r,
         Err(e) => {
             report.outcome = SyncOutcome::Paused(e.downcast::<Paused>()?.0);

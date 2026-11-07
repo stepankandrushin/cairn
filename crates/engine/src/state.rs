@@ -353,6 +353,95 @@ pub struct State {
 /// The page cache of a state's connection, in KiB.
 const STATE_CACHE_KIB: i64 = 32 * 1024;
 
+/// What `warm` reads at a time.
+const WARM_PIECE: usize = 1 << 20;
+
+/// Reads a state's file, and the WAL beside it if a run left one, once from start to end in pieces of
+/// a MiB, so that the system caches what a sync is about to read most of. SQLite reads a page at a
+/// time in the order of a table's keys, and in a state that syncs have rewritten that is not the file's
+/// order: a row rewritten moves, and the file keeps the pages that frees. With the cache cold, as it is
+/// at each sync on a device with little memory to spare, since the daemon holds nothing between syncs,
+/// every page was a seek: about 150 a second on a hard disk, where this goes at the disk's sequential
+/// rate. What is cached already costs a copy. Not for a file over a quarter of this machine's memory,
+/// which the cache would not keep. Before SQLite opens the file: closing another descriptor of it would
+/// drop every POSIX lock this process holds on it, SQLite's too. Only a hint, so a read that fails ends
+/// it, and SQLite says what it then cannot read itself. Returns the bytes read.
+pub fn warm(path: &Path) -> u64 {
+    use std::io::Read;
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let files: Vec<(std::path::PathBuf, u64)> = [path.to_path_buf(), wal.into()]
+        .into_iter()
+        .filter_map(|p| {
+            let len = std::fs::metadata(&p).ok()?.len();
+            (len > 0).then_some((p, len))
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, len)| len).sum();
+    if total == 0 || memory().is_some_and(|m| total > m / 4) {
+        return 0;
+    }
+    let mut piece = vec![0u8; WARM_PIECE];
+    let mut read = 0;
+    for (p, _) in &files {
+        let Ok(mut file) = std::fs::File::open(p) else {
+            continue;
+        };
+        // Twice the read-ahead; the other systems see a sequential reader for themselves.
+        #[cfg(target_os = "linux")]
+        let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Sequential);
+        loop {
+            match file.read(&mut piece) {
+                Ok(0) => break,
+                Ok(n) => read += n as u64,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+    read
+}
+
+/// This machine's memory, in bytes.
+#[cfg(target_os = "linux")]
+fn memory() -> Option<u64> {
+    let info = rustix::system::sysinfo();
+    Some(info.totalram as u64 * u64::from(info.mem_unit.max(1)))
+}
+
+#[cfg(target_os = "macos")]
+fn memory() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a 64-bit integer, written into `bytes`, whose size `len` gives.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && bytes > 0).then_some(bytes)
+}
+
+#[cfg(windows)]
+fn memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX is valid, and the call fills the one it is given, of the length
+    // it is told.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    (ok && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn memory() -> Option<u64> {
+    None
+}
+
 /// What a transaction writes, in the order of the table's keys: each page is then dirtied once, and
 /// written once, however far the transaction outgrows the page cache. In the order given, as random as
 /// object IDs are, a page goes to the WAL again each time it is dirtied again after a spill.
@@ -1138,6 +1227,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = State::open(&dir.join("state.sqlite")).unwrap();
         (dir, state)
+    }
+
+    /// The warm-up reads the file whole, and a WAL a run left beside it, and nothing where there is none.
+    #[test]
+    fn warm_reads_the_state_and_a_wal_left_beside_it_whole() {
+        let (dir, state) = fresh();
+        state.set("big", &"x".repeat(3 << 20)).unwrap();
+        drop(state);
+        let path = dir.join("state.sqlite");
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 3 << 20, "{len}");
+        assert_eq!(warm(&path), len);
+        std::fs::write(dir.join("state.sqlite-wal"), vec![7u8; 5000]).unwrap();
+        assert_eq!(warm(&path), len + 5000);
+        assert_eq!(warm(&dir.join("none.sqlite")), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The ledger speaks for an object only until its base node or row is written: any write marks it,

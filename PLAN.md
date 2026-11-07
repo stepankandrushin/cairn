@@ -279,8 +279,11 @@ holds one folder open for each level down, the daemon takes its hard limit on op
 watch is named. A wake for a change from before the scan the last sync agreed on is none, as that scan saw it, the
 sync's own writes included, and so is the feed's news of commits that sync took in. Change feed: a long-poll
 of `GET /changes`, not a stream, since a plain response survives any proxy; when one cuts it off, the
-client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, and
-it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
+client waits for less. It holds no file open in a root while idle, so a disk can be unmounted under it, nor
+the state in memory, so each sync first reads the state's file through once, in the file's order and in pieces
+of a MiB, unless it is over a quarter of the machine's memory: SQLite reads a page at a time in the order of a
+table's keys, which in a state syncs have rewritten is all over the file, a seek a page on a hard disk whose
+cache has dropped it. And it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
 unmounted, but says nothing when only a bind mount goes away, or when anything is mounted back: the
 reconcile finds the first, and retrying while paused the second. On Windows a watched folder says nothing
 when it is itself renamed, so a second watch, on the folder above, notices the root renamed away or another

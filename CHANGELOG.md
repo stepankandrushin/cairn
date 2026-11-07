@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- A join took away the execute bits of programs. When a device joined a tree that a tool carrying no modes had
+  synced until then, and its copy of a script or a program had the execute bit where the server's lacked it, the
+  join took the server's mode whole: the program no longer ran there, and `git status` called it changed. The only word of it was one entry in
+  the activity log among one for every other file whose mode differed. A file's execute bits now count as fields
+  of their own at a join, as an extended attribute only one side has does: a bit only one side has stays, and goes
+  to the others, where the mode reads the file. A folder's mode, which says who can enter it, is the server's as
+  before.
+
 ## 0.1.7
 
 **Fixed:**

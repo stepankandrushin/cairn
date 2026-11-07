@@ -532,7 +532,8 @@ fn stored_terms(
         // the two records join as a copy and the server's do at adoption, and what that gives is
         // applied here against what is really on disk.
         (Some(k), _) => (
-            crate::merge::join_metadata(&k.body.metadata, &node.metadata, "this device").0,
+            crate::merge::join_metadata(k.kind(), &k.body.metadata, &node.metadata, "this device")
+                .0,
             node.metadata.clone(),
         ),
         (None, _) => same(node.metadata.clone()),

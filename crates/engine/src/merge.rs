@@ -297,14 +297,33 @@ fn folder_in_git(
 /// only one side has stays, and where both have a value and they differ the server's stands and the
 /// other goes in the activity log, value and all, as the loser of a same-field conflict does. Times and
 /// owners differ between any two copies and say nothing of anyone's intent: the server's stand, unlogged.
-pub fn join_metadata(server: &Metadata, here: &Metadata, whose: &str) -> (Metadata, Vec<String>) {
+/// A file's execute bits count as fields of their own, so one only this copy has stays and goes to the
+/// others: whatever kept the copies alike before may have carried no mode, as most sync tools and
+/// archives carry none, and a program without its bit no longer runs.
+pub fn join_metadata(
+    kind: ObjectKind,
+    server: &Metadata,
+    here: &Metadata,
+    whose: &str,
+) -> (Metadata, Vec<String>) {
     let mut out = server.clone();
     let mut notes = Vec::new();
-    if here.mode != server.mode {
-        notes.push(format!(
-            "mode: kept {:o} from the server; {whose} had {:o}",
-            server.mode, here.mode
-        ));
+    if kind == ObjectKind::File {
+        // Each where the mode reads the file, as `chmod +x` gives it.
+        out.mode |= here.mode & 0o111 & ((out.mode & 0o444) >> 2);
+    }
+    if here.mode != out.mode {
+        notes.push(if out.mode == server.mode {
+            format!(
+                "mode: kept {:o} from the server; {whose} had {:o}",
+                server.mode, here.mode
+            )
+        } else {
+            format!(
+                "mode: {:o}, the server's {:o} with the execute bits {whose} had; {whose} had {:o}",
+                out.mode, server.mode, here.mode
+            )
+        });
     }
     for (key, value) in &here.records {
         match server.records.get(key) {
@@ -438,6 +457,7 @@ fn adopt(input: &MergeInput<'_>) -> Adoption {
                 // Same content, and this copy's metadata has no history: it joins the server's
                 // record, and what that holds and this copy lacks is applied here.
                 let (joined, lost) = join_metadata(
+                    input.remote.nodes[y].kind(),
                     &input.remote.nodes[y].body.metadata,
                     &n.stored,
                     "this device",
@@ -453,7 +473,7 @@ fn adopt(input: &MergeInput<'_>) -> Adoption {
         let n = &input.local[x];
         let at = n.links.iter().next().map(|l| l.name.to_string());
         let whose = format!("this device's copy at {}", at.unwrap_or_default());
-        let (_, lost) = join_metadata(&local[y].stored, &n.stored, &whose);
+        let (_, lost) = join_metadata(ObjectKind::File, &local[y].stored, &n.stored, &whose);
         notes.extend(lost.into_iter().map(|t| (*y, t)));
     }
     Adoption {
@@ -1133,6 +1153,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_join_keeps_the_execute_bits_of_a_file_only_this_copy_has() {
+        let mode = |kind, server, here| join_metadata(kind, &meta(server), &meta(here), "it");
+        // A tree synced by something that carried no mode has the bit only where it was made.
+        let (m, notes) = mode(ObjectKind::File, 0o664, 0o755);
+        assert_eq!(m.mode, 0o775);
+        assert_eq!(
+            notes,
+            ["mode: 775, the server's 664 with the execute bits it had; it had 755"]
+        );
+        assert_eq!(mode(ObjectKind::File, 0o644, 0o755).0.mode, 0o755);
+        assert!(mode(ObjectKind::File, 0o644, 0o755).1.is_empty());
+        // Only where the result reads the file, and the server's other bits stand.
+        assert_eq!(mode(ObjectKind::File, 0o600, 0o755).0.mode, 0o700);
+        assert_eq!(mode(ObjectKind::File, 0o755, 0o644).0.mode, 0o755);
+        let (m, notes) = mode(ObjectKind::File, 0o664, 0o644);
+        assert_eq!(m.mode, 0o664);
+        assert_eq!(notes, ["mode: kept 664 from the server; it had 644"]);
+        // A folder's x is whether it can be entered: the server's stands.
+        assert_eq!(mode(ObjectKind::Dir, 0o700, 0o755).0.mode, 0o700);
+    }
+
     struct T {
         base: Tree,
         remote: Tree,
@@ -1452,13 +1494,13 @@ mod tests {
         let mut t = T::new();
         let x = ObjectId::random();
         t.local
-            .insert(x, lnode(at("new"), file("same"), meta(0o750)));
+            .insert(x, lnode(at("new"), file("same"), meta(0o640)));
         let y = t.remote_add(at("new"), file("same"), meta(0o644));
         let p = t.run();
         assert_eq!(p.adopted[&x], y);
         assert_eq!(p.target[&y].body.metadata.mode, 0o644);
         assert_eq!(p.notes.len(), 1);
-        assert!(p.notes[0].1.contains("750"), "{:?}", p.notes);
+        assert!(p.notes[0].1.contains("640"), "{:?}", p.notes);
     }
 
     fn with(mode: u32, records: &[(&str, &str)]) -> Metadata {

@@ -175,6 +175,11 @@ enum StepError {
     /// This step cannot be done here, and repeating it now would not help.
     #[error("{0}")]
     Failed(String),
+    /// The system refused this process the write, for now or until someone changes it: an access
+    /// list, another program holding the file, a program that guards files. In its own words; tried
+    /// again on later syncs, and what is here stays as it was, so nothing reads as deleted or changed.
+    #[error("{0}")]
+    Refused(String),
     /// This filesystem cannot hold this name, and trying again will not change that. `twin`: another
     /// name here is the same name to it, and that may go.
     #[error("{why}")]
@@ -192,6 +197,11 @@ impl From<std::io::Error> for StepError {
             StepError::DiskFull(e)
         } else if is_exists(&e) || fsops::is_not_empty(&e) || is_not_found(&e) {
             StepError::Changed(e.to_string())
+        } else if matches!(
+            crate::refusal::of(&e),
+            Some(crate::refusal::Refusal::Permission | crate::refusal::Refusal::Busy)
+        ) {
+            StepError::Refused(crate::refusal::describe(&e))
         } else {
             StepError::Failed(e.to_string())
         }
@@ -1181,7 +1191,9 @@ impl<'a> Applier<'a> {
             // Taken before the rename: any later difference but ctime is someone's edit.
             written = Some(fingerprint(&dir.stat(&tmp)?));
             hit("apply.create.before_rename");
-            let placed = refuse_name(&name).and_then(|()| dir.rename_new(&tmp, &dir, &name));
+            let placed = refuse_name(&name)
+                .and_then(|()| cairn_failpoint::refuse("apply.place", &name))
+                .and_then(|()| dir.rename_new(&tmp, &dir, &name));
             if let Err(e) = placed {
                 let _ = dir.unlink(&tmp);
                 return Err(unholdable(&dir, &name, e));
@@ -1391,6 +1403,11 @@ impl<'a> Applier<'a> {
         // Swapped, not overwritten: the old file comes out under the temporary name, to be looked at
         // once more, so that no edit can fall between the last look and the replacement.
         let aside = self.root.aside_name(&name);
+        if let Err(e) = cairn_failpoint::refuse("apply.place", &name) {
+            let _ = dir.unlink(&tmp);
+            let _ = self.root.state.drop_intent(&relink_key);
+            return Err(e.into());
+        }
         // Nothing can be at a random name, and not every filesystem can promise that.
         dir.rename_over(&tmp, &dir, &aside)?;
         hit("apply.replace.aside");
@@ -1471,6 +1488,11 @@ impl<'a> Applier<'a> {
                 } else {
                     SkipKind::CannotApply
                 },
+                detail: Some(detail),
+            }),
+            StepError::Refused(detail) => self.outcome.failed.push(Skip {
+                path: display,
+                kind: SkipKind::PermissionDenied,
                 detail: Some(detail),
             }),
             // Only a new entry is left out for it. Anything else, a move onto such a name, stands

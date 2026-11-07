@@ -16,6 +16,15 @@
 
 **Fixed:**
 
+- A file the system refuses this device is held as it was, said by name, and never sent as a delete or a change,
+  to read on one device or to write on another: an access list, another program holding it, a program that guards
+  files, a failing disk. Reads were held already; now a refused write says "waiting for permission" with the
+  system's own words instead of "destination cannot represent this", Windows' codes for a file blocked or removed
+  as a threat (225, 226) and for a policy, a lock or a failing disk are told by kind, with the hint on Windows
+  that another program or security software may block it, and `cairn status` lists what the daemon's last sync
+  skipped. A refused file no longer holds every other change back for up to a minute in the daemon: it is tried
+  again on the backoff, and clears by itself once let in. A tree most of which is refused pauses, as one most of
+  which vanished does, and nothing is sent until it can be read.
 - On macOS the tray's icon went from the menu bar once an update replaced the tray, and stayed gone while it ran:
   the tray started its new program in its own process, by exec, and the menu bar of macOS 26 and later gives a
   program exec'd in another's process no icon. It now starts again as a new process, under its LaunchAgent by

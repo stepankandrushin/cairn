@@ -11,7 +11,7 @@ use cairn_protocol::{
     Tree,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// A local file renamed aside as a conflict copy: which object it now is, whatever the inode's row
 /// says, so that a crash right after the rename cannot confuse it with the original.
@@ -69,6 +69,9 @@ pub struct Identified {
     pub shared: BTreeMap<ObjectId, Shared>,
     /// The scanned inode behind each local object.
     pub scanned: BTreeMap<ObjectId, Scanned>,
+    /// Objects held as they were because the system refused this device a read of them, or of the
+    /// folder they are in: what is counted before a tree mostly unreadable is synced at all.
+    pub refused: BTreeSet<ObjectId>,
 }
 
 /// Several rows can hold one inode number: a deleted file's row lives until the next finalize, and
@@ -593,10 +596,13 @@ fn carry_unobserved(
         }
         all
     };
-    let carry = |id: ObjectId, out: &mut Identified| {
+    let carry = |id: ObjectId, out: &mut Identified, refused: bool| {
         for o in known_subtree(id) {
             if o == ObjectId::ROOT || out.local.contains_key(&o) {
                 continue;
+            }
+            if refused {
+                out.refused.insert(o);
             }
 
             // It stands for what this filesystem was last known to hold, never for the server's
@@ -621,7 +627,15 @@ fn carry_unobserved(
             );
         }
     };
-    for path in &scan.unobserved {
+    // What was refused goes first, to be counted as such, before what is only in motion is carried.
+    let refused: HashSet<&Vec<Name>> = scan.refused.iter().collect();
+    let (first, then): (Vec<&Vec<Name>>, Vec<&Vec<Name>>) =
+        scan.unobserved.iter().partition(|p| refused.contains(p));
+    for (path, refused) in first
+        .into_iter()
+        .map(|p| (p, true))
+        .chain(then.into_iter().map(|p| (p, false)))
+    {
         let Some((name, parent_path)) = path.split_last() else {
             continue;
         };
@@ -629,7 +643,7 @@ fn carry_unobserved(
             continue;
         };
         if let Some(id) = base.child(*parent, name) {
-            carry(id, out);
+            carry(id, out, refused);
         }
     }
     // A file that moved and then became unreadable is known by its inode, not its name. Nothing says
@@ -637,7 +651,7 @@ fn carry_unobserved(
     let by_inode = rows_by_inode(rows);
     for inode in &scan.unobserved_inodes {
         for id in by_inode.get(inode).into_iter().flatten() {
-            carry(*id, out);
+            carry(*id, out, false);
         }
     }
     for path in &scan.unlisted {
@@ -646,7 +660,7 @@ fn carry_unobserved(
         };
         for c in known_subtree(*dir) {
             if c != *dir {
-                carry(c, out);
+                carry(c, out, true);
             }
         }
     }
@@ -657,7 +671,7 @@ fn carry_unobserved(
             .filter(|id| rows.get(id).is_some_and(|r| r.synced.is_some()));
         let live: Vec<ObjectId> = base.live().map(|(id, _)| id).chain(pushed).collect();
         for id in live {
-            carry(id, out);
+            carry(id, out, false);
         }
     }
 }
@@ -725,6 +739,7 @@ mod tests {
             nodes,
             skips: Vec::new(),
             unobserved: Vec::new(),
+            refused: Vec::new(),
             unobserved_inodes: Vec::new(),
             unidentified: false,
             unlisted: Vec::new(),

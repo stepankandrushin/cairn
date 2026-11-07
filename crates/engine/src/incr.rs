@@ -2374,7 +2374,7 @@ pub struct Decisions {
     pub shared: BTreeMap<ObjectId, crate::merge::Shared>,
     /// The rows as the round leaves them before the apply: the view's and the scan's.
     pub rows: BTreeMap<ObjectId, Row>,
-    pub vanished: Option<String>,
+    pub vanished: Option<crate::sync::Hold>,
     pub twins: Vec<cairn_protocol::Skip>,
     pub target: BTreeMap<ObjectId, crate::merge::TNode>,
     pub copies: Vec<crate::merge::ConflictCopy>,
@@ -2705,6 +2705,7 @@ mod tests {
             nodes,
             skips: Vec::new(),
             unobserved: Vec::new(),
+            refused: Vec::new(),
             unobserved_inodes: Vec::new(),
             unidentified: false,
             unlisted: Vec::new(),

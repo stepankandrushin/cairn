@@ -327,8 +327,13 @@ fn run_seed(seed: u64, with_rules: bool) {
                     run.code,
                     run.stdout.trim().replace('\n', " | ")
                 ));
+                // A folder holding most of the tree, refused, pauses the sync: nothing is sent.
+                let paused = run.code == Some(2)
+                    && run
+                        .stdout
+                        .contains("cannot be read: the system refuses them");
                 assert!(
-                    run.ok() || run.code == Some(3),
+                    run.ok() || run.code == Some(3) || paused,
                     "{}",
                     context(format!("step {step}: {}\n{}", run.text(), log.join("\n")))
                 );

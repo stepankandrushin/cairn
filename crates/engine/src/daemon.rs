@@ -1208,10 +1208,16 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         status.last_synced = status.last_sync;
                     }
                     SyncOutcome::Partial => {
-                        let stuck = report
-                            .skips
-                            .iter()
-                            .any(|s| s.kind.retryable() && !s.kind.in_motion());
+                        // A file the system refuses, or that fails to read, is that file's alone: it is
+                        // tried again on the backoff, and everything else goes on syncing meanwhile.
+                        let stuck = report.skips.iter().any(|s| {
+                            s.kind.retryable()
+                                && !s.kind.in_motion()
+                                && !matches!(
+                                    s.kind,
+                                    SkipKind::PermissionDenied | SkipKind::ReadError
+                                )
+                        });
                         if stuck {
                             schedule.failed(opts.retry);
                         } else {

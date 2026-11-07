@@ -3,10 +3,11 @@
 
 use crate::chunker::manifest_of;
 use crate::fsops::{
-    birth_mark, is_busy, is_invalid, is_not_found, is_permission, open_for_writing, AsFd, Dir,
-    FileType, OwnedFd, Stat,
+    birth_mark, is_busy, is_invalid, is_not_found, open_for_writing, AsFd, Dir, FileType, OwnedFd,
+    Stat,
 };
 use crate::metadata::{capture, Accounts};
+use crate::refusal::{describe, Refusal};
 use crate::root::aside_origin;
 use crate::state::{Fingerprint, Known};
 use cairn_failpoint::hit;
@@ -59,6 +60,10 @@ pub struct ScanResult {
     pub skips: Vec<Skip>,
     /// Entries this scan could not observe, each with everything under it.
     pub unobserved: Vec<Vec<Name>>,
+    /// Those of them the system refused this process, or that failed to read: not in motion, but held
+    /// as they were until they can be read. With `unlisted`, what a sync counts before taking a tree
+    /// most of which it may not read for one to sync.
+    pub refused: Vec<Vec<Name>>,
     /// The inodes of those, which may be known objects under a new name.
     pub unobserved_inodes: Vec<(u64, u64)>,
     /// Something could not even be stat'ed, so it may be anything: no absence proves a delete.
@@ -100,6 +105,7 @@ impl ScanResult {
             nodes,
             skips: self.skips.clone(),
             unobserved: self.unobserved.clone(),
+            refused: self.refused.clone(),
             unobserved_inodes: self.unobserved_inodes.clone(),
             unidentified: self.unidentified,
             unlisted: self.unlisted.clone(),
@@ -276,6 +282,7 @@ struct Walk<'a> {
     linked: HashMap<(u64, u64), usize>,
     skips: Vec<Skip>,
     unobserved: Vec<Vec<Name>>,
+    refused: Vec<Vec<Name>>,
     unobserved_inodes: Vec<(u64, u64)>,
     unidentified: bool,
     current_inode: Option<(u64, u64)>,
@@ -336,6 +343,21 @@ pub fn aside_holds_edit(dir: &Dir, temp: &[u8], opts: &ScanOptions) -> Option<Fi
     (!on_record && !on_its_way).then(|| fingerprint(&st))
 }
 
+/// The skip a read refused or failed makes, in the system's own words: not allowed, held by another
+/// program for now, or failed. Each is held as it was and read again, never taken for a delete.
+fn read_failure(e: &std::io::Error) -> (SkipKind, String) {
+    match crate::refusal::of(e) {
+        Some(Refusal::Permission) => (SkipKind::PermissionDenied, describe(e)),
+        // Another program has it open and lets no one else read it, as a program writing a file
+        // often does on Windows. Its close is the end of that.
+        Some(Refusal::Busy) if is_busy(e) => (
+            SkipKind::KeepsChanging,
+            format!("another program has it open and lets no one read it: {e}"),
+        ),
+        _ => (SkipKind::ReadError, describe(e)),
+    }
+}
+
 impl Walk<'_> {
     fn skip(&mut self, path: &[Name], kind: SkipKind, detail: Option<String>) {
         self.skips.push(Skip {
@@ -347,6 +369,9 @@ impl Walk<'_> {
 
     fn unobservable(&mut self, path: &[Name], kind: SkipKind, detail: Option<String>) {
         self.skip(path, kind, detail);
+        if matches!(kind, SkipKind::PermissionDenied | SkipKind::ReadError) {
+            self.refused.push(path.to_vec());
+        }
         self.unobserved.push(path.to_vec());
         match self.current_inode {
             Some(inode) => self.unobserved_inodes.push(inode),
@@ -364,13 +389,9 @@ impl Walk<'_> {
         let listed = dir.stat_self().and_then(|st| Ok((st, dir.list()?)));
         let (st, names) = match listed {
             Ok(v) => v,
-            Err(e) if is_permission(&e) => {
-                self.skip(path, SkipKind::PermissionDenied, Some(e.to_string()));
-                self.unlisted.push(path.clone());
-                return false;
-            }
             Err(e) => {
-                self.skip(path, SkipKind::ReadError, Some(e.to_string()));
+                let (kind, detail) = read_failure(&e);
+                self.skip(path, kind, Some(detail));
                 self.unlisted.push(path.clone());
                 return false;
             }
@@ -446,10 +467,10 @@ impl Walk<'_> {
             Err(e) if is_not_found(&e) => {
                 return self.unobservable(path, SkipKind::VanishedDuringScan, None);
             }
-            Err(e) if is_permission(&e) => {
-                return self.unobservable(path, SkipKind::PermissionDenied, Some(e.to_string()));
+            Err(e) => {
+                let (kind, detail) = read_failure(&e);
+                return self.unobservable(path, kind, Some(detail));
             }
-            Err(e) => return self.unobservable(path, SkipKind::ReadError, Some(e.to_string())),
         };
         self.current_inode = Some((st.dev, st.ino));
         if (self.opts.excluded)(path, &st) {
@@ -544,35 +565,20 @@ impl Walk<'_> {
         for attempt in 0..READ_ATTEMPTS {
             let settling = dir.stat(raw).unwrap_or_else(|_| st.clone());
             wait_until_stable(&settling);
-            let fd = match dir.open_read_once(raw) {
+            let opened =
+                cairn_failpoint::refuse("scan.open", raw).and_then(|()| dir.open_read_once(raw));
+            let fd = match opened {
                 Ok(fd) => fd,
-                Err(e) if is_permission(&e) => {
-                    self.forget_link(&st);
-                    return self.unobservable(
-                        path,
-                        SkipKind::PermissionDenied,
-                        Some(e.to_string()),
-                    );
-                }
                 Err(e) if is_not_found(&e) => {
                     self.forget_link(&st);
                     return self.unobservable(path, SkipKind::VanishedDuringScan, None);
                 }
-                // Windows: another program has it open and lets no one else read it, as a program
-                // writing a file often does. Its close is the end of that.
-                Err(e) if is_busy(&e) => {
-                    self.forget_link(&st);
-                    return self.unobservable(
-                        path,
-                        SkipKind::KeepsChanging,
-                        Some(format!(
-                            "another program has it open and lets no one read it: {e}"
-                        )),
-                    );
-                }
+                // Refused, by an access list, a lock or a program that guards files: held as it was,
+                // in the system's own words, and read again next time. Never a delete.
                 Err(e) => {
                     self.forget_link(&st);
-                    return self.unobservable(path, SkipKind::ReadError, Some(e.to_string()));
+                    let (kind, detail) = read_failure(&e);
+                    return self.unobservable(path, kind, Some(detail));
                 }
             };
             let before = match dir.stat(raw) {
@@ -604,7 +610,8 @@ impl Walk<'_> {
                         continue;
                     }
                     self.forget_link(&st);
-                    return self.unobservable(path, SkipKind::ReadError, Some(e.to_string()));
+                    let (kind, detail) = read_failure(&e);
+                    return self.unobservable(path, kind, Some(detail));
                 }
             };
             let after = match crate::fsops::fstat(fd.as_fd()) {
@@ -887,9 +894,9 @@ impl Walk<'_> {
                     only_excluded,
                 });
             }
-            Err(e) if is_permission(&e) => {
+            Err(e) if crate::refusal::of(&e) == Some(Refusal::Permission) => {
                 self.solid += 1;
-                self.skip(path, SkipKind::PermissionDenied, Some(e.to_string()));
+                self.skip(path, SkipKind::PermissionDenied, Some(describe(&e)));
                 self.unlisted.push(path.clone());
                 // A directory no one here can read must not push that state to devices that can:
                 // like its contents, its record stands as it was until it can be observed.
@@ -943,6 +950,7 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         linked: HashMap::new(),
         skips: Vec::new(),
         unobserved: Vec::new(),
+        refused: Vec::new(),
         unobserved_inodes: Vec::new(),
         unidentified: false,
         current_inode: None,
@@ -1011,6 +1019,7 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         nodes: walk.nodes,
         skips: walk.skips,
         unobserved: walk.unobserved,
+        refused: walk.refused,
         unobserved_inodes: walk.unobserved_inodes,
         unidentified: walk.unidentified,
         unlisted: walk.unlisted,

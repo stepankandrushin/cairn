@@ -295,7 +295,7 @@ folder put at its path, and the root's watch moves there; a folder further up re
 reconcile, as on Linux. After a failure it backs off, up to a
 minute, and holds every change back until then. A file still being written is no failure: the daemon comes
 back for it on the same backoff and holds nothing else back, and the file's own writes wake nothing, though
-its close does. Between syncs it rests for twice what the last one did that every sync repeats, loading the
+its close does. Nor is one the system refuses: it is come back for alike. Between syncs it rests for twice what the last one did that every sync repeats, loading the
 state, the scan and the merge, so a tree that never rests keeps it busy at most a third of the time, but for 30 s at
 the most, so that a change written as a sync ends waits at most about 30 s and one sync, however big the tree; the
 data a big download moved is no reason to wait, as the next sync does not move it again. `cairn status` says when changes wait, until when, and why, and while a sync runs what it is doing,
@@ -337,7 +337,16 @@ projects and anything needing faithful metadata.
 
 **Failure handling, where most of the test effort goes:** watchers plus reconcile, durable queues,
 files changing during a read, disk full, interrupted upgrades, and a missing mount (each root carries
-an ID marker; if it has gone, or an unusual share of the tree vanishes, sync pauses and asks). A request
+an ID marker; if it has gone, or an unusual share of the tree vanishes, sync pauses and asks). A path
+the system refuses this device, to read or to write (an access list, another program holding it, a program
+that guards files, a failing disk: told by the kind of error, never by which program, Windows' codes for a
+file blocked or removed as a threat among them), is held as it was: no delete, no revision, nothing of it
+reverted elsewhere. It is named with the system's own words, and on Windows the hint that another program or
+security software may block it, in a sync's report, `cairn status`, the daemon's status, log and tray, and
+tried again on the backoff, holding nothing else back, until it clears by itself once let in. A tree most of
+which is refused pauses as one most of which vanished does, and `--allow-mass-delete` does not lift that,
+since nothing is deleted. What is gone, whatever took it, is a delete as before, which `cairn deleted`
+lists to bring back. A request
 the network fails in a way that says nothing about the request (no socket buffers, a connection reset,
 refused or closed before the whole answer, a name not found, a proxy's 502 to 504) is tried again within
 it: over about a minute in a sync, a few seconds in a command a person waits on, about three minutes at

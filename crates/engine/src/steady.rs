@@ -232,6 +232,7 @@ pub fn digest(result: &ScanResult, rows: &HashMap<(u64, u64), Known>) -> Hash {
         d.json(s);
     }
     d.paths(&result.unobserved);
+    d.paths(&result.refused);
     d.u64(result.unobserved_inodes.len() as u64);
     for (dev, ino) in &result.unobserved_inodes {
         d.u64(*dev);

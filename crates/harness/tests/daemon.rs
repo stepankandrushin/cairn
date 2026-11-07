@@ -1135,6 +1135,115 @@ fn metadata_refused_here_stays_in_the_status() {
     wait_for("the refusal to go", &log, || !held("script"));
 }
 
+/// A file the system refuses a daemon, to read on one device and to write on another: each is in the
+/// status, by name in the system's words, through `kill -9` and a restart, holds nothing else back,
+/// is never sent as a delete or a change, and clears by itself once the system lets it in.
+#[test]
+fn a_refused_file_stays_in_the_status_through_a_restart_and_clears_by_itself() {
+    // EACCES; on Windows ERROR_VIRUS_INFECTED, what Windows gives for a file a security program blocks.
+    let code = if cfg!(windows) { "225" } else { "13" };
+    let (sb, _s, a, b) = pair("d-refused");
+    a.write("read-me", "v1");
+    a.write("write-me", "v1");
+    a.write("keep", "k");
+    a.synced();
+    b.synced();
+    let gate_a = sb.path("gate-a");
+    let gate_b = sb.path("gate-b");
+    std::fs::write(&gate_a, b"").unwrap();
+    std::fs::write(&gate_b, b"").unwrap();
+    let env_a = format!("scan.open:read-me:{code}:{}", gate_a.display());
+    let env_b = format!("apply.place:write-me:{code}:{}", gate_b.display());
+    let start_a = || {
+        Daemon::start_env(
+            &a,
+            &["--reconcile-secs", DAY],
+            &[("CAIRN_FP_REFUSE", &env_a)],
+        )
+    };
+    let start_b = || {
+        Daemon::start_env(
+            &b,
+            &["--reconcile-secs", DAY],
+            &[("CAIRN_FP_REFUSE", &env_b)],
+        )
+    };
+    let mut da = start_a();
+    let mut db = start_b();
+    da.wait_state("synced");
+    db.wait_state("synced");
+    let refused = |d: &Daemon, path: &str| {
+        d.status()["skips"].as_array().is_some_and(|v| {
+            v.iter().any(|s| {
+                s.as_str().is_some_and(|s| {
+                    s.starts_with(&format!("{path}: waiting for permission"))
+                        && s.contains(&format!("os error {code}"))
+                })
+            })
+        })
+    };
+
+    // a cannot read its edit; b cannot write a's other one.
+    a.write("read-me", "v2 on a");
+    a.write("write-me", "v2 on a");
+    wait_for("a's refusal in its status", &da.log.clone(), || {
+        refused(&da, "read-me")
+    });
+    wait_for("b's refusal in its status", &db.log.clone(), || {
+        refused(&db, "write-me")
+    });
+    // Nothing else waits on them.
+    a.write("other", "o");
+    wait_file(&db, b.path("other"), b"o");
+    assert_eq!(b.read("read-me"), b"v1");
+    assert_eq!(b.read("write-me"), b"v1");
+    let status = b.cairn(&["status"]);
+    assert!(
+        status
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("daemon: skipped: write-me: waiting for permission")),
+        "{}",
+        status.text()
+    );
+
+    // Killed and started again, each says it again and has sent nothing for it.
+    let (old_a, old_b) = (da.child.id(), db.child.id());
+    da.kill();
+    db.kill();
+    let da = start_a();
+    let db = start_b();
+    let (new_a, new_b) = (da.child.id(), db.child.id());
+    assert!(new_a != old_a && new_b != old_b);
+    wait_for("a's refusal after the restart", &da.log.clone(), || {
+        da.status()["pid"] == new_a && refused(&da, "read-me")
+    });
+    wait_for("b's refusal after the restart", &db.log.clone(), || {
+        db.status()["pid"] == new_b && refused(&db, "write-me")
+    });
+    assert_eq!(
+        b.read("read-me"),
+        b"v1",
+        "a's refusal went out as something"
+    );
+    assert_eq!(b.read("write-me"), b"v1");
+    assert_eq!(
+        a.read("write-me"),
+        b"v2 on a",
+        "b's refusal went out as something"
+    );
+
+    // Let in: each clears by itself, on the retry, with no event to wake it.
+    std::fs::remove_file(&gate_a).unwrap();
+    std::fs::remove_file(&gate_b).unwrap();
+    wait_file(&db, b.path("read-me"), b"v2 on a");
+    wait_file(&db, b.path("write-me"), b"v2 on a");
+    wait_for("the refusals to clear", &db.log.clone(), || {
+        !refused(&da, "read-me") && !refused(&db, "write-me")
+    });
+    assert_eq!(a.read("read-me"), b"v2 on a");
+}
+
 /// With nothing to sync and nothing to retry, the feed is the only thing that can notice.
 #[test]
 fn an_idle_daemon_says_when_the_server_goes_away() {

@@ -449,6 +449,9 @@ fn print_view(v: &RootView) {
     }
 }
 
+/// How many of what the daemon's last sync skipped `cairn status` lists.
+const MAX_SKIPS_SHOWN: usize = 20;
+
 fn print_daemon(s: &cairn_engine::daemon::Status) {
     let state = format!(
         "{}{}",
@@ -511,6 +514,17 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
         outln!(
             "daemon: and {} more not applied here",
             s.not_applied_count - s.not_applied.len()
+        );
+    }
+    // What the last sync left out, each in the system's words: a file refused here stays listed until
+    // it can be read, or is gone.
+    for skip in s.skips.iter().take(MAX_SKIPS_SHOWN) {
+        outln!("daemon: skipped: {skip}");
+    }
+    if s.skips.len() > MAX_SKIPS_SHOWN {
+        outln!(
+            "daemon: and {} more skipped: the daemon's log has them all",
+            s.skips.len() - MAX_SKIPS_SHOWN
         );
     }
     if let Some(w) = s.waiting.as_ref().filter(|w| w.until > now()) {

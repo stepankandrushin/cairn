@@ -79,7 +79,7 @@ impl SkipKind {
             | SkipKind::Unsupported => "move it out of the sync root to stop this report",
             SkipKind::MountPoint => "sync that filesystem as its own root",
             SkipKind::PermissionDenied => {
-                "grant read access, or run with access to it, and sync again"
+                "give this user access to it, or let the program that blocks it allow it; it is tried again by itself, and until then it stays as it was, never taken for deleted"
             }
             SkipKind::KeepsChanging => "sync again once it has stopped changing",
             SkipKind::VanishedDuringScan => "sync again",

@@ -16,6 +16,10 @@
 //!   cannot hold (EILSEQ), as APFS does a name that is not UTF-8.
 //! - `CAIRN_FP_EPERM=<name>`: `deny` refuses that point with EPERM, as a filesystem refuses a change
 //!   to a file this user does not own. Not a step: numbered points elsewhere stay where they were.
+//! - `CAIRN_FP_REFUSE=<point>:<entry>:<code>[:<while>]`: `refuse` fails that point for an entry of
+//!   that name (`*` for any) with that raw OS error, while the file `<while>` exists if one is given,
+//!   as a system refuses a file this process may not read or write: an access list, a lock, an
+//!   antivirus. Not a step either.
 //! - `CAIRN_FP_UNSUPPORTED=<name>`: `unsupported` says yes at that point, as a filesystem says it
 //!   cannot do what is asked, the way NTFS cannot swap two names. Not a step either.
 //! - `CAIRN_FP_TUNE=<name>=<n>[,...]`: `tuned` gives `n` for that name instead of its default, to
@@ -91,6 +95,19 @@ pub fn deny(name: &str) -> io::Result<()> {
     #[cfg(not(feature = "enabled"))]
     {
         let _ = name;
+        Ok(())
+    }
+}
+
+/// Before reading or placing an entry of this name: may refuse it with an OS error, as the system
+/// refuses a file this process may not open.
+#[inline]
+pub fn refuse(point: &str, entry: &[u8]) -> io::Result<()> {
+    #[cfg(feature = "enabled")]
+    return imp::refuse(point, entry);
+    #[cfg(not(feature = "enabled"))]
+    {
+        let _ = (point, entry);
         Ok(())
     }
 }
@@ -351,6 +368,29 @@ mod imp {
         match std::env::var("CAIRN_FP_EPERM") {
             Ok(point) if point == name => Err(io::Error::from_raw_os_error(EPERM)),
             _ => Ok(()),
+        }
+    }
+
+    pub fn refuse(point: &str, entry: &[u8]) -> io::Result<()> {
+        let Ok(spec) = std::env::var("CAIRN_FP_REFUSE") else {
+            return Ok(());
+        };
+        // The file to watch for may hold a drive's colon: it is whatever follows the third.
+        let mut parts = spec.splitn(4, ':');
+        let (Some(at), Some(name), Some(code)) = (parts.next(), parts.next(), parts.next()) else {
+            return Ok(());
+        };
+        if at != point || (name != "*" && name.as_bytes() != entry) {
+            return Ok(());
+        }
+        if let Some(path) = parts.next() {
+            if !std::path::Path::new(path).exists() {
+                return Ok(());
+            }
+        }
+        match code.parse::<i32>() {
+            Ok(code) => Err(io::Error::from_raw_os_error(code)),
+            Err(_) => Ok(()),
         }
     }
 

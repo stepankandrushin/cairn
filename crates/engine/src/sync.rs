@@ -737,18 +737,30 @@ fn what_arrives_here(
     Ok(out)
 }
 
-/// An empty or largely vanished tree is not a mass delete until a person says so (invariant 5).
-/// `outside` counts what a round that takes part of the tree found where it was and left out: live on
-/// both sides, and here.
+/// Why a sync stops before it changes anything, and whether `--allow-mass-delete` lets it go on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub why: String,
+    /// Vanished, which a person may say they meant; refused, which nobody can say for the system.
+    pub overridable: bool,
+}
+
+/// An empty or largely vanished tree is not a mass delete until a person says so (invariant 5). Nor
+/// is one the system mostly refuses to this device synced at all: what it refuses is held as it was,
+/// never a delete, but a tree that is mostly that is a disk failing or a folder closed to this user,
+/// for a person to see before anything goes either way. `outside` counts what a round that takes part
+/// of the tree found where it was and left out: live on both sides, and here.
 fn check_vanished(
     base: &Tree,
     remote: &Tree,
     rows: &BTreeMap<ObjectId, Row>,
     local: &BTreeMap<ObjectId, crate::merge::LNode>,
+    refused: &BTreeSet<ObjectId>,
     outside: usize,
-) -> Option<String> {
+) -> Option<Hold> {
     let mut live = outside;
     let mut gone = 0usize;
+    let mut unread = 0usize;
     for (id, _) in remote.live() {
         // Known here: in the base, or pushed from here and not in the base yet.
         let known = base.is_live(id) || rows.get(&id).is_some_and(|r| r.synced.is_some());
@@ -758,15 +770,29 @@ fn check_vanished(
         live += 1;
         if !local.contains_key(&id) {
             gone += 1;
+        } else if refused.contains(&id) {
+            unread += 1;
         }
     }
-    let everything = live > 0 && gone == live;
-    let most = gone >= MASS_DELETE_MIN && gone * 2 >= live;
-    (everything || most).then(|| {
-        format!(
+    let most = |n: usize| (live > 0 && n == live) || (n >= MASS_DELETE_MIN && n * 2 >= live);
+    // Not all of a small tree, as for what vanished: one file refused in a tree of one is that file's
+    // report, and it is held whatever the count.
+    if unread >= MASS_DELETE_MIN && unread * 2 >= live {
+        return Some(Hold {
+            why: format!(
+                "{unread} of {live} synced entries here cannot be read: the system refuses them to this device, \
+                 each listed with its reason. None was taken for deleted and nothing was changed: sync is paused, \
+                 and goes on by itself once they can be read."
+            ),
+            overridable: false,
+        });
+    }
+    most(gone).then(|| Hold {
+        why: format!(
             "{gone} of {live} synced entries have vanished from this folder. If a disk is not mounted, mount it. \
              If you did delete them, run `cairn sync --allow-mass-delete`. Sync is paused and nothing was changed."
-        )
+        ),
+        overridable: true,
     })
 }
 
@@ -1740,14 +1766,15 @@ fn sync_full(
         let mut held: Option<(&BTreeSet<ObjectId>, &BTreeSet<ObjectId>)> = None;
         let thinking;
         if let Some(r) = part {
-            if !opts.allow_mass_delete {
-                if let Some(why) = r.vanished {
-                    let report = SyncReport {
-                        outcome: SyncOutcome::Paused(why),
-                        ..report
-                    };
-                    return Ok((report, trace));
-                }
+            if let Some(hold) = r
+                .vanished
+                .filter(|h| !(h.overridable && opts.allow_mass_delete))
+            {
+                let report = SyncReport {
+                    outcome: SyncOutcome::Paused(hold.why),
+                    ..report
+                };
+                return Ok((report, trace));
             }
             p_base = r.base;
             p_remote = r.remote;
@@ -1934,16 +1961,20 @@ fn sync_full(
             view.settle(rows);
             hit("sync.identified");
 
-            if !opts.allow_mass_delete {
-                if let Some(why) =
-                    check_vanished(&view.base, &view.remote, rows, &identified.local, 0)
-                {
-                    let report = SyncReport {
-                        outcome: SyncOutcome::Paused(why),
-                        ..report
-                    };
-                    return Ok((report, trace));
-                }
+            let hold = check_vanished(
+                &view.base,
+                &view.remote,
+                rows,
+                &identified.local,
+                &identified.refused,
+                0,
+            );
+            if let Some(hold) = hold.filter(|h| !(h.overridable && opts.allow_mass_delete)) {
+                let report = SyncReport {
+                    outcome: SyncOutcome::Paused(hold.why),
+                    ..report
+                };
+                return Ok((report, trace));
             }
 
             // A name the server has in another form goes up as a second name, unless it waits here.
@@ -2379,7 +2410,7 @@ struct Ready {
     plan: Plan,
     unstable: bool,
     retryable: bool,
-    vanished: Option<String>,
+    vanished: Option<Hold>,
     seen: HashMap<ObjectId, Option<Hash>>,
     all: BTreeSet<ObjectId>,
     dirty: BTreeSet<ObjectId>,
@@ -2893,6 +2924,7 @@ fn incremental_head(
             &view.remote,
             &rows,
             &identified.local,
+            &identified.refused,
             c.quiet_outside(&reach),
         );
         let before_twins = identified.local.clone();
@@ -3184,7 +3216,14 @@ fn oracle_full(
     }
     rows_after_scan(&mut rows, &identified, &view.base);
     view.settle(&rows);
-    let vanished = check_vanished(&view.base, &view.remote, &rows, &identified.local, 0);
+    let vanished = check_vanished(
+        &view.base,
+        &view.remote,
+        &rows,
+        &identified.local,
+        &identified.refused,
+        0,
+    );
     let twins = crate::twins::hold_back_twins(root, &mut identified, base, &remote);
     let plan = merge(MergeInput {
         base: &view.base,

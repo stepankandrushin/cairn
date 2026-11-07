@@ -11,6 +11,10 @@
   of their own at a join, as an extended attribute only one side has does: a bit only one side has stays, and goes
   to the others, where the mode reads the file. A folder's mode, which says who can enter it, is the server's as
   before.
+- A Mac kept the wrong time on a file with a resource fork, and said it was synced. When a sync gave a file only
+  its resource fork, at a join or as a change on another device, writing the fork moved the file's modification
+  time to the present, and the time was set only where it had differed before: the moved time stayed, taken for
+  the server's, and never went up. The time is now set after any extended attribute written.
 
 ## 0.1.7
 

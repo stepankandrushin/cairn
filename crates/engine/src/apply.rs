@@ -506,16 +506,18 @@ impl<'a> Applier<'a> {
             // Whatever this is, the record of it says so.
             Err(_) => return Ok(None),
         };
-        // The mtime as it was, unless this run set it, or a record, which may move it where a resource
-        // fork is one. Set, it is what this filesystem keeps of the time asked for, which may be coarser
-        // than it says, or as it was if it could not be set; an edit puts the present there.
-        let mtime_set = cur.apply_from.mtime != want.mtime;
+        // The mtime as it was, unless this run set it, as it does after writing a record, which may have
+        // moved it where a resource fork is one. Set, it is what this filesystem keeps of the time asked
+        // for, which may be coarser than it says, or as it was if it could not be set; an edit puts the
+        // present there.
+        let mtime_set =
+            cur.apply_from.mtime != want.mtime || cur.apply_from.records != want.records;
         let mtime_ok = if mtime_set {
             let off = (crate::scan::ns(now.mtime) - crate::scan::ns(want.mtime)).abs();
             off <= COARSEST_MTIME_NS + i128::from(self.root.dir.fstype_precision_ns())
                 || now.mtime == fp.mtime
         } else {
-            now.mtime == fp.mtime || cur.apply_from.records != want.records
+            now.mtime == fp.mtime
         };
         if now.ino != fp.ino || now.size != fp.size || !mtime_ok {
             return Err(StepError::Changed(

@@ -149,6 +149,62 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
     }
 }
 
+/// A record whose writing moves the file's mtime, as a resource fork's does on macOS: a join that gives
+/// a copy with the server's bytes and time the record it lacks, and then a change of the record alone,
+/// must each leave the server's time on the file. The moved one would stay unseen, the device's record
+/// taking it for the server's, and never go up. On Linux the harness has an xattr's write move the
+/// mtime. Not on Windows, which holds no xattrs.
+#[cfg(unix)]
+#[test]
+fn a_record_whose_write_moves_the_mtime_leaves_the_servers_time_there() {
+    #[cfg(target_os = "macos")]
+    let (key, env): (&str, &[(&str, &str)]) = ("com.apple.ResourceFork", &[]);
+    #[cfg(not(target_os = "macos"))]
+    let (key, env): (&str, &[(&str, &str)]) = (
+        "user.fork",
+        &[("CAIRN_FP_UNSUPPORTED", "fs.xattr.keeps_mtime")],
+    );
+    const WHEN: (i64, i64) = (1_700_000_000, 0);
+    let (sb, server, a) = seed("join-fork");
+    a.write("f", "same bytes");
+    set_xattr(&a.path("f"), key, b"a fork");
+    set_mtime(&a.path("f"), WHEN.0, WHEN.1);
+    a.synced();
+
+    let b = Device::new(&sb, &server, "b");
+    b.write("f", "same bytes");
+    set_mtime(&b.path("f"), WHEN.0, WHEN.1);
+    let run = b.sync_env(env).expect_ok();
+    let f = entry(&b, "f");
+    assert_eq!(xattr(&f, key).as_deref(), Some("a fork"), "{}", run.text());
+    assert_eq!(
+        f.mtime,
+        WHEN,
+        "the join left the moved time: {}",
+        run.text()
+    );
+
+    // The record alone changes, with the time put back where writing it moved it.
+    set_xattr(&a.path("f"), key, b"another fork");
+    set_mtime(&a.path("f"), WHEN.0, WHEN.1);
+    a.synced();
+    let run = b.sync_env(env).expect_ok();
+    let f = entry(&b, "f");
+    assert_eq!(
+        xattr(&f, key).as_deref(),
+        Some("another fork"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(
+        f.mtime,
+        WHEN,
+        "the change in place left the moved time: {}",
+        run.text()
+    );
+    converge(&[&a, &b]);
+}
+
 /// More losers than one commit holds, as a big tree joining after another tool has: each is in the
 /// log, the ones the first commit had no room for in the next. Its losers are xattrs, so not on Windows.
 #[cfg(unix)]

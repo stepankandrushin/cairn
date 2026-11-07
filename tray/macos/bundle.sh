@@ -3,8 +3,11 @@
 #   bash macos/bundle.sh target/release/cairn-tray out/Cairn.app        # the tray, com.cairn.tray
 #   bash macos/bundle.sh ../target/release/cairn "out/Cairn Sync.app"   # the CLI and daemon, com.cairn.sync
 # The daemon runs from inside its bundle, so that System Settings shows "Cairn Sync" with its icon, in Login
-# Items and in the privacy lists, rather than a bare "cairn"; ~/.local/bin/cairn can be a link to it.
-# LSUIElement keeps either out of the Dock.
+# Items and in the privacy lists, rather than a bare "cairn", and Activity Monitor too, as the daemon checks
+# itself in with LaunchServices when it starts on a desktop (crates/cli/src/macos.rs). ~/.local/bin/cairn can
+# be a link to it, though a daemon started through the link shows as "cairn". Neither is in the Dock: the tray
+# is a UI element (LSUIElement), the daemon background-only (LSBackgroundOnly), so that opening its bundle
+# never brings to the front a process with no event loop to answer.
 #
 # The icons come from icons/ (make.py): an asset catalog compiled by Xcode's actool when there is one, which
 # macOS 26 and later draw properly at every size, and a plain .icns either way.

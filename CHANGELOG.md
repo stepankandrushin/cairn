@@ -22,6 +22,16 @@
   rest of the sync held about 2.4 GB, and read every file whose mode it had set a third time. That round now counts
   only what the device holds: on Linux the same join of 16,000 files in a tree of 124,000 peaks at 0.56 GB where
   it peaked at 1.36 GB.
+- On a Mac, Activity Monitor showed the daemon as "cairn", with no icon, beside the tray's "Cairn": the two
+  differed by a capital letter. Activity Monitor gives a process its bundle's name and icon only once
+  LaunchServices knows it as an app, and launchd starts the daemon without AppKit, which is what tells it. The
+  daemon now checks itself in when it starts on a desktop, so it shows as "Cairn Sync" with its icon, and
+  Cairn Sync.app is now background-only rather than a UI element: still no Dock icon, menu or window, and
+  opening the bundle can no longer bring to the front a process with no event loop. Opening it while the daemon
+  runs starts nothing, where it used to start a `cairn` that printed its usage. The bundle's identifier and
+  signature are unchanged, so no permission is asked again. It adds about 2 MB to the daemon's memory, and
+  nothing to any other command; started over SSH or through the `~/.local/bin/cairn` link, the daemon shows as
+  before.
 
 ## 0.1.7
 

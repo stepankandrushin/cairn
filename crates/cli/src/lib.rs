@@ -18,6 +18,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 macro_rules! errln {
     ($($t:tt)*) => {{
         let _ = writeln!(std::io::stderr(), $($t)*);
@@ -660,6 +663,11 @@ fn run_inner() -> Result<u8> {
                 root.display(),
                 cairn_engine::update::running_version()
             ));
+            // The daemon alone: no other command has macOS know it as an app.
+            #[cfg(target_os = "macos")]
+            if let Err(e) = macos::check_in() {
+                say(&format!("macOS does not know this daemon as its app, so Activity Monitor shows it as cairn, without its icon; it syncs as before: {e}"));
+            }
             cairn_engine::daemon::run(&root, &opts, &mut |line| say(line))?;
             // This program was replaced: the new one, in this process where the system allows.
             Err(cairn_engine::update::restart())

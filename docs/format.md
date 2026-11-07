@@ -67,7 +67,8 @@ the root.
   daemon.json    what a running daemon last reported; for reading only, and never needed
   full-checked   when a sync last ended with every decision the full sync's, in seconds since the
                  epoch: the daemon's check on the incremental path is due a day after; never needed
-  state.sqlite   WAL, synchronous=FULL
+  state.sqlite   WAL, synchronous=FULL; rewritten (VACUUM) after a sync that leaves over half of it
+                 free pages
   stage/         entries lifted out for a moment, for swaps and cycles
   chunks/        downloads in progress, by hash, in slices of about 1 GiB, each chunk gone once the
                  files that take it are written; resumes after an interruption

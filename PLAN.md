@@ -283,7 +283,11 @@ client waits for less. It holds no file open in a root while idle, so a disk can
 the state in memory, so each sync first reads the state's file through once, in the file's order and in pieces
 of a MiB, unless it is over a quarter of the machine's memory: SQLite reads a page at a time in the order of a
 table's keys, which in a state syncs have rewritten is all over the file, a seek a page on a hard disk whose
-cache has dropped it. And it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
+cache has dropped it. A sync that leaves over half of that file free pages, which SQLite reuses but never gives
+back, as a join or a big delete does, has it rewritten once it is reported (VACUUM, every table in key order,
+the format as it was, its temporary copy in a file rather than in memory), under the root's lock as a sync: said
+in the log alone, put off while a disk lacks the room, and a kill or a full disk in it leaves the state as it was.
+And it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being
 unmounted, but says nothing when only a bind mount goes away, or when anything is mounted back: the
 reconcile finds the first, and retrying while paused the second. On Windows a watched folder says nothing
 when it is itself renamed, so a second watch, on the folder above, notices the root renamed away or another

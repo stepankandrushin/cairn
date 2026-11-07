@@ -69,6 +69,11 @@ pub struct Root {
 const FULL_CHECKED: &str = "full-checked";
 
 impl Root {
+    /// The state's own file.
+    pub fn state_file(&self) -> PathBuf {
+        self.path.join(name_path(STATE_DIR)).join("state.sqlite")
+    }
+
     pub fn full_checked(&self) -> Option<i64> {
         let path = self.path.join(name_path(STATE_DIR)).join(FULL_CHECKED);
         std::fs::read_to_string(path).ok()?.trim().parse().ok()

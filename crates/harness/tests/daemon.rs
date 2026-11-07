@@ -2689,3 +2689,50 @@ fn a_change_of_metadata_alone_is_listed_where_it_arrives_too() {
         );
     }
 }
+
+/// A big delete taken in leaves most of the state's file free pages: the daemon compacts it after that
+/// sync, says so in its log alone, once, and goes on syncing.
+#[test]
+fn the_daemon_compacts_a_state_a_big_delete_left_mostly_free() {
+    let sb = Sandbox::on_disk("daemon-compact");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    let file = |i: usize| format!("d{}/f{i}", i % 20);
+    for i in 0..2000 {
+        a.write(&file(i), format!("file {i}"));
+    }
+    a.synced();
+    b.synced();
+    let d = Daemon::start_env(
+        &b,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_TUNE", "state.compact_floor=0")],
+    );
+    d.wait_state("synced");
+    for i in 200..2000 {
+        remove_file(&a.path(&file(i)));
+    }
+    a.cairn(&["sync", "--allow-mass-delete"]).expect_ok();
+    wait_for("the compaction", &d.log, || {
+        d.log().contains("compacted the state")
+    });
+    let log = d.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("compacted the state"))
+        .unwrap();
+    assert!(
+        line.contains("% of it free pages: ") && line.contains(" to ") && line.ends_with(" s"),
+        "{line}"
+    );
+    assert!(!b.exists(&file(1999)));
+    a.write("after", "a change after it");
+    a.synced();
+    wait_file(&d, b.path("after"), b"a change after it");
+    let log = d.log();
+    assert_eq!(log.matches("compacted the state").count(), 1, "{log}");
+    assert!(!log.contains("not compacted"), "{log}");
+    let (count, free) = state_pages(&b.path(".cairn/state.sqlite"));
+    assert!(free * 2 <= count, "{free} of {count} pages free");
+}

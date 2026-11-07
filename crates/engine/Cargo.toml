@@ -45,4 +45,4 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 
 [features]
-failpoints = ["cairn-failpoint/enabled"]
+failpoints = ["cairn-failpoint/enabled", "rusqlite/hooks"]

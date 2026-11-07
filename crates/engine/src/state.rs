@@ -9,7 +9,8 @@ use cairn_protocol::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
@@ -442,6 +443,199 @@ fn memory() -> Option<u64> {
     None
 }
 
+/// Free pages under this are not worth rewriting the state for: a small tree's would churn for nothing.
+const COMPACT_FLOOR: u64 = 4 << 20;
+
+/// A state's file by its pages: their size, how many, and how many of them are free, kept by SQLite
+/// for reuse but never given back to the filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pages {
+    pub size: u64,
+    pub count: u64,
+    pub free: u64,
+}
+
+impl Pages {
+    pub fn file(&self) -> u64 {
+        self.size * self.count
+    }
+
+    /// What the pages in use hold: about what a compacted file comes to.
+    pub fn live(&self) -> u64 {
+        self.size * self.count.saturating_sub(self.free)
+    }
+
+    /// More than half of the file free, and enough of it to matter.
+    fn due(&self, floor: u64) -> bool {
+        self.free * 2 > self.count && self.free * self.size >= floor
+    }
+
+    fn free_percent(&self) -> u64 {
+        (self.free * 100).checked_div(self.count).unwrap_or(0)
+    }
+}
+
+/// What `State::compact` found, or did.
+#[derive(Debug)]
+pub enum Compaction {
+    NotDue(Pages),
+    /// Rewritten in key order with no page free: the file's bytes after, and how long it took.
+    Done {
+        before: Pages,
+        after: u64,
+        took: Duration,
+    },
+    /// Due, but the filesystem holding `place` has `free` bytes where the rewrite takes `need`.
+    NoRoom {
+        pages: Pages,
+        place: PathBuf,
+        need: u64,
+        free: u64,
+    },
+}
+
+impl std::fmt::Display for Compaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use cairn_protocol::local::bytes;
+        match self {
+            Compaction::NotDue(p) => write!(
+                f,
+                "the state was not compacted: {} % of its {} is free pages",
+                p.free_percent(),
+                bytes(p.file())
+            ),
+            Compaction::Done {
+                before,
+                after,
+                took,
+            } => write!(
+                f,
+                "compacted the state, {} % of it free pages: {} to {}, in {:.1} s",
+                before.free_percent(),
+                bytes(before.file()),
+                bytes(*after),
+                took.as_secs_f64()
+            ),
+            Compaction::NoRoom {
+                pages,
+                place,
+                need,
+                free,
+            } => write!(
+                f,
+                "the state was not compacted, though {} % of its {} is free pages: rewriting it takes {} \
+                 where {} is, which has {} free; it stays as it was, and is tried again after a later sync",
+                pages.free_percent(),
+                bytes(pages.file()),
+                bytes(*need),
+                place.display(),
+                bytes(*free)
+            ),
+        }
+    }
+}
+
+/// Where SQLite puts a temporary database: its unix VFS's first of these that is a folder it may write
+/// in, Windows's temporary folder there.
+fn sqlite_temp_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let from_env = ["SQLITE_TMPDIR", "TMPDIR"]
+            .into_iter()
+            .filter_map(|v| std::env::var_os(v).map(PathBuf::from));
+        let fixed = ["/var/tmp", "/usr/tmp", "/tmp", "."]
+            .into_iter()
+            .map(PathBuf::from);
+        from_env.chain(fixed).find(|d| {
+            d.is_dir()
+                && rustix::fs::access(
+                    d.as_path(),
+                    rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+                )
+                .is_ok()
+        })
+    }
+    #[cfg(windows)]
+    {
+        Some(std::env::temp_dir())
+    }
+}
+
+/// The bytes free to this user on the filesystem holding `path`, if it says.
+fn free_bytes(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let s = rustix::fs::statvfs(path).ok()?;
+        Some(s.f_bavail.saturating_mul(s.f_frsize))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut free: u64 = 0;
+        // SAFETY: a NUL-terminated path, and one out-parameter, the others null as the call allows.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        ok.then_some(free)
+    }
+}
+
+/// Whether two folders are on one filesystem, so that what is written in each comes out of one room.
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev(),
+            _ => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let prefix = |p: &Path| {
+            std::path::absolute(p)
+                .ok()
+                .and_then(|p| match p.components().next() {
+                    Some(std::path::Component::Prefix(x)) => {
+                        Some(x.as_os_str().to_string_lossy().to_lowercase())
+                    }
+                    _ => None,
+                })
+        };
+        prefix(a) == prefix(b)
+    }
+}
+
+/// Where a compaction of a state whose pages in use hold `live` bytes lacks room, if anywhere: the WAL
+/// beside `file` takes about that much as the rewrite goes into it, and SQLite's temporary database as
+/// much again, each with an eighth and 8 MiB to spare. The WAL then goes back into the file, which only
+/// shrinks, and both are emptied.
+fn short_of_room(file: &Path, live: u64) -> Option<(PathBuf, u64, u64)> {
+    let each = (live + live / 8 + (8 << 20)) * cairn_failpoint::tuned("state.compact_room", 1);
+    if each == 0 {
+        return None;
+    }
+    let state_dir = file.parent()?.to_path_buf();
+    let temp = sqlite_temp_dir();
+    let mut places = vec![(state_dir.clone(), each)];
+    match temp {
+        Some(t) if same_filesystem(&state_dir, &t) => places[0].1 += each,
+        Some(t) => places.push((t, each)),
+        None => {}
+    }
+    places.into_iter().find_map(|(place, need)| {
+        let free = free_bytes(&place)?;
+        (free < need).then_some((place, need, free))
+    })
+}
+
 /// What a transaction writes, in the order of the table's keys: each page is then dirtied once, and
 /// written once, however far the transaction outgrows the page cache. In the order given, as random as
 /// object IDs are, a page goes to the WAL again each time it is dirtied again after a spill.
@@ -486,6 +680,79 @@ impl State {
         ensure_generation(&mut conn)?;
         ensure_ledger(&mut conn)?;
         Ok(Self { conn })
+    }
+
+    pub fn pages(&self) -> Result<Pages> {
+        let get = |pragma: &str| -> Result<u64> {
+            let n: i64 = self.conn.pragma_query_value(None, pragma, |r| r.get(0))?;
+            Ok(n.max(0) as u64)
+        };
+        Ok(Pages {
+            size: get("page_size")?,
+            count: get("page_count")?,
+            free: get("freelist_count")?,
+        })
+    }
+
+    /// Whether `compact` would rewrite the state now. A state it cannot ask is not.
+    pub fn compaction_due(&self) -> bool {
+        self.pages()
+            .is_ok_and(|p| p.due(cairn_failpoint::tuned("state.compact_floor", COMPACT_FLOOR)))
+    }
+
+    /// Rewrites the state, the file at `file`, with every table in key order and no page free, if more
+    /// than half of it is free pages: what a join or any big rewrite leaves, which SQLite reuses but never
+    /// gives back, and which each sync's warm-up reads and a cold read of a table seeks across. Its page
+    /// size and `auto_vacuum` stay as they were, so nothing about the format changes. SQLite's VACUUM,
+    /// through the WAL as any transaction: a kill or a full disk at any point leaves the state as it
+    /// was, or as it is after. Its temporary copy goes to a file, not to memory, where it would take as
+    /// much as the state holds. The WAL is emptied after it either way, so that what a VACUUM that failed
+    /// wrote does not hold the room.
+    pub fn compact(&self, file: &Path) -> Result<Compaction> {
+        let before = self.pages()?;
+        if !before.due(cairn_failpoint::tuned("state.compact_floor", COMPACT_FLOOR)) {
+            return Ok(Compaction::NotDue(before));
+        }
+        cairn_failpoint::hit("state.compact.due");
+        if let Some((place, need, free)) = short_of_room(file, before.live()) {
+            return Ok(Compaction::NoRoom {
+                pages: before,
+                place,
+                need,
+                free,
+            });
+        }
+        let started = Instant::now();
+        self.conn.pragma_update(None, "temp_store", "FILE")?;
+        // Points to kill it at, all the way through: one every thousand of SQLite's steps.
+        #[cfg(feature = "failpoints")]
+        self.conn.progress_handler(
+            1000,
+            Some(|| {
+                cairn_failpoint::hit("state.compact.vacuuming");
+                false
+            }),
+        );
+        let vacuumed = self.conn.execute_batch("VACUUM");
+        #[cfg(feature = "failpoints")]
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+        cairn_failpoint::hit("state.compact.vacuumed");
+        let emptied = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            });
+        let restored = self.conn.pragma_update(None, "temp_store", "MEMORY");
+        vacuumed.context("rewrite the state (VACUUM)")?;
+        emptied.context("empty the state's WAL")?;
+        restored?;
+        cairn_failpoint::hit("state.compact.done");
+        let after = std::fs::metadata(file).map_or(0, |m| m.len());
+        Ok(Compaction::Done {
+            before,
+            after,
+            took: started.elapsed(),
+        })
     }
 
     /// Moved by every write to the state; `None` if this file cannot say.
@@ -1227,6 +1494,176 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = State::open(&dir.join("state.sqlite")).unwrap();
         (dir, state)
+    }
+
+    /// Every table's rows, and the schema with its triggers, in one order: what a compaction keeps.
+    fn everything(state: &State) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        let tables: Vec<String> = {
+            let mut stmt = state
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap();
+            let names = stmt.query_map([], |r| r.get(0)).unwrap();
+            names.map(Result::unwrap).collect()
+        };
+        let mut all = Vec::new();
+        for table in ["sqlite_master".to_string()].into_iter().chain(tables) {
+            // Where each table starts is the one thing in the schema a rewrite moves.
+            let sql = match table.as_str() {
+                "sqlite_master" => {
+                    "SELECT type, name, tbl_name, sql FROM sqlite_master".to_string()
+                }
+                t => format!("SELECT * FROM \"{t}\""),
+            };
+            let mut stmt = state.conn.prepare(&sql).unwrap();
+            let n = stmt.column_count();
+            let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt
+                .query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            all.push((table, rows));
+        }
+        all
+    }
+
+    #[track_caller]
+    fn same_everything(
+        got: &[(String, Vec<Vec<rusqlite::types::Value>>)],
+        want: &[(String, Vec<Vec<rusqlite::types::Value>>)],
+    ) {
+        let names = |all: &[(String, Vec<Vec<rusqlite::types::Value>>)]| -> Vec<String> {
+            all.iter()
+                .map(|(t, rows)| format!("{t}: {}", rows.len()))
+                .collect()
+        };
+        let differ: Vec<&String> = got
+            .iter()
+            .zip(want)
+            .filter(|(g, w)| g != w)
+            .map(|(g, _)| &g.0)
+            .collect();
+        assert!(
+            got.len() == want.len() && differ.is_empty(),
+            "differ: {differ:?}; got {:?}, wanted {:?}",
+            names(got),
+            names(want)
+        );
+    }
+
+    #[test]
+    fn a_state_is_due_a_compaction_past_half_free_and_the_floor_alone() {
+        let pages = |count, free| Pages {
+            size: 4096,
+            count,
+            free,
+        };
+        let floor = COMPACT_FLOOR;
+        let at_floor = floor / 4096;
+        assert!(pages(2 * at_floor - 1, at_floor).due(floor));
+        assert!(
+            !pages(2 * at_floor, at_floor).due(floor),
+            "half is not over half"
+        );
+        assert!(!pages(at_floor, at_floor - 1).due(floor), "under the floor");
+        assert!(!pages(0, 0).due(floor), "empty");
+        assert!(
+            pages(570_789, 302_952).due(floor),
+            "a state rewritten by a join"
+        );
+        assert!(!pages(570_789, 30_000).due(floor), "a state in use");
+    }
+
+    /// The rows stay, every one, the schema and its triggers with them, and the generation, so the next
+    /// sync with nothing to do still knows it has nothing to do; the free pages go, and the WAL is empty.
+    #[test]
+    fn a_compaction_takes_back_the_free_pages_and_keeps_every_row() {
+        let (dir, mut state) = fresh();
+        let path = dir.join("state.sqlite");
+        let rows: Vec<(ObjectId, Row)> = (0..2000).map(|i| (ObjectId::random(), row(i))).collect();
+        let refs: Vec<(ObjectId, &Row)> = rows.iter().map(|(id, r)| (*id, r)).collect();
+        state.store_rows(&refs, &[]).unwrap();
+        let manifests: Vec<(Hash, Vec<u8>)> = (0..48u8)
+            .map(|i| (Hash::of(&[i]), vec![i; 200_000]))
+            .collect();
+        state.put_manifests(&manifests).unwrap();
+        let keep: BTreeSet<Hash> = manifests.iter().take(3).map(|(h, _)| *h).collect();
+        state.retain_manifests(&keep).unwrap();
+        let gone: Vec<ObjectId> = rows.iter().skip(500).map(|(id, _)| *id).collect();
+        state.store_rows(&[], &gone).unwrap();
+
+        let before = state.pages().unwrap();
+        assert!(state.compaction_due(), "{before:?}");
+        let (kept, generation) = (everything(&state), state.generation().unwrap());
+        let (size, vacuum): (i64, i64) = state
+            .conn
+            .query_row(
+                "SELECT * FROM pragma_page_size, pragma_auto_vacuum",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let done = state.compact(&path).unwrap();
+        let Compaction::Done { after, .. } = done else {
+            panic!("{done:?}")
+        };
+        let now = state.pages().unwrap();
+        assert_eq!(now.free, 0, "{now:?}");
+        assert_eq!(after, std::fs::metadata(&path).unwrap().len());
+        assert!(after <= before.live(), "{after} of {before:?}");
+        assert_eq!(
+            std::fs::metadata(dir.join("state.sqlite-wal"))
+                .unwrap()
+                .len(),
+            0
+        );
+        same_everything(&everything(&state), &kept);
+        assert_eq!(state.generation().unwrap(), generation);
+        let same: (i64, i64) = state
+            .conn
+            .query_row(
+                "SELECT * FROM pragma_page_size, pragma_auto_vacuum",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(same, (size, vacuum));
+        let temp: i64 = state
+            .conn
+            .pragma_query_value(None, "temp_store", |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp, 2, "back to memory for what a sync does");
+        assert!(!state.compaction_due());
+        assert!(matches!(
+            state.compact(&path).unwrap(),
+            Compaction::NotDue(_)
+        ));
+
+        // And as the next open finds it.
+        drop(state);
+        let state = State::open(&path).unwrap();
+        same_everything(&everything(&state), &kept);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_mostly_in_use_is_left_as_it_is() {
+        let (dir, state) = fresh();
+        let path = dir.join("state.sqlite");
+        state.set("big", &"x".repeat(12 << 20)).unwrap();
+        state.set("other", &"x".repeat(12 << 20)).unwrap();
+        state.set("other", &"y".repeat(4 << 20)).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let pages = state.pages().unwrap();
+        assert!(pages.free > 0 && pages.free * 2 < pages.count, "{pages:?}");
+        assert!(matches!(
+            state.compact(&path).unwrap(),
+            Compaction::NotDue(_)
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The warm-up reads the file whole, and a WAL a run left beside it, and nothing where there is none.

@@ -5,6 +5,7 @@ use cairn_engine::client::{Client, Retries};
 use cairn_engine::daemon::DaemonOptions;
 use cairn_engine::root::{open_config, Busy, Paused};
 use cairn_engine::scan::display_path;
+use cairn_engine::state::Compaction;
 use cairn_engine::{control, registry, restore, selection};
 use cairn_engine::{
     init_root, sync, ApplyPolicy, InitOptions, OwnerPolicy, Root, SyncOptions, SyncOutcome,
@@ -539,7 +540,23 @@ fn now() -> i64 {
 }
 
 fn run_sync(root: &Path, opts: SyncOptions) -> Result<u8> {
-    Ok(print_sync(&sync(root, &opts)?))
+    let report = sync(root, &opts)?;
+    let code = print_sync(&report);
+    if report.compact_due {
+        compact(root);
+    }
+    Ok(code)
+}
+
+/// After a sync whose report is out, as the daemon does: said only when it cannot be done, which leaves
+/// the state as it was and the sync's result as printed.
+fn compact(root: &Path) {
+    match cairn_engine::sync::compact(root) {
+        Ok(Compaction::Done { .. } | Compaction::NotDue(_)) => {}
+        Ok(short) => errln!("cairn: {short}"),
+        Err(e) if e.downcast_ref::<Busy>().is_some() => {}
+        Err(e) => errln!("cairn: the state was not compacted, and stays as it was: {e:#}"),
+    }
 }
 
 fn date_time(epoch: i64) -> String {

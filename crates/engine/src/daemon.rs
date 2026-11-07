@@ -22,6 +22,7 @@ use crate::control::{Handler, Hub};
 use crate::fsops::Dir;
 use crate::root::{read_config, read_root_id, Busy};
 use crate::scan::{display_path, STATE_FILE_DAEMON};
+use crate::state::Compaction;
 use crate::sync::{sync, SyncOptions, SyncOutcome, SyncReport};
 use crate::watch::{WatchCounts, Watcher};
 use anyhow::{bail, Result};
@@ -883,6 +884,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut said: BTreeSet<String> = BTreeSet::new();
     let mut said_counts = WatchCounts::default();
     let mut said_feed: Option<String> = None;
+    // Why the state was last not compacted, so that a disk short of room for it is said once.
+    let mut said_compact: Option<(String, String)> = None;
     let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
@@ -1103,6 +1106,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
 
         status.syncs += 1;
         status.last_sync = now_secs();
+        let compact_due = result.as_ref().is_ok_and(|r| r.compact_due);
         let mut lines = BTreeSet::new();
         match result {
             Ok(mut report) => {
@@ -1260,6 +1264,35 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         say_feed(&feed_down, &mut said_feed, log);
         status.feed_down.clone_from(&said_feed);
         show(path, &status, &hub);
+
+        // Once the sync is shown, and before the next: in the log alone, as it changes nothing a
+        // person sees. One that cannot be done leaves the state as it was, and the next sync tries again.
+        if compact_due {
+            // By what it is about, as the room a disk has changes from one sync to the next.
+            let why = match crate::sync::compact(path) {
+                Ok(done @ Compaction::Done { .. }) => {
+                    log(&done.to_string());
+                    give_back_memory();
+                    None
+                }
+                Ok(Compaction::NotDue(_)) => None,
+                Ok(ref short @ Compaction::NoRoom { ref place, .. }) => {
+                    Some((place.display().to_string(), short.to_string()))
+                }
+                Err(e) if e.downcast_ref::<Busy>().is_some() => said_compact.clone(),
+                Err(e) => {
+                    let line = format!("the state was not compacted, and stays as it was: {e:#}");
+                    Some((line.clone(), line))
+                }
+            };
+            if let Some((about, line)) = &why {
+                if said_compact.as_ref().map(|(a, _)| a) != Some(about) {
+                    log(line);
+                }
+            }
+            said_compact = why;
+            hit("daemon.compacted");
+        }
 
         if reconcile {
             let degraded =

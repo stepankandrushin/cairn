@@ -154,6 +154,8 @@ pub struct SyncReport {
     /// The files this sync read to hash them, and their bytes.
     pub files_read: u64,
     pub bytes_read: u64,
+    /// Over half of the state's file is free pages, for `compact` to take back once this is reported.
+    pub compact_due: bool,
 }
 
 impl SyncReport {
@@ -187,6 +189,7 @@ impl SyncReport {
             retries: 0,
             files_read: 0,
             bytes_read: 0,
+            compact_due: false,
         }
     }
 }
@@ -1482,6 +1485,14 @@ pub fn sync(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     })
 }
 
+/// After a sync that left over half of the state's file free pages, rewrite it without them, as
+/// `State::compact` says: once the sync is reported, so that it waits for nothing, under the root's lock,
+/// as a sync, so that nothing else has the state open meanwhile. `Busy` if something else holds it.
+pub fn compact(path: &Path) -> Result<crate::state::Compaction> {
+    let root = Root::open(path)?;
+    root.state.compact(&root.state_file())
+}
+
 fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let mut report = SyncReport::new();
     let mut root = match Root::open_to_sync(path) {
@@ -1515,8 +1526,9 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         }
         false => None,
     };
-    if let Some(fast) = fast {
+    if let Some(mut fast) = fast {
         hit("sync.fast");
+        fast.report.compact_due = root.state.compaction_due();
         if !crate::steady::oracle() {
             return Ok(counted(fast.report));
         }
@@ -2303,6 +2315,7 @@ fn sync_full(
             trace.steady = Some(record);
         }
     }
+    report.compact_due = !opts.dry_run && root.state.compaction_due();
     Ok((report, trace))
 }
 /// The base and rows whole, for rounds that take the whole tree, and the server's tree once the journal

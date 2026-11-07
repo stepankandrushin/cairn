@@ -471,3 +471,112 @@ fn a_skip_fails_where_every_test_must_run() {
         );
     }
 }
+
+/// The rewrite that takes back a state's free pages, on a disk with less room than it needs: told
+/// beforehand, and when told nothing, by the disk itself, partway through. Either way the sync it came
+/// after stands as reported, the state is as it was, and what a rewrite that failed wrote does not keep
+/// the room it took.
+#[test]
+fn a_compaction_on_a_full_disk_leaves_the_state_and_the_sync_as_they_were() {
+    let sb = Sandbox::on_disk("full-compact");
+    let dir = sb.path("small");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = on_small_disk("inner_compaction_on_a_full_disk", &dir, 64) {
+        assert!(ok, "see the output above");
+    }
+}
+
+fn free_on(dir: &std::path::Path) -> u64 {
+    let s = rustix::fs::statvfs(dir).unwrap();
+    s.f_bavail * s.f_frsize
+}
+
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_compaction_on_a_full_disk() {
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-compact-outer");
+    let server = Server::start(sb.path("server"));
+    let writer = Device::new(&sb, &server, "writer");
+    let reader = device_on(&server, small.join("reader"), "reader");
+    for i in 0..2000 {
+        writer.write(&format!("d{}/f{i}", i % 20), format!("file {i}"));
+    }
+    writer.synced();
+    reader.synced();
+    for i in 200..2000 {
+        remove_file(&writer.path(&format!("d{}/f{i}", i % 20)));
+    }
+    writer.cairn(&["sync", "--allow-mass-delete"]).expect_ok();
+    reader.synced();
+    reader.synced();
+    let state = reader.path(".cairn/state.sqlite");
+    let (count, free) = state_pages(&state);
+    assert!(free * 2 > count, "not mostly free: {free} of {count} pages");
+    let kept = state_everything(&state);
+    let live = (count - free) * 4096;
+
+    // Half of what the rewrite's WAL takes is left.
+    let ballast = small.join("ballast");
+    let left = live / 2;
+    std::fs::write(&ballast, vec![1u8; (free_on(&small) - left) as usize]).unwrap();
+    let room = free_on(&small);
+    assert!(room < live, "{room} free, {live} in use");
+
+    // Told: not tried, and said.
+    let run = reader
+        .sync_env(&[("CAIRN_FP_TUNE", "state.compact_floor=0")])
+        .expect_ok();
+    assert!(run.stdout.contains("synced at sequence"), "{}", run.text());
+    assert!(
+        run.stderr.contains("not compacted") && run.stderr.contains("free"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(state_pages(&state), (count, free));
+    same_state(
+        &state_everything(&state),
+        &kept,
+        "not tried for want of room",
+    );
+
+    // Not told: the disk fills partway through the rewrite.
+    let run = reader
+        .sync_env(&[(
+            "CAIRN_FP_TUNE",
+            "state.compact_floor=0,state.compact_room=0",
+        )])
+        .expect_ok();
+    assert!(run.stdout.contains("synced at sequence"), "{}", run.text());
+    assert!(
+        run.stderr.contains("not compacted, and stays as it was") && run.stderr.contains("full"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(state_pages(&state), (count, free));
+    same_state(
+        &state_everything(&state),
+        &kept,
+        "the disk filled during it",
+    );
+    assert_eq!(
+        wal_len(&state),
+        0,
+        "what the failed rewrite wrote is let go"
+    );
+    assert!(
+        free_on(&small) + 64 * 1024 >= room,
+        "{} free after, {room} before",
+        free_on(&small)
+    );
+
+    // Room again: the next sync's compaction goes through.
+    std::fs::remove_file(&ballast).unwrap();
+    let run = reader
+        .sync_env(&[("CAIRN_FP_TUNE", "state.compact_floor=0")])
+        .expect_ok();
+    assert!(!run.stderr.contains("compact"), "{}", run.text());
+    assert_eq!(state_pages(&state).1, 0);
+    same_state(&state_everything(&state), &kept, "compacted");
+    converge(&[&reader, &writer]);
+}

@@ -1126,3 +1126,85 @@ pub fn converge(devices: &[&Device]) -> Picture {
     }
     panic!("the devices did not converge in 12 passes");
 }
+
+// --- A client's state file, read from outside ---
+
+fn state_read_only(state: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(state, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+}
+
+/// (page count, free pages).
+pub fn state_pages(state: &Path) -> (u64, u64) {
+    let db = state_read_only(state);
+    let get = |p: &str| -> u64 {
+        db.pragma_query_value(None, p, |r| r.get::<_, i64>(0))
+            .unwrap() as u64
+    };
+    (get("page_count"), get("freelist_count"))
+}
+
+/// Every table's rows, and the schema with its triggers but not where each table starts, which is
+/// what a rewrite moves: what a compaction, or one killed, must leave as it was.
+pub fn state_everything(state: &Path) -> Vec<(String, Vec<String>)> {
+    let db = state_read_only(state);
+    let check: String = db
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok", "{}", state.display());
+    let tables: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = stmt.query_map([], |r| r.get(0)).unwrap();
+        names.map(Result::unwrap).collect()
+    };
+    let mut all = Vec::new();
+    for table in ["sqlite_master".to_string()].into_iter().chain(tables) {
+        let sql = match table.as_str() {
+            "sqlite_master" => "SELECT type, name, tbl_name, sql FROM sqlite_master".to_string(),
+            t => format!("SELECT * FROM \"{t}\""),
+        };
+        let mut stmt = db.prepare(&sql).unwrap();
+        let n = stmt.column_count();
+        let mut rows: Vec<String> = stmt
+            .query_map([], |r| {
+                (0..n)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap()
+            .map(|r| format!("{:?}", r.unwrap()))
+            .collect();
+        rows.sort();
+        all.push((table, rows));
+    }
+    all
+}
+
+#[track_caller]
+pub fn same_state(got: &[(String, Vec<String>)], want: &[(String, Vec<String>)], context: &str) {
+    let counts = |all: &[(String, Vec<String>)]| -> Vec<String> {
+        all.iter()
+            .map(|(t, rows)| format!("{t}: {}", rows.len()))
+            .collect()
+    };
+    let differ: Vec<&String> = got
+        .iter()
+        .zip(want)
+        .filter(|(g, w)| g != w)
+        .map(|(g, _)| &g.0)
+        .collect();
+    assert!(
+        got.len() == want.len() && differ.is_empty(),
+        "{context}: differ: {differ:?}; got {:?}, wanted {:?}",
+        counts(got),
+        counts(want)
+    );
+}
+
+pub fn wal_len(state: &Path) -> u64 {
+    let mut wal = state.as_os_str().to_owned();
+    wal.push("-wal");
+    std::fs::metadata(PathBuf::from(wal)).map_or(0, |m| m.len())
+}

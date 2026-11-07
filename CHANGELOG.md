@@ -14,6 +14,14 @@
   in 244 reads in one sequential run before loading, where loading had taken 5,311 reads at 4,329 places and its
   first round another 14,541 at 7,461; a sync with nothing to do, 10,616 at 6,605. A state over a quarter of the
   machine's memory, which the cache would not keep, is read as before.
+- The state of a sync root never shrank. A join, or any sync that rewrites or deletes much, leaves its file
+  mostly free pages, which SQLite reuses but never gives back: on the devices of a tree of 558,000 entries the
+  state stood at 1.6 to 2.7 GB, over half of it free, and each sync's read of it went through all of it. Once a
+  sync that leaves over half of the file free has been reported, the state is now rewritten without them,
+  every table in key order, which only the daemon's log mentions. On copies of two of those states, 2.34
+  GB came to 0.98 GB in 3.5 s (Linux, NVMe) and 2.65 GB to 1.08 GB in 7.7 s (an M1's SSD), with 70 to 85 MB more
+  memory and about twice what the state holds of room for the moment. Where a disk lacks that room it is put
+  off, and the log says so once; a kill or a full disk partway through leaves the state as it was.
 - On Windows, Task Manager showed the daemon as a bare `cairn.exe` with the generic program icon and no
   description, beside the tray's "Cairn": the gap macOS had until 0.1.8. Windows takes a program's name and icon
   from its file, and `cairn.exe` had neither. It now carries the daemon's icon, the cairn inside two sync arrows

@@ -1112,6 +1112,10 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             Ok(mut report) => {
                 last_error = None;
                 walk_first = false;
+                // In the log alone, as a compaction is: nothing a person sees changes.
+                if let Some(m) = &report.migrated {
+                    log(m);
+                }
                 if let Some(t) = report.agreed_since {
                     agreed_at = Some(t);
                     if let Some(w) = &watcher {

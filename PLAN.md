@@ -51,7 +51,7 @@ These outrank features and speed; each has failure tests.
 |---|---|---|
 | Sync engine, server | Rust; Tokio + Axum on the server | One data model and engine everywhere; the hard part is client filesystem work: races, partial writes, platform APIs, crash recovery |
 | Server metadata | SQLite by default, PostgreSQL for multi-user scale | One binary for a home user, real concurrency for an organisation; both behind one narrow store trait and run through the same test suite |
-| Client state | SQLite (WAL) per sync root | Holds the base state for three-way merge, the durable queue, resumable transfers |
+| Client state | SQLite (WAL) per sync root, one SQL row per object holding its base node and its row as binary records, the row written against the node so each detail is stored once (docs/format.md); an older layout is moved to it in one transaction when a build first opens it | Holds the base state for three-way merge, the durable queue, resumable transfers; nodes, rows and manifests in about a seventh of the pages their JSON text took, and a kill or a full disk during the move leaves one layout or the other whole |
 | Content store | Immutable content-addressed chunks on local disk, S3-compatible optional | Trivial to back up and replicate |
 | Chunking | FastCDC (average ~1-4 MB), BLAKE3, optional Zstd | Inserting bytes mid-file changes only nearby chunks |
 | Transport | HTTPS: batched idempotent operations plus a persistent change feed | Passes through any reverse proxy and still gives instant push; QUIC only if measurements later ask for it |
@@ -284,7 +284,7 @@ the state in memory, so each sync first reads the state's file through once, in 
 of a MiB, unless it is over a quarter of the machine's memory: SQLite reads a page at a time in the order of a
 table's keys, which in a state syncs have rewritten is all over the file, a seek a page on a hard disk whose
 cache has dropped it. A sync that leaves over half of that file free pages, which SQLite reuses but never gives
-back, as a join or a big delete does, has it rewritten once it is reported (VACUUM, every table in key order,
+back, as a join or the move from an older layout does, has it rewritten once it is reported (VACUUM, every table in key order,
 the format as it was, its temporary copy in a file rather than in memory), under the root's lock as a sync: said
 in the log alone, put off while a disk lacks the room, and a kill or a full disk in it leaves the state as it was.
 And it handles no signal: a kill is the crash a sync already recovers from. inotify reports a filesystem being

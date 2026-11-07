@@ -502,28 +502,11 @@ fn the_periodic_check_finds_a_write_whose_mark_was_lost() {
         d.synced();
     }
     let db = a.path(".cairn/state.sqlite");
-    // The base64 of the name, as a link holds it.
-    let named = "%\"name\":\"dW5tYXJrZWQ=\"%";
-    let racy = || -> bool {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.query_row(
-            "SELECT row FROM rows WHERE object IN (SELECT object FROM base WHERE node LIKE ?1)",
-            [named],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
-        .contains("\"racy\":true")
-    };
+    let racy = || -> bool { row_named(&db, b"unmarked").racy };
     {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let n = conn
-            .execute(
-                "UPDATE rows SET row = replace(row, '\"racy\":false', '\"racy\":true') \
-                 WHERE object IN (SELECT object FROM base WHERE node LIKE ?1)",
-                [named],
-            )
-            .unwrap();
+        let n = edit_rows(&db, |n| named(n, b"unmarked"), |r| r.racy = true);
         assert_eq!(n, 1);
+        let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute("DELETE FROM dirty", []).unwrap();
     }
     assert!(racy());
@@ -2690,10 +2673,12 @@ fn a_change_of_metadata_alone_is_listed_where_it_arrives_too() {
     }
 }
 
-/// A big delete taken in leaves most of the state's file free pages: the daemon compacts it after that
-/// sync, says so in its log alone, once, and goes on syncing.
+/// A join leaves most of the state's file free pages, from the marks its rounds made and dropped: the
+/// daemon compacts it after that sync, says so in its log alone, once, and goes on syncing. (A big delete
+/// no longer does: what it frees is the deleted files' rows, ledger entries and manifests, while their
+/// nodes stay, under half of what the state holds.)
 #[test]
-fn the_daemon_compacts_a_state_a_big_delete_left_mostly_free() {
+fn the_daemon_compacts_a_state_its_join_left_mostly_free() {
     let sb = Sandbox::on_disk("daemon-compact");
     let server = Server::start(sb.path("server"));
     let a = Device::new(&sb, &server, "a");
@@ -2703,17 +2688,11 @@ fn the_daemon_compacts_a_state_a_big_delete_left_mostly_free() {
         a.write(&file(i), format!("file {i}"));
     }
     a.synced();
-    b.synced();
     let d = Daemon::start_env(
         &b,
         &["--reconcile-secs", DAY],
         &[("CAIRN_FP_TUNE", "state.compact_floor=0")],
     );
-    d.wait_state("synced");
-    for i in 200..2000 {
-        remove_file(&a.path(&file(i)));
-    }
-    a.cairn(&["sync", "--allow-mass-delete"]).expect_ok();
     wait_for("the compaction", &d.log, || {
         d.log().contains("compacted the state")
     });
@@ -2726,7 +2705,7 @@ fn the_daemon_compacts_a_state_a_big_delete_left_mostly_free() {
         line.contains("% of it free pages: ") && line.contains(" to ") && line.ends_with(" s"),
         "{line}"
     );
-    assert!(!b.exists(&file(1999)));
+    assert_eq!(b.read(&file(1999)), b"file 1999");
     a.write("after", "a change after it");
     a.synced();
     wait_file(&d, b.path("after"), b"a change after it");
@@ -2735,4 +2714,44 @@ fn the_daemon_compacts_a_state_a_big_delete_left_mostly_free() {
     assert!(!log.contains("not compacted"), "{log}");
     let (count, free) = state_pages(&b.path(".cairn/state.sqlite"));
     assert!(free * 2 <= count, "{free} of {count} pages free");
+}
+
+/// A state of 0.1.8's layout, as an update to this build finds it: the daemon's first sync moves it,
+/// says so in its log alone, once, and compacts what that freed after the sync; changes go on arriving.
+#[test]
+fn the_daemon_moves_a_state_of_an_older_layout_and_goes_on_syncing() {
+    let sb = Sandbox::on_disk("daemon-migrate");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..500 {
+        a.write(&format!("d{}/f{i}", i % 10), format!("file {i}"));
+    }
+    a.synced();
+    b.synced();
+    let state = b.path(".cairn/state.sqlite");
+    cairn_engine::state::legacy::to_v1(&state).unwrap();
+    let d = Daemon::start_env(
+        &b,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_TUNE", "state.compact_floor=0")],
+    );
+    d.wait_state("synced");
+    wait_for("the compaction after the move", &d.log, || {
+        d.log().contains("compacted the state")
+    });
+    let log = d.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("moved the state from layout 1 to 2"))
+        .unwrap_or_else(|| panic!("no move in the log: {log}"));
+    assert!(
+        line.contains("objects") && line.ends_with("after a sync"),
+        "{line}"
+    );
+    assert_eq!(cairn_engine::state::legacy::version(&state).unwrap(), 2);
+    a.write("after", "a change after it");
+    a.synced();
+    wait_file(&d, b.path("after"), b"a change after it");
+    assert_eq!(d.log().matches("moved the state").count(), 1, "{}", d.log());
 }

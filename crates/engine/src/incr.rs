@@ -31,19 +31,19 @@
 
 use crate::fsops::birth_mark;
 use crate::merge::LNode;
+use crate::record::{R, W};
 use crate::root::Root;
 use crate::scan::{ScanResult, Scanned};
 use crate::selection::Selection;
 use crate::state::{Fingerprint, Known, Row};
 use anyhow::Result;
-use cairn_protocol::{
-    Bytes, Content, Hash, Link, Name, Node, ObjectId, ObjectKind, Op, Timestamp, Tree,
-};
+use cairn_protocol::{Content, Hash, Link, Name, Node, ObjectId, ObjectKind, Op, Tree};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Moved whenever what the ledger means changes, so that none written before is read as one of these.
-pub const FORMAT: u32 = 1;
+/// Moved whenever what the ledger means or how it is written changes, so that none written before is read
+/// as one of these. 2: integers as varints.
+pub const FORMAT: u32 = 2;
 
 /// What the last agreement was for one live object of the base.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,63 +77,6 @@ impl Seen {
     }
 }
 
-struct W(Vec<u8>);
-
-impl W {
-    fn u8(&mut self, v: u8) {
-        self.0.push(v);
-    }
-    fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    fn bytes(&mut self, b: &[u8]) {
-        self.u32(b.len() as u32);
-        self.0.extend_from_slice(b);
-    }
-    fn time(&mut self, t: Timestamp) {
-        self.u64(t.sec as u64);
-        self.u32(t.nsec);
-    }
-}
-
-struct R<'a>(&'a [u8]);
-
-impl<'a> R<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.0.len() < n {
-            return None;
-        }
-        let (a, b) = self.0.split_at(n);
-        self.0 = b;
-        Some(a)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-    fn bytes(&mut self) -> Option<&'a [u8]> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
-    }
-    fn time(&mut self) -> Option<Timestamp> {
-        Some(Timestamp {
-            sec: self.u64()? as i64,
-            nsec: self.u32()?,
-        })
-    }
-}
-
 fn kind_byte(k: ObjectKind) -> u8 {
     match k {
         ObjectKind::File => 0,
@@ -142,50 +85,35 @@ fn kind_byte(k: ObjectKind) -> u8 {
     }
 }
 
+/// An entry: its format, kind and entries, then what the scan saw, its integers as varints and the rest
+/// as `record` writes them.
 impl Entry {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::with_capacity(96));
         w.u8(FORMAT as u8);
         w.u8(kind_byte(self.kind));
-        w.u32(self.links.len() as u32);
-        for l in &self.links {
-            w.0.extend_from_slice(&l.parent.0);
-            w.bytes(l.name.as_bytes());
-        }
+        crate::record::put_links(&mut w, self.links.iter());
         match &self.seen {
             None => w.u8(0),
             Some(s) => {
-                w.u8(1);
-                w.u64(s.fp.dev);
-                w.u64(s.fp.ino);
-                w.u64(s.fp.size);
+                let ctime_same = s.fp.ctime == s.fp.mtime;
+                w.u8(1
+                    | u8::from(s.fp.btime.is_some()) << 1
+                    | u8::from(ctime_same) << 2
+                    | u8::from(s.digest.is_some()) << 3);
+                w.uv(s.fp.dev);
+                w.uv(s.fp.ino);
+                w.uv(s.fp.size);
                 w.time(s.fp.mtime);
-                w.time(s.fp.ctime);
-                match s.fp.btime {
-                    Some(t) => {
-                        w.u8(1);
-                        w.time(t);
-                    }
-                    None => w.u8(0),
+                if !ctime_same {
+                    w.time(s.fp.ctime);
                 }
-                match &s.content {
-                    Content::Dir => w.u8(1),
-                    Content::File { manifest, size } => {
-                        w.u8(0);
-                        w.0.extend_from_slice(&manifest.0);
-                        w.u64(*size);
-                    }
-                    Content::Symlink { target } => {
-                        w.u8(2);
-                        w.bytes(&target.0);
-                    }
+                if let Some(t) = s.fp.btime {
+                    w.time(t);
                 }
-                match &s.digest {
-                    Some(d) => {
-                        w.u8(1);
-                        w.0.extend_from_slice(&d.0);
-                    }
-                    None => w.u8(0),
+                crate::record::put_content(&mut w, &s.content);
+                if let Some(d) = &s.digest {
+                    w.raw(&d.0);
                 }
             }
         }
@@ -203,41 +131,30 @@ impl Entry {
             2 => ObjectKind::Symlink,
             _ => return None,
         };
-        let n = r.u32()? as usize;
+        let n = r.count(18)?;
         let mut links = Vec::with_capacity(n.min(64));
         for _ in 0..n {
-            let parent = ObjectId(r.array::<16>()?);
-            let name = Name::new(r.bytes()?.to_vec()).ok()?;
-            links.push(Link { parent, name });
+            links.push(crate::record::get_link(&mut r)?);
         }
         let seen = match r.u8()? {
             0 => None,
-            1 => {
-                let dev = r.u64()?;
-                let ino = r.u64()?;
-                let size = r.u64()?;
+            flags if flags & 1 == 1 && flags >> 4 == 0 => {
+                let dev = r.uv()?;
+                let ino = r.uv()?;
+                let size = r.uv()?;
                 let mtime = r.time()?;
-                let ctime = r.time()?;
-                let btime = match r.u8()? {
-                    0 => None,
-                    1 => Some(r.time()?),
-                    _ => return None,
+                let ctime = match flags & 4 != 0 {
+                    true => mtime,
+                    false => r.time()?,
                 };
-                let content = match r.u8()? {
-                    0 => Content::File {
-                        manifest: Hash(r.array::<32>()?),
-                        size: r.u64()?,
-                    },
-                    1 => Content::Dir,
-                    2 => Content::Symlink {
-                        target: Bytes(r.bytes()?.to_vec()),
-                    },
-                    _ => return None,
+                let btime = match flags & 2 != 0 {
+                    true => Some(r.time()?),
+                    false => None,
                 };
-                let digest = match r.u8()? {
-                    0 => None,
-                    1 => Some(Hash(r.array::<32>()?)),
-                    _ => return None,
+                let content = crate::record::get_content(&mut r)?;
+                let digest = match flags & 8 != 0 {
+                    true => Some(Hash(r.array::<32>()?)),
+                    false => None,
                 };
                 Some(Seen {
                     fp: Fingerprint {
@@ -2749,6 +2666,7 @@ pub fn check_finalized(root: &Root, full: &FullRound) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_protocol::{Bytes, Timestamp};
 
     fn fp(n: u64) -> Fingerprint {
         Fingerprint {

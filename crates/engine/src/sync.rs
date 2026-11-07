@@ -156,6 +156,8 @@ pub struct SyncReport {
     pub bytes_read: u64,
     /// Over half of the state's file is free pages, for `compact` to take back once this is reported.
     pub compact_due: bool,
+    /// What opening the state for this sync moved it from an older build's layout, for the log.
+    pub migrated: Option<String>,
 }
 
 impl SyncReport {
@@ -190,6 +192,7 @@ impl SyncReport {
             files_read: 0,
             bytes_read: 0,
             compact_due: false,
+            migrated: None,
         }
     }
 }
@@ -1502,6 +1505,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
             return Ok(report);
         }
     };
+    report.migrated = root.state.migrated().map(|m| m.to_string());
     let client = Client::new(&root.config, Retries::Sync)?;
     let retried = client.retried();
     let counted = |mut report: SyncReport| {
@@ -1529,6 +1533,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     if let Some(mut fast) = fast {
         hit("sync.fast");
         fast.report.compact_due = root.state.compaction_due();
+        fast.report.migrated = report.migrated.clone();
         if !crate::steady::oracle() {
             return Ok(counted(fast.report));
         }

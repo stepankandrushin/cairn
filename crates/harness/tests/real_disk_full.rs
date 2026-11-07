@@ -516,7 +516,14 @@ fn inner_compaction_on_a_full_disk() {
     let kept = state_everything(&state);
     let live = (count - free) * 4096;
 
-    // Half of what the rewrite's WAL takes is left.
+    // Half of what the rewrite's WAL takes is left, and the WAL emptied first: what the join wrote into
+    // it, more than the state now holds, would otherwise take the rewrite without the disk growing.
+    rusqlite::Connection::open(&state)
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
     let ballast = small.join("ballast");
     let left = live / 2;
     std::fs::write(&ballast, vec![1u8; (free_on(&small) - left) as usize]).unwrap();
@@ -579,4 +586,93 @@ fn inner_compaction_on_a_full_disk() {
     assert_eq!(state_pages(&state).1, 0);
     same_state(&state_everything(&state), &kept, "compacted");
     converge(&[&reader, &writer]);
+}
+
+/// A state of version 1 moved to this build's layout on a disk short of room: told before it starts,
+/// and the sync stops with the reason; untold, the disk fills partway through, and the state is version
+/// 1 as it was, its WAL let go. Room again, the next sync moves it and holds the same.
+#[test]
+fn a_move_of_the_state_on_a_full_disk_leaves_version_1_as_it_was() {
+    let sb = Sandbox::on_disk("full-migrate");
+    let dir = sb.path("small");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = on_small_disk("inner_migration_on_a_full_disk", &dir, 64) {
+        assert!(ok, "see the output above");
+    }
+}
+
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_migration_on_a_full_disk() {
+    use cairn_engine::state::legacy;
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-migrate-outer");
+    let server = Server::start(sb.path("server"));
+    let writer = Device::new(&sb, &server, "writer");
+    let reader = device_on(&server, small.join("reader"), "reader");
+    for i in 0..3000 {
+        writer.write(&format!("d{}/f{i}", i % 20), format!("file {i}"));
+    }
+    writer.synced();
+    reader.synced();
+    let state = reader.path(".cairn/state.sqlite");
+    legacy::to_v1(&state).unwrap();
+    let held = legacy::contents(&state).unwrap();
+    let kept = state_everything(&state);
+    let (count, free) = state_pages(&state);
+    let live = (count - free) * 4096;
+
+    // Less than the move asks for.
+    let ballast = small.join("ballast");
+    std::fs::write(&ballast, vec![1u8; (free_on(&small) - live / 2) as usize]).unwrap();
+    let run = reader.sync();
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr.contains("no sync runs here until there is room") && run.stderr.contains("free"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(legacy::version(&state).unwrap(), 1);
+    same_state(
+        &state_everything(&state),
+        &kept,
+        "not tried for want of room",
+    );
+
+    // Not told, and its pages spilling into the WAL: the disk fills partway through.
+    let room = free_on(&small);
+    let more = small.join("more");
+    std::fs::write(&more, vec![1u8; (room - 96 * 1024) as usize]).unwrap();
+    let run = reader.sync_env(&[("CAIRN_FP_TUNE", "state.migrate_room=0,state.cache_kib=64")]);
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr.contains("ran out of room") && run.stderr.contains("stays as it was"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(legacy::version(&state).unwrap(), 1);
+    same_state(
+        &state_everything(&state),
+        &kept,
+        "the disk filled during it",
+    );
+    assert_eq!(wal_len(&state), 0, "what the failed move wrote is let go");
+    std::fs::remove_file(&more).unwrap();
+    assert!(
+        free_on(&small) + 64 * 1024 >= room,
+        "{} free after, {room} before",
+        free_on(&small)
+    );
+
+    // Room again.
+    std::fs::remove_file(&ballast).unwrap();
+    reader.synced();
+    assert_eq!(legacy::version(&state).unwrap(), 2);
+    assert!(
+        legacy::contents(&state).unwrap() == held,
+        "moved, not the same"
+    );
+    writer.write("d0/after", "after the move");
+    converge(&[&reader, &writer]);
+    assert_eq!(reader.read("d0/after"), b"after the move");
 }

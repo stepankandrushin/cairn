@@ -1,6 +1,7 @@
 //! The client's durable state, one SQLite file per sync root: the base tree and cursor for three-way
 //! merge, what each local object looked like, and the queue of commits not yet acknowledged.
 
+use crate::record;
 use anyhow::{bail, Context, Result};
 use cairn_protocol::wire::CommitRequest;
 use cairn_protocol::{
@@ -12,26 +13,38 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const MIGRATIONS: &[&str] = &[r#"
+/// The layout of the state, `PRAGMA user_version`: moved whenever what a table holds changes, and an
+/// older layout is moved to this one when the state is opened (`migrate_v1`). One newer than this
+/// build is refused, as an older build would misread it.
+pub const SCHEMA_VERSION: usize = 2;
+
+/// Version 2: one SQL row per object, with its base node and its row each a binary record (record.rs)
+/// or NULL, and manifests stored small.
+const SCHEMA: &str = r#"
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE base (object BLOB PRIMARY KEY, node TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE rows (object BLOB PRIMARY KEY, row TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE objects (
+    object BLOB PRIMARY KEY,
+    node BLOB,
+    row BLOB,
+    CHECK (node IS NOT NULL OR row IS NOT NULL)
+) WITHOUT ROWID;
 CREATE TABLE manifests (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE outbox (op_id BLOB PRIMARY KEY, request TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE intents (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-"#];
+"#;
 
 /// Every write to the state moves the generation, by triggers in the file itself, so that whatever
 /// writes it, this build or another, a sync can tell that nothing in it has changed since one that had
 /// nothing to do. Made once, all together, in one transaction; not a migration, so an older build still
 /// opens the file, and its writes move the generation too.
 const GENERATION_TRIGGERS: &[(&str, &str, &str)] = &[
-    ("base", "INSERT", ""),
-    ("base", "UPDATE", "WHEN OLD.node IS NOT NEW.node"),
-    ("base", "DELETE", ""),
-    ("rows", "INSERT", ""),
-    ("rows", "UPDATE", "WHEN OLD.row IS NOT NEW.row"),
-    ("rows", "DELETE", ""),
+    ("objects", "INSERT", ""),
+    (
+        "objects",
+        "UPDATE",
+        "WHEN OLD.node IS NOT NEW.node OR OLD.row IS NOT NEW.row",
+    ),
+    ("objects", "DELETE", ""),
     ("manifests", "INSERT", ""),
     ("manifests", "UPDATE", "WHEN OLD.bytes IS NOT NEW.bytes"),
     ("manifests", "DELETE", ""),
@@ -70,27 +83,22 @@ CREATE TABLE IF NOT EXISTS ledger_anchor (k INTEGER PRIMARY KEY, v TEXT NOT NULL
 
 /// Table, operation, condition, and the objects it marks.
 const DIRTY_TRIGGERS: &[(&str, &str, &str, &[&str])] = &[
-    ("base", "INSERT", "", &["NEW"]),
+    ("objects", "INSERT", "", &["NEW"]),
     (
-        "base",
+        "objects",
         "UPDATE",
-        "WHEN OLD.node IS NOT NEW.node OR OLD.object IS NOT NEW.object",
+        "WHEN OLD.node IS NOT NEW.node OR OLD.row IS NOT NEW.row OR OLD.object IS NOT NEW.object",
         &["OLD", "NEW"],
     ),
-    ("base", "DELETE", "", &["OLD"]),
-    ("rows", "INSERT", "", &["NEW"]),
-    (
-        "rows",
-        "UPDATE",
-        "WHEN OLD.row IS NOT NEW.row OR OLD.object IS NOT NEW.object",
-        &["OLD", "NEW"],
-    ),
-    ("rows", "DELETE", "", &["OLD"]),
+    ("objects", "DELETE", "", &["OLD"]),
 ];
 
 fn dirty_triggers() -> Vec<(String, String)> {
-    DIRTY_TRIGGERS
-        .iter()
+    dirty_triggers_of(DIRTY_TRIGGERS)
+}
+
+pub(crate) fn dirty_triggers_of(list: &[(&str, &str, &str, &[&str])]) -> Vec<(String, String)> {
+    list.iter()
         .map(|(table, op, when, marks)| {
             let name = format!("dirty_{table}_{}", op.to_lowercase());
             let body: String = marks
@@ -170,8 +178,11 @@ const KEY_GENERATION: &str = "generation";
 const KEY_STEADY: &str = "steady";
 
 fn generation_triggers() -> Vec<(String, String)> {
-    GENERATION_TRIGGERS
-        .iter()
+    generation_triggers_of(GENERATION_TRIGGERS)
+}
+
+pub(crate) fn generation_triggers_of(list: &[(&str, &str, &str)]) -> Vec<(String, String)> {
+    list.iter()
         .map(|(table, op, when)| {
             let name = format!("generation_{table}_{}", op.to_lowercase());
             let sql = format!(
@@ -326,13 +337,23 @@ impl Known<'_> {
 }
 
 /// A row as a sync with nothing to do reads it: what the scan needs, without the rest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Glance {
     pub fp: Fingerprint,
     pub racy: bool,
     pub content: Content,
-    #[serde(default)]
     pub incomplete: bool,
+}
+
+impl From<Row> for Glance {
+    fn from(r: Row) -> Glance {
+        Glance {
+            fp: r.fp,
+            racy: r.racy,
+            content: r.content,
+            incomplete: r.incomplete,
+        }
+    }
 }
 
 impl Glance {
@@ -349,7 +370,70 @@ impl Glance {
 
 pub struct State {
     conn: Connection,
+    migrated: Option<Migration>,
 }
+
+/// An object as the state stores it: its base node and its row, each a record (record.rs) or none,
+/// the row written against the node.
+pub struct Stored {
+    pub node: Option<Vec<u8>>,
+    pub row: Option<Vec<u8>>,
+}
+
+impl Stored {
+    pub fn node(&self) -> Result<Option<Node>> {
+        self.node.as_deref().map(record::decode_node).transpose()
+    }
+
+    /// The row, read against the node beside it.
+    pub fn row(&self) -> Result<Option<Row>> {
+        let Some(row) = &self.row else {
+            return Ok(None);
+        };
+        let node = self.node()?;
+        record::decode_row(row, node.as_ref()).map(Some)
+    }
+}
+
+/// What moving a state from version 1 to this one took: the bytes its pages in use held before and
+/// after, and how long.
+#[derive(Clone, Debug)]
+pub struct Migration {
+    pub from: usize,
+    pub before: u64,
+    pub after: u64,
+    pub objects: u64,
+    pub took: Duration,
+}
+
+impl std::fmt::Display for Migration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use cairn_protocol::local::bytes;
+        write!(
+            f,
+            "moved the state from layout {} to {}: {} objects, {} in use to {}, in {:.1} s; \
+             what that freed is given back by the compaction after a sync",
+            self.from,
+            SCHEMA_VERSION,
+            self.objects,
+            bytes(self.before),
+            bytes(self.after),
+            self.took.as_secs_f64()
+        )
+    }
+}
+
+/// Why a state of an older layout was left as it was, which this build cannot sync from.
+#[derive(Debug)]
+pub struct NotMigrated(pub String);
+
+impl std::fmt::Display for NotMigrated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotMigrated {}
 
 /// The page cache of a state's connection, in KiB.
 const STATE_CACHE_KIB: i64 = 32 * 1024;
@@ -636,6 +720,221 @@ fn short_of_room(file: &Path, live: u64) -> Option<(PathBuf, u64, u64)> {
     })
 }
 
+/// Where moving a state of version 1 to this layout lacks room, if anywhere. The new tables go into
+/// the WAL as they are written, at most three quarters of what the old ones held (records in binary
+/// take a third to a tenth of their JSON, base64 in it a third more than its bytes), and from the WAL
+/// into the file at the checkpoint: into the pages it has free, and past its end for the rest. With an
+/// eighth and 8 MiB to spare. The old tables' pages are only freed, which the compaction after a sync
+/// gives back.
+fn migration_short_of_room(file: &Path, p: &Pages) -> Option<(PathBuf, u64, u64)> {
+    let new = p.live() / 4 * 3;
+    let growth = new.saturating_sub(p.free * p.size);
+    let need =
+        (new + growth + new / 8 + (8 << 20)) * cairn_failpoint::tuned("state.migrate_room", 1);
+    if need == 0 {
+        return None;
+    }
+    let dir = file.parent()?.to_path_buf();
+    let free = free_bytes(&dir)?;
+    (free < need).then_some((dir, need, free))
+}
+
+/// Objects moved between two of the migration's failpoints.
+const MIGRATE_STEP: u64 = 256;
+
+/// Moves a state of version 1 (JSON text in `base` and `rows`) to this layout, in one transaction:
+/// a kill or a full disk at any point leaves version 1 whole, or this one whole, as SQLite's commit
+/// is all of it or none. Checks for room first. The ledger is dropped with it, which the next sync
+/// rebuilds from the state, as it does after any new build, and the generation moves.
+fn migrate_v1(conn: &mut Connection, file: &Path) -> Result<Migration> {
+    let started = Instant::now();
+    let pages = |c: &Connection| -> Result<Pages> {
+        let get = |pragma: &str| -> Result<u64> {
+            let n: i64 = c.pragma_query_value(None, pragma, |r| r.get(0))?;
+            Ok(n.max(0) as u64)
+        };
+        Ok(Pages {
+            size: get("page_size")?,
+            count: get("page_count")?,
+            free: get("freelist_count")?,
+        })
+    };
+    let before = pages(conn)?;
+    cairn_failpoint::hit("state.migrate.due");
+    if let Some((place, need, free)) = migration_short_of_room(file, &before) {
+        use cairn_protocol::local::bytes;
+        return Err(NotMigrated(format!(
+            "this root's state is in the layout of an older build, which this one moves to its own before \
+             it syncs: that takes {} where {} is, which has {} free. The state stays as it was, and no \
+             sync runs here until there is room",
+            bytes(need),
+            place.display(),
+            bytes(free)
+        ))
+        .into());
+    }
+    let moved = move_v1(conn);
+    if moved.is_err() {
+        // What the transaction wrote into the WAL before it failed holds room it no longer needs.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        });
+    }
+    let objects = match moved {
+        Ok(n) => n,
+        Err(e) if crate::is_disk_full(&e) => {
+            return Err(NotMigrated(format!(
+                "this root's state is in the layout of an older build, and moving it to this one's ran \
+                 out of room on the disk that holds it ({e:#}). The state stays as it was, and no sync \
+                 runs here until there is room"
+            ))
+            .into())
+        }
+        Err(e) => return Err(e.context("move the state to this build's layout; it stays as it was")),
+    };
+    cairn_failpoint::hit("state.migrate.committed");
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    let after = pages(conn)?;
+    Ok(Migration {
+        from: 1,
+        before: before.live(),
+        after: after.live(),
+        objects,
+        took: started.elapsed(),
+    })
+}
+
+/// The transaction of `migrate_v1`; the objects moved.
+fn move_v1(conn: &mut Connection) -> Result<u64> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if tx.pragma_query_value(None, "user_version", |r| r.get::<_, usize>(0))? != 1 {
+        bail!("the state's layout changed while it was being moved");
+    }
+    // The old triggers name tables about to go, and would count and mark every object moved.
+    let triggers: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        names.collect::<rusqlite::Result<_>>()?
+    };
+    for name in &triggers {
+        tx.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE objects (
+             object BLOB PRIMARY KEY,
+             node BLOB,
+             row BLOB,
+             CHECK (node IS NOT NULL OR row IS NOT NULL)
+         ) WITHOUT ROWID;
+         CREATE TABLE manifests_v2 (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) WITHOUT ROWID;",
+    )?;
+    cairn_failpoint::hit("state.migrate.begun");
+    let mut objects = 0u64;
+    {
+        // Both tables in the order of their keys, merged: each object read once, and written in key
+        // order, so each page of the new table is written once.
+        let mut nodes = tx.prepare("SELECT object, node FROM base ORDER BY object")?;
+        let mut rows = tx.prepare("SELECT object, row FROM rows ORDER BY object")?;
+        let mut put = tx.prepare("INSERT INTO objects (object, node, row) VALUES (?1, ?2, ?3)")?;
+        let mut nodes = nodes.query([])?;
+        let mut rows = rows.query([])?;
+        let next = |q: &mut rusqlite::Rows<'_>| -> Result<Option<(ObjectId, String)>> {
+            match q.next()? {
+                Some(r) => Ok(Some((
+                    object_id(r.get::<_, Vec<u8>>(0)?)?,
+                    r.get::<_, String>(1)?,
+                ))),
+                None => Ok(None),
+            }
+        };
+        let mut n = next(&mut nodes)?;
+        let mut r = next(&mut rows)?;
+        loop {
+            let (id, node_text, row_text) = match (&n, &r) {
+                (None, None) => break,
+                (Some((a, _)), Some((b, _))) if a == b => {
+                    let (id, node) = n.take().expect("matched");
+                    let (_, row) = r.take().expect("matched");
+                    n = next(&mut nodes)?;
+                    r = next(&mut rows)?;
+                    (id, Some(node), Some(row))
+                }
+                (Some((a, _)), Some((b, _))) if a > b => {
+                    let (id, row) = r.take().expect("matched");
+                    r = next(&mut rows)?;
+                    (id, None, Some(row))
+                }
+                (Some(_), _) => {
+                    let (id, node) = n.take().expect("matched");
+                    n = next(&mut nodes)?;
+                    (id, Some(node), None)
+                }
+                (None, Some(_)) => {
+                    let (id, row) = r.take().expect("matched");
+                    r = next(&mut rows)?;
+                    (id, None, Some(row))
+                }
+            };
+            let node: Option<Node> = node_text
+                .map(|t| serde_json::from_str(&t))
+                .transpose()
+                .with_context(|| format!("read the base node of {id}"))?;
+            let row: Option<Row> = row_text
+                .map(|t| serde_json::from_str(&t))
+                .transpose()
+                .with_context(|| format!("read the row of {id}"))?;
+            put.execute(params![
+                id.0,
+                node.as_ref().map(record::encode_node),
+                row.as_ref().map(|r| record::encode_row(r, node.as_ref())),
+            ])?;
+            objects += 1;
+            if objects % MIGRATE_STEP == 0 {
+                cairn_failpoint::hit("state.migrate.objects");
+            }
+        }
+    }
+    {
+        let mut old = tx.prepare("SELECT hash, bytes FROM manifests ORDER BY hash")?;
+        let mut put = tx.prepare("INSERT INTO manifests_v2 (hash, bytes) VALUES (?1, ?2)")?;
+        let mut old = old.query([])?;
+        let mut n = 0u64;
+        while let Some(m) = old.next()? {
+            let hash = m.get_ref(0)?.as_blob()?;
+            put.execute(params![
+                hash,
+                record::encode_manifest(m.get_ref(1)?.as_blob()?)
+            ])?;
+            n += 1;
+            if n % MIGRATE_STEP == 0 {
+                cairn_failpoint::hit("state.migrate.manifests");
+            }
+        }
+    }
+    tx.execute_batch(
+        "DROP TABLE base; DROP TABLE rows; DROP TABLE manifests;
+         ALTER TABLE manifests_v2 RENAME TO manifests;",
+    )?;
+    // Its format and its anchor's go with the build, so the next sync rebuilds it from the state in
+    // any case.
+    tx.execute_batch(LEDGER_TABLES)?;
+    tx.execute_batch("DELETE FROM ledger_anchor; DELETE FROM ledger; DELETE FROM dirty;")?;
+    for (_, sql) in generation_triggers().iter().chain(dirty_triggers().iter()) {
+        tx.execute_batch(&format!("{sql};"))?;
+    }
+    tx.execute("DELETE FROM kv WHERE key = ?1", [KEY_STEADY])?;
+    tx.execute(
+        "INSERT INTO kv (key, value) VALUES (?1, '1') ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [KEY_GENERATION],
+    )?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    cairn_failpoint::hit("state.migrate.commit");
+    tx.commit()?;
+    Ok(objects)
+}
+
 /// What a transaction writes, in the order of the table's keys: each page is then dirtied once, and
 /// written once, however far the transaction outgrows the page cache. In the order given, as random as
 /// object IDs are, a page goes to the WAL again each time it is dirtied again after a spill.
@@ -666,20 +965,31 @@ impl State {
         // Pages held between steps, in KiB: enough for the inner pages of a state of millions of entries,
         // so a lookup costs a leaf and not a walk from the top, and for what one transaction dirties in
         // key order before it spills. Taken only as pages are read; the default is 2 MiB.
-        conn.pragma_update(None, "cache_size", -STATE_CACHE_KIB)?;
+        let cache = cairn_failpoint::tuned("state.cache_kib", STATE_CACHE_KIB as u64);
+        conn.pragma_update(None, "cache_size", -(cache as i64))?;
         let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > MIGRATIONS.len() {
+        if version > SCHEMA_VERSION {
             bail!("this root's state is schema {version}, newer than this binary: upgrade cairn");
         }
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", i + 1)?;
-            tx.commit()?;
+        let mut migrated = None;
+        match version {
+            0 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
+            }
+            1 => migrated = Some(migrate_v1(&mut conn, path)?),
+            _ => {}
         }
         ensure_generation(&mut conn)?;
         ensure_ledger(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, migrated })
+    }
+
+    /// What opening this state moved it from an older layout, if it did.
+    pub fn migrated(&self) -> Option<&Migration> {
+        self.migrated.as_ref()
     }
 
     pub fn pages(&self) -> Result<Pages> {
@@ -784,18 +1094,18 @@ impl State {
         let mut want: Vec<ObjectId> = objects.into_iter().collect();
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT node FROM base WHERE object = ?1")?;
+            .prepare_cached("SELECT node FROM objects WHERE object = ?1 AND node IS NOT NULL")?;
         while let Some(id) = want.pop() {
             if nodes.contains_key(&id) {
                 continue;
             }
-            let Some(text) = stmt
-                .query_row([id.0], |r| r.get::<_, String>(0))
+            let Some(bytes) = stmt
+                .query_row([id.0], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
             else {
                 continue;
             };
-            let node: Node = serde_json::from_str(&text)?;
+            let node = record::decode_node(&bytes)?;
             want.extend(node.links.iter().map(|l| l.parent));
             nodes.insert(id, node);
         }
@@ -804,43 +1114,45 @@ impl State {
 
     /// How many objects the base holds, the root and those deleted among them.
     pub fn base_len(&self) -> Result<usize> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM base", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM objects WHERE node IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(n as usize)
     }
 
     /// Whether the base holds anything besides the root: a first sync's has nothing.
     pub fn has_base(&self) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM base WHERE object != ?1)",
+            "SELECT EXISTS (SELECT 1 FROM objects WHERE object != ?1 AND node IS NOT NULL)",
             [ObjectId::ROOT.0],
             |r| r.get(0),
         )?)
     }
 
-    /// Every base node, then every row, as text, in the order of the objects, in batches to `each`:
-    /// what the ledger is rebuilt from, read once, with no more of it held than a batch.
+    /// Every object with a base node, or with a row, as stored, in the order of the objects, in batches
+    /// to `each`: what the ledger is rebuilt from, read once, with no more of it held than a batch. A
+    /// row comes with the node it is written against.
     pub fn each_in_batches(
         &self,
         table: StateTable,
         batch: usize,
-        each: &mut dyn FnMut(Vec<(ObjectId, String)>) -> Result<()>,
+        each: &mut dyn FnMut(Vec<(ObjectId, Stored)>) -> Result<()>,
     ) -> Result<()> {
         let sql = match table {
-            StateTable::Base => "SELECT object, node FROM base ORDER BY object",
-            StateTable::Rows => "SELECT object, row FROM rows ORDER BY object",
+            StateTable::Base => {
+                "SELECT object, node, NULL FROM objects WHERE node IS NOT NULL ORDER BY object"
+            }
+            StateTable::Rows => {
+                "SELECT object, node, row FROM objects WHERE row IS NOT NULL ORDER BY object"
+            }
         };
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::with_capacity(batch);
         while let Some(row) = rows.next()? {
-            let id: [u8; 16] = row
-                .get_ref(0)?
-                .as_blob()?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
-            out.push((ObjectId(id), row.get_ref(1)?.as_str()?.to_string()));
+            out.push(stored_of(row)?);
             if out.len() == batch {
                 each(std::mem::replace(&mut out, Vec::with_capacity(batch)))?;
             }
@@ -873,18 +1185,18 @@ impl State {
         )?)
     }
 
-    /// Every row, as a scan needs it and no more, in the order of `load_rows`. Read here and parsed on
+    /// Every row, as a scan needs it and no more, in the order of `load_rows`. Read here and decoded on
     /// as many threads as there are, in batches put back in order.
     pub fn glance_rows(&self) -> Result<Vec<(ObjectId, Glance)>> {
         const BATCH: usize = 8_192;
         type Parsed = Vec<(usize, Vec<(ObjectId, Glance)>)>;
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
-        let mut stmt = self
-            .conn
-            .prepare("SELECT object, row FROM rows ORDER BY object")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT object, node, row FROM objects WHERE row IS NOT NULL ORDER BY object",
+        )?;
         let mut rows = stmt.query([])?;
         let (tx, rx) =
-            std::sync::mpsc::sync_channel::<(usize, Vec<(ObjectId, String)>)>(threads * 2);
+            std::sync::mpsc::sync_channel::<(usize, Vec<(ObjectId, Stored)>)>(threads * 2);
         let rx = std::sync::Mutex::new(rx);
         let mut parsed: Parsed = std::thread::scope(|s| -> Result<Parsed> {
             let workers: Vec<_> = (0..threads)
@@ -902,9 +1214,11 @@ impl State {
                             if failed.is_some() {
                                 continue;
                             }
-                            let parsed: serde_json::Result<Vec<(ObjectId, Glance)>> = batch
+                            let parsed: Result<Vec<(ObjectId, Glance)>> = batch
                                 .into_iter()
-                                .map(|(id, text)| Ok((id, serde_json::from_str::<Glance>(&text)?)))
+                                .filter_map(|(id, stored)| {
+                                    stored.row().transpose().map(|r| r.map(|r| (id, r.into())))
+                                })
                                 .collect();
                             match parsed {
                                 Ok(out) => done.push((i, out)),
@@ -912,7 +1226,7 @@ impl State {
                             }
                         }
                         match failed {
-                            Some(e) => Err(e.into()),
+                            Some(e) => Err(e),
                             None => Ok(done),
                         }
                     })
@@ -922,12 +1236,7 @@ impl State {
                 let mut batch = Vec::with_capacity(BATCH);
                 let mut n = 0;
                 while let Some(row) = rows.next()? {
-                    let id: [u8; 16] = row
-                        .get_ref(0)?
-                        .as_blob()?
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
-                    batch.push((ObjectId(id), row.get_ref(1)?.as_str()?.to_string()));
+                    batch.push(stored_of(row)?);
                     if batch.len() == BATCH {
                         tx.send((n, std::mem::take(&mut batch)))?;
                         n += 1;
@@ -1043,14 +1352,14 @@ impl State {
     pub fn nodes_of(&self, objects: &[ObjectId]) -> Result<BTreeMap<ObjectId, Node>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT node FROM base WHERE object = ?1")?;
+            .prepare_cached("SELECT node FROM objects WHERE object = ?1 AND node IS NOT NULL")?;
         let mut out = BTreeMap::new();
         for id in objects {
-            if let Some(text) = stmt
-                .query_row([id.0], |r| r.get::<_, String>(0))
+            if let Some(bytes) = stmt
+                .query_row([id.0], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
             {
-                out.insert(*id, serde_json::from_str::<Node>(&text)?);
+                out.insert(*id, record::decode_node(&bytes)?);
             }
         }
         Ok(out)
@@ -1058,16 +1367,23 @@ impl State {
 
     /// The rows of these objects, those that have one.
     pub fn rows_of(&self, objects: &[ObjectId]) -> Result<BTreeMap<ObjectId, Row>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT row FROM rows WHERE object = ?1")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT node, row FROM objects WHERE object = ?1 AND row IS NOT NULL",
+        )?;
         let mut out = BTreeMap::new();
         for id in objects {
-            if let Some(text) = stmt
-                .query_row([id.0], |r| r.get::<_, String>(0))
+            if let Some(stored) = stmt
+                .query_row([id.0], |r| {
+                    Ok(Stored {
+                        node: r.get(0)?,
+                        row: r.get(1)?,
+                    })
+                })
                 .optional()?
             {
-                out.insert(*id, serde_json::from_str::<Row>(&text)?);
+                if let Some(row) = stored.row()? {
+                    out.insert(*id, row);
+                }
             }
         }
         Ok(out)
@@ -1102,16 +1418,13 @@ impl State {
 
     pub fn load_base(&self) -> Result<Tree> {
         let mut nodes = BTreeMap::new();
-        let mut stmt = self.conn.prepare("SELECT object, node FROM base")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, node) = row?;
-            let id: [u8; 16] = id
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
-            nodes.insert(ObjectId(id), serde_json::from_str::<Node>(&node)?);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT object, node FROM objects WHERE node IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = object_id(row.get::<_, Vec<u8>>(0)?)?;
+            nodes.insert(id, record::decode_node(row.get_ref(1)?.as_blob()?)?);
         }
         Ok(Tree::from_nodes(nodes))
     }
@@ -1143,19 +1456,17 @@ impl State {
         ledger: Option<&LedgerWrite<'_>>,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        put_rows(&tx, rows, gone)?;
-        {
-            let mut put = tx.prepare_cached(
-                "INSERT INTO base (object, node) VALUES (?1, ?2) ON CONFLICT (object) DO UPDATE SET node = excluded.node",
-            )?;
-            // The same tree when nothing came from the server: nothing to compare.
-            let same = std::ptr::eq(old, new);
-            for (id, node) in new.nodes.iter().filter(|_| !same) {
-                if old.nodes.get(id) != Some(node) {
-                    put.execute(params![id.0, serde_json::to_string(node)?])?;
-                }
-            }
-        }
+        // The same tree when nothing came from the server: nothing to compare.
+        let nodes: Vec<(ObjectId, &Node)> = match std::ptr::eq(old, new) {
+            true => Vec::new(),
+            false => new
+                .nodes
+                .iter()
+                .filter(|(id, node)| old.nodes.get(id) != Some(*node))
+                .map(|(id, node)| (*id, node))
+                .collect(),
+        };
+        write_objects(&tx, &nodes, rows, gone)?;
         tx.execute(
             "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                         params![KEY_CURSOR, cursor.to_string()],
@@ -1175,16 +1486,15 @@ impl State {
 
     pub fn load_rows(&self) -> Result<BTreeMap<ObjectId, Row>> {
         let mut out = BTreeMap::new();
-        let mut stmt = self.conn.prepare("SELECT object, row FROM rows")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, value) = row?;
-            let id: [u8; 16] = id
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("a stored ID is not 16 bytes"))?;
-            out.insert(ObjectId(id), serde_json::from_str::<Row>(&value)?);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT object, node, row FROM objects WHERE row IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let (id, stored) = stored_of(row)?;
+            if let Some(r) = stored.row()? {
+                out.insert(id, r);
+            }
         }
         Ok(out)
     }
@@ -1195,7 +1505,7 @@ impl State {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        put_rows(&tx, changed, gone)?;
+        write_objects(&tx, &[], changed, gone)?;
         tx.commit()?;
         Ok(())
     }
@@ -1209,22 +1519,26 @@ impl State {
             let mut put =
                 tx.prepare_cached("INSERT OR IGNORE INTO manifests (hash, bytes) VALUES (?1, ?2)")?;
             for (h, b) in in_key_order(manifests, |(h, _)| h) {
-                put.execute(params![h.0, b])?;
+                put.execute(params![h.0, record::encode_manifest(b)])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
+    /// A manifest's canonical bytes, if it is held.
     pub fn manifest(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        Ok(self
+        let stored: Option<Vec<u8>> = self
             .conn
             .query_row(
                 "SELECT bytes FROM manifests WHERE hash = ?1",
                 [hash.0],
                 |r| r.get(0),
             )
-            .optional()?)
+            .optional()?;
+        stored
+            .map(|b| record::decode_manifest(&b, hash))
+            .transpose()
     }
 
     pub fn has_manifest(&self, hash: &Hash) -> Result<bool> {
@@ -1286,7 +1600,7 @@ impl State {
             "INSERT INTO outbox (op_id, request) VALUES (?1, ?2)",
             params![req.op_id.0, serde_json::to_string(req)?],
         )?;
-        put_rows(&tx, rows, &[])?;
+        write_objects(&tx, &[], rows, &[])?;
         {
             let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
             for key in in_key_order(marks, |k| k.as_str()) {
@@ -1347,7 +1661,7 @@ impl State {
         changed: &[(ObjectId, &Row)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        put_rows(&tx, changed, &[])?;
+        write_objects(&tx, &[], changed, &[])?;
         tx.execute(
             "INSERT INTO intents (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![key, serde_json::to_string(value)?],
@@ -1366,7 +1680,7 @@ impl State {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        put_rows(&tx, changed, &[])?;
+        write_objects(&tx, &[], changed, &[])?;
         {
             let mut del = tx.prepare_cached("DELETE FROM intents WHERE key = ?1")?;
             for key in in_key_order(marks, |k| k.as_str()) {
@@ -1445,24 +1759,292 @@ fn object_id(bytes: Vec<u8>) -> Result<ObjectId> {
     Ok(ObjectId(id))
 }
 
-fn put_rows(
+/// An object's ID and what is stored of it, from a statement's object, node and row columns.
+fn stored_of(row: &rusqlite::Row<'_>) -> Result<(ObjectId, Stored)> {
+    let id = object_id(row.get::<_, Vec<u8>>(0)?)?;
+    Ok((
+        id,
+        Stored {
+            node: row.get(1)?,
+            row: row.get(2)?,
+        },
+    ))
+}
+
+/// What a write does to an object's row.
+#[derive(Clone, Copy)]
+enum RowWrite<'a> {
+    Keep,
+    Put(&'a Row),
+    Gone,
+}
+
+/// Base nodes put and rows put or dropped, object by object in key order, each object's SQL row read
+/// and written once. A row is written against the node it will be beside, so one kept while its node
+/// changes is read against the old node and written again against the new: what it says never moves
+/// with the node. An object left with neither goes.
+fn write_objects(
     tx: &rusqlite::Transaction<'_>,
-    changed: &[(ObjectId, &Row)],
+    nodes: &[(ObjectId, &Node)],
+    rows: &[(ObjectId, &Row)],
     gone: &[ObjectId],
 ) -> Result<()> {
-    {
-        let mut put = tx.prepare_cached(
-            "INSERT INTO rows (object, row) VALUES (?1, ?2) ON CONFLICT (object) DO UPDATE SET row = excluded.row",
-        )?;
-        for (id, row) in in_key_order(changed, |(id, _)| id) {
-            put.execute(params![id.0, serde_json::to_string(row)?])?;
+    let mut by: BTreeMap<ObjectId, (Option<&Node>, RowWrite<'_>)> = BTreeMap::new();
+    for (id, node) in nodes {
+        by.entry(*id).or_insert((None, RowWrite::Keep)).0 = Some(*node);
+    }
+    for (id, row) in rows {
+        by.entry(*id).or_insert((None, RowWrite::Keep)).1 = RowWrite::Put(row);
+    }
+    for id in gone {
+        by.entry(*id).or_insert((None, RowWrite::Keep)).1 = RowWrite::Gone;
+    }
+    let mut get = tx.prepare_cached("SELECT node, row FROM objects WHERE object = ?1")?;
+    let mut put = tx.prepare_cached(
+        "INSERT INTO objects (object, node, row) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (object) DO UPDATE SET node = excluded.node, row = excluded.row",
+    )?;
+    let mut del = tx.prepare_cached("DELETE FROM objects WHERE object = ?1")?;
+    for (id, (node, row)) in by {
+        let old = get
+            .query_row([id.0], |r| {
+                Ok(Stored {
+                    node: r.get(0)?,
+                    row: r.get(1)?,
+                })
+            })
+            .optional()?;
+        let (old_node, old_row) = match old {
+            Some(s) => (s.node, s.row),
+            None => (None, None),
+        };
+        if node.is_none() && matches!(row, RowWrite::Keep) {
+            continue;
+        }
+        let decoded_old =
+            || -> Result<Option<Node>> { old_node.as_deref().map(record::decode_node).transpose() };
+        let new_node = node.map(record::encode_node).or_else(|| old_node.clone());
+        let new_row = match (row, node) {
+            (RowWrite::Gone, _) => None,
+            (RowWrite::Put(r), Some(n)) => Some(record::encode_row(r, Some(n))),
+            (RowWrite::Put(r), None) => Some(record::encode_row(r, decoded_old()?.as_ref())),
+            (RowWrite::Keep, Some(n)) => match &old_row {
+                Some(bytes) => {
+                    let r = record::decode_row(bytes, decoded_old()?.as_ref())?;
+                    Some(record::encode_row(&r, Some(n)))
+                }
+                None => None,
+            },
+            (RowWrite::Keep, None) => old_row.clone(),
+        };
+        if new_node == old_node && new_row == old_row {
+            continue;
+        }
+        if new_node.is_none() && new_row.is_none() {
+            del.execute([id.0])?;
+        } else {
+            put.execute(params![id.0, new_node, new_row])?;
         }
     }
-    let mut del = tx.prepare_cached("DELETE FROM rows WHERE object = ?1")?;
-    for id in in_key_order(gone, |id| id) {
-        del.execute([id.0])?;
-    }
     Ok(())
+}
+
+/// Version 1 of the state, for the tests of the move from it: a state of that layout made from one of
+/// this, as 0.1.8 and before left it, and what a state of either layout holds, decoded, to compare.
+#[cfg(any(test, feature = "failpoints"))]
+pub mod legacy {
+    use super::*;
+
+    const GENERATION_TRIGGERS_V1: &[(&str, &str, &str)] = &[
+        ("base", "INSERT", ""),
+        ("base", "UPDATE", "WHEN OLD.node IS NOT NEW.node"),
+        ("base", "DELETE", ""),
+        ("rows", "INSERT", ""),
+        ("rows", "UPDATE", "WHEN OLD.row IS NOT NEW.row"),
+        ("rows", "DELETE", ""),
+    ];
+
+    const DIRTY_TRIGGERS_V1: &[(&str, &str, &str, &[&str])] = &[
+        ("base", "INSERT", "", &["NEW"]),
+        (
+            "base",
+            "UPDATE",
+            "WHEN OLD.node IS NOT NEW.node OR OLD.object IS NOT NEW.object",
+            &["OLD", "NEW"],
+        ),
+        ("base", "DELETE", "", &["OLD"]),
+        ("rows", "INSERT", "", &["NEW"]),
+        (
+            "rows",
+            "UPDATE",
+            "WHEN OLD.row IS NOT NEW.row OR OLD.object IS NOT NEW.object",
+            &["OLD", "NEW"],
+        ),
+        ("rows", "DELETE", "", &["OLD"]),
+    ];
+
+    /// Everything a state holds that a sync acts on, decoded, whatever its layout.
+    #[derive(Debug, PartialEq, Eq, Default)]
+    pub struct Contents {
+        pub nodes: BTreeMap<ObjectId, Node>,
+        pub rows: BTreeMap<ObjectId, Row>,
+        /// Each manifest's canonical bytes.
+        pub manifests: BTreeMap<Hash, Vec<u8>>,
+        /// Besides the generation and the record of the last sync with nothing to do, which a move
+        /// resets.
+        pub kv: BTreeMap<String, String>,
+        pub outbox: BTreeMap<Vec<u8>, String>,
+        pub intents: BTreeMap<String, String>,
+    }
+
+    pub fn version(path: &Path) -> Result<usize> {
+        let conn = Connection::open(path)?;
+        Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
+    /// What the state at `path` holds, read without changing it.
+    pub fn contents(path: &Path) -> Result<Contents> {
+        let conn = Connection::open(path)?;
+        let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let mut c = Contents::default();
+        let blob = |r: &rusqlite::Row<'_>, i| r.get::<_, Vec<u8>>(i);
+        match version {
+            1 => {
+                let mut stmt = conn.prepare("SELECT object, node FROM base")?;
+                let mut q = stmt.query([])?;
+                while let Some(r) = q.next()? {
+                    c.nodes.insert(
+                        object_id(blob(r, 0)?)?,
+                        serde_json::from_str(&r.get::<_, String>(1)?)?,
+                    );
+                }
+                let mut stmt = conn.prepare("SELECT object, row FROM rows")?;
+                let mut q = stmt.query([])?;
+                while let Some(r) = q.next()? {
+                    c.rows.insert(
+                        object_id(blob(r, 0)?)?,
+                        serde_json::from_str(&r.get::<_, String>(1)?)?,
+                    );
+                }
+                let mut stmt = conn.prepare("SELECT hash, bytes FROM manifests")?;
+                let mut q = stmt.query([])?;
+                while let Some(r) = q.next()? {
+                    let h: [u8; 32] = blob(r, 0)?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("a hash of another length"))?;
+                    c.manifests.insert(Hash(h), blob(r, 1)?);
+                }
+            }
+            SCHEMA_VERSION => {
+                let mut stmt = conn.prepare("SELECT object, node, row FROM objects")?;
+                let mut q = stmt.query([])?;
+                while let Some(r) = q.next()? {
+                    let (id, stored) = stored_of(r)?;
+                    if let Some(n) = stored.node()? {
+                        c.nodes.insert(id, n);
+                    }
+                    if let Some(row) = stored.row()? {
+                        c.rows.insert(id, row);
+                    }
+                }
+                let mut stmt = conn.prepare("SELECT hash, bytes FROM manifests")?;
+                let mut q = stmt.query([])?;
+                while let Some(r) = q.next()? {
+                    let h: [u8; 32] = blob(r, 0)?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("a hash of another length"))?;
+                    let h = Hash(h);
+                    c.manifests
+                        .insert(h, record::decode_manifest(&blob(r, 1)?, &h)?);
+                }
+            }
+            v => bail!("no layout {v}"),
+        }
+        let mut stmt = conn.prepare("SELECT key, value FROM kv")?;
+        let mut q = stmt.query([])?;
+        while let Some(r) = q.next()? {
+            let key: String = r.get(0)?;
+            if key != KEY_GENERATION && key != KEY_STEADY {
+                c.kv.insert(key, r.get(1)?);
+            }
+        }
+        let mut stmt = conn.prepare("SELECT op_id, request FROM outbox")?;
+        let mut q = stmt.query([])?;
+        while let Some(r) = q.next()? {
+            c.outbox.insert(blob(r, 0)?, r.get(1)?);
+        }
+        let mut stmt = conn.prepare("SELECT key, value FROM intents")?;
+        let mut q = stmt.query([])?;
+        while let Some(r) = q.next()? {
+            c.intents.insert(r.get(0)?, r.get(1)?);
+        }
+        Ok(c)
+    }
+
+    /// Rewrites the state at `path`, of this layout, in version 1's, with its triggers: JSON text from
+    /// the same types and the same serializer as 0.1.8's. Nothing may have the file open.
+    pub fn to_v1(path: &Path) -> Result<()> {
+        let mut conn = Connection::open(path)?;
+        let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            bail!("layout {version}, not this build's");
+        }
+        let c = contents(path)?;
+        let tx = conn.transaction()?;
+        let triggers: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
+            let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            names.collect::<rusqlite::Result<_>>()?
+        };
+        for name in &triggers {
+            tx.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
+        }
+        tx.execute_batch(
+            "DROP TABLE objects; DROP TABLE manifests;
+             CREATE TABLE base (object BLOB PRIMARY KEY, node TEXT NOT NULL) WITHOUT ROWID;
+             CREATE TABLE rows (object BLOB PRIMARY KEY, row TEXT NOT NULL) WITHOUT ROWID;
+             CREATE TABLE manifests (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) WITHOUT ROWID;",
+        )?;
+        for (id, n) in &c.nodes {
+            tx.execute(
+                "INSERT INTO base (object, node) VALUES (?1, ?2)",
+                params![id.0, serde_json::to_string(n)?],
+            )?;
+        }
+        for (id, r) in &c.rows {
+            tx.execute(
+                "INSERT INTO rows (object, row) VALUES (?1, ?2)",
+                params![id.0, serde_json::to_string(r)?],
+            )?;
+        }
+        for (h, b) in &c.manifests {
+            tx.execute(
+                "INSERT INTO manifests (hash, bytes) VALUES (?1, ?2)",
+                params![h.0, b],
+            )?;
+        }
+        let gen_v1: Vec<(&str, &str, &str)> = GENERATION_TRIGGERS_V1
+            .iter()
+            .chain(
+                GENERATION_TRIGGERS
+                    .iter()
+                    .filter(|(t, _, _)| *t != "objects"),
+            )
+            .copied()
+            .collect();
+        for (_, sql) in generation_triggers_of(&gen_v1)
+            .iter()
+            .chain(dirty_triggers_of(DIRTY_TRIGGERS_V1).iter())
+        {
+            tx.execute_batch(&format!("{sql};"))?;
+        }
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1750,11 +2332,14 @@ mod tests {
         // Written by anything else than these methods, as an older build would: still marked.
         state
             .conn
-            .execute("UPDATE rows SET row = row || ' '", [])
+            .execute(
+                "UPDATE objects SET row = row || x'00' WHERE row IS NOT NULL",
+                [],
+            )
             .unwrap();
         state
             .conn
-            .execute("DELETE FROM base WHERE object = ?1", [id.0])
+            .execute("DELETE FROM objects WHERE object = ?1", [id.0])
             .unwrap();
         marked(&state, "plain SQL", &[id]);
         drop(state);
@@ -1789,7 +2374,7 @@ mod tests {
         assert_eq!(state.ledger_entries().unwrap().len(), 1);
         state
             .conn
-            .execute_batch("DROP TRIGGER dirty_base_update;")
+            .execute_batch("DROP TRIGGER dirty_objects_update;")
             .unwrap();
         drop(state);
         let state = State::open(&dir.join("state.sqlite")).unwrap();
@@ -1870,13 +2455,19 @@ mod tests {
         // Written by anything else than these methods, as an older build would: still counted.
         state
             .conn
-            .execute("UPDATE rows SET row = row || ' '", [])
+            .execute(
+                "UPDATE objects SET row = row || x'00' WHERE row IS NOT NULL",
+                [],
+            )
             .unwrap();
         state.store_rows(&[(id, &row(3))], &[]).unwrap();
         moved(&state, "a row", true);
         state
             .conn
-            .execute("UPDATE rows SET row = row || ' '", [])
+            .execute(
+                "UPDATE objects SET row = row || x'00' WHERE row IS NOT NULL",
+                [],
+            )
             .unwrap();
         moved(&state, "a row written by hand", true);
         drop(state);
@@ -1985,7 +2576,7 @@ mod tests {
         assert_eq!(state.generation().unwrap(), Some(before));
         state
             .conn
-            .execute_batch("DROP TRIGGER generation_rows_update;")
+            .execute_batch("DROP TRIGGER generation_objects_update;")
             .unwrap();
         drop(state);
         let state = State::open(&dir.join("state.sqlite")).unwrap();
@@ -2002,5 +2593,447 @@ mod tests {
         assert_eq!(triggers as usize, GENERATION_TRIGGERS.len());
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A row and a base node in the JSON 0.1.8 wrote, field for field (the values made up).
+    const NODE_V1: &str = r#"{"rev":"00112233445566778899aabbccddeeff","body":{"content":{"type":"file","manifest":"19cc0819915f922a8cbfef7515adae2b9eb8ca4ef8455ec8be567304298735c8","size":523},"metadata":{"mode":400,"owner":{"uid":1000,"gid":1000,"user":"dXNlcg==","group":"Z3JvdXA="},"mtime":{"sec":1794046484,"nsec":73936147},"btime":{"sec":1793550921,"nsec":852849101},"time_precision_ns":1}},"links":[{"parent":"0123456789abcdef0123456789abcdef","name":"cmVwb3J0LnR4dA=="}]}"#;
+    const ROW_V1: &str = r#"{"fp":{"dev":38654705664,"ino":87571869,"size":523,"mtime":{"sec":1794046484,"nsec":73936147},"ctime":{"sec":1794046484,"nsec":73936147},"btime":{"sec":1793550921,"nsec":852849101}},"racy":false,"content":{"type":"file","manifest":"19cc0819915f922a8cbfef7515adae2b9eb8ca4ef8455ec8be567304298735c8","size":523},"scan":{"mode":400,"owner":{"uid":1000,"gid":1000,"user":"dXNlcg==","group":"Z3JvdXA="},"mtime":{"sec":1794046484,"nsec":73936147},"btime":{"sec":1793550921,"nsec":852849101},"time_precision_ns":1},"applied":{"mode":400,"owner":{"uid":1000,"gid":1000,"user":"dXNlcg==","group":"Z3JvdXA="},"mtime":{"sec":1794046484,"nsec":73936147},"btime":{"sec":1793550921,"nsec":852849101},"time_precision_ns":1},"synced":null,"incomplete":false,"held":[{"parent":"0123456789abcdef0123456789abcdef","name":"cmVwb3J0LnR4dA=="}]}"#;
+    /// A row of a build before `held`, `applied` and `incomplete`, which 0.1.8 still read.
+    const ROW_V1_OLDEST: &str = r#"{"fp":{"dev":1,"ino":2,"size":0,"mtime":{"sec":3,"nsec":4},"ctime":{"sec":5,"nsec":6}},"racy":true,"content":{"type":"dir"},"scan":{"mode":493,"mtime":{"sec":3,"nsec":4}}}"#;
+
+    /// A state of this layout with one of every kind of thing in it: nodes of each kind, deleted and
+    /// hard-linked, rows beside their node and without one, each part of a row equal to the node's
+    /// and not, manifests, a queued commit, intents and keys.
+    fn everything_kind(state: &mut State) {
+        let meta = |mode: u32| Metadata {
+            mode,
+            owner: Some(cairn_protocol::Owner {
+                uid: 501,
+                gid: 20,
+                user: Some(cairn_protocol::Bytes(b"user".to_vec())),
+                group: None,
+            }),
+            mtime: Timestamp {
+                sec: 1_700_000_000,
+                nsec: 5,
+            },
+            btime: Some(Timestamp {
+                sec: 1_600_000_000,
+                nsec: 7,
+            }),
+            ..Default::default()
+        };
+        let mut rich = meta(0o600);
+        rich.records.insert(
+            cairn_protocol::RecordKey {
+                ns: cairn_protocol::NS_MACOS_XATTR.into(),
+                name: cairn_protocol::Bytes(b"com.apple.quarantine".to_vec()),
+            },
+            cairn_protocol::Bytes(vec![1, 2, 3]),
+        );
+        rich.unknown = serde_json::from_str(r#"{"later":[1,"two"]}"#).unwrap();
+        let link = |p: ObjectId, n: &str| Link {
+            parent: p,
+            name: cairn_protocol::Name::new(n.as_bytes().to_vec()).unwrap(),
+        };
+        let (dir, file, hard, sym, gone, local) = (
+            ObjectId([1; 16]),
+            ObjectId([2; 16]),
+            ObjectId([3; 16]),
+            ObjectId([4; 16]),
+            ObjectId([5; 16]),
+            ObjectId([6; 16]),
+        );
+        let manifest = cairn_protocol::Manifest::new(
+            9,
+            vec![cairn_protocol::Segment {
+                offset: 0,
+                chunks: vec![cairn_protocol::ChunkRef {
+                    hash: Hash::of(b"chunk"),
+                    len: 9,
+                }],
+            }],
+        );
+        let m = manifest.hash();
+        let node = |content: Content, metadata: Metadata, links: Vec<Link>| Node {
+            rev: cairn_protocol::RevisionId(rand::random()),
+            body: RevisionBody { content, metadata },
+            links: links.into_iter().collect(),
+        };
+        let mut tree = Tree::new();
+        let nodes = [
+            (
+                dir,
+                node(Content::Dir, meta(0o755), vec![link(ObjectId::ROOT, "d")]),
+            ),
+            (
+                file,
+                node(
+                    Content::File {
+                        manifest: m,
+                        size: 9,
+                    },
+                    meta(0o644),
+                    vec![link(dir, "f")],
+                ),
+            ),
+            (
+                hard,
+                node(
+                    Content::File {
+                        manifest: m,
+                        size: 9,
+                    },
+                    rich.clone(),
+                    vec![link(dir, "h1"), link(ObjectId::ROOT, "h2")],
+                ),
+            ),
+            (
+                sym,
+                node(
+                    Content::Symlink {
+                        target: cairn_protocol::Bytes(b"../\xff".to_vec()),
+                    },
+                    meta(0o777),
+                    vec![link(dir, "s")],
+                ),
+            ),
+            (gone, node(Content::Dir, meta(0o700), vec![])),
+        ];
+        for (id, n) in &nodes {
+            tree.nodes.insert(*id, n.clone());
+        }
+        let tree = Tree::from_nodes(tree.nodes);
+        let row_of = |n: &Node, fp_size: u64| Row {
+            fp: Fingerprint {
+                dev: 66311,
+                ino: rand::random::<u32>().into(),
+                size: fp_size,
+                mtime: n.body.metadata.mtime,
+                ctime: Timestamp {
+                    sec: 1_700_000_001,
+                    nsec: 0,
+                },
+                btime: n.body.metadata.btime,
+            },
+            racy: false,
+            content: n.body.content.clone(),
+            scan: n.body.metadata.clone(),
+            applied: Some(n.body.metadata.clone()),
+            synced: None,
+            incomplete: false,
+            held: Some(n.links.clone()),
+        };
+        let r_dir = row_of(&nodes[0].1, 4096);
+        let r_file = row_of(&nodes[1].1, 9);
+        let mut r_hard = row_of(&nodes[2].1, 9);
+        r_hard.scan.mode = 0o640;
+        r_hard.held = Some([link(dir, "h1")].into());
+        r_hard.synced = Some(Synced {
+            body: nodes[2].1.body.clone(),
+            links: nodes[2].1.links.clone(),
+            applied: rich.clone(),
+            commit: Some(OpId([9; 16])),
+            unapplied: true,
+            folder_time: None,
+        });
+        let mut r_sym = row_of(&nodes[3].1, 4);
+        r_sym.applied = None;
+        r_sym.held = None;
+        r_sym.racy = true;
+        r_sym.incomplete = true;
+        let r_local = Row {
+            content: Content::File {
+                manifest: Hash::of(b"local"),
+                size: 3,
+            },
+            ..row(3)
+        };
+        let rows = [
+            (dir, &r_dir),
+            (file, &r_file),
+            (hard, &r_hard),
+            (sym, &r_sym),
+            (local, &r_local),
+        ];
+        state
+            .store_base(&Tree::new(), &tree, 42, Some(OpId([8; 16])), &rows, &[])
+            .unwrap();
+        state
+            .put_manifests(&[(m, manifest.encode()), (Hash::of(b"odd"), b"odd".to_vec())])
+            .unwrap();
+        state
+            .conn
+            .execute(
+                "INSERT INTO outbox (op_id, request) VALUES (?1, '{\"queued\":1}')",
+                [[7u8; 16]],
+            )
+            .unwrap();
+        state.put_intent("conflict/1", &vec![1, 2]).unwrap();
+        state.set(KEY_ROOT_ID, "abc").unwrap();
+        state.set_steady(Some("{}")).unwrap();
+        let tx = state.conn.transaction().unwrap();
+        write_ledger(
+            &tx,
+            &LedgerWrite {
+                whole: true,
+                put: vec![(file, vec![1, 2, 3])],
+                anchor: Some("{}".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn triggers(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+            .unwrap();
+        let names = stmt.query_map([], |r| r.get(0)).unwrap();
+        names.map(Result::unwrap).collect()
+    }
+
+    /// A state of 0.1.8's layout is moved to this one when it is opened, and every record means what
+    /// it did: the same nodes, rows, manifests, queued commits, intents and keys, decoded. The ledger
+    /// goes, for the next sync to rebuild, and with it the record of the last sync with nothing to do.
+    #[test]
+    fn a_state_of_version_1_is_moved_and_every_record_means_what_it_did() {
+        let (dir, mut state) = fresh();
+        everything_kind(&mut state);
+        let file = dir.join("state.sqlite");
+        let held = legacy::contents(&file).unwrap();
+        assert_eq!(held.rows.len(), 5);
+        drop(state);
+        legacy::to_v1(&file).unwrap();
+        assert_eq!(legacy::version(&file).unwrap(), 1);
+        let mut v1 = legacy::contents(&file).unwrap();
+        assert_eq!(v1, held, "made into version 1 as it was");
+        {
+            let conn = Connection::open(&file).unwrap();
+            assert!(triggers(&conn).iter().any(|t| t == "dirty_base_update"));
+            // Two more, as 0.1.8's JSON reads them.
+            let (id, oldest) = (ObjectId([0xa0; 16]), ObjectId([0xa1; 16]));
+            conn.execute(
+                "INSERT INTO base (object, node) VALUES (?1, ?2)",
+                params![id.0, NODE_V1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rows (object, row) VALUES (?1, ?2), (?3, ?4)",
+                params![id.0, ROW_V1, oldest.0, ROW_V1_OLDEST],
+            )
+            .unwrap();
+            v1.nodes.insert(id, serde_json::from_str(NODE_V1).unwrap());
+            v1.rows.insert(id, serde_json::from_str(ROW_V1).unwrap());
+            v1.rows
+                .insert(oldest, serde_json::from_str(ROW_V1_OLDEST).unwrap());
+        }
+        let generation = |file: &Path| -> u64 {
+            let conn = Connection::open(file).unwrap();
+            conn.query_row("SELECT value FROM kv WHERE key = 'generation'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+            .parse()
+            .unwrap()
+        };
+        let was = generation(&file);
+        let state = State::open(&file).unwrap();
+        let moved = state.migrated().expect("moved").clone();
+        assert_eq!((moved.from, moved.objects), (1, 8), "{moved}");
+        assert_eq!(legacy::version(&file).unwrap(), SCHEMA_VERSION);
+        assert_eq!(legacy::contents(&file).unwrap(), v1);
+        assert_eq!(state.load_rows().unwrap(), v1.rows);
+        assert_eq!(state.load_base().unwrap().nodes.len(), v1.nodes.len() + 1);
+        assert_eq!(state.ledger_anchor().unwrap(), None);
+        assert!(state.ledger_entries().unwrap().is_empty());
+        assert_eq!(state.steady().unwrap(), None);
+        assert!(state.generation().unwrap().unwrap() > was);
+        let mut want: Vec<String> = generation_triggers()
+            .into_iter()
+            .chain(dirty_triggers())
+            .map(|(n, _)| n)
+            .collect();
+        want.sort();
+        assert_eq!(triggers(&state.conn), want);
+        let tables: Vec<String> = {
+            let mut stmt = state
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap();
+            let names = stmt.query_map([], |r| r.get(0)).unwrap();
+            names.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            tables,
+            [
+                "dirty",
+                "intents",
+                "kv",
+                "ledger",
+                "ledger_anchor",
+                "manifests",
+                "objects",
+                "outbox"
+            ]
+        );
+        // Opened again: nothing more to move, and writes are marked as before.
+        drop(state);
+        let mut state = State::open(&file).unwrap();
+        assert!(state.migrated().is_none());
+        let id = ObjectId([0xa0; 16]);
+        let mut r = v1.rows[&id].clone();
+        r.racy = true;
+        state.store_rows(&[(id, &r)], &[]).unwrap();
+        assert_eq!(state.dirty().unwrap(), [id].into());
+        assert_eq!(state.rows_of(&[id]).unwrap()[&id], r);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A record that does not read stops the move before anything of it is kept: the state stays as
+    /// it was, table for table, and moves once it reads.
+    #[test]
+    fn a_move_that_fails_leaves_version_1_as_it_was() {
+        let (dir, mut state) = fresh();
+        everything_kind(&mut state);
+        drop(state);
+        let file = dir.join("state.sqlite");
+        legacy::to_v1(&file).unwrap();
+        let v1 = legacy::contents(&file).unwrap();
+        let raw = |file: &Path| {
+            let conn = Connection::open(file).unwrap();
+            let mut out = Vec::new();
+            for t in [
+                "base",
+                "rows",
+                "manifests",
+                "kv",
+                "outbox",
+                "intents",
+                "ledger",
+            ] {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {t}")).unwrap();
+                let n = stmt.column_count();
+                let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+                    .query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                out.push((t, rows));
+            }
+            (out, triggers(&conn))
+        };
+        let bad = ObjectId([0xbb; 16]);
+        {
+            let conn = Connection::open(&file).unwrap();
+            conn.execute(
+                "INSERT INTO rows (object, row) VALUES (?1, '{\"fp\":')",
+                [bad.0],
+            )
+            .unwrap();
+        }
+        let before = raw(&file);
+        let err = State::open(&file).err().expect("refused");
+        assert!(format!("{err:#}").contains("stays as it was"), "{err:#}");
+        assert_eq!(legacy::version(&file).unwrap(), 1);
+        assert_eq!(raw(&file), before);
+        assert_eq!(
+            std::fs::metadata(dir.join("state.sqlite-wal")).map_or(0, |m| m.len()),
+            0
+        );
+        {
+            let conn = Connection::open(&file).unwrap();
+            conn.execute("DELETE FROM rows WHERE object = ?1", [bad.0])
+                .unwrap();
+        }
+        let state = State::open(&file).unwrap();
+        assert!(state.migrated().is_some());
+        drop(state);
+        assert_eq!(legacy::contents(&file).unwrap(), v1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A layout newer than this build is refused, whole and with the reason, as 0.1.8 refuses this one.
+    #[test]
+    fn a_state_newer_than_this_build_is_refused() {
+        let (dir, state) = fresh();
+        state
+            .conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(state);
+        let err = State::open(&dir.join("state.sqlite"))
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string()
+                .contains("newer than this binary: upgrade cairn"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The state named by `CAIRN_STATE_COPY`, a copy of a real one of version 1, moved: its contents
+    /// the same, decoded, and how long it took, then compacted. `cargo test --release -p cairn-engine
+    /// -- --ignored a_copy_of_a_real_state` with the variable set.
+    #[test]
+    #[ignore]
+    fn a_copy_of_a_real_state_is_moved_and_holds_the_same() {
+        let Some(file) = std::env::var_os("CAIRN_STATE_COPY").map(PathBuf::from) else {
+            return;
+        };
+        let size = |f: &Path| std::fs::metadata(f).map_or(0, |m| m.len());
+        let t = Instant::now();
+        let before = legacy::contents(&file).unwrap();
+        eprintln!(
+            "read as version 1: {} nodes, {} rows, {} manifests, in {:.1} s; file {} B",
+            before.nodes.len(),
+            before.rows.len(),
+            before.manifests.len(),
+            t.elapsed().as_secs_f64(),
+            size(&file)
+        );
+        let state = State::open(&file).unwrap();
+        eprintln!("{}", state.migrated().expect("moved"));
+        let t = Instant::now();
+        let after = legacy::contents(&file).unwrap();
+        eprintln!("read as version 2 in {:.1} s", t.elapsed().as_secs_f64());
+        assert!(after == before, "the move changed what the state holds");
+        let t = Instant::now();
+        let rows = state.load_rows().unwrap().len();
+        let base = state.load_base().unwrap().nodes.len();
+        eprintln!(
+            "load_rows and load_base: {rows} and {base} in {:.2} s",
+            t.elapsed().as_secs_f64()
+        );
+        let t = Instant::now();
+        let glance = state.glance_rows().unwrap().len();
+        eprintln!(
+            "glance_rows: {glance} in {:.2} s",
+            t.elapsed().as_secs_f64()
+        );
+        eprintln!("{}", state.compact(&file).unwrap());
+        let mut stmt = state
+            .conn
+            .prepare(
+                "SELECT name, sum(pgsize), sum(payload) FROM dbstat GROUP BY name ORDER BY 2 DESC",
+            )
+            .unwrap();
+        let tables = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap();
+        for t in tables {
+            let (name, pages, payload) = t.unwrap();
+            eprintln!("{name}: {pages} B in pages, {payload} B of records");
+        }
+        eprintln!("file after: {} B", size(&file));
     }
 }

@@ -22,6 +22,18 @@
   GB came to 0.98 GB in 3.5 s (Linux, NVMe) and 2.65 GB to 1.08 GB in 7.7 s (an M1's SSD), with 70 to 85 MB more
   memory and about twice what the state holds of room for the moment. Where a disk lacks that room it is put
   off, and the log says so once; a kill or a full disk partway through leaves the state as it was.
+- The state held each file's details two and three times over, as JSON text: the base node and the row each in
+  a table of its own, the row repeating the node's content, metadata and entries, and repeating its own metadata
+  as `scan` and `applied`, with every hash and ID in hex and every name in base64. A row and its node now share
+  one SQL row as binary records, the row written against the node, so it holds only what differs from it
+  (usually the device and inode alone), and manifests are stored as their fields, their canonical JSON made
+  again when one is read and checked against its hash. The first build of this layout to open a state moves it,
+  in one transaction, after checking the disk has room; the next sync rebuilds the ledger and compacts the file.
+  On copies of two states of a tree of 568,000 entries, what their nodes, rows and manifests took went from 1.0
+  GiB to 144 MiB in a move of 3.4 s (Linux, NVMe), and from 1.2 GiB to 188 MiB in 7.7 s (an M1's SSD), every
+  record decoding to what it was; compacted, the files came to 131 and 174 MiB before the ledger, from 2.34 and
+  2.65 GB. A kill or a full disk during the move leaves the state as it was, and a disk short of room stops the
+  sync until there is room. An older build refuses a state this one has moved.
 - On Windows, Task Manager showed the daemon as a bare `cairn.exe` with the generic program icon and no
   description, beside the tray's "Cairn": the gap macOS had until 0.1.8. Windows takes a program's name and icon
   from its file, and `cairn.exe` had neither. It now carries the daemon's icon, the cairn inside two sync arrows

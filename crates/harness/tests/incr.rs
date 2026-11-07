@@ -909,13 +909,12 @@ fn what_a_killed_run_stored_of_its_scan_is_taken_up_by_a_rebuilt_ledger() {
 #[test]
 fn a_file_with_no_record_comes_down_in_a_rebuilt_ledger() {
     let (_sb, _s, a, _b) = started("incr-no-record");
-    let conn = rusqlite::Connection::open(a.path(".cairn/state.sqlite")).unwrap();
-    // The base64 of `f2`, as a link holds it.
+    let db = a.path(".cairn/state.sqlite");
+    let f2 = objects_named(&db, b"f2");
+    assert_eq!(f2.len(), 1);
+    let conn = rusqlite::Connection::open(&db).unwrap();
     let n = conn
-        .execute(
-            "DELETE FROM rows WHERE object IN (SELECT object FROM base WHERE node LIKE '%\"name\":\"ZjI=\"%')",
-            [],
-        )
+        .execute("UPDATE objects SET row = NULL WHERE object = ?1", [&f2[0]])
         .unwrap();
     assert_eq!(n, 1);
     conn.execute("DELETE FROM dirty", []).unwrap();
@@ -936,15 +935,8 @@ fn a_file_with_no_record_comes_down_in_a_rebuilt_ledger() {
 fn a_row_written_by_another_build_is_taken_up() {
     let (_sb, _s, a, b) = started("incr-foreign");
     let db = a.path(".cairn/state.sqlite");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let n = conn
-        .execute(
-            "UPDATE rows SET row = replace(row, '\"racy\":false', '\"racy\":true')",
-            [],
-        )
-        .unwrap();
+    let n = edit_rows(&db, |_| true, |r| r.racy = true);
     assert!(n > 5, "{n}");
-    drop(conn);
     a.write("d/f2", "edited");
     // Every row was written: every object is looked at.
     let run = incremental(&a);
@@ -954,7 +946,7 @@ fn a_row_written_by_another_build_is_taken_up() {
     same_trees(&a, &b, "after the rows were written");
     // A missing trigger means writes went unmarked: the ledger goes, and the whole tree is looked at.
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TRIGGER dirty_rows_update;")
+    conn.execute_batch("DROP TRIGGER dirty_objects_update;")
         .unwrap();
     drop(conn);
     rebuilt(&a.sync(), "no full sync has agreed");

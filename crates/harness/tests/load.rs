@@ -106,10 +106,10 @@ fn a_sync_reads_its_state_through_in_order_before_it_loads_it() {
         a.synced();
     }
     let state = a.path(".cairn/state.sqlite");
-    let (out_of_order, steps) = jumps(&state, "rows");
+    let (out_of_order, steps) = jumps(&state, "objects");
     assert!(
         out_of_order * 4 > steps,
-        "a walk of the rows jumps {out_of_order} times in {steps} steps: in the file's order, which proves nothing"
+        "a walk of the objects jumps {out_of_order} times in {steps} steps: in the file's order, which proves nothing"
     );
     evict(&state);
     let (cached, pages) = resident(&state);

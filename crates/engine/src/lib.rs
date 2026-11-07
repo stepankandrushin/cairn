@@ -14,6 +14,7 @@ pub mod merge;
 pub mod metadata;
 pub mod progress;
 pub mod rebuild;
+pub mod record;
 pub mod registry;
 pub mod restore;
 pub mod root;

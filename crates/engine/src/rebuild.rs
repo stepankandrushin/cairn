@@ -18,7 +18,7 @@ use crate::incr::{Entry, FxMap, Ledger, Seen};
 use crate::root::Root;
 use crate::scan::Scanned;
 use crate::selection::Selection;
-use crate::state::{Glance, Row, StateTable};
+use crate::state::{Glance, Row, StateTable, Stored};
 use anyhow::Result;
 use cairn_protocol::{Content, Link, Name, Node, ObjectId, ObjectKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -109,14 +109,16 @@ fn in_parallel<B: Send, R: Send>(
 pub fn skeleton(root: &Root) -> Result<Ledger> {
     type Parsed = Vec<(ObjectId, Option<(ObjectKind, Node)>)>;
     let mut sk = Ledger::default();
-    let work = |batch: Vec<(ObjectId, String)>| -> Result<Parsed> {
+    let work = |batch: Vec<(ObjectId, Stored)>| -> Result<Parsed> {
         batch
             .into_iter()
-            .map(|(id, text)| {
+            .map(|(id, stored)| {
                 if id == ObjectId::ROOT {
                     return Ok((id, None));
                 }
-                let node: Node = serde_json::from_str(&text)?;
+                let Some(node) = stored.node()? else {
+                    return Ok((id, None));
+                };
                 Ok((id, (!node.links.is_empty()).then(|| (node.kind(), node))))
             })
             .collect()
@@ -419,15 +421,17 @@ fn judge_rows(
     skip: &(dyn Fn(&ObjectId) -> bool + Sync),
     sink: &mut dyn FnMut(Judged) -> Result<()>,
 ) -> Result<()> {
-    let work = |batch: Vec<(ObjectId, String)>| -> Result<Judged> {
+    let work = |batch: Vec<(ObjectId, Stored)>| -> Result<Judged> {
         let mut out = Vec::with_capacity(batch.len());
-        for (id, text) in batch {
+        for (id, stored) in batch {
             let si = sk.find(&id);
             if skip(&id) {
                 out.push((id, si, Rebuilt::Unsettled("taken up by the round"), None));
                 continue;
             }
-            let row: Row = serde_json::from_str(&text)?;
+            let Some(row) = stored.row()? else {
+                continue;
+            };
             match of_row(sk, vis, p, id, si, &row) {
                 r @ Rebuilt::Unsettled(_) => out.push((id, si, r, Some(row))),
                 r => out.push((id, si, r, None)),

@@ -67,8 +67,8 @@ the root.
   daemon.json    what a running daemon last reported; for reading only, and never needed
   full-checked   when a sync last ended with every decision the full sync's, in seconds since the
                  epoch: the daemon's check on the incremental path is due a day after; never needed
-  state.sqlite   WAL, synchronous=FULL; rewritten (VACUUM) after a sync that leaves over half of it
-                 free pages
+  state.sqlite   WAL, synchronous=FULL; its layout in `PRAGMA user_version`, now 2; rewritten (VACUUM)
+                 after a sync that leaves over half of it free pages
   stage/         entries lifted out for a moment, for swaps and cycles
   chunks/        downloads in progress, by hash, in slices of about 1 GiB, each chunk gone once the
                  files that take it are written; resumes after an interruption
@@ -77,21 +77,45 @@ the root.
 | Table | Holds |
 |---|---|
 | `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move, and for one a sync kept out of what this device held, that object, whose record does not bring it back into view; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way. `generation`, which triggers in the file move on every write to any table, whatever build makes it, and `steady`, what the last sync that had nothing to do and wrote nothing read: that generation, the cursor and its operation, a hash of the build, configuration and rules, a digest of its scan, and what it reported |
-| `base` | The server's tree as of the cursor: the common ancestor for merging |
-| `rows` | Per object: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read, or last written, or whose metadata alone was set, by a run whose watch on the file saw nothing done to it until a later write would have shown; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
-| `manifests` | Manifests of local content, needed to upload it |
+| `objects` | Per object, its base node and its row, each a binary record or NULL, never both NULL: the node is the server's tree as of the cursor, the common ancestor for merging; the row is what this device knows of it: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read, or last written, or whose metadata alone was set, by a run whose watch on the file saw nothing done to it until a later write would have shown; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
+| `manifests` | Manifests of local content, needed to upload it: `1` and the fields of its canonical JSON (size, then each segment's offset and chunks, each chunk's hash and length), which is made again when it is read and checked against the hash it is stored under; or `0` and the bytes as they came, for any that are not a canonical manifest |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run |
 | `intents` | Marks made before a step that a crash could interrupt: a conflict copy's identity and the names it moves to, a kept edit's identity as a conflict copy, the losing side of a same-field metadata conflict until the commit that logs it is queued, a staged entry's origin, a directory's real mode, new content on its way to every hard link of a file, and what the server had for each object a run was about to change, with where the plan puts it here, the policy it applied by, and whether it is a folder only something inside changes or one the run makes, private until its last pass, which the next scan compares with the disk to tell what arrived from what this device did |
 | `ledger` | Per live object of the base, the last agreement a sync can take what changed alone against: the kind and entries, and what the scan that agreed found, the device, inode and fingerprint, the content (a file's manifest and size, a link's target), and for anything but a file a BLAKE3 digest of the rest it read; no scan part for an entry out of view here. A compact binary record, its first byte the format |
-| `dirty` | Every object whose base node or row has been written since the ledger last spoke for it, put there by triggers on `base` and `rows` |
+| `dirty` | Every object whose base node or row has been written since the ledger last spoke for it, put there by triggers on `objects` |
 | `ledger_anchor` | What the ledger stands on: its format, a hash of the build, configuration, rules and selection it was written under, and the entries on the server out of view then. Without it, or with any of that changed, a sync takes the whole tree and writes the ledger anew |
 
-The triggers are not a migration: an older build opens the file as before, and its writes move the generation
-too. A file found without all of them, or with one changed, gets them all again and loses its `steady` record, in
-one transaction. The same for the ledger: an older build's writes mark what they touch, and a file found without
+**Records.** Integers are LEB128, signed ones zigzagged first; IDs and hashes are their raw bytes; names, targets
+and other bytes are a length and the bytes. A timestamp is its seconds and nanoseconds. A node is its format
+byte (1), revision, content (a tag, then a file's manifest hash and size or a link's target), metadata and
+entries (a count, then each parent ID and name). Metadata is a byte of flags for what is present, the mode, the
+owner (uid, gid, user and group names), mtime, birth time, the timestamp precision when it is not 1 ns, the
+records and named streams, each record's namespace a byte for one this build knows or the name written out, and
+any fields of a newer build as the JSON they came in. A row is its format byte (1), a varint of flags, and only
+what is not already in the node beside it: its content, `scan` and `applied` unless they are the node's (or, for
+`applied`, the same as `scan`), the fingerprint's device and inode, its size, mtime, ctime and birth time unless
+they are the content's size, `scan`'s times and its own mtime, `synced` whole, and the entries it holds unless
+they are the node's. So a row says nothing about the node but where it agrees with it, and is written again
+whenever the node beside it changes; a hand edit of a node must write its row again too. On a real tree's 568,000
+objects a node takes about 130 bytes and a row about 30.
+
+**Layouts.** Version 1, up to 0.1.8, kept the node in `base` and the row in `rows`, each as JSON text, and
+manifests as their canonical JSON. A build of version 2 moves such a state when it opens it, before a sync, in
+one transaction: both tables read in key order and merged, each object written once, manifests the same, the old
+tables dropped, the ledger with them, rebuilt by the next sync, and the generation moved. It first checks that
+the state's filesystem has room for the new tables in the WAL, and for the file to grow by what its free pages
+do not hold; short of it, or should the disk fill during it, the state stays version 1 and no sync runs until
+there is room. A kill at any point leaves version 1 or version 2, each whole. The pages the old tables held are
+free after it, which the compaction after the next sync gives back. A build older than the layout refuses the
+state, saying so ("newer than this binary: upgrade cairn"), so an update taken back past this one needs the
+state made again: remove `.cairn` and run `cairn init`, which merges by name and content.
+
+The triggers are not a migration: an older build of the same layout opens the file as before, and its writes
+move the generation too. A file found without all of them, or with one changed, gets them all again and loses
+its `steady` record, in one transaction. The same for the ledger: an older build's writes mark what they touch, and a file found without
 the `dirty_*` triggers, or with one changed, gets them again and loses its ledger.
 
-`rows.applied` next to `base` is what keeps stored and applied metadata separate. A local change is
+A row's `applied` next to its node is what keeps stored and applied metadata separate. A local change is
 "the filesystem differs from `applied`", never "the filesystem differs from what is stored", so a field
 this client cannot hold is not a change.
 

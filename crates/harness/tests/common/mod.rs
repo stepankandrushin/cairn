@@ -1208,3 +1208,93 @@ pub fn wal_len(state: &Path) -> u64 {
     wal.push("-wal");
     std::fs::metadata(PathBuf::from(wal)).map_or(0, |m| m.len())
 }
+
+// --- The state's records, read and written from outside with SQL alone, as another build might ---
+
+/// The base node and the row of every object in the state, each as stored and decoded.
+fn state_records(
+    db: &rusqlite::Connection,
+) -> Vec<(
+    Vec<u8>,
+    Option<cairn_protocol::Node>,
+    Option<cairn_engine::state::Row>,
+)> {
+    let mut stmt = db.prepare("SELECT object, node, row FROM objects").unwrap();
+    let all = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|(id, node, row)| {
+            let node = node.map(|n| cairn_engine::record::decode_node(&n).unwrap());
+            let row = row.map(|r| cairn_engine::record::decode_row(&r, node.as_ref()).unwrap());
+            (id, node, row)
+        })
+        .collect();
+    all
+}
+
+/// Whether a base node has an entry of this name.
+pub fn named(node: Option<&cairn_protocol::Node>, name: &[u8]) -> bool {
+    node.is_some_and(|n| n.links.iter().any(|l| l.name.as_bytes() == name))
+}
+
+/// The objects whose base node has an entry named `name`.
+pub fn objects_named(state: &Path, name: &[u8]) -> Vec<Vec<u8>> {
+    let db = rusqlite::Connection::open(state).unwrap();
+    state_records(&db)
+        .into_iter()
+        .filter(|(_, n, _)| named(n.as_ref(), name))
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
+/// The row of the one object whose base node has an entry named `name`.
+pub fn row_named(state: &Path, name: &[u8]) -> cairn_engine::state::Row {
+    let db = rusqlite::Connection::open(state).unwrap();
+    let mut found: Vec<_> = state_records(&db)
+        .into_iter()
+        .filter(|(_, n, _)| named(n.as_ref(), name))
+        .filter_map(|(_, _, r)| r)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "rows named {:?}",
+        String::from_utf8_lossy(name)
+    );
+    found.remove(0)
+}
+
+/// Each row whose base node `pick` takes, changed by `edit` and written back with an UPDATE of its own,
+/// as another build or a person would: how many changed.
+pub fn edit_rows(
+    state: &Path,
+    pick: impl Fn(Option<&cairn_protocol::Node>) -> bool,
+    edit: impl Fn(&mut cairn_engine::state::Row),
+) -> usize {
+    let db = rusqlite::Connection::open(state).unwrap();
+    let mut n = 0;
+    for (id, node, row) in state_records(&db) {
+        let Some(mut row) = row.filter(|_| pick(node.as_ref())) else {
+            continue;
+        };
+        let was = row.clone();
+        edit(&mut row);
+        if row != was {
+            let bytes = cairn_engine::record::encode_row(&row, node.as_ref());
+            n += db
+                .execute(
+                    "UPDATE objects SET row = ?1 WHERE object = ?2",
+                    rusqlite::params![bytes, id],
+                )
+                .unwrap();
+        }
+    }
+    n
+}

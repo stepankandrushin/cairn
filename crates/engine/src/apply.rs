@@ -623,6 +623,7 @@ impl<'a> Applier<'a> {
                 }
             }
         }
+        crate::progress::to_download(coming);
         // Each file's row and manifest, and the cache: the first slice may still be there while the
         // last is fetched.
         let records = 8192 * files.len() as u64;
@@ -2173,6 +2174,7 @@ impl<'a> Applier<'a> {
             .map(|(id, c)| (*id, (c.kind, c.links.clone())))
             .collect();
         let steps = schedule(&from, &to).context("ordering local changes")?;
+        crate::progress::total(steps.len() as u64);
         self.order_writes(&steps, plan);
         self.give_up_what_goes(&steps)?;
         // Folders this filesystem cannot hold: what goes in them waits with them.
@@ -2212,6 +2214,7 @@ impl<'a> Applier<'a> {
                 TopoOp::Unlink { object, link } => self.remove_link(*object, link),
                 TopoOp::Move { object, from, to } => self.move_entry(plan, *object, from, to),
             };
+            crate::progress::done(1);
             match (done, step) {
                 (Ok(()), _) => self.outcome.applied_steps += 1,
                 (

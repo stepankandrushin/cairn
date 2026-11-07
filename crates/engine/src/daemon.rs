@@ -74,6 +74,9 @@ pub struct DaemonOptions {
     pub watch: bool,
     /// Long-poll the server; without it, only the reconcile finds remote changes.
     pub feed: bool,
+    /// Where a sync that runs long says, from another thread, how far it has got, and one in which
+    /// nothing moves says so: the daemon's log, as `log` is. Without it they are only in the status.
+    pub say: Option<fn(&str)>,
 }
 
 impl Default for DaemonOptions {
@@ -84,6 +87,7 @@ impl Default for DaemonOptions {
             retry: Duration::from_secs(60),
             watch: true,
             feed: true,
+            say: None,
         }
     }
 }
@@ -198,6 +202,137 @@ fn write_status(path: &Path, status: &Status) {
 fn show(path: &Path, status: &Status, hub: &Hub) {
     write_status(path, status);
     hub.publish(status);
+}
+
+/// While a sync runs, how often what it is doing goes to the local API, for `cairn status` and the tray.
+const PROGRESS_SHOWN: Duration = Duration::from_secs(2);
+/// A sync still running this long after it began says in the log what it is doing, and again every
+/// [`PROGRESS_SAID`] after: a scan that reads a folder just taken in can run for an hour, and a log
+/// silent for that long reads as a daemon that has hung.
+const PROGRESS_FIRST: Duration = Duration::from_secs(60);
+const PROGRESS_SAID: Duration = Duration::from_secs(300);
+/// A sync in which nothing has moved for this long says so in the log, once, and again when it moves.
+const STALLED: Duration = Duration::from_secs(600);
+
+fn tuned(name: &str, default: Duration) -> Duration {
+    Duration::from_millis(cairn_failpoint::tuned(name, default.as_millis() as u64))
+}
+
+/// The sync running now, as the reporter shows it.
+struct Running {
+    progress: Arc<crate::progress::Progress>,
+    status: Status,
+    ticks: u64,
+    moved: Instant,
+    moved_secs: i64,
+    next_line: Instant,
+    stalled: bool,
+}
+
+/// What the main loop and the reporter share: the sync running now, if one is.
+#[derive(Default)]
+struct Live {
+    running: Mutex<Option<Running>>,
+    wake: std::sync::Condvar,
+}
+
+impl Live {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Running>> {
+        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A sync begins: shown at once, with what it is doing from then on.
+    fn begin(&self, progress: Arc<crate::progress::Progress>, status: &Status, hub: &Hub) {
+        let now = Instant::now();
+        let running = Running {
+            ticks: progress.ticks(),
+            progress,
+            status: status.clone(),
+            moved: now,
+            moved_secs: now_secs(),
+            next_line: now + tuned("daemon.progress_first_ms", PROGRESS_FIRST),
+            stalled: false,
+        };
+        let mut live = self.lock();
+        hub.publish(&running.shown());
+        *live = Some(running);
+        self.wake.notify_all();
+    }
+
+    /// It is over: the reporter shows nothing more of it, and what the main loop shows next stands.
+    fn end(&self) {
+        *self.lock() = None;
+    }
+}
+
+impl Running {
+    fn shown(&self) -> Status {
+        let mut status = self.status.clone();
+        status.syncing = true;
+        status.progress = Some(self.progress.snapshot(self.moved_secs));
+        status
+    }
+}
+
+/// Shows the sync running now every [`PROGRESS_SHOWN`], and says in the log how a long one goes. The
+/// lock is held while it shows, so a sync that has ended is never shown again after the main loop's
+/// own status.
+fn report_progress(live: Arc<Live>, hub: Arc<Hub>, say: Option<fn(&str)>) {
+    let shown_every = tuned("daemon.progress_shown_ms", PROGRESS_SHOWN);
+    let said_every = tuned("daemon.progress_said_ms", PROGRESS_SAID);
+    let stalled_after = tuned("daemon.stalled_ms", STALLED);
+    let mut guard = live.lock();
+    loop {
+        // Between syncs it sleeps until the next begins: an idle daemon stays idle.
+        guard = match guard.is_some() {
+            true => live
+                .wake
+                .wait_timeout(guard, shown_every)
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0),
+            false => live.wake.wait(guard).unwrap_or_else(|e| e.into_inner()),
+        };
+        let Some(r) = guard.as_mut() else {
+            continue;
+        };
+        let now = Instant::now();
+        let ticks = r.progress.ticks();
+        let still = now.duration_since(r.moved);
+        if ticks != r.ticks {
+            r.ticks = ticks;
+            if r.stalled {
+                r.stalled = false;
+                if let Some(say) = say {
+                    say(&format!(
+                        "the sync moves again, after {} in which nothing did",
+                        cairn_protocol::local::span(still.as_secs() as i64)
+                    ));
+                }
+            }
+            r.moved = now;
+            r.moved_secs = now_secs();
+        }
+        let status = r.shown();
+        hub.publish(&status);
+        let Some(say) = say else {
+            continue;
+        };
+        let Some(progress) = &status.progress else {
+            continue;
+        };
+        if now >= r.next_line {
+            say(&format!("still syncing, {}", progress.describe(now_secs())));
+            r.next_line = now + said_every;
+        }
+        if !r.stalled && now.duration_since(r.moved) >= stalled_after {
+            r.stalled = true;
+            say(&format!(
+                "nothing in this sync has moved for {}, so it may be stuck; it has run {}",
+                cairn_protocol::local::span(now.duration_since(r.moved).as_secs() as i64),
+                progress.describe(now_secs()),
+            ));
+        }
+    }
 }
 
 /// What a daemon said before it was restarted: the last changes it made are still the last ones.
@@ -682,6 +817,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         }))
     };
 
+    let live = Arc::new(Live::default());
+    {
+        let (live, hub, say) = (live.clone(), hub.clone(), opts.say);
+        std::thread::spawn(move || report_progress(live, hub, say));
+    }
+
     let updater = {
         let tx = wake_tx.clone();
         Arc::new(crate::update::Worker::start(move || {
@@ -930,10 +1071,9 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
             _ => None,
         };
         status.waiting = None;
-        // To the local API only: writing the file twice a sync would be for nobody.
-        status.syncing = true;
-        hub.publish(&status);
-        status.syncing = false;
+        // To the local API only, while it runs: writing the file twice a sync would be for nobody.
+        let progress = Arc::new(crate::progress::Progress::default());
+        live.begin(progress.clone(), &status, &hub);
         hit("daemon.sync");
         let result = sync(
             path,
@@ -941,9 +1081,11 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 changed_here,
                 full_every: Some(opts.full_sync),
                 scope,
+                progress: Some(progress),
                 ..SyncOptions::default()
             },
         );
+        live.end();
         hit("daemon.synced");
         // Got through a sync, whatever it found: a version just installed works.
         updater.synced();
@@ -1035,7 +1177,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         opts.full_sync.as_secs()
                     ));
                 }
-                if report.commits > 0 || report.steps_applied > 0 {
+                let long = started.elapsed() >= tuned("daemon.progress_first_ms", PROGRESS_FIRST);
+                if report.commits > 0 || report.steps_applied > 0 || long {
                     let took = match (&report.whole_because, report.part) {
                         (None, Some((_, took, of))) => {
                             format!(", looked at {took} of {of} entries")
@@ -1046,10 +1189,18 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         Some(folders) => format!(", listed {} folder(s)", folders.len()),
                         None => String::new(),
                     };
+                    let read = match report.files_read {
+                        0 => String::new(),
+                        n => format!(
+                            ", read {n} file(s), {}, to hash them",
+                            cairn_protocol::local::bytes(report.bytes_read)
+                        ),
+                    };
                     log(&format!(
-                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s){took}{looked}, in {} round(s), scans {:.1} s",
+                        "synced to sequence {}: {} steps applied here, {} commits pushed, {} bytes uploaded, {} conflict(s){took}{looked}, in {} round(s), scans {:.1} s{read}, took {}",
                         report.head, report.steps_applied, report.commits, report.bytes_uploaded, report.conflicts,
-                        report.rounds, report.scan_time.as_secs_f64()
+                        report.rounds, report.scan_time.as_secs_f64(),
+                        cairn_protocol::local::span(started.elapsed().as_secs() as i64)
                     ));
                 }
             }

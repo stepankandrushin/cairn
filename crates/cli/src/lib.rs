@@ -426,11 +426,25 @@ fn print_view(v: &RootView) {
 }
 
 fn print_daemon(s: &cairn_engine::daemon::Status) {
+    let state = format!(
+        "{}{}",
+        if s.state.is_empty() {
+            "starting"
+        } else {
+            &s.state
+        },
+        s.detail
+            .as_ref()
+            .map_or(String::new(), |d| format!(" ({d})"))
+    );
     outln!(
-        "daemon: running as process {}, {}{}; last sync {}, last fully synced {}; {} folders watched",
+        "daemon: running as process {}, {}; last sync {}, last fully synced {}; {} folders watched",
         s.pid,
-        if s.state.is_empty() { "starting" } else { &s.state },
-        s.detail.as_ref().map_or(String::new(), |d| format!(" ({d})")),
+        match (s.syncing, s.state.is_empty()) {
+            (false, _) => state,
+            (true, true) => "syncing now, its first sync".to_string(),
+            (true, false) => format!("syncing now, after a sync that ended {state}"),
+        },
         if s.last_sync == 0 {
             "none yet".to_string()
         } else {
@@ -443,6 +457,11 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
         },
         s.watched,
     );
+    match &s.progress {
+        Some(p) if s.syncing => outln!("daemon: syncing {}", p.describe(now())),
+        _ if s.syncing => outln!("daemon: a sync is running now"),
+        _ => {}
+    }
     if s.unwatched > 0 {
         outln!(
             "daemon: {} folders are not watched, so changes in them wait for a full sync{}",
@@ -620,18 +639,19 @@ fn run_inner() -> Result<u8> {
             no_feed,
         } => {
             let root = find_root(cli.root)?;
+            // Whoever reads this going away is no reason to stop syncing.
+            let say: fn(&str) = |line: &str| {
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{} {line}", date_time(now()));
+                let _ = out.flush();
+            };
             let opts = DaemonOptions {
                 reconcile: Duration::from_secs(reconcile_secs.max(1)),
                 full_sync: Duration::from_secs(full_sync_secs.max(1)),
                 retry: Duration::from_secs(retry_secs.max(1)),
                 watch: !no_watch,
                 feed: !no_feed,
-            };
-            // Whoever reads this going away is no reason to stop syncing.
-            let say: fn(&str) = |line: &str| {
-                let mut out = std::io::stdout();
-                let _ = writeln!(out, "{} {line}", date_time(now()));
-                let _ = out.flush();
+                say: Some(say),
             };
             // Tries go in this log: a request's first new try and its outcome, not a line a try.
             cairn_engine::client::log_retries_with(say);

@@ -2478,6 +2478,103 @@ fn a_subscriber_sees_each_sync_start_and_what_it_did() {
     let _ = sub.wait();
 }
 
+/// A long sync says what it is doing, how far it has got and when anything last moved, in the status
+/// and in the log while it runs, and one in which nothing moves says so. A scan that read a folder just
+/// taken in ran for most of an hour with a silent log and a status that said only "synced", and was
+/// taken for hung.
+#[test]
+fn a_long_sync_says_how_far_it_has_got_and_a_stuck_one_says_so() {
+    let (sb, _s, a, _b) = pair("d-progress");
+    for f in ["one", "two", "three"] {
+        a.write(f, f);
+    }
+    let gate = sb.path("gate");
+    std::fs::create_dir(&gate).unwrap();
+    let pause = format!("daemon.sync:{}", gate.display());
+    let tune = "daemon.progress_first_ms=300,daemon.progress_said_ms=700,\
+                daemon.stalled_ms=1500,daemon.progress_shown_ms=100";
+    let da = Daemon::start_env(
+        &a,
+        &["--reconcile-secs", DAY],
+        &[
+            ("CAIRN_FP_PAUSE", &pause),
+            ("CAIRN_FP_DELAY", "scan.file.reading:1000"),
+            ("CAIRN_FP_TUNE", tune),
+        ],
+    );
+    let log = da.log.clone();
+    // Held before it has done anything: nothing moves, and the log says so.
+    wait_for("the stall to be said", &log, || {
+        da.log().contains("nothing in this sync has moved for")
+    });
+    assert!(
+        da.log().contains("still syncing, for")
+            && da.log().contains("loading what this device knows"),
+        "{}",
+        da.log()
+    );
+    // `--all`, as the tray asks: `cairn status` alone would also run a dry sync, which reads the
+    // files the daemon is about to.
+    let status = a.cairn(&["status", "--all"]);
+    assert!(
+        status.stdout.contains("syncing now, its first sync")
+            && status.stdout.contains("daemon: syncing for")
+            && status.stdout.contains("last moved"),
+        "{}",
+        status.text()
+    );
+    std::fs::write(gate.join("go"), b"").unwrap();
+    wait_for("the sync to move again", &log, || {
+        da.log().contains("the sync moves again, after")
+    });
+    // Each file takes a second to read: the status names it, with what the scan has done so far.
+    let mut seen = serde_json::Value::Null;
+    wait_for("the status to name the file being read", &log, || {
+        let run = a.cairn(&["ask", "status"]);
+        let v: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap_or_default();
+        let p = &v["progress"];
+        if v["syncing"] == true && p["phase"] == "scanning" && p["reading"].is_string() {
+            seen = v.clone();
+            return true;
+        }
+        false
+    });
+    // What a person or an agent asks: the same, in words.
+    let status = a.cairn(&["status"]);
+    assert!(
+        status.stdout.contains("daemon: syncing for")
+            && status.stdout.contains("to hash them, now ")
+            && status.stdout.contains("last moved"),
+        "{}",
+        status.text()
+    );
+    let p = &seen["progress"];
+    assert!(
+        ["one", "two", "three"].contains(&p["reading"].as_str().unwrap())
+            && p["files_read"].as_u64().unwrap() >= 1
+            && p["entries"].as_u64().unwrap() >= 1,
+        "{seen}"
+    );
+    wait_for("the log to say the scan goes on", &log, || {
+        da.log()
+            .lines()
+            .any(|l| l.contains("still syncing, for") && l.contains("looking at the tree"))
+    });
+    da.wait_state("synced");
+    let ended = da.status();
+    assert!(
+        ended["syncing"] == false && ended["progress"].is_null(),
+        "{ended}"
+    );
+    assert!(
+        da.log().lines().any(|l| l.contains("synced to sequence")
+            && l.contains("file(s)")
+            && l.contains("to hash them, took")),
+        "{}",
+        da.log()
+    );
+}
+
 /// A mode or a time changed elsewhere is listed where it arrives, as where it was made: as metadata,
 /// not as an edit, and not left out.
 #[test]

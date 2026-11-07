@@ -104,6 +104,7 @@ impl Read for RunReader<'_> {
         let n = read_at(self.fd, &mut buf[..want], self.at)?;
         self.at += n as u64;
         self.left -= n as u64;
+        crate::progress::read(n as u64);
         Ok(n)
     }
 }
@@ -119,6 +120,7 @@ pub fn manifest_of(fd: impl AsFd, size: u64) -> io::Result<Manifest> {
             // result is the same single chunk.
             let mut buf = vec![0u8; len as usize];
             read_exact_at(fd, &mut buf, offset)?;
+            crate::progress::read(len);
             chunks.push(ChunkRef {
                 hash: Hash::of(&buf),
                 len: len as u32,

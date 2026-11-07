@@ -78,6 +78,10 @@ pub struct DaemonStatus {
     /// there it is always false.
     #[serde(default)]
     pub syncing: bool,
+    /// While `syncing`, what that sync is doing, how far it has got, and when it last moved: a sync
+    /// that takes an hour tells itself from a stuck one by this, not by how long it has run.
+    #[serde(default)]
+    pub progress: Option<Progress>,
     /// The last changes this daemon sent or applied, newest first, at most [`MAX_RECENT`].
     #[serde(default)]
     pub recent: Vec<Activity>,
@@ -99,6 +103,203 @@ pub struct DaemonStatus {
 
 pub const MAX_NOT_APPLIED: usize = 200;
 pub const MAX_RECENT: usize = 100;
+
+/// What part of a sync is running. A reader that meets a part it does not know shows it as
+/// [`Phase::Other`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Reading what this device knows: its state, the ledger, or rebuilding the ledger.
+    #[default]
+    Loading,
+    /// Taking what the server's journal has since the last sync.
+    Journal,
+    /// Looking at every entry in the tree, or at what changed, and reading the files that are new
+    /// or changed here, to hash them.
+    Scanning,
+    /// Matching what it found with the server's tree and working out what to do.
+    Deciding,
+    /// Downloading and placing what the server has, and removing and moving what it says.
+    Applying,
+    /// Sending the server the content it does not have yet.
+    Uploading,
+    /// Sending the changes made here as commits.
+    Committing,
+    /// Recording what was done, for the next sync.
+    Recording,
+    #[serde(other)]
+    Other,
+}
+
+/// What the sync running now is doing: [`DaemonStatus::progress`]. Counts start at nought with each
+/// sync; `entries` with each scan, the others go on across its rounds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// When the sync began.
+    pub started: Secs,
+    /// Its round, from 1: a round that changed something is followed by one that checks it.
+    pub round: u32,
+    pub phase: Phase,
+    /// When it came to that phase.
+    pub phase_since: Secs,
+    /// Entries the scan running now, or the last one, has looked at, and how many the tree had at
+    /// the last sync, as a guide to how many it will; 0 where the scan looks at part of the tree.
+    pub entries: u64,
+    pub entries_known: u64,
+    /// The files this sync has read to hash them, and their bytes: what makes a scan long, as when a
+    /// folder is taken in that the last sync left out.
+    pub files_read: u64,
+    pub bytes_read: u64,
+    /// The file being read now, relative to the root, and its size.
+    #[serde(default)]
+    pub reading: Option<String>,
+    #[serde(default)]
+    pub reading_size: u64,
+    /// The phase's own count of what it has to do, where it knows it: steps applied, chunks uploaded
+    /// or commits sent. `total` is 0 where it is not known.
+    pub done: u64,
+    pub total: u64,
+    /// Bytes downloaded and uploaded so far in this sync, and how many it has found it has to.
+    pub downloaded: u64,
+    pub to_download: u64,
+    pub uploaded: u64,
+    pub to_upload: u64,
+    /// When any count above last went up, or the phase or the file read changed.
+    pub moved: Secs,
+}
+
+impl Phase {
+    fn doing(self) -> &'static str {
+        match self {
+            Phase::Loading => "loading what this device knows",
+            Phase::Journal => "taking the server's journal",
+            Phase::Scanning => "looking at the tree",
+            Phase::Deciding => "working out what to do",
+            Phase::Applying => "applying the server's changes here",
+            Phase::Uploading => "uploading",
+            Phase::Committing => "sending commits",
+            Phase::Recording => "recording what it did",
+            Phase::Other => "busy",
+        }
+    }
+}
+
+impl Progress {
+    /// The phase and how far it has got in it, as "looking at the tree, 120,345 of about 556,010
+    /// entries".
+    pub fn doing(&self) -> String {
+        let mut line = self.phase.doing().to_string();
+        let count = |n: u64| group(n);
+        match self.phase {
+            Phase::Scanning if self.entries_known >= self.entries.max(1) => {
+                line += &format!(
+                    ", {} of about {} entries",
+                    count(self.entries),
+                    count(self.entries_known)
+                )
+            }
+            Phase::Scanning if self.entries == 1 => line += ", 1 entry",
+            Phase::Scanning => line += &format!(", {} entries", count(self.entries)),
+            Phase::Journal if self.done > 0 => {
+                line += &format!(", {} operations", count(self.done))
+            }
+            Phase::Applying if self.total > 0 => {
+                line += &format!(", {} of {} steps", count(self.done), count(self.total))
+            }
+            Phase::Uploading if self.total > 0 => {
+                line += &format!(", {} of {} chunks", count(self.done), count(self.total))
+            }
+            Phase::Committing if self.total > 0 => {
+                line += &format!(", {} of {}", count(self.done), count(self.total))
+            }
+            _ => {}
+        }
+        line
+    }
+
+    /// Short enough for a tray's line: what it is doing and for how long.
+    pub fn brief(&self, now: Secs) -> String {
+        format!("{}, for {}", self.doing(), span(now - self.started))
+    }
+
+    /// What it is doing, in one line, as `cairn status`, the tray and the daemon's log say it: how long
+    /// the sync has run, what it is at and how far it has got there, what it has read and moved, and
+    /// how long since anything moved.
+    pub fn describe(&self, now: Secs) -> String {
+        let mut line = format!("for {}", span(now - self.started));
+        if self.round > 1 {
+            line += &format!(", round {}", self.round);
+        }
+        line += ": ";
+        line += &self.doing();
+        line += &format!(", at it for {}", span(now - self.phase_since));
+        if self.files_read > 0 || self.reading.is_some() {
+            line += &format!(
+                "; read {} file(s), {}, to hash them",
+                group(self.files_read),
+                bytes(self.bytes_read)
+            );
+        }
+        if let Some(path) = &self.reading {
+            line += &format!(", now {path} ({})", bytes(self.reading_size));
+        }
+        if self.to_download > 0 || self.downloaded > 0 {
+            line += &format!(
+                "; downloaded {} of {}",
+                bytes(self.downloaded),
+                bytes(self.to_download.max(self.downloaded))
+            );
+        }
+        if self.to_upload > 0 || self.uploaded > 0 {
+            line += &format!(
+                "; uploaded {} of {}",
+                bytes(self.uploaded),
+                bytes(self.to_upload.max(self.uploaded))
+            );
+        }
+        line += &format!("; last moved {} ago", span(now - self.moved));
+        line
+    }
+}
+
+/// A count with its thousands apart, as 556,010.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A size as a person reads it.
+pub fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} bytes")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// A length of time as a person reads it: 45 s, 3 min 12 s, 1 h 4 min.
+pub fn span(secs: Secs) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min {} s", s / 60, s % 60),
+        _ => format!("{} h {} min", s / 3600, s % 3600 / 60),
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotApplied {
@@ -284,5 +485,54 @@ mod tests {
             "skips":[],"waiting":null}"#;
         let s: DaemonStatus = serde_json::from_str(old).unwrap();
         assert_eq!((s.pid, s.paused_since, s.recent.len()), (7, None, 0));
+        assert_eq!(s.progress, None);
+    }
+
+    #[test]
+    fn a_long_scan_says_how_far_it_has_got_and_when_it_last_moved() {
+        let p = Progress {
+            started: 1000,
+            round: 1,
+            phase: Phase::Scanning,
+            phase_since: 1010,
+            entries: 120_345,
+            entries_known: 556_010,
+            files_read: 13_201,
+            bytes_read: 129_277_427_712,
+            reading: Some("photo/a.mov".into()),
+            reading_size: 1_288_490_189,
+            moved: 4240,
+            ..Progress::default()
+        };
+        assert_eq!(
+            p.describe(4241),
+            "for 54 min 1 s: looking at the tree, 120,345 of about 556,010 entries, at it for 53 min 51 s; \
+             read 13,201 file(s), 120.4 GiB, to hash them, now photo/a.mov (1.2 GiB); last moved 1 s ago"
+        );
+        let up = Progress {
+            started: 0,
+            round: 2,
+            phase: Phase::Uploading,
+            phase_since: 3600,
+            done: 3,
+            total: 10,
+            uploaded: 3 << 20,
+            to_upload: 10 << 20,
+            moved: 3700,
+            ..Progress::default()
+        };
+        assert_eq!(
+            up.describe(4300),
+            "for 1 h 11 min, round 2: uploading, 3 of 10 chunks, at it for 11 min 40 s; uploaded 3.0 MiB \
+             of 10.0 MiB; last moved 10 min 0 s ago"
+        );
+    }
+
+    #[test]
+    fn a_phase_from_a_newer_daemon_still_reads() {
+        let p: Phase = serde_json::from_str(r#""pondering""#).unwrap();
+        assert_eq!(p, Phase::Other);
+        let s: Phase = serde_json::from_str(r#""scanning""#).unwrap();
+        assert_eq!(s, Phase::Scanning);
     }
 }

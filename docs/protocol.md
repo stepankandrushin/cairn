@@ -154,7 +154,13 @@ A malformed request gets an `error { text }`. The status adds only fields with d
 an older file keeps working: `recent` lists the last 100 changes the daemon sent (`up`) or applied
 (`down`) as `added`, `changed`, `metadata` (a file's or a link's alone; a folder's goes unlisted), `moved`
 with `to`, `removed` (a folder once) or `conflict`, newest first, and outlives a restart; `syncing` is true while a sync runs, on the socket only, as
-the file is written after each sync. A daemon from before this API holds the Linux socket
+the file is written after each sync, and with it `progress`, sent again every 2 s: the sync's `phase`
+(`loading`, `journal`, `scanning`, `deciding`, `applying`, `uploading`, `committing`, `recording`; a reader
+shows one it does not know as `other`), its `round`, when it began and came to that phase, the entries its
+scan has looked at of about how many, the files and bytes it has read to hash them and the file being read,
+the phase's own `done` of `total`, the bytes downloaded and uploaded of how many, and `moved`, when any of
+it last went up. `cairn status` and the tray say it in words, and the daemon's log every 5 minutes once a
+sync has run for one, and once when nothing in it has moved for 10 minutes. A daemon from before this API holds the Linux socket
 without answering, so `cairn status` waits 2 s for an answer and then reads its lock and file. `update` is what
 this user's updater on this device knows, the same in every daemon's status, and `version` the daemon's own.
 

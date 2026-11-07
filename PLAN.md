@@ -288,7 +288,9 @@ back for it on the same backoff and holds nothing else back, and the file's own 
 its close does. Between syncs it rests for twice what the last one did that every sync repeats, loading the
 state, the scan and the merge, so a tree that never rests keeps it busy at most a third of the time, but for 30 s at
 the most, so that a change written as a sync ends waits at most about 30 s and one sync, however big the tree; the
-data a big download moved is no reason to wait, as the next sync does not move it again. `cairn status` says when changes wait, until when, and why. It serves the local API
+data a big download moved is no reason to wait, as the next sync does not move it again. `cairn status` says when changes wait, until when, and why, and while a sync runs what it is doing,
+how far it has got and when anything in it last moved, which the log says too once it has run a minute, so a
+long scan is told from a stuck one. It serves the local API
 (`cairn_protocol::local`) on a socket only its user can open: its status, pushed on each change, the open
 conflicts, and three requests that change no tree: look now, pause, resume. A pause outlives a restart
 and shows as `paused`. Each user's roots on a device are listed in a registry the CLI and the daemon add

@@ -58,6 +58,10 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
         set_xattr(&a.path("f"), "user.both", b"server's");
         a.write("d/g", "also the same");
         a.write("d/only-there", "comes down");
+        // A program whose execute bit the tree's old sync never carried, and a private folder.
+        a.write("run.sh", "#!/bin/sh\n");
+        chmod(&a.path("run.sh"), 0o664);
+        chmod(&a.path("d"), 0o750);
         a.synced();
 
         let b = Device::new(&sb, &server, "b");
@@ -66,6 +70,9 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
         set_xattr(&b.path("f"), "user.mine", b"2");
         set_xattr(&b.path("f"), "user.both", b"mine");
         b.write("d/g", "also the same");
+        b.write("run.sh", "#!/bin/sh\n");
+        chmod(&b.path("run.sh"), 0o755);
+        chmod(&b.path("d"), 0o755);
         set_xattr(&b.path("d"), "user.folder", b"tagged");
         set_xattr(&b.path("d/g"), "user.tag", b"red");
         if let Some(point) = kill {
@@ -84,6 +91,16 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
         );
         assert_eq!(f.mode, 0o664, "the server's stands: {context}");
         assert_eq!(
+            entry(&b, "run.sh").mode,
+            0o775,
+            "the execute bits only this copy had stay: {context}"
+        );
+        assert_eq!(
+            entry(&b, "d").mode,
+            0o750,
+            "a folder's are the server's: {context}"
+        );
+        assert_eq!(
             xattr(&entry(&b, "d/g"), "user.tag").as_deref(),
             Some("red"),
             "{context}"
@@ -99,6 +116,9 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
             let log = b.cairn(&["log"]).expect_ok();
             for line in [
                 "note: mode: kept 664 from the server; this device had 644".to_string(),
+                "note: mode: 775, the server's 664 with the execute bits this device had; this \
+                 device had 755"
+                    .to_string(),
                 format!(
                     "note: record {NS} user.both: kept the server's value; this device had mine"
                 ),
@@ -109,6 +129,7 @@ fn a_joining_device_keeps_the_metadata_it_has_and_the_server_lacks() {
 
         // What only this device had reaches the others.
         a.synced();
+        assert_eq!(entry(&a, "run.sh").mode, 0o775, "{context}");
         assert_eq!(
             xattr(&entry(&a, "f"), "user.mine").as_deref(),
             Some("2"),

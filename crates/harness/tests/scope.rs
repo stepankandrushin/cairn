@@ -240,22 +240,35 @@ fn every_kind_through_scoped_syncs(label: &str, env: &[(&str, &str)]) {
     db.wait_rest();
     let mut s = Steps::new(log);
     s.mark();
-    let settle = |what: &str| {
-        da.wait_rest();
-        db.wait_rest();
-        // An oracle that found a round deciding otherwise than the full sync fails the sync, which the
-        // daemon says and tries again whole: the trees would end the same, and the log would not.
-        for d in [&da, &db] {
-            assert!(!d.log().contains("error:"), "after {what}: {}", d.log());
-        }
-        let diff = Picture::of(&a.root).diff(
+    let diff = || {
+        Picture::of(&a.root).diff(
             &Picture::of(&b.root),
             Ignore {
                 owner: true,
                 ..Ignore::default()
             },
-        );
-        assert_eq!(diff, Vec::<String>::new(), "after {what}");
+        )
+    };
+    let settle = |what: &str| {
+        // A rest is no sync for a while, not the end of one: under load a sync of the tree, and the
+        // pause after it, outlast it. So the trees are compared until they agree, and only a
+        // difference that lasts fails. A walk that a sync's write moved a file under is taken again.
+        let start = Instant::now();
+        loop {
+            da.wait_rest();
+            db.wait_rest();
+            let agree =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diff().is_empty()));
+            if agree.unwrap_or(false) || start.elapsed() > SOON {
+                break;
+            }
+        }
+        // An oracle that found a round deciding otherwise than the full sync fails the sync, which the
+        // daemon says and tries again whole: the trees would end the same, and the log would not.
+        for d in [&da, &db] {
+            assert!(!d.log().contains("error:"), "after {what}: {}", d.log());
+        }
+        assert_eq!(diff(), Vec::<String>::new(), "after {what}");
     };
     std::fs::rename(a.path("d0"), a.path("d0-renamed")).unwrap();
     settle("a folder renamed");
@@ -453,6 +466,49 @@ fn an_edit_whose_event_was_lost_waits_for_the_check_or_the_reconcile() {
             });
         }
     }
+}
+
+/// A root named through the data volume, `/System/Volumes/Data/Users/...`, which `canonicalize` leaves
+/// so, gets its events by the path the system volume shows it at, `/Users/...`. They are under the root
+/// all the same: an edit is a scoped sync of a few folders, not a loss of track and a walk of the tree.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_root_named_through_the_data_volume_has_scoped_syncs() {
+    let (sb, _s, a, b) = pair("scope-data-volume");
+    tree(&a, &b, 20, 5);
+    let real = std::fs::canonicalize(&a.root).unwrap();
+    let mut long = a.clone();
+    long.root = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+    assert_eq!(
+        std::fs::canonicalize(&long.root).unwrap(),
+        long.root,
+        "the data volume's name is the case here only if canonicalize keeps it"
+    );
+    let log = sb.path("a-steps");
+    let da = Daemon::start(
+        &long,
+        &["--reconcile-secs", DAY],
+        &[("CAIRN_FP_LOG", log.to_str().unwrap())],
+    );
+    da.wait_rest();
+    let mut s = Steps::new(log);
+    s.mark();
+    a.write("d7/e/f3", "edited");
+    let db = Daemon::start(&b, &["--reconcile-secs", DAY], &[]);
+    wait_file(&db, &b.path("d7/e/f3"), b"edited");
+    da.wait_rest();
+    let got = s.since();
+    let listed = count(&got, "scan.dir");
+    let rounds = count(&got, "sync.round");
+    assert!(
+        count(&got, "sync.scoped") >= 1,
+        "no round had a scope: {got:?}"
+    );
+    assert!(
+        listed <= 3 * rounds,
+        "{listed} folders listed in {rounds} round(s) for one edit, of 41: {}",
+        da.log()
+    );
 }
 
 /// An edit after a scoped round's scan, in a folder the scope did not list, is not taken for agreed: its

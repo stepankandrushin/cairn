@@ -108,7 +108,7 @@ pub struct WatchCounts {
 }
 
 struct Inner {
-    /// Its real path, since that is what events are named by.
+    /// The path events name it by: its real path, or the shorter one the data volume shows it at.
     root: PathBuf,
     rules: Rules,
     wake: Box<dyn Fn() + Send>,
@@ -189,6 +189,15 @@ impl Inner {
     }
 }
 
+/// Whether two paths are one folder, by device and inode.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 extern "C" fn on_events(
     _: Stream,
     info: *mut c_void,
@@ -221,9 +230,10 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(root: &Path, wake: impl Fn() + Send + 'static) -> std::io::Result<Self> {
         let real = std::fs::canonicalize(root)?;
+        let named = crate::scope::fsevents_root(&real, same_folder);
         let inner = Arc::new(Mutex::new(Inner {
-            rules: load_rules(&real),
-            root: real.clone(),
+            rules: load_rules(&named),
+            root: named,
             wake: Box::new(wake),
             in_motion: HashSet::new(),
             marks: crate::scope::Shared::default(),

@@ -17,6 +17,7 @@
 
 use cairn_protocol::Name;
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -163,6 +164,24 @@ pub fn mark_fsevent(marks: &mut Marks, rel: Option<&[Name]>, flags: u32) {
     }
 }
 
+/// The data volume, as macOS mounts it under the system volume.
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// The path FSEvents names a root's events by, from the root's real path. A root named through the data
+/// volume, `/System/Volumes/Data/Users/...`, stays so in `canonicalize`, but its events come by the
+/// path the system volume shows it at, `/Users/...`: so that one, if `same` says it is the same folder
+/// (by device and inode). Matched against the longer, no event would be under the root, and each would
+/// be a loss of track and a wake.
+pub fn fsevents_root(real: &Path, same: impl Fn(&Path, &Path) -> bool) -> PathBuf {
+    if let Ok(rest) = real.strip_prefix(DATA_VOLUME) {
+        let short = Path::new("/").join(rest);
+        if !rest.as_os_str().is_empty() && same(real, &short) {
+            return short;
+        }
+    }
+    real.to_path_buf()
+}
+
 /// `ReadDirectoryChangesW`'s actions.
 pub mod rdcw {
     pub const ADDED: u32 = 1;
@@ -267,5 +286,44 @@ mod tests {
         assert_eq!(got.get(&names("b/f")), Some(&false));
         mark_rdcw(&mut m, None, 3);
         assert_eq!(m.since(t), None);
+    }
+
+    #[test]
+    fn a_root_named_through_the_data_volume_is_matched_by_the_path_fsevents_gives() {
+        let p = |s: &str| PathBuf::from(s);
+        let same = |_: &Path, _: &Path| true;
+        assert_eq!(
+            fsevents_root(&p("/System/Volumes/Data/Users/u/tree"), same),
+            p("/Users/u/tree")
+        );
+        assert_eq!(
+            fsevents_root(&p("/System/Volumes/Data/private/var/t"), same),
+            p("/private/var/t")
+        );
+        // Not the same folder at the shorter path: the real one, and the seam was asked of the two.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let other = |a: &Path, b: &Path| {
+            asked.borrow_mut().push((a.to_path_buf(), b.to_path_buf()));
+            false
+        };
+        assert_eq!(
+            fsevents_root(&p("/System/Volumes/Data/Volumes/x"), other),
+            p("/System/Volumes/Data/Volumes/x")
+        );
+        assert_eq!(
+            asked.into_inner(),
+            [(p("/System/Volumes/Data/Volumes/x"), p("/Volumes/x"))]
+        );
+        // Anything else is left as it is, the data volume itself and a name that only begins like it.
+        let never = |_: &Path, _: &Path| -> bool { panic!("asked") };
+        for real in [
+            "/Users/u/tree",
+            "/System/Volumes/Data",
+            "/System/Volumes/DataX/u",
+            "/System/Volumes/Preboot/u",
+            "/private/var/t",
+        ] {
+            assert_eq!(fsevents_root(&p(real), never), p(real), "{real}");
+        }
     }
 }

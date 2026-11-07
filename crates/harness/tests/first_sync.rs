@@ -87,7 +87,9 @@ fn sync_with_gap(
         let env: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         device.sync_env(&env)
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // Only against a run that never gets there: under a full suite's load each commit of a big upload
+    // can take many seconds, as on macOS, whose full flushes wait on each other.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     while !gate.join("reached").exists() {
         assert!(
             std::time::Instant::now() < deadline,

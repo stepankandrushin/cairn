@@ -36,7 +36,8 @@ for t in "${targets[@]}"; do
     cargo build --release --locked --target "$t" -p cairn-cli
     (cd tray && cargo build --release --locked --target "$t" --bin cairn-tray)
 done
-universal=target/macos-$arch
+# Absolute, as bundle.sh works from tray/.
+universal=$PWD/target/macos-$arch
 mkdir -p "$universal"
 cairns=() trays=()
 for t in "${targets[@]}"; do

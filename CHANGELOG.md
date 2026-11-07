@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.7
+
+**Fixed:**
+
+- A long sync looked like a hung one. A Mac's daemon took in a folder its rules had left out until then, 73,498
+  files and about 700 GB already there, and read each to hash it: one thread busy for 54 minutes, nothing in the
+  log from the line before to the one after, and `cairn status` saying "synced", the last sync's outcome, with no
+  word that one was running. While a sync runs, `cairn status`, `cairn status --all` and the tray now say so and
+  what it is doing: its phase (loading the state, the server's journal, looking at the tree, working out what to
+  do, applying, uploading, committing, recording), how far it has got there (entries looked at of about how many,
+  steps applied, chunks uploaded, commits sent), the files and bytes it has read to hash them and the file it is
+  reading, the bytes downloaded and uploaded of how many, how long it has run and when anything in it last moved.
+  The local API's status carries the same as `progress`, sent again every 2 s. A sync still running a minute after
+  it began says it in the daemon's log, and again every 5 minutes; one in which nothing has moved for 10 minutes
+  says so there, once, and again when it moves; and the line at a sync's end says what it read to hash and how
+  long it took, now also for a sync that changed nothing but took a minute.
+- GitHub's CI fails a test that cannot run there, where it passed with its skip hidden in the test's output. It
+  found one that had never run, which now does.
+
 ## 0.1.6
 
 **Added:**

@@ -811,6 +811,18 @@ impl Before<'_> {
         self.dirty.contains(id)
     }
 
+    /// Written since, and nothing now: no base node or row, no entry in the ledger, nothing in the
+    /// journal. What a row moved to another object leaves, as a join's adoption leaves the ID the scan
+    /// gave each file found here before it took the server's. No part of the tree, so no part of what a
+    /// round on it costs.
+    pub fn holds_nothing(&self, id: &ObjectId) -> bool {
+        self.is_dirty(id)
+            && !self.dirty_nodes.contains_key(id)
+            && !self.dirty_rows.contains_key(id)
+            && !self.journal.touched.contains(id)
+            && !self.ledger.contains(id)
+    }
+
     /// The base's entries of an object.
     fn base_links(&self, id: &ObjectId) -> Vec<Link> {
         if self.is_dirty(id) {

@@ -51,7 +51,12 @@ fn count(steps: &[String], step: &str) -> usize {
 /// A sync whose every round took what changed alone, the oracle agreeing.
 #[track_caller]
 fn incremental(d: &Device) -> Run {
-    let (run, steps) = logged(d, &[]);
+    incremental_env(d, &[])
+}
+
+#[track_caller]
+fn incremental_env(d: &Device, env: &[(&str, &str)]) -> Run {
+    let (run, steps) = logged(d, env);
     assert!(run.ok(), "{}: {}", d.name, run.text());
     assert!(
         !took(&steps, "sync.incr.declined") && !run.text().contains("looked at the whole tree"),
@@ -759,6 +764,66 @@ fn a_folder_of_thousands_renamed_looks_at_what_is_in_it_and_no_more() {
     assert!(took < 100, "{took} of {of}");
     assert_eq!(b.read("renamed/7/7"), b"edited");
     same_trees(&a, &b, "after the rename");
+}
+
+/// A rule taken off a folder whose copy is here already, the server's bytes and times with other modes,
+/// as on a device that left its photos out until then. The round that takes it in moves each file's row
+/// from the ID its scan gave it to the server's, and the round that confirms it finds both written since:
+/// what moved away holds nothing, no node, no row, no word in the ledger or the journal, and counted, it
+/// doubled the round, which then took the whole tree, about four times what the join itself held (a Mac
+/// with 557,000 entries peaked at 8.9 GB). The limit set so that what the join decides about fits in it
+/// once and not twice; every round goes the incremental way, the oracle agreeing, and comes to the
+/// server's modes.
+#[test]
+fn a_rule_taken_off_what_is_here_already_goes_the_incremental_way() {
+    const REST: usize = 600;
+    const MEDIA: usize = 200;
+    let (_sb, _s, a, b) = pair("incr-rule-off");
+    let rest = |i: usize| format!("rest/{}/{i}", i % 12);
+    let media = |i: usize| format!("media/{}/{i}", i % 4);
+    for i in 0..REST {
+        a.write(&rest(i), format!("rest {i}"));
+    }
+    for i in 0..MEDIA {
+        a.write(&media(i), format!("photo {i}"));
+        chmod(&a.path(&media(i)), 0o664);
+    }
+    a.synced();
+    std::fs::write(b.path(".cairn/ignore"), "media/\n").unwrap();
+    for i in 0..REST {
+        b.write(&rest(i), format!("rest {i}"));
+        let (sec, nsec) = mtime_of(&a.path(&rest(i)));
+        set_mtime(&b.path(&rest(i)), sec, nsec);
+    }
+    for i in 0..MEDIA {
+        b.write(&media(i), format!("photo {i}"));
+        chmod(&b.path(&media(i)), 0o644);
+        let (sec, nsec) = mtime_of(&a.path(&media(i)));
+        set_mtime(&b.path(&media(i)), sec, nsec);
+    }
+    b.synced();
+    incremental(&b);
+    assert_eq!(mode_of(&b.path(&media(0))), 0o644);
+    std::fs::write(b.path(".cairn/ignore"), "").unwrap();
+    let limit = (MEDIA + MEDIA / 2).to_string();
+    let run = incremental_env(&b, &[("CAIRN_FP_INCR_LIMIT", &limit)]);
+    let (took, of) = looked_at(&run);
+    assert!(
+        took < MEDIA as u64 + 20 && of > (REST + MEDIA) as u64,
+        "{took} of {of}: {}",
+        run.text()
+    );
+    for i in 0..MEDIA {
+        assert_eq!(
+            mode_of(&b.path(&media(i))),
+            mode_of(&a.path(&media(i))),
+            "{}",
+            media(i)
+        );
+    }
+    incremental_env(&b, &[("CAIRN_FP_INCR_LIMIT", &limit)]);
+    incremental(&a);
+    same_trees(&a, &b, "after the rule came off");
 }
 
 /// Where the ledger cannot vouch for a sync, it is rebuilt from the state, or, with nothing to rebuild it

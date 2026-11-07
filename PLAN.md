@@ -233,7 +233,9 @@ something moves while it walks, or that identification takes a folder for anothe
 says, goes again on a fresh scan and the ledger rebuilt. The full sync runs instead, said too, on a first
 sync, with no base to rebuild from; on a dry run; with copies kept by `cairn exclude`, found by inode; with
 a leftover of a run that did not finish; when the journal, the set or what a rebuild finds unsettled comes
-to more than a quarter of the tree; when the journal does not replay on the part loaded; when a round on a
+to more than a quarter of the tree, the set counting only what the state holds something of, so not the
+ID a join's adoption leaves behind for each file it took in; when the journal does not replay on the part
+loaded; when a round on a
 rebuilt ledger cannot go on either, or a rebuild finds records going out of view while the journal moves things;
 or after four widenings. A round holds the scan and the ledger, a few
 hundred bytes an entry, and decodes the base and rows of the set alone; a rebuild holds every row's glance

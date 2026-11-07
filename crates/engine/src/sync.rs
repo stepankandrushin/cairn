@@ -2765,10 +2765,17 @@ fn incremental_head(
     for _ in 0..WIDENINGS {
         let also: BTreeSet<ObjectId> = unheld.union(&promoted).copied().collect();
         let reach = incr::reach(&before, &c, rules, &also, &beside);
-        if reach.all.len() > limit {
+        // What the state holds nothing of is no part of the tree, and costs the round nothing. Counted,
+        // the IDs a join's adoption leaves behind doubled the round that confirms it, which then took the
+        // whole tree, at several times what the join held.
+        let held = reach
+            .all
+            .iter()
+            .filter(|x| !before.holds_nothing(x))
+            .count();
+        if held > limit {
             return Ok(Err(Declined::Whole(format!(
-                "{} objects changed or are next to a change, more than taking the whole tree costs",
-                reach.all.len()
+                "{held} objects changed or are next to a change, more than taking the whole tree costs"
             ))));
         }
         // Nothing the round loads may be the ledger's word alone, and every folder whose every name it
@@ -3011,7 +3018,7 @@ fn incremental_head(
         // The root is always among them, and never in the ledger.
         let (core, all, of) = (
             reach.core.len().saturating_sub(1) as u64,
-            reach.all.len().saturating_sub(1) as u64,
+            held.saturating_sub(1) as u64,
             session.size as u64,
         );
         report.part = Some(match report.part {

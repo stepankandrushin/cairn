@@ -19,4 +19,8 @@ jobs:
         env:
           CAIRN_SEEDS: "200"
       - run: rustup target add x86_64-unknown-linux-musl
+      # Only that a release builds, static and without build paths: its binary is thrown away, so it
+      # needs no feed to update from.
       - run: bash scripts/release.sh
+        env:
+          CAIRN_UPDATE: "off"

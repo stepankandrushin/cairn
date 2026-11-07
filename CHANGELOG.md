@@ -15,6 +15,13 @@
   its resource fork, at a join or as a change on another device, writing the fork moved the file's modification
   time to the present, and the time was set only where it had differed before: the moved time stayed, taken for
   the server's, and never went up. The time is now set after any extended attribute written.
+- Taking in a big folder that was already on the disk took about four times the memory it needed. When a rule
+  came off a folder a device held a copy of, the sync took it in on the part of the tree that changed, then counted
+  each file twice in the round that confirms it, under the ID the scan had given it and the server's, and took the
+  whole tree there instead: a Mac taking in 82,000 photos in a tree of 557,000 entries peaked at 8.9 GB, where the
+  rest of the sync held about 2.4 GB, and read every file whose mode it had set a third time. That round now counts
+  only what the device holds: on Linux the same join of 16,000 files in a tree of 124,000 peaks at 0.56 GB where
+  it peaked at 1.36 GB.
 
 ## 0.1.7
 

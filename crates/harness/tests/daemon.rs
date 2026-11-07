@@ -601,6 +601,71 @@ fn the_periodic_check_holds_little_more_than_the_round() {
     );
 }
 
+/// A rule taken off a folder whose copy is here already, the server's bytes and times with other modes,
+/// as on a device that left its photos out until then: the daemon's sync that takes it in holds about
+/// what it decides about, not the whole tree. On a tree of 16,000 with 2,200 taken in, its peak against
+/// that of the same daemon's sync just before, which listed the whole tree and took one edit: within
+/// 50 KB more for each file taken in (31 KB when measured), where the round confirming the join took the
+/// whole tree and held some 11 KB more for every entry of it, 79 KB for each file taken in here, and on a
+/// Mac with 557,000 entries 8.9 GB.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rule_taken_off_what_is_here_holds_what_the_join_decides_about() {
+    const REST: usize = 14_000;
+    const MEDIA: usize = 2_200;
+    let (_sb, _s, a, b) = pair("d-rule-off-memory");
+    let rest = |i: usize| format!("rest/{}/{}/{i}", i % 30, i % 7);
+    let media = |i: usize| format!("media/{}/{i}", i % 6);
+    for i in 0..REST {
+        a.write(&rest(i), format!("{i}"));
+    }
+    for i in 0..MEDIA {
+        a.write(&media(i), format!("photo {i}"));
+        chmod(&a.path(&media(i)), 0o664);
+    }
+    a.synced();
+    std::fs::write(b.path(".cairn/ignore"), "media/\n").unwrap();
+    for (path, text) in (0..REST)
+        .map(|i| (rest(i), format!("{i}")))
+        .chain((0..MEDIA).map(|i| (media(i), format!("photo {i}"))))
+    {
+        b.write(&path, text);
+        let (sec, nsec) = mtime_of(&a.path(&path));
+        set_mtime(&b.path(&path), sec, nsec);
+    }
+    for i in 0..MEDIA {
+        chmod(&b.path(&media(i)), 0o644);
+    }
+    b.synced();
+    b.synced();
+    let release = [("CAIRN_FP_INCR_ORACLE", "0"), ("CAIRN_FP_FAST_ORACLE", "0")];
+    b.write("rest/3/3/3", "edited");
+    let d = Daemon::start_env(&b, &["--reconcile-secs", DAY], &release);
+    let peak = || -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", d.child.id())).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    };
+    let synced = |n: usize| d.log().matches("synced to sequence").count() >= n;
+    wait_for("the edit", &d.log, || synced(1));
+    let edit = peak();
+    std::fs::write(b.path(".cairn/ignore"), "").unwrap();
+    wait_for("the join", &d.log, || synced(2));
+    let join = peak();
+    let log = d.log();
+    eprintln!("the join peaked at {join} kB, the sync of one edit at {edit} kB");
+    assert!(!log.contains("looked at the whole tree"), "{log}");
+    assert_eq!(mode_of(&b.path(&media(0))), 0o664, "{log}");
+    let most = edit + 50 * MEDIA as u64;
+    assert!(
+        join <= most,
+        "the join peaked at {join} kB, the sync of one edit at {edit} kB: at most {most} kB expected"
+    );
+}
+
 #[test]
 fn a_change_on_the_server_with_no_feed_is_found_by_the_reconcile() {
     let (_sb, _s, a, b) = pair("d-nofeed");

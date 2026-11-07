@@ -4,7 +4,9 @@
 //! not sign is installed; and the one before is kept, to go back to.
 //!
 //! They run on Windows too, outside CI, but for those that need a program a shell script can play, and a
-//! daemon restarting in place, which Windows leaves to the loop that runs it.
+//! daemon restarting in place, which Windows leaves to the loop that runs it. On macOS, where the updater
+//! takes only a program whose signature holds, the programs they make are signed ad hoc, and what a
+//! script would play is compiled.
 
 mod common;
 use base64::Engine as _;
@@ -51,14 +53,60 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
-/// A program as an installed one: a copy of the harness's `cairn`, and for a new release the same with
-/// bytes after its end, which the loader ignores, so that the two tell apart.
+/// A program as an installed one: a copy of the harness's `cairn`, and for a new release one that tells
+/// apart from it: the same with bytes after its end, which the loader ignores, or on macOS, where those
+/// would break its signature, the same signed again under another identifier.
 fn program_bytes(new: bool) -> Vec<u8> {
-    let mut b = std::fs::read(CAIRN).unwrap();
-    if new {
-        b.extend_from_slice(b"\0a newer release\0");
+    let b = std::fs::read(CAIRN).unwrap();
+    if !new {
+        return b;
     }
+    static NEW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    NEW.get_or_init(|| newer(b)).clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn newer(mut b: Vec<u8>) -> Vec<u8> {
+    b.extend_from_slice(b"\0a newer release\0");
     b
+}
+
+#[cfg(target_os = "macos")]
+fn newer(b: Vec<u8>) -> Vec<u8> {
+    signed_ad_hoc(&b, "cairn.newer")
+}
+
+/// A folder of its own for making a program in, as the tests run in parallel.
+#[cfg(target_os = "macos")]
+fn scratch() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "cairn-update-program-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// This program signed ad hoc under this identifier, as the linker signs one on Apple silicon.
+#[cfg(target_os = "macos")]
+fn signed_ad_hoc(program: &[u8], identifier: &str) -> Vec<u8> {
+    let dir = scratch();
+    let path = dir.join("program");
+    write_exe(&path, program);
+    let out = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--identifier", identifier])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "codesign: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signed = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    signed
 }
 
 /// A folder holding an installed `cairn`, a user dir of its own, and a release beside it.
@@ -238,9 +286,38 @@ fn spawn_retrying(cmd: &mut Command) -> Child {
     panic!("the program stayed busy");
 }
 
-#[cfg(unix)]
-fn script(text: &str) -> Vec<u8> {
-    format!("#!/bin/sh\n{text}\n").into_bytes()
+/// A program that prints this line and exits with this code: a shell script.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn program_saying(line: &str, code: i32) -> Vec<u8> {
+    format!("#!/bin/sh\necho '{line}'\nexit {code}\n").into_bytes()
+}
+
+/// A program that prints this line and exits with this code. On macOS a compiled one, signed ad hoc: the
+/// updater refuses a script there, whose signature would be in xattrs that a download does not carry.
+/// `cc` is there wherever Rust is, as its linker.
+#[cfg(target_os = "macos")]
+fn program_saying(line: &str, code: i32) -> Vec<u8> {
+    let dir = scratch();
+    let (source, program) = (dir.join("program.c"), dir.join("program"));
+    std::fs::write(
+        &source,
+        format!("#include <stdio.h>\nint main(void) {{ puts({line:?}); return {code}; }}\n"),
+    )
+    .unwrap();
+    let out = Command::new("cc")
+        .arg("-o")
+        .arg(&program)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&program).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    signed_ad_hoc(&bytes, "cairn.stand-in")
 }
 
 #[test]
@@ -369,11 +446,33 @@ fn an_older_or_the_same_version_is_never_installed() {
 #[test]
 fn a_new_program_that_does_not_say_it_is_that_version_is_not_installed() {
     let lab = Lab::new("update-self-check");
-    for (what, bytes) in [
-        ("another version", script("echo cairn 9.9.9")),
-        ("failing", script("echo cairn 0.1.5; exit 1")),
-        ("not cairn", script(&format!("echo other {VERSION}"))),
-        ("not a program", b"\x7fELF but nothing more".to_vec()),
+    // Refused for its own reason, not an earlier one: on macOS a file that is no program is not signed.
+    let no_program = if cfg!(target_os = "macos") {
+        "not validly signed"
+    } else {
+        "--version: "
+    };
+    for (what, bytes, why) in [
+        (
+            "another version",
+            program_saying("cairn 9.9.9", 0),
+            "says it is 9.9.9",
+        ),
+        (
+            "failing",
+            program_saying(&format!("cairn {VERSION}"), 1),
+            "exit status: 1",
+        ),
+        (
+            "not cairn",
+            program_saying(&format!("other {VERSION}"), 0),
+            "not `cairn <version>`",
+        ),
+        (
+            "not a program",
+            b"\x7fELF but nothing more".to_vec(),
+            no_program,
+        ),
     ] {
         lab.publish(
             VERSION,
@@ -382,6 +481,35 @@ fn a_new_program_that_does_not_say_it_is_that_version_is_not_installed() {
         );
         let r = lab.update_now(&[]);
         assert!(!r.ok(), "{what}: installed: {}", r.text());
+        assert!(r.stderr.contains(why), "{what}: not {why:?}: {}", r.text());
+        assert_eq!(lab.installed(), program_bytes(false), "{what}");
+        assert!(lab.previous().is_none(), "{what}");
+        lab.runs();
+    }
+}
+
+/// On macOS the updater takes only a program whose signature holds: one changed after it was signed, or
+/// one never signed, as a script would come down with its signature left behind in xattrs, is refused.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_program_whose_signature_does_not_hold_is_not_installed() {
+    let lab = Lab::new("update-signature");
+    let mut changed = program_bytes(false);
+    changed.extend_from_slice(b"\0after its end\0");
+    let script = format!("#!/bin/sh\necho cairn {VERSION}\n").into_bytes();
+    for (what, bytes) in [("changed after signing", changed), ("not signed", script)] {
+        lab.publish(
+            VERSION,
+            cairn_protocol::PROTOCOL_VERSION,
+            &[("cairn", "cairn-new", bytes)],
+        );
+        let r = lab.update_now(&[]);
+        assert!(!r.ok(), "{what}: installed: {}", r.text());
+        assert!(
+            r.stderr.contains("not validly signed"),
+            "{what}: {}",
+            r.text()
+        );
         assert_eq!(lab.installed(), program_bytes(false), "{what}");
         assert!(lab.previous().is_none(), "{what}");
         lab.runs();
@@ -526,8 +654,8 @@ fn a_release_on_another_protocol_waits_until_the_server_speaks_it() {
 fn the_tray_beside_it_is_updated_too() {
     let lab = Lab::new("update-tray");
     let tray = lab.bin.join("cairn-tray");
-    write_exe(&tray, &script(&format!("echo cairn-tray {OLD}")));
-    let new_tray = script(&format!("echo cairn-tray {VERSION}"));
+    write_exe(&tray, &program_saying(&format!("cairn-tray {OLD}"), 0));
+    let new_tray = program_saying(&format!("cairn-tray {VERSION}"), 0);
     lab.publish(
         VERSION,
         cairn_protocol::PROTOCOL_VERSION,

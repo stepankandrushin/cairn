@@ -14,6 +14,12 @@
   in 244 reads in one sequential run before loading, where loading had taken 5,311 reads at 4,329 places and its
   first round another 14,541 at 7,461; a sync with nothing to do, 10,616 at 6,605. A state over a quarter of the
   machine's memory, which the cache would not keep, is read as before.
+- On Windows, Task Manager showed the daemon as a bare `cairn.exe` with the generic program icon and no
+  description, beside the tray's "Cairn": the gap macOS had until 0.1.8. Windows takes a program's name and icon
+  from its file, and `cairn.exe` had neither. It now carries the daemon's icon, the cairn inside two sync arrows
+  that Cairn Sync.app has, and version information naming it "Cairn Sync", product "Cairn", at the release's
+  version, so Task Manager and the file's Properties show it so. The commands are the same program and show the
+  same way.
 
 ## 0.1.8
 

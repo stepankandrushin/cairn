@@ -5,7 +5,8 @@ pycairo and Pillow (Debian: python3-cairo python3-pil). It writes, next to this 
 
 - Cairn.xcassets and Sync.xcassets, the asset catalogs macos/bundle.sh compiles with Xcode's actool;
 - icon.icns and sync.icns, the plain icons a bundle falls back on without actool;
-- icon.png and icon.ico, the app's, which Tauri builds into the tray on Windows.
+- icon.png and icon.ico, the app's, which Tauri builds into the tray on Windows;
+- sync.ico, the daemon's, which crates/cli/build.rs builds into cairn.exe on Windows.
 
 The body follows macOS's app icon grid, an 824 px continuous-corner square on a 1024 px canvas with room for
 its shadow. macOS 26 and later draw an icon they do not take for one of theirs smaller, on a gray tile: a plain
@@ -341,6 +342,7 @@ def main():
     (HERE / 'sync.icns').write_bytes(icns(sync, sync_flat))
     (HERE / 'icon.png').write_bytes(png(app.resize((512, 512), Image.LANCZOS)))
     (HERE / 'icon.ico').write_bytes(ico(app, app_flat))
+    (HERE / 'sync.ico').write_bytes(ico(sync, sync_flat))
     return 0
 
 

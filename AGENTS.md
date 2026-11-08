@@ -21,6 +21,9 @@ on the owner's own trees and machines.
 - **Never lose data or metadata, and never fail silently**: PLAN.md's invariants outrank features and
   speed, because a sync tool that is wrong once is not trusted again. A change that touches them comes
   with a failure test (crash, full disk, lost event, missing mount).
+- **A test on a real user's account sets its own `CAIRN_USER_DIR`**, for every `cairn` and tray it runs:
+  `cairn init` and a starting daemon add their root to that user's list of roots, which the tray and
+  `cairn status --all` show, so a scratch root made without it shows up to the person whose machine it is.
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
   Windows, the tray on them, and updates are the exceptions, at the owner's asking, for milestone 3's run.

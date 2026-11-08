@@ -92,6 +92,39 @@ pub fn check_in() -> Result<bool, String> {
     }
 }
 
+/// What libmalloc reads once, as a process starts: `0` has it keep no cache of freed large blocks.
+const LARGE_CACHE: &str = "MallocLargeCache";
+
+/// Start the daemon again in this same process, with the allocator keeping no cache of freed large blocks.
+/// Without that, macOS 26 and 27 keep the blocks of 64 KiB and more that a sync frees, for a later
+/// allocation, and `malloc_zone_pressure_relief` hands none of them back. So an idle daemon held much of
+/// its biggest sync's peak: 0.8 to 1.9 GB on Macs syncing a tree of 568k entries, of which about 1 MB
+/// was still allocated, and 15 MB with the cache off, where a block goes back to the system when it is
+/// freed. Its cost is a fresh mapping for each such allocation. The variable is read before
+/// `main`, so it has to be in the environment the program starts with: this sets it and runs the same
+/// program, with the same arguments, in this same process, where launchd sees nothing end. A
+/// variable that is set already, to any value, is left as it is, so this happens at most once.
+/// Returns only when that could not be done, with why, and the daemon goes on as it is.
+pub fn without_large_cache() -> Option<String> {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os(LARGE_CACHE).is_some() {
+        return None;
+    }
+    // The path as started, as `check_in` needs it, and the same first argument.
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return Some(format!("cannot tell where this program is: {e}")),
+    };
+    let mut args = std::env::args_os();
+    let first = args.next().unwrap_or_else(|| exe.clone().into_os_string());
+    let err = std::process::Command::new(&exe)
+        .arg0(first)
+        .args(args)
+        .env(LARGE_CACHE, "0")
+        .exec();
+    Some(format!("cannot start {} again: {err}", exe.display()))
+}
+
 /// Whether this process's security session has graphic access: a person's desktop, not SSH's session
 /// or the system's.
 fn on_a_desktop() -> Result<bool, String> {

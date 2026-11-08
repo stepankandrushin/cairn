@@ -827,7 +827,9 @@ fn raise_open_files(log: &mut dyn FnMut(&str)) {
 }
 
 /// Hand what the allocator holds free back to the system: after a sync of a big tree that is gigabytes,
-/// which would otherwise stay this process's while it waits.
+/// which would otherwise stay this process's while it waits. On macOS 26 and 27 the call below was
+/// measured to give back nothing: what does it there is the daemon running with the allocator's cache of
+/// large blocks off (`without_large_cache` in the CLI), so that a freed block goes back at once.
 fn give_back_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {

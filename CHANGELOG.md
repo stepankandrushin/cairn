@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- On macOS 26 and later an idle daemon held much of what its biggest sync had used, for as long as it ran: 0.8 to
+  1.9 GB on a tree of 568k entries, shown as Cairn Sync in Activity Monitor, with about 1 MB of it in use. The
+  system's allocator keeps the blocks of 64 KiB and more that a program frees, for later, and the call the daemon
+  made at each sync's end to give memory back frees none of them there. The daemon now starts itself again, in the
+  same process, with that cache off (`MallocLargeCache=0`), and holds about 15 MB between syncs on that tree. A
+  daemon started with the variable set already, to any value, is left as it is.
+
 ## 0.1.9 (2026-11-08)
 
 **Added:**

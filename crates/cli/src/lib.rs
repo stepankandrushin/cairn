@@ -699,6 +699,12 @@ fn run_inner() -> Result<u8> {
                 let _ = writeln!(out, "{} {line}", date_time(now()));
                 let _ = out.flush();
             };
+            // Before the daemon does anything, as this starts the program again: so that what a sync frees
+            // goes back to the system.
+            #[cfg(target_os = "macos")]
+            if let Some(e) = macos::without_large_cache() {
+                say(&format!("the allocator keeps the large blocks a sync frees, so this daemon holds what its biggest sync used while it waits; it syncs as before: {e}"));
+            }
             let opts = DaemonOptions {
                 reconcile: Duration::from_secs(reconcile_secs.max(1)),
                 full_sync: Duration::from_secs(full_sync_secs.max(1)),

@@ -241,9 +241,13 @@ dependencies = [
 name = "cairn-tray"
 version = "0.1.10"
 dependencies = [
+ "block2",
  "cairn-protocol",
  "chrono",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",

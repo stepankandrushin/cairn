@@ -29,7 +29,7 @@ function el(tag, attrs, ...children) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === 'class') e.className = v;
-    else if (k === 'onclick') e.addEventListener('click', v);
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
     else if (k === 'disabled') e.disabled = !!v;
     else e.setAttribute(k, v);
   }
@@ -237,18 +237,33 @@ const CHANGE = {
   conflict: 'conflict copy made',
 };
 
+// Where the change left it: a move by its new name.
+function changedPath(a) {
+  return a.change === 'moved' && a.to ? a.to : a.path;
+}
+
+// A click shows the change in its folder, a right click copies its full path, as the menu's do.
 function drawRecent() {
   if (state.roots.length === 0) return noRoots();
+  const row = (r, a) => el('tr', {
+    class: 'change-row',
+    title: `Click to show it in ${state.file_manager}, right-click to copy its path`,
+    onclick: () => call('show_change', { rootId: r.root_id, path: changedPath(a) }),
+    oncontextmenu: (ev) => {
+      ev.preventDefault();
+      call('copy_change_path', { rootId: r.root_id, path: changedPath(a) });
+    },
+  },
+  el('td', { class: 'time' }, a.when),
+  el('td', { class: 'dir', title: a.direction === 'up' ? 'sent from here' : 'from the server' },
+    a.direction === 'up' ? '↑ sent' : '↓ came'),
+  el('td', { class: 'change' }, CHANGE[a.change] || a.change),
+  el('td', { class: 'p' }, a.to ? `${a.path} → ${a.to}` : a.path));
   return state.roots.map((r) => el('div', { class: 'card' },
     title(r),
     !r.up ? el('div', { class: 'empty' }, 'Its daemon is not running, so its activity cannot be read.')
       : r.recent.length === 0 ? el('div', { class: 'empty' }, 'Nothing synced since the daemon started.')
-        : el('table', {}, r.recent.map((a) => el('tr', {},
-          el('td', { class: 'time' }, a.when),
-          el('td', { class: 'dir', title: a.direction === 'up' ? 'sent from here' : 'from the server' },
-            a.direction === 'up' ? '↑ sent' : '↓ came'),
-          el('td', { class: 'change' }, CHANGE[a.change] || a.change),
-          el('td', { class: 'p' }, a.to ? `${a.path} → ${a.to}` : a.path))))));
+        : el('table', {}, r.recent.map((a) => row(r, a)))));
 }
 
 function drawProblems() {
@@ -414,13 +429,26 @@ function drawSettings() {
       onclick: async () => { await call('set_clock', { clock: value }); await tick(); draw(true); },
     }, state.clock === value ? { checked: '' } : {})),
     label, el('span', { class: 'meta' }, example));
-  return [drawUpdates(), el('div', { class: 'card' },
+  return [drawUpdates(), drawLogin(), el('div', { class: 'card' },
     el('h2', {}, 'Clock'),
     el('div', { class: 'choices' },
       choice('24h', '24-hour', '16:52'),
       choice('12h', '12-hour', '4:52 PM')),
     state.settings_error ? el('div', { class: 'todo' }, state.settings_error + '; the defaults are in use until a choice here writes it anew.') : null,
     state.settings_path ? el('div', { class: 'meta' }, 'Kept in ' + state.settings_path) : null)];
+}
+
+// Whether the tray starts when this user logs in to this computer; the daemons start by themselves.
+function drawLogin() {
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Start at login'),
+    el('label', { class: 'choice' },
+      el('input', Object.assign({
+        type: 'checkbox',
+        // Drawn again either way, so a choice the tray could not keep shows as it is.
+        onclick: async (ev) => { await call('set_login', { on: ev.target.checked }); await tick(); draw(true); },
+      }, state.login ? { checked: '' } : {})),
+      'Start the tray when I log in'));
 }
 
 // One updater for every daemon of this user here and the tray beside them: what it last found, and how

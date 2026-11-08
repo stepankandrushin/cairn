@@ -102,6 +102,165 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Where something a daemon reported is: `rel` is relative to the root, by `/`, as `cairn status`
+/// prints it. None for a path that would leave the root.
+pub fn under(root: &Path, rel: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            name => path.push(name),
+        }
+    }
+    Some(path)
+}
+
+/// Shows it selected in its folder or, once it has gone, the nearest folder above it in the root that
+/// has not.
+pub fn show(root: &Path, path: &Path) -> Result<(), String> {
+    if path.symlink_metadata().is_ok() {
+        return reveal(path);
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir.filter(|d| d.starts_with(root)) {
+        if d.is_dir() {
+            return open(d);
+        }
+        dir = d.parent();
+    }
+    Err(format!(
+        "{} is not there, nor is the root's folder {}",
+        path.display(),
+        root.display()
+    ))
+}
+
+/// Onto the clipboard, as a person's copy would put it.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // pbcopy reads by the locale, which a program started by launchd may not have.
+        pipe(
+            std::process::Command::new("/usr/bin/pbcopy").env("LC_CTYPE", "UTF-8"),
+            text,
+        )
+    }
+    #[cfg(windows)]
+    {
+        windows_clipboard::set(text)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut last = String::new();
+        for (program, args) in [
+            ("wl-copy", &[][..]),
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ] {
+            match pipe(std::process::Command::new(program).args(args), text) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        Err(format!("cannot copy: no clipboard program worked ({last})"))
+    }
+}
+
+#[cfg(unix)]
+fn pipe(cmd: &mut std::process::Command, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
+    let wrote = child.stdin.take().map(|mut i| i.write_all(text.as_bytes()));
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("{:?} did not finish: {e}", cmd.get_program()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{:?} failed: {}",
+            cmd.get_program(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    match wrote {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!("cannot write to {:?}: {e}", cmd.get_program())),
+        None => Err(format!("{:?} took no input", cmd.get_program())),
+    }
+}
+
+#[cfg(windows)]
+mod windows_clipboard {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    pub fn set(text: &str) -> Result<(), String> {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        // Another program may hold the clipboard for a moment.
+        let mut tries = 0;
+        // SAFETY: opened by no window, and closed below whatever happens in between.
+        while unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+            tries += 1;
+            if tries == 10 {
+                return Err(failed("open"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: the clipboard is open.
+        let r = unsafe { put(&wide) };
+        // SAFETY: opened above.
+        unsafe { CloseClipboard() };
+        r
+    }
+
+    fn failed(what: &str) -> String {
+        format!(
+            "cannot {what} the clipboard: {}",
+            std::io::Error::last_os_error()
+        )
+    }
+
+    /// # Safety
+    /// The clipboard is open on this thread.
+    unsafe fn put(wide: &[u16]) -> Result<(), String> {
+        unsafe {
+            if EmptyClipboard() == 0 {
+                return Err(failed("empty"));
+            }
+            let mem = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(wide));
+            if mem.is_null() {
+                return Err(failed("make room on"));
+            }
+            let at = GlobalLock(mem) as *mut u16;
+            if at.is_null() {
+                GlobalFree(mem);
+                return Err(failed("write to"));
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), at, wide.len());
+            GlobalUnlock(mem);
+            // Once set, the memory is the clipboard's.
+            if SetClipboardData(CF_UNICODETEXT, mem).is_null() {
+                GlobalFree(mem);
+                return Err(failed("write to"));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(unix)]
 fn run(cmd: &mut std::process::Command) -> Result<(), String> {
     let out = cmd
@@ -180,10 +339,11 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// A path as a person writes it, for comparing two: on Windows without the `\\?\` that some calls put
-/// in front. What is done to a path is done to it as given, since a long path needs that prefix.
+/// A path as a person writes it, for comparing two and for copying one: on Windows without the `\\?\`
+/// that some calls put in front. What is done to a path is done to it as given, since a long path needs
+/// that prefix.
 #[cfg(windows)]
-fn plain(p: &Path) -> PathBuf {
+pub fn plain(p: &Path) -> PathBuf {
     use std::path::Prefix;
     let mut parts = p.components();
     let Some(Component::Prefix(prefix)) = parts.next() else {
@@ -210,7 +370,7 @@ fn plain(p: &Path) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn plain(p: &Path) -> PathBuf {
+pub fn plain(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
@@ -520,6 +680,32 @@ pub mod login {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change is found under its root by its parts, in this system's own way of joining them.
+    #[test]
+    fn a_change_is_found_under_its_root() {
+        let root = Path::new("root");
+        let want: PathBuf = ["root", "docs", "a b.txt"].iter().collect();
+        assert_eq!(under(root, "docs/a b.txt"), Some(want.clone()));
+        assert_eq!(under(root, "./docs//a b.txt"), Some(want));
+        assert_eq!(under(root, ""), Some(root.to_path_buf()));
+        assert_eq!(under(root, "docs/../../x"), None);
+    }
+
+    /// Shown in its folder where it is, or the nearest folder above it in the root once it has gone.
+    #[test]
+    fn a_change_that_has_gone_shows_its_folder() {
+        let root = std::env::temp_dir().join(format!("cairn-tray-show-{}", std::process::id()));
+        let gone = root.join("gone").join("deeper").join("x.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.parent().unwrap().join("not-the-root");
+        let r = show(&root.join("missing-root"), &outside);
+        assert!(r.is_err(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        // Nothing of it is left, the root's folder included: said, not opened.
+        let r = show(&root, &gone);
+        assert!(r.is_err(), "{r:?}");
+    }
 
     #[cfg(windows)]
     #[test]

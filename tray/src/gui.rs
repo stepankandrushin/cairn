@@ -6,16 +6,21 @@ use crate::hub::{Hub, Link, State};
 use crate::icon;
 use crate::link;
 use crate::model::{self, Light, Problem};
+use crate::native;
 use crate::settings::{self, Clock};
-use cairn_protocol::local::{self as local_api, Activity, DeletedItem, Reply, Request};
+use cairn_protocol::local::{
+    self as local_api, Activity, Change, DeletedItem, Direction, Reply, Request, MAX_RECENT,
+};
 use cairn_protocol::update::Policy;
 use cairn_protocol::ObjectKind;
 use serde::Serialize;
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu,
 };
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
@@ -39,6 +44,9 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             forget,
             open_folder,
             open_server,
+            show_change,
+            copy_change_path,
+            set_login,
             set_clock,
             set_update_policy,
             update_now
@@ -46,6 +54,11 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // Before the tray, on the thread its menu runs on. Without it the menu still works, but may
+            // be set anew while open, and a right click copies nothing.
+            if let Err(e) = native::watch(right_click) {
+                crate::log(&e);
+            }
             let tray = TrayIconBuilder::with_id("cairn")
                 .icon(image(Light::NotRunning))
                 .icon_as_template(false)
@@ -85,9 +98,11 @@ struct MenuModel {
     roots: Vec<RootLine>,
     problems: usize,
     conflicts: usize,
-    login: bool,
     /// A release that is out and not installed here.
     update: Option<String>,
+    recent: Vec<RecentLine>,
+    /// A daemon is running, so an empty `recent` means nothing has synced since it started.
+    any_up: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,6 +112,16 @@ struct RootLine {
     line: String,
     up: bool,
     paused_by_you: bool,
+}
+
+/// A change in the menu's Recent activity: a click shows it in its folder, a right click copies its
+/// path.
+#[derive(Clone, Debug, PartialEq)]
+struct RecentLine {
+    text: String,
+    root: PathBuf,
+    /// Where the change left it: for a move, the new name.
+    path: PathBuf,
 }
 
 fn worst(s: &State, now: i64) -> Light {
@@ -136,16 +161,81 @@ fn menu_model(s: &State) -> MenuModel {
         problems: s.roots.iter().map(|r| model::problems(r).len()).sum(),
         conflicts: s.roots.iter().filter_map(model::open_conflicts).sum(),
         roots,
-        login: actions::login::enabled(),
         update: crate::update::status()
             .ok()
             .flatten()
             .and_then(|s| s.available),
+        recent: recent_lines(s),
+        any_up: s.roots.iter().any(|r| matches!(r.link, Link::Up(_))),
     }
 }
 
-/// Follows the hub, and redraws the icon and menu when what they show has changed: rebuilding a menu
-/// a person has open would close it.
+/// Every root's, newest first: each daemon keeps its last [`MAX_RECENT`], and the menu shows as many.
+fn recent_lines(s: &State) -> Vec<RecentLine> {
+    let many = s.roots.len() > 1;
+    let mut all: Vec<(i64, RecentLine)> = Vec::new();
+    for r in &s.roots {
+        let Link::Up(st) = &r.link else { continue };
+        for a in &st.recent {
+            let rel = shown_path(a);
+            let Some(path) = actions::under(&r.entry.path, rel) else {
+                continue;
+            };
+            let shown = if many {
+                format!("{}/{rel}", model::name(r))
+            } else {
+                rel.to_string()
+            };
+            all.push((
+                a.time,
+                RecentLine {
+                    text: format!(
+                        "{}  {} {}  ·  {}",
+                        model::when(a.time),
+                        match a.direction {
+                            Direction::Up => "↑",
+                            Direction::Down => "↓",
+                        },
+                        model::clip_middle(&shown, 64),
+                        change_word(a.change)
+                    ),
+                    root: r.entry.path.clone(),
+                    path,
+                },
+            ));
+        }
+    }
+    // Stable, so each daemon's own order stands within a second.
+    all.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    all.truncate(MAX_RECENT);
+    all.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Where the change left it, relative to its root: a move is shown by its new name.
+fn shown_path(a: &Activity) -> &str {
+    match (&a.change, &a.to) {
+        (Change::Moved, Some(to)) => to,
+        _ => &a.path,
+    }
+}
+
+/// As the window's Recent activity says it.
+fn change_word(c: Change) -> &'static str {
+    match c {
+        Change::Added => "added",
+        Change::Changed => "changed",
+        Change::Metadata => "metadata changed",
+        Change::Moved => "moved",
+        Change::Removed => "removed",
+        Change::Conflict => "conflict copy made",
+    }
+}
+
+/// Set when a menu could not be set because it was open, so the next round sets it.
+static UNSET: AtomicBool = AtomicBool::new(false);
+
+/// Follows the hub, and redraws the icon and menu when what they show has changed, but never the menu
+/// while a person has it open: setting it anew closes it (`native`). It is set once it has closed.
 fn refresh(app: AppHandle, tray: TrayIcon) {
     let mut version = 0;
     let mut shown: Option<MenuModel> = None;
@@ -162,8 +252,11 @@ fn refresh(app: AppHandle, tray: TrayIcon) {
                 "A new version of the tray is installed, and {e}: quit and start it again"
             ));
         }
+        if UNSET.swap(false, Ordering::SeqCst) {
+            shown = None;
+        }
         let m = menu_model(&hub().snapshot());
-        if shown.as_ref() == Some(&m) {
+        if shown.as_ref() == Some(&m) || native::menu_open() {
             continue;
         }
         let light_changed = shown.as_ref().map(|s| s.light) != Some(m.light);
@@ -173,10 +266,23 @@ fn refresh(app: AppHandle, tray: TrayIcon) {
                 let _ = t.set_icon(Some(image(model.light)));
             }
             let _ = t.set_tooltip(Some(&model.tooltip));
-            match build_menu(&a, &model) {
-                Ok(menu) => {
-                    let _ = t.set_menu(Some(menu));
-                }
+            // Asked again on the thread the menu opens on, as it may have opened since.
+            if native::menu_open() {
+                UNSET.store(true, Ordering::SeqCst);
+                return;
+            }
+            let n = MENU_NUMBER.fetch_add(1, Ordering::SeqCst) + 1;
+            match build_menu(&a, &model, n) {
+                Ok((menu, recent_at)) => match t.set_menu(Some(menu.clone())) {
+                    Ok(()) => {
+                        native::recent_menu(&menu, recent_at);
+                        let mut shown = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+                        shown.push((n, model.recent.clone()));
+                        let extra = shown.len().saturating_sub(2);
+                        shown.drain(..extra);
+                    }
+                    Err(e) => crate::log(&format!("cannot set the menu: {e}")),
+                },
                 Err(e) => crate::log(&format!("cannot build the menu: {e}")),
             }
         });
@@ -184,81 +290,86 @@ fn refresh(app: AppHandle, tray: TrayIcon) {
     }
 }
 
-fn clip(s: &str) -> String {
-    const MAX: usize = 90;
-    if s.chars().count() <= MAX {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(MAX - 1).collect();
-    format!("{cut}…")
+/// Each menu set is numbered, and its items of Recent activity carry the number.
+static MENU_NUMBER: AtomicU64 = AtomicU64::new(0);
+
+/// The Recent activity of the menu set last, and of the one before, for a click that was on its way as
+/// the menu was set anew: by the menu's number.
+static RECENT: Mutex<Vec<(u64, Vec<RecentLine>)>> = Mutex::new(Vec::new());
+
+fn recent_line(n: u64, i: usize) -> Option<RecentLine> {
+    let shown = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    shown
+        .iter()
+        .find(|(m, _)| *m == n)
+        .and_then(|(_, lines)| lines.get(i).cloned())
 }
 
-fn root_items(app: &AppHandle, r: &RootLine) -> tauri::Result<Vec<MenuItem<Wry>>> {
+/// A right click on the `i`th item of Recent activity in the menu that is open, which is the one set last,
+/// as none is set while open. Windows says it from inside the menu.
+fn right_click(i: usize) {
+    let line = {
+        let shown = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        shown.last().and_then(|(_, lines)| lines.get(i).cloned())
+    };
+    if let Some(line) = line {
+        std::thread::spawn(move || copy_path(&line.path));
+    }
+}
+
+/// As a person would write it, so on Windows without the `\\?\` the registry's root may have.
+fn copy_path(path: &Path) {
+    if let Err(e) = actions::copy_text(&actions::plain(path).to_string_lossy()) {
+        hub().notice(e);
+    }
+}
+
+fn item(app: &AppHandle, id: impl Into<MenuId>, text: &str, on: bool) -> tauri::Result<Kind> {
+    Ok(Kind::MenuItem(MenuItem::with_id(
+        app,
+        id,
+        model::menu_label(text),
+        on,
+        None::<&str>,
+    )?))
+}
+
+type Kind = MenuItemKind<Wry>;
+
+fn root_items(app: &AppHandle, r: &RootLine) -> tauri::Result<Vec<Kind>> {
     let pause = if r.paused_by_you {
-        MenuItem::with_id(
-            app,
-            format!("resume:{}", r.id),
-            "Resume",
-            r.up,
-            None::<&str>,
-        )?
+        item(app, format!("resume:{}", r.id), "Resume", r.up)?
     } else {
-        MenuItem::with_id(app, format!("pause:{}", r.id), "Pause", r.up, None::<&str>)?
+        item(app, format!("pause:{}", r.id), "Pause", r.up)?
     };
     Ok(vec![
-        MenuItem::with_id(
-            app,
-            format!("sync:{}", r.id),
-            "Sync now",
-            r.up,
-            None::<&str>,
-        )?,
+        item(app, format!("sync:{}", r.id), "Sync now", r.up)?,
         pause,
-        MenuItem::with_id(
-            app,
-            format!("folder:{}", r.id),
-            "Open folder",
-            true,
-            None::<&str>,
-        )?,
-        MenuItem::with_id(
-            app,
-            format!("web:{}", r.id),
-            "Open in browser",
-            true,
-            None::<&str>,
-        )?,
+        item(app, format!("folder:{}", r.id), "Open folder", true)?,
+        item(app, format!("web:{}", r.id), "Open in browser", true)?,
     ])
 }
 
-fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
-    let menu = Menu::new(app)?;
-    let line = |id: String, text: &str| MenuItem::with_id(app, id, clip(text), false, None::<&str>);
-    if let Some(e) = &m.registry_error {
-        menu.append(&line("line:registry".into(), e)?)?;
+fn recent_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<Submenu<Wry>> {
+    let sub = Submenu::with_id(app, "recent", "Recent activity", true)?;
+    if m.recent.is_empty() {
+        let why = if m.any_up {
+            "Nothing synced since the daemon started"
+        } else {
+            "No daemon is running to ask"
+        };
+        sub.append(&item(app, "recent:none", why, false)?)?;
     }
-    for r in &m.roots {
-        menu.append(&line(format!("line:{}", r.id), &r.line)?)?;
+    for (i, r) in m.recent.iter().enumerate() {
+        sub.append(&item(app, format!("recent:{n}:{i}"), &r.text, true)?)?;
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    match m.roots.as_slice() {
-        [] => {}
-        [one] => {
-            for item in root_items(app, one)? {
-                menu.append(&item)?;
-            }
-            menu.append(&PredefinedMenuItem::separator(app)?)?;
-        }
-        many => {
-            for r in many {
-                let items = root_items(app, r)?;
-                let refs: Vec<&dyn IsMenuItem<Wry>> =
-                    items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
-                menu.append(&Submenu::with_items(app, &r.name, true, &refs)?)?;
-            }
-            menu.append(&PredefinedMenuItem::separator(app)?)?;
-        }
-    }
+    Ok(sub)
+}
+
+/// The menu, and where its Recent activity is in it: Settings nearest the icon, then Recent activity and
+/// the rest a person deals with, then each root's actions, then what each root is doing, laid out by
+/// `model::from_icon`; Quit last.
+fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry>, usize)> {
     let count = |word: &str, n: usize| {
         if n == 0 {
             word.to_string()
@@ -266,82 +377,93 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
             format!("{word} ({n})")
         }
     };
-    menu.append(&MenuItem::with_id(
-        app,
-        "recent",
-        "Recent activity",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "problems",
-        count("Problems", m.problems),
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "conflicts",
-        count("Conflicts", m.conflicts),
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "deleted",
-        "Recently deleted…",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    let mut settings = vec![item(app, "settings", "Settings…", true)?];
     if let Some(v) = &m.update {
-        menu.append(&MenuItem::with_id(
+        settings.push(item(
             app,
             "settings",
-            format!("Cairn {v} is available…"),
+            &format!("Cairn {v} is available…"),
             true,
-            None::<&str>,
-        )?)?;
+        )?);
     }
-    menu.append(&MenuItem::with_id(
-        app,
-        "settings",
-        "Settings…",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&CheckMenuItem::with_id(
-        app,
-        "login",
-        "Start at login",
-        true,
-        m.login,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "quit",
-        "Quit Cairn",
-        true,
-        None::<&str>,
-    )?)?;
-    Ok(menu)
+    let deal = vec![
+        Kind::Submenu(recent_menu(app, m, n)?),
+        item(app, "problems", &count("Problems", m.problems), true)?,
+        item(app, "conflicts", &count("Conflicts", m.conflicts), true)?,
+        item(app, "deleted", "Recently deleted…", true)?,
+    ];
+    let actions = match m.roots.as_slice() {
+        [] => Vec::new(),
+        [one] => root_items(app, one)?,
+        many => {
+            let mut subs = Vec::new();
+            for r in many {
+                let items = root_items(app, r)?;
+                let refs: Vec<&dyn IsMenuItem<Wry>> =
+                    items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
+                subs.push(Kind::Submenu(Submenu::with_items(
+                    app,
+                    model::menu_label(&r.name),
+                    true,
+                    &refs,
+                )?));
+            }
+            subs
+        }
+    };
+    let mut lines = Vec::new();
+    if let Some(e) = &m.registry_error {
+        lines.push(item(app, "line:registry", e, false)?);
+    }
+    for r in &m.roots {
+        lines.push(item(app, format!("line:{}", r.id), &r.line, false)?);
+    }
+    let sections = model::from_icon([settings, deal, actions, lines], cfg!(target_os = "macos"));
+    let menu = Menu::new(app)?;
+    let mut at = 0;
+    let mut recent_at = 0;
+    for s in sections.iter().filter(|s| !s.is_empty()) {
+        if at > 0 {
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
+            at += 1;
+        }
+        for i in s {
+            if i.id().as_ref() == "recent" {
+                recent_at = at;
+            }
+            menu.append(i)?;
+            at += 1;
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&item(app, "quit", "Quit Cairn", true)?)?;
+    Ok((menu, recent_at))
 }
 
 fn on_menu(app: &AppHandle, event: MenuEvent) {
+    // Taken for every item, so what macOS said of one click is not read for another.
+    let secondary = native::take_secondary();
     let id = event.id().as_ref().to_string();
     let (what, root) = id.split_once(':').unwrap_or((id.as_str(), ""));
     let (what, root) = (what.to_string(), root.to_string());
     match what.as_str() {
         "quit" => app.exit(0),
-        "recent" | "problems" | "conflicts" | "deleted" | "settings" => show_window(app, &what),
-        "login" => {
-            let on = !actions::login::enabled();
-            if let Err(e) = actions::login::set(on) {
-                hub().notice(e);
-                show_window(app, "status");
-            }
+        "problems" | "conflicts" | "deleted" | "settings" => show_window(app, &what),
+        "recent" => {
+            let line = root
+                .split_once(':')
+                .and_then(|(n, i)| Some((n.parse().ok()?, i.parse().ok()?)))
+                .and_then(|(n, i)| recent_line(n, i));
+            let Some(line) = line else { return };
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if secondary {
+                    copy_path(&line.path);
+                } else if let Err(e) = actions::show(&line.root, &line.path) {
+                    hub().notice(e);
+                    show_window(&app, "recent");
+                }
+            });
         }
         "sync" | "pause" | "resume" => {
             let request = match what.as_str() {
@@ -428,6 +550,10 @@ struct UiState {
     /// Why `tray.json` could not be read, so its defaults are in use.
     settings_error: Option<String>,
     settings_path: Option<String>,
+    /// The tray starts at login.
+    login: bool,
+    /// What a click on a change opens, for saying so.
+    file_manager: &'static str,
     update: UiUpdate,
     roots: Vec<UiRoot>,
 }
@@ -615,6 +741,14 @@ async fn snapshot() -> UiState {
         clock: settings::clock(),
         settings_error: settings::error(),
         settings_path: settings::path().map(|p| p.display().to_string()),
+        login: actions::login::enabled(),
+        file_manager: if cfg!(target_os = "macos") {
+            "Finder"
+        } else if cfg!(windows) {
+            "Explorer"
+        } else {
+            "its folder"
+        },
         update,
         roots,
     }
@@ -770,6 +904,41 @@ async fn open_folder(root_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_server(root_id: String) -> Result<(), String> {
     blocking(move || open_server_of(&root_id)).await
+}
+
+/// Where a change in Recent activity is: `path` relative to the root, as the daemon said it.
+fn change_path(root_id: &str, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let r = hub()
+        .root(root_id)
+        .ok_or("that root is no longer in the registry")?;
+    let full = actions::under(&r.entry.path, path)
+        .ok_or_else(|| format!("{path} is not a path inside the root"))?;
+    Ok((r.entry.path, full))
+}
+
+#[tauri::command]
+async fn show_change(root_id: String, path: String) -> Result<(), String> {
+    blocking(move || {
+        let (root, full) = change_path(&root_id, &path)?;
+        actions::show(&root, &full)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn copy_change_path(root_id: String, path: String) -> Result<String, String> {
+    blocking(move || {
+        let (_, full) = change_path(&root_id, &path)?;
+        let text = actions::plain(&full).to_string_lossy().into_owned();
+        actions::copy_text(&text)?;
+        Ok(format!("Copied {text}"))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_login(on: bool) -> Result<(), String> {
+    blocking(move || actions::login::set(on)).await
 }
 
 /// For every program of this user here: the daemons' updater reads it.

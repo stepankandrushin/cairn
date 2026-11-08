@@ -11,6 +11,8 @@ mod hub;
 mod icon;
 mod link;
 mod model;
+#[cfg(feature = "gui")]
+mod native;
 mod registry;
 mod settings;
 mod update;

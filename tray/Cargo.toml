@@ -13,7 +13,14 @@ publish = false
 [features]
 default = ["gui"]
 # Without it, only `--probe` and `--login`: what can be built and checked where no webview is.
-gui = ["dep:tauri", "dep:tauri-build"]
+gui = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:block2",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+]
 
 [dependencies]
 cairn-protocol = { path = "../crates/protocol" }
@@ -26,13 +33,34 @@ trash = "5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# For the menu: whether it is open, and how an item was clicked (src/native.rs). Tauri's own versions.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSMenu",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
+    "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_Threading",

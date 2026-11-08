@@ -2,11 +2,14 @@
 //! root, registers it in the registry, and makes up activity. Point CAIRN_USER_DIR at a scratch
 //! directory for it and the tray alike, so the real registry and daemons are not touched.
 //!
-//!     cargo run --example mock-daemon -- /tmp/mock-root [--problems]
+//!     cargo run --example mock-daemon -- /tmp/mock-root [--problems] [--long-syncs]
+//!
+//! `--long-syncs` makes each sync last 20 s with its progress shown, whose line the tray redraws each
+//! second, as a real daemon's on a big tree.
 
 use cairn_protocol::local::{
     control_address, registry_path, Activity, Change, DaemonStatus, Direction, LocalAddress,
-    NotApplied, OpenConflict, Registry, Reply, Request, RootEntry, Waiting,
+    NotApplied, OpenConflict, Phase, Progress, Registry, Reply, Request, RootEntry, Waiting,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -45,9 +48,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = PathBuf::from(
         args.first()
-            .expect("usage: mock-daemon <root dir> [--problems]"),
+            .expect("usage: mock-daemon <root dir> [--problems] [--long-syncs]"),
     );
     let problems = args.iter().any(|a| a == "--problems");
+    let long_syncs = args.iter().any(|a| a == "--long-syncs");
     std::fs::create_dir_all(root.join(".cairn")).unwrap();
     std::fs::write(root.join(".cairn/root-id"), format!("{ROOT_ID}\n")).unwrap();
     for (name, text) in [
@@ -119,33 +123,54 @@ fn main() {
             if s.status.lock().unwrap().1.paused_since.is_some() {
                 continue;
             }
-            s.change(|st| st.syncing = true);
-            std::thread::sleep(Duration::from_secs(1));
+            s.change(|st| {
+                st.syncing = true;
+                st.progress = Some(Progress {
+                    started: now(),
+                    round: 1,
+                    phase: Phase::Deciding,
+                    phase_since: now(),
+                    moved: now(),
+                    ..Default::default()
+                });
+            });
+            std::thread::sleep(Duration::from_secs(if long_syncs { 20 } else { 1 }));
+            // Every fifth with a name a menu would read as marking a key, and one not in ASCII.
+            let name = if n.is_multiple_of(5) {
+                format!("file-{n} & отчёт.txt")
+            } else {
+                format!("file-{n}.txt")
+            };
+            let a = Activity {
+                time: now(),
+                direction: if n.is_multiple_of(2) {
+                    Direction::Up
+                } else {
+                    Direction::Down
+                },
+                change: [
+                    Change::Added,
+                    Change::Changed,
+                    Change::Moved,
+                    Change::Removed,
+                ][(n % 4) as usize],
+                path: format!("docs/{name}"),
+                to: (n % 4 == 2).then(|| format!("docs/moved-{name}")),
+            };
+            // There, as the change left it, for the tray to show; one removed is not.
+            if a.change != Change::Removed {
+                let at = s.root.join(a.to.as_deref().unwrap_or(&a.path));
+                let _ = std::fs::create_dir_all(at.parent().unwrap());
+                let _ = std::fs::write(&at, format!("made up by mock-daemon, {n}\n"));
+            }
             s.change(|st| {
                 st.syncing = false;
+                st.progress = None;
                 st.head += 1;
                 st.syncs += 1;
                 st.last_sync = now();
                 st.last_synced = now();
-                st.recent.insert(
-                    0,
-                    Activity {
-                        time: now(),
-                        direction: if n.is_multiple_of(2) {
-                            Direction::Up
-                        } else {
-                            Direction::Down
-                        },
-                        change: [
-                            Change::Added,
-                            Change::Changed,
-                            Change::Moved,
-                            Change::Removed,
-                        ][(n % 4) as usize],
-                        path: format!("docs/file-{n}.txt"),
-                        to: (n % 4 == 2).then(|| format!("docs/moved-{n}.txt")),
-                    },
-                );
+                st.recent.insert(0, a);
                 st.recent.truncate(cairn_protocol::local::MAX_RECENT);
             });
         }
@@ -223,6 +248,23 @@ fn answer(stream: impl std::io::Read + Write, shared: &Shared) {
         ),
         // A mock has no updater: the tray's button only has to be taken.
         Request::UpdateNow => send(out, &Reply::Done),
+        // Nor a server's history.
+        Request::Deleted { .. } => {
+            let head = shared.status.lock().unwrap().1.head;
+            send(
+                out,
+                &Reply::Deleted {
+                    head,
+                    items: Vec::new(),
+                },
+            )
+        }
+        Request::Undelete { .. } => send(
+            out,
+            &Reply::Error {
+                text: "a mock daemon has nothing deleted to bring back".into(),
+            },
+        ),
     }
 }
 

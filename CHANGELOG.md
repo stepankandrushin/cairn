@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- The tray's menu keeps what is used most next to its icon on both systems: Settings…, then Recent activity,
+  Problems, Conflicts and Recently deleted…, then each root's actions, then what each root is doing, with Quit
+  last. macOS drops the menu from the top of the screen and Windows raises it from the bottom, so the order
+  runs down on macOS and up on Windows; before, it was the same list on both, and on macOS the status lines
+  came first and Settings near the bottom.
+- Recent activity in the menu is a submenu listing the changes themselves, every root's, newest first, up to
+  100. A click shows the file selected in Finder or Explorer, or its folder once it has gone; a right click
+  copies its full path (on macOS a Control- or Option-click as well). The window's Recent activity does the
+  same, and says what it copied.
+- Start at login moved from the menu to the window's Settings tab.
+
+**Fixed:**
+
+- The tray's menu vanished while the pointer was on it, most often during a sync. The menu was made anew
+  whenever what it shows changed, which during a sync is every second or two, as its line counts the
+  seconds; on Windows that destroyed the menu on screen, which then shrank to an empty 6 by 6 pixel box. The
+  menu is no longer touched while open, and is brought up to date as it closes.
+
 ## 0.1.10 (2026-11-08)
 
 **Fixed:**

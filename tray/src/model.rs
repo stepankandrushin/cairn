@@ -45,6 +45,48 @@ pub fn now_secs() -> Secs {
         .map_or(0, |d| d.as_secs() as Secs)
 }
 
+/// The menu's four sections, given in order out from its icon. macOS drops the menu from the menu bar
+/// at the top of the screen, so they go down as given; Windows raises it from the taskbar at the bottom,
+/// so they, and the items of the first two, go up, and what is nearest the icon is so on both.
+pub fn from_icon<T>(mut sections: [Vec<T>; 4], downward: bool) -> [Vec<T>; 4] {
+    if !downward {
+        sections[0].reverse();
+        sections[1].reverse();
+        sections.reverse();
+    }
+    sections
+}
+
+/// A menu item's text as it is to be written: muda reads `&` as marking the key that chooses it, and
+/// Windows a tab as starting a shortcut's column.
+pub fn menu_label(s: &str) -> String {
+    const MAX: usize = 90;
+    let s: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let s = if s.chars().count() <= MAX {
+        s
+    } else {
+        let cut: String = s.chars().take(MAX - 1).collect();
+        format!("{cut}…")
+    };
+    s.replace('&', "&&")
+}
+
+/// A path cut in its middle, so that the file's name stays.
+pub fn clip_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail = max * 2 / 3;
+    let head = max - tail - 1;
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    format!("{start}…{end}")
+}
+
 /// `16:52` today, `3 Nov 16:52` before; `4:52 PM` and `3 Nov 4:52 PM` on a 12-hour clock. The
 /// window shows these strings too, rather than the webview's own, which follow the locale.
 pub fn when(secs: Secs) -> String {
@@ -126,10 +168,12 @@ pub fn headline(view: &RootView, now: Secs) -> String {
             Some(t) => format!("paused by you since {}", when(t)),
             None => format!("paused: {}", detail(&s.detail, "it waits for a person")),
         },
-        _ if light(view, now) == Light::Syncing => match s.progress.as_ref().filter(|_| s.syncing) {
-            Some(p) => format!("syncing: {}", p.brief(now)),
-            None => "syncing".into(),
-        },
+        _ if light(view, now) == Light::Syncing => {
+            match s.progress.as_ref().filter(|_| s.syncing) {
+                Some(p) => format!("syncing: {}", p.brief(now)),
+                None => "syncing".into(),
+            }
+        }
         "partial" => format!("partly synced: {}", detail(&s.detail, "some changes wait")),
         _ => match &s.waiting {
             Some(w) => format!("changes wait until {}: {}", when(w.until), w.why),
@@ -324,6 +368,68 @@ mod tests {
         assert_eq!(when_at(at(6, 0, 7), day(6), Clock::H12), "12:07 AM");
         assert_eq!(when_at(at(6, 12, 0), day(6), Clock::H12), "12:00 PM");
         assert_eq!(when_at(at(3, 9, 5), day(6), Clock::H12), "3 Nov 9:05 AM");
+    }
+
+    /// Settings is nearest the icon and Recent activity next to it, on a menu that drops from the top of
+    /// the screen as on one raised from the bottom.
+    #[test]
+    fn the_menu_keeps_what_matters_by_its_icon() {
+        let given = || {
+            [
+                vec!["Settings", "update"],
+                vec!["Recent", "Problems", "Conflicts", "Deleted"],
+                vec!["Sync now", "Pause"],
+                vec!["root: synced"],
+            ]
+        };
+        let flat = |s: [Vec<&'static str>; 4]| s.concat();
+        assert_eq!(
+            flat(from_icon(given(), true)),
+            [
+                "Settings",
+                "update",
+                "Recent",
+                "Problems",
+                "Conflicts",
+                "Deleted",
+                "Sync now",
+                "Pause",
+                "root: synced"
+            ]
+        );
+        assert_eq!(
+            flat(from_icon(given(), false)),
+            [
+                "root: synced",
+                "Sync now",
+                "Pause",
+                "Deleted",
+                "Conflicts",
+                "Problems",
+                "Recent",
+                "update",
+                "Settings"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_menu_label_says_what_it_was_given() {
+        assert_eq!(menu_label("Tom & Jerry.txt"), "Tom && Jerry.txt");
+        assert_eq!(menu_label("a\tb\nc"), "a b c");
+        let long = "й".repeat(100);
+        assert_eq!(menu_label(&long).chars().count(), 90);
+        assert!(menu_label(&long).ends_with('…'));
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_name() {
+        assert_eq!(clip_middle("docs/a.txt", 64), "docs/a.txt");
+        let p = format!("{}/report.pdf", "folder/".repeat(20));
+        let c = clip_middle(&p, 30);
+        assert_eq!(c.chars().count(), 30);
+        assert!(c.ends_with("/report.pdf"), "{c}");
+        assert!(c.starts_with("folder/"), "{c}");
     }
 
     #[test]

@@ -66,3 +66,5 @@ td.what { word-break: break-all; }
 td.what .meta { word-break: normal; }
 td.go { width: 1%; white-space: nowrap; text-align: right; }
 .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+tr.change-row { cursor: pointer; }
+tr.change-row:hover td { background: var(--button); }

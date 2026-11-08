@@ -14,6 +14,8 @@
   copies its full path (on macOS a Control- or Option-click as well). The window's Recent activity does the
   same, and says what it copied.
 - Start at login moved from the menu to the window's Settings tab.
+- Escape closes the tray's window, as its × does. In Recently deleted's search box, with something typed, it
+  clears the search first.
 
 **Fixed:**
 

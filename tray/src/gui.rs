@@ -49,7 +49,8 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             set_login,
             set_clock,
             set_update_policy,
-            update_now
+            update_now,
+            close_window
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -979,4 +980,12 @@ async fn update_now() -> Result<String, String> {
 #[tauri::command]
 async fn set_clock(clock: Clock) -> Result<(), String> {
     blocking(move || settings::set_clock(clock)).await
+}
+
+/// Escape in the window, as its × does: closed, and built anew the next time it is asked for.
+#[tauri::command]
+async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    window
+        .close()
+        .map_err(|e| format!("cannot close the window: {e}"))
 }

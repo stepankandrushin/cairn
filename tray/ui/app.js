@@ -46,6 +46,14 @@ function notice(text) {
 }
 
 document.getElementById('notice-close').addEventListener('click', () => notice(''));
+// Escape closes the window, as its × does, unless it has something of its own to undo first: typing in
+// progress, or a search the field clears itself.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+  if (e.target.id === 'deleted-search' && e.target.value) return;
+  e.preventDefault();
+  invoke('close_window').catch((err) => notice(String(err)));
+});
 for (const b of document.querySelectorAll('#tabs button')) {
   b.addEventListener('click', () => setTab(b.dataset.tab));
 }

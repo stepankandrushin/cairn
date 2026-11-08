@@ -771,6 +771,11 @@ fn a_daemon_restarts_into_the_new_version_in_the_same_process() {
     });
     assert_eq!(d.status()["version"], OLD);
     let pid = d.status()["pid"].clone();
+    #[cfg(target_os = "linux")]
+    let watching = {
+        wait_until("synced", &d, || d.status()["state"] == "synced");
+        inotify_descriptors(pid.as_u64().unwrap())
+    };
     lab.publish_new();
     let r = lab.update_now(&[]).expect_ok();
     assert!(
@@ -787,6 +792,27 @@ fn a_daemon_restarts_into_the_new_version_in_the_same_process() {
         "{}",
         d.log()
     );
+    // The old version's watches went with it: one carried over holds a whole tree's watches against
+    // the kernel's limit, another tree's worth at each update, until that limit stops the watching.
+    #[cfg(target_os = "linux")]
+    {
+        assert!(watching > 0, "the daemon watched nothing");
+        assert_eq!(
+            inotify_descriptors(pid.as_u64().unwrap()),
+            watching,
+            "descriptors of inotify kept through the restart"
+        );
+    }
+}
+
+/// How many of a process's descriptors are inotify's.
+#[cfg(target_os = "linux")]
+fn inotify_descriptors(pid: u64) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| target.as_os_str() == "anon_inode:inotify")
+        .count()
 }
 
 #[cfg(unix)]

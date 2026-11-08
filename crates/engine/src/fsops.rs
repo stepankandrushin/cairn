@@ -576,7 +576,8 @@ impl Dir {
     }
 
     pub fn dup(&self) -> io::Result<Dir> {
-        Ok(Dir(rustix::io::dup(&self.0)?))
+        // Closed on exec, as every descriptor this opens: the daemon restarts into an update in place.
+        Ok(Dir(rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?))
     }
 
     pub fn fd(&self) -> BorrowedFd<'_> {

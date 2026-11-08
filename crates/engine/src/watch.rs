@@ -65,7 +65,7 @@ struct Inner {
     rules: Rules,
     /// Each watch and the directory it is on. A path goes stale when a parent is renamed, until the
     /// walk that a rename leads to.
-    paths: HashMap<i32, Vec<Name>>,
+    paths: WatchPaths,
     state_watch: Option<i32>,
     counts: WatchCounts,
     stopped: bool,
@@ -78,6 +78,78 @@ struct Inner {
     marks: crate::scope::Shared,
     /// Watches whose folder was deleted, whose end is no news.
     deleted: HashSet<i32>,
+}
+
+/// Each watch's path, joined (`scope::join`), all in one buffer. As a vector of names each, a tree's
+/// paths are hundreds of thousands of small blocks, made again by every walk among a sync's own; spread
+/// over the heap that way they kept it from being given back between syncs: on 65k folders, 54 to 87 MB
+/// held between syncs for 24 in use, and 23 to 25 held like this.
+#[derive(Default)]
+struct WatchPaths {
+    /// Where in `bytes` each watch's path is, and how long.
+    at: HashMap<i32, (usize, usize)>,
+    bytes: Vec<u8>,
+    /// How much of `bytes` is paths since replaced or removed.
+    dead: usize,
+}
+
+impl WatchPaths {
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    fn joined(&self, wd: i32) -> Option<&[u8]> {
+        let &(start, len) = self.at.get(&wd)?;
+        Some(&self.bytes[start..start + len])
+    }
+
+    fn get(&self, wd: i32) -> Option<Vec<Name>> {
+        self.joined(wd).map(crate::scope::split)
+    }
+
+    /// Make `path` the watch's, and say whether it was not that already: a walk that finds a path as it
+    /// was allocates nothing.
+    fn set(&mut self, wd: i32, path: &[Name]) -> bool {
+        if let Some(joined) = self.joined(wd) {
+            if crate::scope::is_joined(joined, path) {
+                return false;
+            }
+            self.dead += joined.len();
+        }
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(&crate::scope::join(path));
+        self.at.insert(wd, (start, self.bytes.len() - start));
+        self.compact();
+        true
+    }
+
+    /// Take the watch off, with the path it had.
+    fn remove(&mut self, wd: i32) -> Option<Vec<Name>> {
+        let path = self.get(wd)?;
+        let (_, len) = self.at.remove(&wd).expect("just read");
+        self.dead += len;
+        self.compact();
+        Some(path)
+    }
+
+    fn wds(&self) -> impl Iterator<Item = i32> + '_ {
+        self.at.keys().copied()
+    }
+
+    /// Once most of the buffer is paths no watch has, only the ones they have, in a buffer of their own.
+    fn compact(&mut self) {
+        if self.dead < 4096 || self.dead * 2 < self.bytes.len() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(self.bytes.len() - self.dead);
+        for (start, len) in self.at.values_mut() {
+            let moved = bytes.len();
+            bytes.extend_from_slice(&self.bytes[*start..*start + *len]);
+            *start = moved;
+        }
+        self.bytes = bytes;
+        self.dead = 0;
+    }
 }
 
 /// A folder being walked, with the subfolders of it still to go.
@@ -113,7 +185,7 @@ impl Inner {
         match inotify::add_watch(&self.inotify, proc.as_str(), dir_mask()) {
             Ok(wd) => {
                 // A folder watched only now may have changed while it was not.
-                if self.paths.insert(wd, path.to_vec()).as_deref() != Some(path) {
+                if self.paths.set(wd, path) {
                     crate::scope::lock(&self.marks).mark(path, false);
                 }
                 seen.insert(wd);
@@ -216,15 +288,10 @@ impl Inner {
                 self.state_watch = Some(wd);
             }
         }
-        let stale: Vec<i32> = self
-            .paths
-            .keys()
-            .filter(|wd| !seen.contains(wd))
-            .copied()
-            .collect();
+        let stale: Vec<i32> = self.paths.wds().filter(|wd| !seen.contains(wd)).collect();
         for wd in stale {
             let _ = inotify::remove_watch(&self.inotify, wd);
-            self.paths.remove(&wd);
+            self.paths.remove(wd);
         }
         self.counts.watched = self.paths.len();
     }
@@ -270,7 +337,7 @@ impl Inner {
             return;
         }
         if flags.contains(ReadFlags::IGNORED) {
-            let gone = self.paths.remove(&wd);
+            let gone = self.paths.remove(wd);
             let was_root = gone.as_ref().is_some_and(|p| p.is_empty());
             let deleted = self.deleted.remove(&wd);
             match &gone {
@@ -288,7 +355,7 @@ impl Inner {
             batch.wake |= was_root;
             return;
         }
-        let Some(path) = self.paths.get(&wd).cloned() else {
+        let Some(path) = self.paths.get(wd) else {
             return;
         };
         if flags.intersects(ReadFlags::UNMOUNT | ReadFlags::DELETE_SELF | ReadFlags::MOVE_SELF) {
@@ -369,12 +436,14 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(root: &Path, wake: impl Fn() + Send + 'static) -> std::io::Result<Self> {
         let fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
-        let reader = rustix::io::dup(&fd)?;
+        // Closed on exec, as the daemon restarts into an update in the same process: one carried over
+        // would keep the old watches, a whole tree's, counted against the kernel's limit for good.
+        let reader = rustix::io::fcntl_dupfd_cloexec(&fd, 0)?;
         let inner = Arc::new(Mutex::new(Inner {
             inotify: fd,
             root: root.to_path_buf(),
             rules: Rules::none(),
-            paths: HashMap::new(),
+            paths: WatchPaths::default(),
             state_watch: None,
             counts: WatchCounts::default(),
             stopped: false,
@@ -475,5 +544,84 @@ fn read_events(fd: OwnedFd, inner: Arc<Mutex<Inner>>, wake: impl Fn()) {
         if batch.wake {
             wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(names: &[&str]) -> Vec<Name> {
+        names
+            .iter()
+            .map(|n| Name::new(n.as_bytes()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn paths_come_back_as_they_were_put() {
+        let mut paths = WatchPaths::default();
+        assert!(paths.set(1, &[]));
+        assert!(paths.set(2, &path(&["a"])));
+        let odd = vec![
+            Name::new(b"\xff\\x".to_vec()).unwrap(),
+            Name::new(b" .b ".to_vec()).unwrap(),
+        ];
+        assert!(paths.set(3, &odd));
+        assert_eq!(paths.get(1), Some(Vec::new()));
+        assert_eq!(paths.get(2), Some(path(&["a"])));
+        assert_eq!(paths.get(3), Some(odd.clone()));
+        assert_eq!(paths.get(4), None);
+        assert_eq!(paths.len(), 3);
+        let mut wds: Vec<i32> = paths.wds().collect();
+        wds.sort();
+        assert_eq!(wds, [1, 2, 3]);
+        assert_eq!(paths.remove(3), Some(odd));
+        assert_eq!(paths.remove(3), None);
+        assert_eq!(paths.get(3), None);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn a_path_set_again_as_it_was_says_so_and_takes_nothing() {
+        let mut paths = WatchPaths::default();
+        assert!(paths.set(1, &path(&["a", "b"])));
+        let used = paths.bytes.len();
+        assert!(!paths.set(1, &path(&["a", "b"])));
+        assert_eq!(paths.bytes.len(), used);
+        // The same bytes cut another way, a prefix, and the root are all other paths.
+        assert!(paths.set(1, &path(&["a", "b", "c"])));
+        assert!(paths.set(1, &path(&["a"])));
+        assert!(paths.set(1, &[]));
+        assert!(!paths.set(1, &[]));
+        assert!(paths.set(1, &path(&["a"])));
+        assert_eq!(paths.get(1), Some(path(&["a"])));
+    }
+
+    #[test]
+    fn paths_replaced_and_removed_are_given_back() {
+        let mut paths = WatchPaths::default();
+        let long = "n".repeat(200);
+        for round in 0..50 {
+            for wd in 0..100 {
+                let name = format!("{long}-{round}");
+                assert!(paths.set(wd, &path(&["top", &name, &wd.to_string()])));
+            }
+            for wd in 100..110 {
+                paths.set(wd, &path(&["gone", &round.to_string()]));
+                paths.remove(wd);
+            }
+        }
+        let live: usize = (0..100).map(|wd| paths.joined(wd).unwrap().len()).sum();
+        assert!(
+            paths.bytes.len() <= 2 * live + 4096,
+            "{} for {live}",
+            paths.bytes.len()
+        );
+        for wd in 0..100 {
+            let name = format!("{long}-49");
+            assert_eq!(paths.get(wd), Some(path(&["top", &name, &wd.to_string()])));
+        }
+        assert_eq!(paths.len(), 100);
     }
 }

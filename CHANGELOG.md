@@ -15,6 +15,18 @@
   start, or one that looks at the whole tree) has grown the heap, what each later sync frees stays the process's,
   and the daemon gave back nothing on Windows. It now compacts the heap and empties its caches as each sync ends:
   on a tree of 200k files, 13 MB between syncs where it held 24 to 132 MB, and in about 5 ms.
+- On Linux an idle daemon held several times what it used: 102 MB between syncs on a tree of 570k entries. All
+  but 1 MB of what it kept in use was its watcher's record of each folder it watches, by path, as a vector of
+  names: on 65k folders half a million small blocks, made again by each walk of the watches, which every
+  reconcile does among a sync's own blocks. Spread over the heap like that, they kept it from giving back what
+  the syncs freed, and the allocator of the Linux build has no call to make it. Each path is now one run of bytes
+  in one buffer, and a walk that finds a path as it was makes nothing; the watcher's marks of where something
+  happened are one block each too. On a tree of that one's 65k folders, with a reconcile every 2 minutes: 25 MB
+  between syncs where it held 54 to 60 MB, with 16 MB in use where it had 24.
+- On Linux each update a daemon restarted into, in the same process, kept the version before's inotify watches:
+  a whole tree's more at each update, counted against the kernel's limit on watches until the daemon stopped,
+  and enough updates would reach it, after which every sync lists the whole tree. Every descriptor the daemon
+  holds is now closed when it restarts.
 
 ## 0.1.9 (2026-11-08)
 

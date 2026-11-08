@@ -24,9 +24,9 @@ use std::time::Instant;
 /// What a watcher has seen, and since when it can be trusted.
 #[derive(Debug)]
 pub struct Marks {
-    /// Each folder something happened in, by its path when the event was read: when it last did, and
-    /// whether everything under it is new to the watcher.
-    folders: HashMap<Vec<Name>, (Instant, bool)>,
+    /// Each folder something happened in, by its path when the event was read (`join`): when it last
+    /// did, and whether everything under it is new to the watcher.
+    folders: HashMap<Box<[u8]>, (Instant, bool)>,
     /// When the watcher last lost track, from its start on.
     lost: Instant,
 }
@@ -43,11 +43,48 @@ impl Default for Marks {
 /// The folders to list, by path, and whether everything under each is to be listed too.
 pub type Folders = BTreeMap<Vec<Name>, bool>;
 
+/// A path's names joined by `/`, which no name holds, so nothing is lost: one block of memory where a
+/// vector of names is one for each name and one more. Kept for long, in their thousands, among a sync's
+/// own blocks, those would spread over the heap and keep it from being given back between syncs.
+pub(crate) fn join(path: &[Name]) -> Box<[u8]> {
+    let len = path.iter().map(|n| n.as_bytes().len() + 1).sum::<usize>();
+    let mut out = Vec::with_capacity(len.saturating_sub(1));
+    for (i, name) in path.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(name.as_bytes());
+    }
+    out.into_boxed_slice()
+}
+
+/// The names `join` was given.
+pub(crate) fn split(joined: &[u8]) -> Vec<Name> {
+    if joined.is_empty() {
+        return Vec::new();
+    }
+    joined
+        .split(|&b| b == b'/')
+        .map(|n| Name::new(n).expect("joined from names"))
+        .collect()
+}
+
+/// Whether `joined` is `path` joined, without making it.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn is_joined(joined: &[u8], path: &[Name]) -> bool {
+    if path.is_empty() || joined.is_empty() {
+        return path.is_empty() && joined.is_empty();
+    }
+    joined
+        .split(|&b| b == b'/')
+        .eq(path.iter().map(Name::as_bytes))
+}
+
 impl Marks {
     /// Something happened in this folder; with `whole`, in everything under it.
     pub fn mark(&mut self, folder: &[Name], whole: bool) {
         let now = Instant::now();
-        let e = self.folders.entry(folder.to_vec()).or_insert((now, false));
+        let e = self.folders.entry(join(folder)).or_insert((now, false));
         e.0 = now;
         e.1 |= whole;
     }
@@ -79,7 +116,7 @@ impl Marks {
             self.folders
                 .iter()
                 .filter(|(_, (at, _))| *at >= since)
-                .map(|(p, (_, whole))| (p.clone(), *whole))
+                .map(|(p, (_, whole))| (split(p), *whole))
                 .collect(),
         )
     }
@@ -211,6 +248,38 @@ mod tests {
             .filter(|s| !s.is_empty())
             .map(|s| Name::new(s.as_bytes().to_vec()).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn a_path_joined_comes_back_as_it_was_and_is_no_other() {
+        let odd = vec![
+            Name::new(b"\xff\\x".to_vec()).unwrap(),
+            Name::new(b" .b ".to_vec()).unwrap(),
+        ];
+        for path in [Vec::new(), names("a"), names("a/b/c"), odd] {
+            let joined = join(&path);
+            assert_eq!(split(&joined), path);
+            assert!(is_joined(&joined, &path));
+        }
+        let ab = join(&names("a/b"));
+        for other in ["", "a", "a/b/c", "ab", "b/a"] {
+            assert!(!is_joined(&ab, &names(other)), "{other}");
+        }
+        assert!(!is_joined(b"", &names("a")));
+        assert!(is_joined(b"", &[]));
+    }
+
+    #[test]
+    fn the_root_and_a_folder_are_marked_apart() {
+        let mut m = Marks::default();
+        let t0 = Instant::now();
+        m.mark(&[], false);
+        m.mark(&names("a"), true);
+        m.mark(&names("a"), false);
+        let got = m.since(t0).unwrap();
+        assert_eq!(got.get(&Vec::new()), Some(&false));
+        assert_eq!(got.get(&names("a")), Some(&true));
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

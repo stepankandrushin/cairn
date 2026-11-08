@@ -10,6 +10,11 @@
   made at each sync's end to give memory back frees none of them there. The daemon now starts itself again, in the
   same process, with that cache off (`MallocLargeCache=0`), and holds about 15 MB between syncs on that tree. A
   daemon started with the variable set already, to any value, is left as it is.
+- On Windows an idle daemon could hold a few hundred megabytes it no longer used, shown as Cairn Sync in Task
+  Manager: 441 MB between syncs of a file or two on a tree of 568k entries. Once a big sync (the first after a
+  start, or one that looks at the whole tree) has grown the heap, what each later sync frees stays the process's,
+  and the daemon gave back nothing on Windows. It now compacts the heap and empties its caches as each sync ends:
+  on a tree of 200k files, 13 MB between syncs where it held 24 to 132 MB, and in about 5 ms.
 
 ## 0.1.9 (2026-11-08)
 

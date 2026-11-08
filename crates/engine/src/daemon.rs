@@ -829,7 +829,9 @@ fn raise_open_files(log: &mut dyn FnMut(&str)) {
 /// Hand what the allocator holds free back to the system: after a sync of a big tree that is gigabytes,
 /// which would otherwise stay this process's while it waits. On macOS 26 and 27 the call below was
 /// measured to give back nothing: what does it there is the daemon running with the allocator's cache of
-/// large blocks off (`without_large_cache` in the CLI), so that a freed block goes back at once.
+/// large blocks off (`without_large_cache` in the CLI), so that a freed block goes back at once. On
+/// Windows, once a big sync has grown the heap, what each later one frees stays committed, a few hundred
+/// megabytes on a big tree, until the calls below hand it back.
 fn give_back_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -849,6 +851,34 @@ fn give_back_memory() {
         // SAFETY: libSystem's own; a null zone means every zone, and a goal of 0 as much as it can.
         unsafe {
             malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{
+            GetProcessHeap, HeapCompact, HeapOptimizeResources, HeapSetInformation,
+        };
+        use windows_sys::Win32::System::SystemServices::{
+            HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
+        };
+        // Free blocks merged, then the low-fragmentation heap's caches emptied and what is free decommitted,
+        // in every heap of the process. The second gives nearly all of it back; merging first lets it give
+        // more (on 200k files, 13 MB left against 21). Either failing leaves the memory this process's
+        // until the next sync tries again, which is not worth a line a sync.
+        let info = HEAP_OPTIMIZE_RESOURCES_INFORMATION {
+            Version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,
+            Flags: 0,
+        };
+        // SAFETY: the process's own heap, which lives as long as it does; a null heap means every heap,
+        // and the information is the documented structure, of its own size.
+        unsafe {
+            HeapCompact(GetProcessHeap(), 0);
+            HeapSetInformation(
+                std::ptr::null_mut(),
+                HeapOptimizeResources,
+                (&info as *const HEAP_OPTIMIZE_RESOURCES_INFORMATION).cast(),
+                std::mem::size_of_val(&info),
+            );
         }
     }
 }

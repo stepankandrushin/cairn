@@ -5,8 +5,9 @@ owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
 **Status: 0.1.11, early.** Clients for Linux, macOS and Windows, with only Linux in CI; the server on Linux;
-one user. It has been through a harsh failure harness and now syncs real trees, but for days, not yet weeks,
-so keep another copy of anything you put through it. See
+users with their own folders and shared ones, read-only or not, in the code but not yet in a release. It has
+been through a harsh failure harness and now syncs real trees, but for days, not yet weeks, so keep another
+copy of anything you put through it. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
 
 ## Cairn vs Nextcloud vs Seafile vs Syncthing
@@ -115,6 +116,40 @@ cairn undelete <ID>                              # bring it back as it was, besi
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with
 `--behind-tls-proxy`, and use an `https://` URL. A read timeout above 25 seconds lets changes arrive at once
 (nginx's default of 60 is fine); with a shorter one the daemon asks more often.
+
+## Users and folders
+
+A server holds folders, each with its own tree, history and set of chunks, and users, each with tokens of its
+own, one per device at best. A user reaches only the folders given to it, at one of three levels: `read`,
+`write`, or `manage`, which is write and also saying who else has access. To anyone else a folder answers as
+one that does not exist. `cairn-server init` makes the user `admin`, who manages the folder `default`, with
+its token in the data directory's `token` file; a server from before accounts gives that file's token the
+same, managing every folder it has.
+
+```sh
+# On the server, while it runs or not
+cairn-server user add alice --token-file alice.token --data ~/cairn-data
+cairn-server user add bob   --token-file bob.token   --data ~/cairn-data
+cairn-server folder add alice --manager alice --data ~/cairn-data      # her own
+cairn-server folder add team  --manager alice --data ~/cairn-data      # to share
+cairn-server grant team bob read --data ~/cairn-data
+cairn-server token add bob --label laptop --token-file bob-laptop.token --data ~/cairn-data
+cairn-server user list --data ~/cairn-data
+cairn-server revoke team bob --data ~/cairn-data
+cairn-server token list --data ~/cairn-data; cairn-server token remove <ID> --data ~/cairn-data
+
+# On a device: each folder is a root of its own
+cairn folders --server https://cairn.example --token-file bob.token
+cairn init --server https://cairn.example --token-file bob.token --folder team ~/Team
+cairn access                                     # who has access to this root's folder
+cairn access grant carol write                   # a manager shares it; nobody else can
+```
+
+A folder a user may only read comes down whole, and nothing made on that user's devices goes up or is lost
+there: an edit, a new file, a rename stay as they are, listed by every sync as `read-only`; something deleted
+there comes back from the server; where the server changes something also changed there, both stay, the
+server's at the name. Moved out of the root, a change is kept and the server's version comes back; once the
+user may write, what was held back goes up like any change. `cairn log` says which user made each commit.
 
 ## The daemon
 

@@ -110,7 +110,7 @@ pub struct Plan {
 }
 
 /// A directory's mtime moves with every entry in it; it says nothing about intent.
-fn meta_changed(kind: ObjectKind, a: &Metadata, b: &Metadata) -> bool {
+pub(crate) fn meta_changed(kind: ObjectKind, a: &Metadata, b: &Metadata) -> bool {
     if kind == ObjectKind::Dir {
         let mut b = b.clone();
         b.mtime = a.mtime;

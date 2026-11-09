@@ -1,17 +1,18 @@
 //! The default store: one SQLite file in WAL mode with full synchronous commits.
 
-use crate::meta::{CommitOutcome, MetaStore, StoredRevision, TreeState};
+use crate::meta::{CommitOutcome, MetaStore, StoredRevision, TokenInfo, TreeState, UserInfo};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
-use cairn_protocol::wire::{Change, CommitRequest, ConflictEntry};
+use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
 use cairn_protocol::{
-    check_and_apply, Content, Link, Metadata, ObjectId, ObjectKind, Op, OpReject, RevisionBody,
-    RevisionId, TreeStore,
+    check_and_apply, Content, Hash, Link, Metadata, ObjectId, ObjectKind, Op, OpReject,
+    RevisionBody, RevisionId, TreeStore,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE namespaces (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, head INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE objects (
     ns INTEGER NOT NULL, id BLOB NOT NULL, kind TEXT NOT NULL, head BLOB NOT NULL,
@@ -37,7 +38,111 @@ CREATE TABLE conflicts (
     ns INTEGER NOT NULL, seq INTEGER NOT NULL, copy BLOB NOT NULL, object BLOB NOT NULL, competing BLOB NOT NULL,
     PRIMARY KEY (ns, seq, copy)
 ) WITHOUT ROWID;
-"#];
+"#,
+    r#"
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created INTEGER NOT NULL);
+CREATE TABLE tokens (
+    hash BLOB PRIMARY KEY, user INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    label TEXT NOT NULL, created INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX tokens_user ON tokens (user);
+CREATE TABLE grants (
+    ns INTEGER NOT NULL REFERENCES namespaces (id), user INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    access TEXT NOT NULL,
+    PRIMARY KEY (ns, user)
+) WITHOUT ROWID;
+CREATE INDEX grants_user ON grants (user);
+ALTER TABLE journal ADD COLUMN user TEXT;
+"#,
+];
+
+/// The schema this binary writes: `PRAGMA user_version` once every migration has run.
+pub const SCHEMA: usize = MIGRATIONS.len();
+
+/// The user a data directory's one token from before accounts becomes, managing every namespace.
+pub const FIRST_USER: &str = "admin";
+
+/// How to open a database.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Opening<'a> {
+    /// The data directory's `token`, if it has one: the moment the schema gains accounts, it becomes
+    /// [`FIRST_USER`]'s, who manages every namespace there is, so that nothing that used it stops.
+    pub first_token: Option<&'a str>,
+    /// Another process serves this database: take it as it is, at this binary's schema or not at all,
+    /// and write nothing on opening. What the server reads per request then sees each change at once.
+    pub beside_server: bool,
+}
+
+/// The hash a token is kept and looked up by: the token itself is never stored.
+pub fn token_hash(token: &str) -> Hash {
+    Hash::of(token.trim().as_bytes())
+}
+
+/// How a token is named in lists: the first 12 digits of its hash, which say nothing of the token.
+pub fn token_id(hash: &Hash) -> String {
+    hash.to_string()[..12].to_string()
+}
+
+fn access_of(s: &str) -> Result<Access> {
+    s.parse()
+        .map_err(|e: String| anyhow!("in the database: {e}"))
+}
+
+/// The namespace by that name, made if it is not there yet: its root directory at revision zero.
+fn ensure_namespace(conn: &Connection, ns: &str) -> Result<i64> {
+    if let Some(id) = conn
+        .query_row("SELECT id FROM namespaces WHERE name = ?1", [ns], |r| {
+            r.get(0)
+        })
+        .optional()?
+    {
+        return Ok(id);
+    }
+    conn.execute("INSERT INTO namespaces (name) VALUES (?1)", [ns])?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO objects (ns, id, kind, head) VALUES (?1, ?2, 'dir', ?3)",
+        params![id, ObjectId::ROOT.0, RevisionId::ZERO.0],
+    )?;
+    conn.execute(
+        "INSERT INTO revisions (ns, id, object, base, seq, body) VALUES (?1, ?2, ?3, NULL, 0, ?4)",
+        params![
+            id,
+            RevisionId::ZERO.0,
+            ObjectId::ROOT.0,
+            serde_json::to_string(&root_body())?
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Schema 2's own step, in its transaction: the one token there was becomes the first user's.
+fn adopt_first_token(tx: &Transaction<'_>, token: Option<&str>, time: i64) -> Result<()> {
+    let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(());
+    };
+    ensure_namespace(tx, "default")?;
+    tx.execute(
+        "INSERT INTO users (name, created) VALUES (?1, ?2)",
+        params![FIRST_USER, time],
+    )?;
+    let user = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO tokens (hash, user, label, created) VALUES (?1, ?2, 'token file', ?3)",
+        params![token_hash(token).0, user, time],
+    )?;
+    tx.execute(
+        "INSERT INTO grants (ns, user, access) SELECT id, ?1, 'manage' FROM namespaces",
+        [user],
+    )?;
+    Ok(())
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
 
 pub struct SqliteStore {
     conn: Connection,
@@ -74,35 +179,62 @@ fn kind_of(s: &str) -> Result<ObjectKind> {
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, Opening::default())
+    }
+
+    pub fn open_with(path: &Path, how: Opening<'_>) -> Result<Self> {
+        if how.beside_server && !path.exists() {
+            bail!("{} does not exist", path.display());
+        }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        Self::with_connection(conn)
+        Self::with_connection(conn, how)
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::with_connection(Connection::open_in_memory()?)
+        Self::with_connection(Connection::open_in_memory()?, Opening::default())
     }
 
-    fn with_connection(mut conn: Connection) -> Result<Self> {
+    fn with_connection(mut conn: Connection, how: Opening<'_>) -> Result<Self> {
+        // An administrator's command beside the server writes now and then: each waits for the other
+        // rather than failing.
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // FULL: an acknowledged commit survives power loss (invariant 1).
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > MIGRATIONS.len() {
+        if version > SCHEMA {
             bail!(
-                "this database has schema {version}, newer than this binary's {}: upgrade the binary",
-                MIGRATIONS.len()
+                "this database has schema {version}, newer than this binary's {SCHEMA}: upgrade the binary"
             );
+        }
+        if how.beside_server {
+            if version != SCHEMA {
+                bail!(
+                    "this database has schema {version} and this binary writes {SCHEMA}: run this with the binary the server runs, or stop the server and run it again, which brings the database up to date"
+                );
+            }
+            return Ok(Self { conn });
         }
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
+            if i == 1 {
+                adopt_first_token(&tx, how.first_token, now())?;
+            }
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
         }
         let mut store = Self { conn };
         store.create_namespace("default")?;
         Ok(store)
+    }
+
+    fn user_id(&self, name: &str) -> Result<i64> {
+        self.conn
+            .query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow!("no user {name:?}"))
     }
 
     fn ns_id(&self, ns: &str) -> Result<i64> {
@@ -275,21 +407,195 @@ impl MetaStore for SqliteStore {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO namespaces (name) VALUES (?1)", [ns])?;
-        let id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO objects (ns, id, kind, head) VALUES (?1, ?2, 'dir', ?3)",
-            params![id, ObjectId::ROOT.0, RevisionId::ZERO.0],
-        )?;
-        tx.execute(
-            "INSERT INTO revisions (ns, id, object, base, seq, body) VALUES (?1, ?2, ?3, NULL, 0, ?4)",
-            params![id, RevisionId::ZERO.0, ObjectId::ROOT.0, serde_json::to_string(&root_body())?],
-        )?;
+        ensure_namespace(&tx, ns)?;
         tx.commit()?;
         Ok(())
     }
 
-    fn commit(&mut self, ns: &str, req: &CommitRequest, time: i64) -> Result<CommitOutcome> {
+    fn add_user(&mut self, name: &str, time: i64) -> Result<()> {
+        if self.user_id(name).is_ok() {
+            bail!("there is a user {name:?} already");
+        }
+        self.conn.execute(
+            "INSERT INTO users (name, created) VALUES (?1, ?2)",
+            params![name, time],
+        )?;
+        Ok(())
+    }
+
+    fn remove_user(&mut self, name: &str) -> Result<()> {
+        let id = self.user_id(name)?;
+        // Its tokens and grants go with it. The journal keeps its name on what it committed.
+        self.conn.execute("DELETE FROM users WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn users(&mut self) -> Result<Vec<UserInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.name, u.created, (SELECT count(*) FROM tokens t WHERE t.user = u.id)
+             FROM users u ORDER BY u.name",
+        )?;
+        let users = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for (name, created, tokens) in users {
+            let folders = self.folders_of(&name)?;
+            out.push(UserInfo {
+                name,
+                created,
+                tokens: tokens as u64,
+                folders,
+            });
+        }
+        Ok(out)
+    }
+
+    fn add_token(&mut self, user: &str, hash: &Hash, label: &str, time: i64) -> Result<()> {
+        let id = self.user_id(user)?;
+        self.conn.execute(
+            "INSERT INTO tokens (hash, user, label, created) VALUES (?1, ?2, ?3, ?4)",
+            params![hash.0, id, label, time],
+        )?;
+        Ok(())
+    }
+
+    fn tokens(&mut self) -> Result<Vec<TokenInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.hash, u.name, t.label, t.created FROM tokens t JOIN users u ON u.id = t.user
+             ORDER BY u.name, t.created, t.hash",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (hash, user, label, created) = row?;
+            let hash = Hash(
+                hash.try_into()
+                    .map_err(|_| anyhow!("a stored token hash is not 32 bytes"))?,
+            );
+            out.push(TokenInfo {
+                id: token_id(&hash),
+                hash,
+                user,
+                label,
+                created,
+            });
+        }
+        Ok(out)
+    }
+
+    fn remove_token(&mut self, hash: &Hash) -> Result<()> {
+        if self
+            .conn
+            .execute("DELETE FROM tokens WHERE hash = ?1", [hash.0])?
+            == 0
+        {
+            bail!("no such token");
+        }
+        Ok(())
+    }
+
+    fn token_user(&mut self, hash: &Hash) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT u.name FROM tokens t JOIN users u ON u.id = t.user WHERE t.hash = ?1",
+            )?
+            .query_row([hash.0], |r| r.get(0))
+            .optional()?)
+    }
+
+    fn access(&mut self, ns: &str, user: &str) -> Result<Option<Access>> {
+        let level: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT g.access FROM grants g
+                 JOIN namespaces n ON n.id = g.ns JOIN users u ON u.id = g.user
+                 WHERE n.name = ?1 AND u.name = ?2",
+            )?
+            .query_row([ns, user], |r| r.get(0))
+            .optional()?;
+        level.as_deref().map(access_of).transpose()
+    }
+
+    fn set_access(&mut self, ns: &str, user: &str, access: Option<Access>) -> Result<()> {
+        let ns_id = self.ns_id(ns)?;
+        let user_id = self.user_id(user)?;
+        match access {
+            Some(a) => self.conn.execute(
+                "INSERT INTO grants (ns, user, access) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (ns, user) DO UPDATE SET access = excluded.access",
+                params![ns_id, user_id, a.as_str()],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM grants WHERE ns = ?1 AND user = ?2",
+                params![ns_id, user_id],
+            )?,
+        };
+        Ok(())
+    }
+
+    fn members(&mut self, ns: &str) -> Result<Vec<Member>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT u.name, g.access FROM grants g JOIN users u ON u.id = g.user
+             WHERE g.ns = ?1 ORDER BY u.name",
+        )?;
+        let rows = stmt.query_map([ns_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (user, access) = row?;
+            out.push(Member {
+                user,
+                access: access_of(&access)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn folders_of(&mut self, user: &str) -> Result<Vec<FolderAccess>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT n.name, g.access FROM grants g
+             JOIN namespaces n ON n.id = g.ns JOIN users u ON u.id = g.user
+             WHERE u.name = ?1 ORDER BY n.name",
+        )?;
+        let rows = stmt.query_map([user], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (folder, access) = row?;
+            out.push(FolderAccess {
+                folder,
+                access: access_of(&access)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn commit(
+        &mut self,
+        ns: &str,
+        req: &CommitRequest,
+        time: i64,
+        user: Option<&str>,
+    ) -> Result<CommitOutcome> {
         let ns_id = self.ns_id(ns)?;
         check("server.commit.begin")?;
         let tx = self
@@ -343,8 +649,8 @@ impl MetaStore for SqliteStore {
             }
         }
         tx.execute(
-            "INSERT INTO journal (ns, seq, op_id, device, device_name, time, ops) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![ns_id, seq, req.op_id.0, req.device.0, req.device_name, time, serde_json::to_string(&req.ops)?],
+            "INSERT INTO journal (ns, seq, op_id, device, device_name, time, ops, user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![ns_id, seq, req.op_id.0, req.device.0, req.device_name, time, serde_json::to_string(&req.ops)?, user],
         )?;
         tx.execute(
             "UPDATE namespaces SET head = ?2 WHERE id = ?1",
@@ -369,7 +675,7 @@ impl MetaStore for SqliteStore {
     ) -> Result<Vec<Change>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, op_id, device, device_name, time, ops FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            "SELECT seq, op_id, device, device_name, time, ops, user FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![ns_id, after as i64, limit], |r| {
             Ok((
@@ -379,6 +685,7 @@ impl MetaStore for SqliteStore {
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -387,7 +694,7 @@ impl MetaStore for SqliteStore {
             if bytes >= max_bytes {
                 break;
             }
-            let (seq, op_id, device, device_name, time, ops) = row?;
+            let (seq, op_id, device, device_name, time, ops, user) = row?;
             bytes += ops.len();
             out.push(Change {
                 seq: seq as u64,
@@ -396,6 +703,7 @@ impl MetaStore for SqliteStore {
                 device_name,
                 time,
                 ops: serde_json::from_str(&ops)?,
+                user,
             });
         }
         Ok(out)
@@ -404,7 +712,7 @@ impl MetaStore for SqliteStore {
     fn changes_without_ops(&mut self, ns: &str, after: u64, limit: u32) -> Result<Vec<Change>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, op_id, device, device_name, time FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            "SELECT seq, op_id, device, device_name, time, user FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![ns_id, after as i64, limit], |r| {
             Ok((
@@ -413,11 +721,12 @@ impl MetaStore for SqliteStore {
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, op_id, device, device_name, time) = row?;
+            let (seq, op_id, device, device_name, time, user) = row?;
             out.push(Change {
                 seq: seq as u64,
                 op_id: cairn_protocol::OpId(blob16(op_id)?),
@@ -425,6 +734,7 @@ impl MetaStore for SqliteStore {
                 device_name,
                 time,
                 ops: Vec::new(),
+                user,
             });
         }
         Ok(out)
@@ -540,6 +850,111 @@ mod tests {
     #[test]
     fn sqlite_passes_the_store_suite() {
         crate::meta::suite::run(&mut SqliteStore::in_memory().unwrap());
+    }
+
+    fn scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-schema-{}",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A database as a release before accounts left it: schema 1, with namespaces in it.
+    fn schema_1(db: &Path, namespaces: &[&str]) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        for ns in namespaces {
+            ensure_namespace(&conn, ns).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+
+    #[test]
+    fn the_token_from_before_accounts_becomes_the_first_users_with_every_namespace() {
+        let dir = scratch();
+        let db = dir.join("db");
+        schema_1(&db, &["default", "team"]);
+        let how = Opening {
+            first_token: Some("abc123\n"),
+            beside_server: false,
+        };
+        let mut s = SqliteStore::open_with(&db, how).unwrap();
+        assert_eq!(
+            s.token_user(&token_hash("abc123")).unwrap().as_deref(),
+            Some(FIRST_USER)
+        );
+        for ns in ["default", "team"] {
+            assert_eq!(s.access(ns, FIRST_USER).unwrap(), Some(Access::Manage));
+        }
+        drop(s);
+        // Only the move to accounts does that: a token file seen again later changes nothing.
+        let mut s = SqliteStore::open_with(
+            &db,
+            Opening {
+                first_token: Some("other"),
+                beside_server: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.users().unwrap().len(), 1);
+        assert_eq!(s.token_user(&token_hash("other")).unwrap(), None);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_database_with_a_token_gives_its_user_the_default_namespace() {
+        let dir = scratch();
+        let mut s = SqliteStore::open_with(
+            &dir.join("db"),
+            Opening {
+                first_token: Some("t"),
+                beside_server: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.access("default", FIRST_USER).unwrap(),
+            Some(Access::Manage)
+        );
+        let mut none = SqliteStore::open(&dir.join("other")).unwrap();
+        assert!(none.users().unwrap().is_empty(), "no token, no user");
+        drop((s, none));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn beside_a_server_only_this_schema_is_taken_and_nothing_is_migrated() {
+        let dir = scratch();
+        let db = dir.join("db");
+        let beside = Opening {
+            first_token: None,
+            beside_server: true,
+        };
+        assert!(
+            SqliteStore::open_with(&db, beside).is_err(),
+            "no database yet"
+        );
+        assert!(!db.exists(), "and none made");
+        schema_1(&db, &["default"]);
+        let err = SqliteStore::open_with(&db, beside)
+            .err()
+            .expect("must refuse");
+        assert!(
+            err.to_string().contains("the binary the server runs"),
+            "{err}"
+        );
+        let version: usize = Connection::open(&db)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "left as it was");
+        SqliteStore::open(&db).unwrap();
+        let mut s = SqliteStore::open_with(&db, beside).unwrap();
+        s.add_user("u", 0).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

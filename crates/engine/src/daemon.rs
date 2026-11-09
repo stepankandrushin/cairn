@@ -1250,8 +1250,14 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                                     SkipKind::PermissionDenied | SkipKind::ReadError
                                 )
                         });
+                        // In a folder it may only read, what only a commit would settle waits for a
+                        // change here or on the server: another try now would find the same.
+                        let waits =
+                            report.read_only && report.skips.iter().all(|s| !s.kind.retryable());
                         if stuck {
                             schedule.failed(opts.retry);
+                        } else if waits {
+                            schedule.backoff = Duration::ZERO;
                         } else {
                             schedule.settling(opts.retry);
                         }

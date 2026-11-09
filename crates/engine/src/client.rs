@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cairn_protocol::wire::{
     self, ChangesResponse, CommitRequest, CommitResponse, ConflictEntry, HashList, Info,
 };
+use cairn_protocol::wire::{Access, Grant, Me, Member};
 use cairn_protocol::Hash;
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
@@ -75,6 +76,17 @@ impl<R: Resolver> Resolver for CachedResolver<R> {
 #[derive(Debug, thiserror::Error)]
 #[error("the server's disk is full: nothing was lost; free space on the server and sync again")]
 pub struct ServerFull;
+
+/// The server refused a request this token's access does not cover (403), as an upload or a commit
+/// in a folder its user may only read. Nothing there changed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Forbidden(pub String);
+
+/// Whether an error chain is a [`Forbidden`] answer.
+pub fn is_forbidden(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Forbidden>())
+}
 
 /// How hard a client tries a request again that the network failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,8 +262,13 @@ impl Failure {
 
 pub struct Client {
     agent: Agent,
+    /// The server's URL, for what is not about one namespace.
+    server: String,
     base: String,
     auth: String,
+    /// What this token may do in the namespace, as the server said when this client was made. `None`
+    /// from a server before accounts, whose one token may do everything.
+    access: Option<Access>,
     /// How hard a request the network failed is tried again.
     retries: Retries,
     /// How many times a request was tried again, for the sync's report.
@@ -276,7 +293,7 @@ fn host_is_loopback(url: &str) -> bool {
 
 impl Client {
     pub fn new(config: &Config, retries: Retries) -> Result<Self> {
-        let client = Self::unchecked(config, retries)?;
+        let mut client = Self::unchecked(config, retries)?;
         let info = client.info()?;
         if info.protocol != cairn_protocol::PROTOCOL_VERSION {
             bail!(
@@ -285,7 +302,36 @@ impl Client {
                 cairn_protocol::PROTOCOL_VERSION
             );
         }
+        client.access = info.access;
         Ok(client)
+    }
+
+    /// A client of the server alone, for what is not about one namespace: who the token is, and what
+    /// it may reach.
+    pub fn of_server(server: &str, token: &str, allow_http: bool) -> Result<Self> {
+        Self::unchecked(
+            &Config {
+                server: server.trim_end_matches('/').to_string(),
+                namespace: String::new(),
+                token: token.trim().to_string(),
+                device: cairn_protocol::DeviceId::random(),
+                device_name: String::new(),
+                policy: Default::default(),
+                filenames: Default::default(),
+                allow_http,
+            },
+            Retries::Short,
+        )
+    }
+
+    /// What this token may do here, as the server said when this client was made.
+    pub fn access(&self) -> Option<Access> {
+        self.access
+    }
+
+    /// Whether this token may only read here: nothing changed here may go up.
+    pub fn read_only(&self) -> bool {
+        self.access.is_some_and(|a| !a.can_write())
     }
 
     /// The protocol the server speaks, whichever it is: for the updater, which takes a release on
@@ -323,8 +369,10 @@ impl Client {
         );
         let client = Self {
             agent,
+            server: url.to_string(),
             base: format!("{url}/v1/ns/{}", config.namespace),
             auth: format!("Bearer {}", config.token),
+            access: None,
             retries,
             retried: Arc::new(AtomicU64::new(0)),
         };
@@ -425,6 +473,10 @@ impl Client {
                 "{what}: the server refused the access token"
             ))),
             507 => Err(refused(anyhow!(ServerFull))),
+            403 => Err(refused(anyhow::Error::new(Forbidden(format!(
+                "{what}: {}",
+                String::from_utf8_lossy(&body)
+            ))))),
             other => Err(refused(anyhow!(
                 "{what}: server answered {other}: {}",
                 String::from_utf8_lossy(&body)
@@ -577,6 +629,55 @@ impl Client {
 
     pub fn conflicts(&self) -> Result<Vec<ConflictEntry>> {
         self.get_json("reading conflicts", "client.conflicts", "/conflicts")
+    }
+
+    /// Who this token is and every folder it reaches. A server before accounts has no such question
+    /// to answer.
+    pub fn me(&self) -> Result<Me> {
+        let url = format!("{}/v1/me", self.server);
+        let body = self
+            .exchange("asking who this token is", "client.me", || {
+                self.agent
+                    .get(&url)
+                    .header("Authorization", &self.auth)
+                    .call()
+            })
+            .map_err(|e| {
+                if format!("{e:#}").contains("server answered 404") {
+                    anyhow!("this server has no accounts, so its one token reaches every folder: upgrade it to have users")
+                } else {
+                    e
+                }
+            })?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Who has access to this folder, at which level.
+    pub fn members(&self) -> Result<Vec<Member>> {
+        self.get_json("reading who has access", "client.access", "/access")
+    }
+
+    /// Give `user` this level here, or with `None` take all of it away. Only a manager may.
+    pub fn set_member(&self, user: &str, access: Option<Access>) -> Result<()> {
+        let url = format!("{}/access/{user}", self.base);
+        let body = match access {
+            Some(access) => Some(serde_json::to_vec(&Grant { access })?),
+            None => None,
+        };
+        self.exchange("changing who has access", "client.access", || match &body {
+            Some(b) => self
+                .agent
+                .put(&url)
+                .header("Authorization", &self.auth)
+                .header("Content-Type", "application/json")
+                .send(b.as_slice()),
+            None => self
+                .agent
+                .delete(&url)
+                .header("Authorization", &self.auth)
+                .call(),
+        })?;
+        Ok(())
     }
 }
 

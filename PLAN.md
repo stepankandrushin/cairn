@@ -387,9 +387,26 @@ than answered.
 
 ## Sharing and access
 
-Each shared folder is its own namespace, mounted into recipients' trees, so permissions are checked
-once per namespace and moving a share rewrites nothing. Public links are expiring tokens to a namespace
-or a single manifest. Auth: local accounts, then OIDC.
+Each folder is its own namespace, so permissions are checked once per namespace and moving a share
+rewrites nothing: a user's own folder and a shared one differ only in who has access. A user has tokens,
+one per device, kept as their hashes, and a level in each folder given it: `read`, `write`, or `manage`,
+which is write and also saying who else has access, and never leaves a folder without a manager. No level is
+no access, and the folder answers 404 as one that does not exist, so that nobody learns what is there by
+asking; too low a level answers 403. The server's administrator adds users, tokens and folders with
+`cairn-server` on the data directory, while it serves too, and a folder's managers change who has access
+through the API. The journal says whose token made each commit. A data directory's one token from before
+accounts becomes the user `admin`'s, managing every folder there is, when the schema gains accounts.
+
+A shared folder is synced as a root of its own; mounting one into another root's tree, so that a recipient
+sees it inside their home, waits for moves between namespaces (Open). A folder a device's user may only read
+takes nothing from it and loses nothing on it: the merge is given a local tree in which nothing shows as a
+change that could only go up, as it is never shown what is excluded. What is new there is held back; what
+changed there while the server's stayed as it was is carried, standing for the server's state as something
+unreadable does, with its row keeping its baseline, so that the next sync sees it again; what was deleted
+there is given up, so that it comes back; where both sides changed something the merge keeps both, the
+server's at the name. A sync completes and records its agreement as any other, so a reader costs no more,
+and every held-back change is listed until it is moved out of the root or the user may write, when it goes
+up. Public links are expiring tokens to a namespace or a single manifest. Auth: local accounts, then OIDC.
 
 Dedup is scoped to an account or a shared namespace, never global: the "which chunks are missing"
 question would otherwise tell one user what another stores.
@@ -422,7 +439,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
 | 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
 | 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal until this API holds it | GC under load never removes a reachable chunk |
-| 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite |
+| 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite. Accounts came early, at the owner's asking: users, their tokens, folders as namespaces with read, write and manage access, sharing by a folder's managers, and read-only folders on the client, with their failure tests; OIDC, PostgreSQL and mounting a share into another root wait here |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3's devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. Installers wait here |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |

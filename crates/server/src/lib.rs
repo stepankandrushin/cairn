@@ -2,16 +2,17 @@
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use cairn_protocol::wire::{
-    self, ChangesResponse, CommitRequest, HashList, Info, MAX_CHUNK_BATCH_BYTES,
+    self, Access, ChangesResponse, CommitRequest, Grant, HashList, Info, Me, Member,
+    MAX_CHUNK_BATCH_BYTES,
 };
-use cairn_store::{is_disk_full, ChunkStore, Repo};
+use cairn_store::{is_disk_full, token_hash, ChunkStore, Repo};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::io::Write;
@@ -19,9 +20,10 @@ use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
+mod admin;
+
 struct App {
     repo: Repo,
-    token: String,
     /// Moves after every durable commit, in any namespace: what a waiting `GET /changes` sleeps on.
     commits: tokio::sync::watch::Sender<u64>,
     /// Set when the server is stopping, so that no waiting request holds the shutdown up.
@@ -68,28 +70,63 @@ async fn blocking<T: Send + 'static>(
         .map_err(anyhow::Error::from)??)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// The user a request's token belongs to: every request has one, or it is answered 401.
+#[derive(Clone)]
+struct Caller {
+    user: String,
 }
 
-async fn authorize(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+/// What the caller may do in the namespace of the path: no access at all is answered as a namespace
+/// that does not exist, so that nobody learns what is there by asking.
+#[derive(Clone, Copy)]
+struct Allowed(Access);
+
+impl Allowed {
+    /// A 403 to answer with, unless the caller may at least `want` here.
+    fn refuses(self, want: Access, ns: &str, caller: &Caller) -> Option<Response> {
+        if self.0 >= want {
+            return None;
+        }
+        let why = match want {
+            Access::Read => unreachable!("any access reads"),
+            Access::Write => format!("folder {ns:?} is read-only for user {:?}", caller.user),
+            Access::Manage => format!(
+                "only a manager of folder {ns:?} says who has access to it, and user {:?} is not one",
+                caller.user
+            ),
+        };
+        Some((StatusCode::FORBIDDEN, why).into_response())
+    }
+}
+
+async fn authorize(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(token) if constant_time_eq(token.as_bytes(), app.token.as_bytes()) => {
+    let Some(token) = presented else {
+        return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response();
+    };
+    // Looked up by its hash, which a guess cannot steer: a stored hash is no token, and timing the
+    // lookup says nothing about any token there is.
+    let hash = token_hash(token);
+    let found = blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await;
+    match found {
+        Ok(Some(user)) => {
+            req.extensions_mut().insert(Caller { user });
             next.run(req).await
         }
-        _ => (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
+        Ok(None) => (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
 async fn check_namespace(
     State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
     Path(params): Path<Vec<(String, String)>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let ns = params
@@ -97,37 +134,76 @@ async fn check_namespace(
         .find(|(k, _)| k == "ns")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    match app.repo.namespace_exists(&ns) {
-        Ok(true) => next.run(req).await,
-        Ok(false) => (StatusCode::NOT_FOUND, format!("no namespace {ns:?}")).into_response(),
-        Err(e) => ApiError(e).into_response(),
+    let user = caller.user.clone();
+    let name = ns.clone();
+    match blocking(move || app.repo.with_meta(|m| m.access(&name, &user))).await {
+        Ok(Some(access)) => {
+            req.extensions_mut().insert(Allowed(access));
+            next.run(req).await
+        }
+        // The same answer whether it exists or not.
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no folder {ns:?} for user {:?}", caller.user),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
-async fn info(State(app): State<Arc<App>>, Path(ns): Path<String>) -> ApiResult<Json<Info>> {
+async fn info(
+    State(app): State<Arc<App>>,
+    Extension(allowed): Extension<Allowed>,
+    Path(ns): Path<String>,
+) -> ApiResult<Json<Info>> {
     let head = blocking(move || app.repo.head(&ns)).await?;
     Ok(Json(Info {
         protocol: cairn_protocol::PROTOCOL_VERSION,
         server_version: env!("CARGO_PKG_VERSION").into(),
         head,
         max_batch_bytes: MAX_CHUNK_BATCH_BYTES as u64,
+        access: Some(allowed.0),
+    }))
+}
+
+/// Who the token is, and every namespace it may reach: what a client offers to sync.
+async fn me(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<Me>> {
+    let user = caller.user.clone();
+    let folders = blocking(move || app.repo.with_meta(|m| m.folders_of(&user))).await?;
+    Ok(Json(Me {
+        user: caller.user,
+        folders,
     }))
 }
 
 async fn missing(
     State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
     Path(ns): Path<String>,
     Json(req): Json<HashList>,
-) -> ApiResult<Json<HashList>> {
+) -> ApiResult<Response> {
+    // Only what is about to be uploaded is asked about.
+    if let Some(r) = allowed.refuses(Access::Write, &ns, &caller) {
+        return Ok(r);
+    }
     let hashes = blocking(move || app.repo.missing(&ns, &req.hashes)).await?;
-    Ok(Json(HashList { hashes }))
+    Ok(Json(HashList { hashes }).into_response())
 }
 
 async fn upload(
     State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
     Path(ns): Path<String>,
     body: Bytes,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Response> {
+    if let Some(r) = allowed.refuses(Access::Write, &ns, &caller) {
+        return Ok(r);
+    }
     let stored = blocking(move || {
         let Ok(frames) = wire::read_frames(&body) else {
             return Ok(false);
@@ -141,7 +217,8 @@ async fn upload(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::BAD_REQUEST
-    })
+    }
+    .into_response())
 }
 
 async fn download(
@@ -175,11 +252,16 @@ fn now() -> i64 {
 
 async fn commit(
     State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
     Path(ns): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> ApiResult<Response> {
+    if let Some(r) = allowed.refuses(Access::Write, &ns, &caller) {
+        return Ok(r);
+    }
     let repo = app.clone();
-    let result = blocking(move || repo.repo.commit(&ns, &req, now())).await?;
+    let result = blocking(move || repo.repo.commit(&ns, &req, now(), Some(&caller.user))).await?;
     // Durable by now, so a device that wakes reads it. A retried commit wakes them for nothing.
     app.commits.send_modify(|n| *n = n.wrapping_add(1));
     // The acknowledgement goes out only now that the commit is durable.
@@ -259,6 +341,77 @@ async fn conflicts(
     Ok(Json(list))
 }
 
+async fn members(
+    State(app): State<Arc<App>>,
+    Path(ns): Path<String>,
+) -> ApiResult<Json<Vec<Member>>> {
+    Ok(Json(
+        blocking(move || app.repo.with_meta(|m| m.members(&ns))).await?,
+    ))
+}
+
+/// A manager changes who has access, but never so that nobody manages the folder any more: the
+/// server's administrator could mend that, a manager could not.
+async fn set_member(
+    app: Arc<App>,
+    caller: Caller,
+    allowed: Allowed,
+    ns: String,
+    user: String,
+    access: Option<Access>,
+) -> ApiResult<Response> {
+    if let Some(r) = allowed.refuses(Access::Manage, &ns, &caller) {
+        return Ok(r);
+    }
+    let answer = blocking(move || {
+        app.repo.with_meta(|m| {
+            if !m.users()?.iter().any(|u| u.name == user) {
+                return Ok((StatusCode::NOT_FOUND, format!("no user {user:?}")).into_response());
+            }
+            let members = m.members(&ns)?;
+            let now = members.iter().find(|x| x.user == user).map(|x| x.access);
+            if access.is_none() && now.is_none() {
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    format!("user {user:?} has no access to folder {ns:?}"),
+                )
+                    .into_response());
+            }
+            let managers = members.iter().filter(|x| x.access == Access::Manage).count();
+            if now == Some(Access::Manage) && access != Some(Access::Manage) && managers == 1 {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    format!("user {user:?} is the last manager of folder {ns:?}: make another one first"),
+                )
+                    .into_response());
+            }
+            m.set_access(&ns, &user, access)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        })
+    })
+    .await?;
+    Ok(answer)
+}
+
+async fn grant(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
+    Path((ns, user)): Path<(String, String)>,
+    Json(grant): Json<Grant>,
+) -> ApiResult<Response> {
+    set_member(app, caller, allowed, ns, user, Some(grant.access)).await
+}
+
+async fn revoke(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
+    Path((ns, user)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    set_member(app, caller, allowed, ns, user, None).await
+}
+
 fn router(app: Arc<App>) -> Router {
     let api = Router::new()
         .route("/info", get(info))
@@ -268,10 +421,14 @@ fn router(app: Arc<App>) -> Router {
         .route("/commit", post(commit))
         .route("/changes", get(changes))
         .route("/conflicts", get(conflicts))
+        .route("/access", get(members))
+        .route("/access/{user}", put(grant).delete(revoke))
         .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
         .with_state(app.clone());
     Router::new()
+        .route("/v1/me", get(me))
+        .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .layer(middleware::from_fn_with_state(app, authorize))
 }
@@ -285,8 +442,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a data directory and its access token.
+    /// Create a data directory, with the user `admin`, who manages the folder `default`, and that
+    /// user's token in the directory's `token` file.
     Init {
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Users, each with tokens of their own and access to the folders given them. These commands
+    /// work while the server runs, which sees each change on its next request.
+    User {
+        #[command(subcommand)]
+        what: admin::UserCommand,
+    },
+    /// Tokens: one per device is best, so that a lost one is taken back alone.
+    Token {
+        #[command(subcommand)]
+        what: admin::TokenCommand,
+    },
+    /// Folders, each its own tree, history and set of chunks, synced by a client as one root.
+    Folder {
+        #[command(subcommand)]
+        what: admin::FolderCommand,
+    },
+    /// Give a user access to a folder: read, write, or manage, which is write and also saying who
+    /// else has access. Replaces the level the user had.
+    Grant {
+        folder: String,
+        user: String,
+        access: Access,
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Take all of a user's access to a folder away. What the user's devices hold of it stays on them.
+    Revoke {
+        folder: String,
+        user: String,
         #[arg(long)]
         data: PathBuf,
     },
@@ -308,24 +498,46 @@ enum Command {
     },
 }
 
+/// A new file only this user reads, holding `text`, synced. Fails if the file is there already.
+pub(crate) fn write_secret(path: &FsPath, text: &str) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // Windows has no mode: who reads the token is up to the directory's ACL.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn new_token() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
 fn init(data: &FsPath) -> Result<()> {
     std::fs::create_dir_all(data)?;
     let token_path = data.join("token");
     if token_path.exists() {
         bail!("{} already has a token", data.display());
     }
+    if data.join("meta.sqlite").exists() {
+        bail!(
+            "{} already holds a server's data: add users and tokens with `cairn-server user add` and `cairn-server token add`",
+            data.display()
+        );
+    }
+    // The token first: the database, made with accounts, makes it the first user's.
+    write_secret(&token_path, &new_token())?;
     Repo::open(data)?;
-    let token = hex::encode(rand::random::<[u8; 32]>());
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    // Windows has no mode: who reads the token is up to the data directory's ACL.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(&token_path)?;
-    f.write_all(token.as_bytes())?;
-    f.sync_all()?;
     println!("initialized {}", data.display());
-    println!("token file: {}", token_path.display());
+    println!(
+        "user {} manages folder default; its token file: {}",
+        cairn_store::FIRST_USER,
+        token_path.display()
+    );
     Ok(())
 }
 
@@ -351,19 +563,20 @@ async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Res
             "{listen} is beyond loopback and this server speaks plain HTTP: put a TLS proxy in front and pass --behind-tls-proxy"
         );
     }
-    let token = std::fs::read_to_string(data.join("token"))
-        .with_context(|| {
-            format!(
-                "read {}: run `cairn-server init` first",
-                data.join("token").display()
-            )
-        })?
-        .trim()
-        .to_string();
+    if !data.join("meta.sqlite").exists() && !data.join("token").exists() {
+        bail!(
+            "{} holds no server: run `cairn-server init` first",
+            data.display()
+        );
+    }
     let repo = Repo::open(&data)?;
+    if repo.with_meta(|m| m.users())?.is_empty() {
+        eprintln!(
+            "cairn-server: there are no users, so every request is refused: add one with `cairn-server user add`"
+        );
+    }
     let app = Arc::new(App {
         repo,
-        token,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
     });
@@ -393,6 +606,16 @@ fn run_inner() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { data } => init(&data)?,
+        Command::User { what } => admin::user(what)?,
+        Command::Token { what } => admin::token(what)?,
+        Command::Folder { what } => admin::folder(what)?,
+        Command::Grant {
+            folder,
+            user,
+            access,
+            data,
+        } => admin::grant(&data, &folder, &user, Some(access))?,
+        Command::Revoke { folder, user, data } => admin::grant(&data, &folder, &user, None)?,
         Command::Serve {
             data,
             listen,

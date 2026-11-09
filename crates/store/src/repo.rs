@@ -3,7 +3,7 @@
 
 use crate::chunks::{sync_dir, ChunkStore, FsChunkStore};
 use crate::meta::{CommitOutcome, MetaStore};
-use crate::sqlite::SqliteStore;
+use crate::sqlite::{Opening, SqliteStore};
 use anyhow::{Context, Result};
 use cairn_protocol::manifest::ManifestError;
 use cairn_protocol::wire::{Change, CommitRequest, CommitResponse, ConflictEntry, RejectReason};
@@ -19,8 +19,19 @@ pub struct Repo {
     root: PathBuf,
     meta: Mutex<Box<dyn MetaStore>>,
     chunks: Mutex<BTreeMap<String, std::sync::Arc<FsChunkStore>>>,
-    /// Holds an exclusive lock on the data directory for the life of the process.
-    _lock: File,
+    /// Holds an exclusive lock on the data directory for the life of the process. `None` for an
+    /// administrator's command while a server holds it, which touches nothing but the database.
+    _lock: Option<File>,
+}
+
+/// The data directory's one token from before accounts, which the schema's move to accounts makes
+/// the first user's.
+fn token_file(root: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(root.join("token")) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", root.join("token").display())),
+    }
 }
 
 /// The data directory's lock, held exclusively until the process ends however it ends.
@@ -56,14 +67,56 @@ impl Repo {
         let root = root.into();
         std::fs::create_dir_all(root.join("ns"))?;
         let lock = lock(&root)?;
-        let meta = SqliteStore::open(&root.join("meta.sqlite"))?;
+        Self::opened(root, lock)
+    }
+
+    fn opened(root: PathBuf, lock: File) -> Result<Self> {
+        let first_token = token_file(&root)?;
+        let meta = SqliteStore::open_with(
+            &root.join("meta.sqlite"),
+            Opening {
+                first_token: first_token.as_deref(),
+                beside_server: false,
+            },
+        )?;
         sync_dir(&root)?;
         Ok(Self {
             root,
             meta: Mutex::new(Box::new(meta)),
             chunks: Mutex::new(BTreeMap::new()),
-            _lock: lock,
+            _lock: Some(lock),
         })
+    }
+
+    /// For an administrator's command, which only reads and writes accounts and namespaces: the data
+    /// directory as `open` takes it when no server has it, and otherwise its database alone, beside the
+    /// server, which sees each change on its next request.
+    pub fn open_for_admin(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        if !root.join("meta.sqlite").exists() {
+            anyhow::bail!(
+                "{} is no data directory: run `cairn-server init` first",
+                root.display()
+            );
+        }
+        match lock(&root) {
+            Ok(lock) => Self::opened(root, lock),
+            Err(_) => {
+                let meta = SqliteStore::open_with(
+                    &root.join("meta.sqlite"),
+                    Opening {
+                        first_token: None,
+                        beside_server: true,
+                    },
+                )?;
+                Ok(Self {
+                    root,
+                    meta: Mutex::new(Box::new(meta)),
+                    chunks: Mutex::new(BTreeMap::new()),
+                    _lock: None,
+                })
+            }
+        }
     }
 
     fn meta(&self) -> std::sync::MutexGuard<'_, Box<dyn MetaStore>> {
@@ -111,11 +164,17 @@ impl Repo {
         Ok(out)
     }
 
-    pub fn commit(&self, ns: &str, req: &CommitRequest, time: i64) -> Result<CommitResponse> {
+    pub fn commit(
+        &self,
+        ns: &str,
+        req: &CommitRequest,
+        time: i64,
+        user: Option<&str>,
+    ) -> Result<CommitResponse> {
         if let Some(reject) = self.check_content(ns, req)? {
             return Ok(CommitResponse::Rejected { reject });
         }
-        let outcome = self.meta().commit(ns, req, time)?;
+        let outcome = self.meta().commit(ns, req, time, user)?;
         Ok(match outcome {
             CommitOutcome::Committed { seq, .. } => CommitResponse::Committed { seq },
             CommitOutcome::Rejected { op_index, reason } => CommitResponse::Rejected {
@@ -174,10 +233,8 @@ impl Repo {
         self.meta().conflicts(ns)
     }
 
-    pub(crate) fn with_meta<T>(
-        &self,
-        f: impl FnOnce(&mut dyn MetaStore) -> Result<T>,
-    ) -> Result<T> {
+    /// The metadata store, for one request's worth of work: accounts, access, namespaces.
+    pub fn with_meta<T>(&self, f: impl FnOnce(&mut dyn MetaStore) -> Result<T>) -> Result<T> {
         f(self.meta().as_mut())
     }
 }
@@ -286,14 +343,14 @@ mod tests {
 
         let req = create_file(mhash, 5);
         assert_eq!(
-            repo.commit("default", &req, 0).unwrap(),
+            repo.commit("default", &req, 0, None).unwrap(),
             CommitResponse::Rejected {
                 reject: RejectReason::MissingChunk { hash: mhash }
             }
         );
         store.put(&mhash, &mbytes).unwrap();
         assert_eq!(
-            repo.commit("default", &req, 0).unwrap(),
+            repo.commit("default", &req, 0, None).unwrap(),
             CommitResponse::Rejected {
                 reject: RejectReason::MissingChunk { hash: chunk }
             }
@@ -302,14 +359,14 @@ mod tests {
 
         let wrong_size = create_file(mhash, 6);
         assert!(matches!(
-            repo.commit("default", &wrong_size, 0).unwrap(),
+            repo.commit("default", &wrong_size, 0, None).unwrap(),
             CommitResponse::Rejected {
                 reject: RejectReason::BadManifest { .. }
             }
         ));
 
         assert_eq!(
-            repo.commit("default", &req, 0).unwrap(),
+            repo.commit("default", &req, 0, None).unwrap(),
             CommitResponse::Committed { seq: 1 }
         );
         drop(repo);

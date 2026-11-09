@@ -272,6 +272,33 @@ impl Server {
     }
 }
 
+impl Server {
+    /// An administrator's command on this server's data directory, while it runs, as `cairn-server`
+    /// takes them: `["user", "add", "alice"]`.
+    pub fn admin(&self, args: &[&str]) -> Run {
+        let out = Command::new(SERVER)
+            .args(args)
+            .arg("--data")
+            .arg(&self.data)
+            .output()
+            .unwrap();
+        Run::from(out)
+    }
+
+    /// A new user, with its token in a file of its own beside the data directory.
+    #[track_caller]
+    pub fn user(&self, name: &str) -> PathBuf {
+        let file = self
+            .data
+            .parent()
+            .unwrap()
+            .join(format!("{name}-{:08x}.token", rand::random::<u32>()));
+        self.admin(&["user", "add", name, "--token-file", file.to_str().unwrap()])
+            .expect_ok();
+        file
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.kill();
@@ -304,6 +331,54 @@ impl Device {
         args.push(&r);
         run(&args, &[]).expect_ok();
         d
+    }
+
+    /// A root of `folder` with `token_file`'s token, or the run of `cairn init` that refused it.
+    pub fn try_as_user(
+        sandbox: &Sandbox,
+        server: &Server,
+        name: &str,
+        token_file: &Path,
+        folder: &str,
+    ) -> Result<Self, Run> {
+        let root = sandbox.path(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let token = token_file.to_str().unwrap();
+        let r = root_str(&root);
+        let args = [
+            "init",
+            "--server",
+            &server.url,
+            "--device-name",
+            name,
+            "--token-file",
+            token,
+            "--folder",
+            folder,
+            &r,
+        ];
+        let run = run(&args, &[]);
+        if !run.ok() {
+            return Err(run);
+        }
+        Ok(Self {
+            root,
+            name: name.into(),
+        })
+    }
+
+    #[track_caller]
+    pub fn as_user(
+        sandbox: &Sandbox,
+        server: &Server,
+        name: &str,
+        token_file: &Path,
+        folder: &str,
+    ) -> Self {
+        match Self::try_as_user(sandbox, server, name, token_file, folder) {
+            Ok(d) => d,
+            Err(run) => panic!("cairn init: {}", run.text()),
+        }
     }
 
     pub fn cairn(&self, args: &[&str]) -> Run {

@@ -1,8 +1,8 @@
 # Cairn protocol, version 1
 
-HTTP with JSON bodies, except chunk batches. Every path below is under `/v1/ns/{namespace}` and needs
-`Authorization: Bearer <token>`. The types are defined once, in `crates/protocol`; this page explains
-them. `Info.protocol` is the version: a client refuses a server that speaks another one.
+HTTP with JSON bodies, except chunk batches. Every path below but `/v1/me` is under `/v1/ns/{namespace}`,
+and every request needs `Authorization: Bearer <token>`. The types are defined once, in `crates/protocol`;
+this page explains them. `Info.protocol` is the version: a client refuses a server that speaks another one.
 
 The server in this release speaks plain HTTP on loopback; beyond loopback it refuses to start without
 `--behind-tls-proxy`, and the client refuses `http://` beyond loopback without an explicit opt-in.
@@ -24,16 +24,36 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /info` | | `{protocol, server_version, head, max_batch_bytes}` |
-| `POST /chunks/missing` | `{hashes}` | `{hashes}`: those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it |
-| `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept |
+| `GET /v1/me` | | `{user, folders: [{folder, access}]}`: whose the token is, and every namespace it reaches |
+| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything |
+| `POST /chunks/missing` | `{hashes}` | `{hashes}`: those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
+| `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept. Needs `write` |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
-| `POST /commit` | `CommitRequest` | `CommitResponse` |
+| `POST /commit` | `CommitRequest` | `CommitResponse`. Needs `write` |
 | `GET /changes?after=N&limit=M&wait=S&ops=false` | | `{changes, head}`: journal entries after sequence N, in order: at most M (1000 if not given, at most 10,000), and fewer once about 16 MiB of operations are in the answer, but always one if there is one. With `wait`, see [Waiting](#waiting). With `ops=false`, each without its operations: where a client stands, for the price of one entry however large its commit |
 | `GET /conflicts` | | The conflict inbox |
+| `GET /access` | | `[{user, access}]`: who has access here, at which level |
+| `PUT /access/{user}` | `{access}` | 204: that user has this level here now, in place of any other. Needs `manage`. 404: no such user. 409: it would leave the namespace with no manager |
+| `DELETE /access/{user}` | | 204: that user has no access here now. Needs `manage`. 404: no such user, or it had none. 409: as for `PUT` |
 
-401 means a missing or wrong token, 404 an unknown namespace, and 507 a full disk on the server, in
-which case nothing changed.
+401 means a missing or wrong token, 404 an unknown namespace or one the token has no access to, alike, 403
+a level too low for the request, and 507 a full disk on the server; in each case nothing changed.
+
+## Access
+
+A token belongs to one user, and the server keeps only its hash, BLAKE3 of its text. A user has a level in
+each namespace given it, each level holding the one before:
+
+| `access` | May |
+|---|---|
+| `read` | Read the tree, its chunks, the journal and the conflict inbox, and who has access |
+| `write` | Also upload chunks and commit |
+| `manage` | Also give other users a level here, or take it away |
+
+No level is no access: the namespace answers 404, word for word as one that does not exist. What a user may
+do is looked up on every request, so a change holds from the next one, and a device whose access went keeps
+what it holds. A client that learns from `Info.access` that it may only read sends nothing up (PLAN.md,
+"Sharing and access"); one from before accounts tries, and is answered 403 with the reason.
 
 A **chunk batch** is any number of frames: 32 bytes of hash, a big-endian `u32` length, the bytes.
 Every frame is verified against its hash by whoever receives it.
@@ -95,8 +115,10 @@ Only `linux.xattr` and `macos.xattr` are produced by this release, and each plat
 ## Changes
 
 ```
-Change { seq, op_id, device, device_name, time, ops }
+Change { seq, op_id, device, device_name, time, ops, user? }
 ```
+
+`user` is whose token made the commit, as named then; absent for what was committed before accounts.
 
 `seq` is per namespace, starts at 1 and has no gaps. Replaying every change after `N` onto the tree as
 of `N` gives exactly the tree at the head; that is how clients learn what happened, how `export` reads

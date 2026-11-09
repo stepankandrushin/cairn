@@ -25,6 +25,9 @@ pub enum SkipKind {
     /// Something new here at a name the server has in another form, which this filesystem takes for
     /// the same name. Held back until renamed here, or it would go up as a second name.
     SameNameOnServer,
+    /// A change made here in a folder this device's user may only read: it stays here as it is, and
+    /// is never uploaded.
+    ReadOnly,
 }
 
 impl SkipKind {
@@ -67,6 +70,7 @@ impl SkipKind {
             SkipKind::SameNameOnServer => {
                 "the server has this name in another form, which this filesystem takes for the same name"
             }
+            SkipKind::ReadOnly => "this folder is read-only for you, so a change made here is not uploaded",
         }
     }
 
@@ -93,6 +97,9 @@ impl SkipKind {
             SkipKind::ReadError => "check the disk, then sync again",
             SkipKind::SameNameOnServer => {
                 "rename it here to the server's form, and the two merge; until then it does not go up, nor the server's come down"
+            }
+            SkipKind::ReadOnly => {
+                "it stays here as it is; to keep it, move it out of the sync root, and the server's version comes back; or ask a manager of the folder for write access, and it goes up"
             }
         }
     }

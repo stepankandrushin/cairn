@@ -158,6 +158,9 @@ pub struct SyncReport {
     pub compact_due: bool,
     /// What opening the state for this sync moved it from an older build's layout, for the log.
     pub migrated: Option<String>,
+    /// This device's user may only read this folder: what changed here is listed in `skips` as
+    /// `read_only`, and none of it went up.
+    pub read_only: bool,
 }
 
 impl SyncReport {
@@ -193,6 +196,7 @@ impl SyncReport {
             bytes_read: 0,
             compact_due: false,
             migrated: None,
+            read_only: false,
         }
     }
 }
@@ -1045,8 +1049,20 @@ fn upload(
 fn replay_outbox(root: &mut Root, client: &Client, report: &mut SyncReport) -> Result<()> {
     for req in root.state.outbox()? {
         hit("sync.outbox.replay");
-        let resp = client.commit(&req)?;
-        if matches!(resp, CommitResponse::Committed { .. }) {
+        // Refused for what this token may do, which has changed since it was queued: nothing of it
+        // was applied, as for a commit the server rejected, and what it held is still here, to be
+        // listed as changed here.
+        let resp = match client.commit(&req) {
+            Ok(resp) => Some(resp),
+            Err(e) if crate::client::is_forbidden(&e) => {
+                report.events.push(format!(
+                    "a commit waiting here since an earlier sync was refused, and what it held stays here: {e:#}"
+                ));
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(CommitResponse::Committed { .. }) = resp {
             report.commits += 1;
         } else {
             notes_back(root, &req)?;
@@ -1560,6 +1576,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         hit("sync.fast");
         fast.report.compact_due = root.state.compaction_due();
         fast.report.migrated = report.migrated.clone();
+        fast.report.read_only = client.read_only();
         if !crate::steady::oracle() {
             return Ok(counted(fast.report));
         }
@@ -1592,6 +1609,18 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     Ok(counted(report))
 }
 
+/// Whether what was deleted here may be given up, in a folder this device may only read: not while
+/// the check for a mass delete holds the sync, unless a person has said the deletes are meant.
+fn gives_up(vanished: &Option<Hold>, allow_mass_delete: bool) -> bool {
+    vanished
+        .as_ref()
+        .is_none_or(|h| h.overridable && allow_mass_delete)
+}
+
+/// How many rounds a sync of a folder it may only read goes on after one that would have sent
+/// something up, for what the merge made of changes on both sides to settle into what is held back.
+const READ_ONLY_ROUNDS: u32 = 2;
+
 /// The whole sync: every object scanned, identified, merged, applied and pushed, until both sides agree.
 fn sync_full(
     mut root: Root,
@@ -1605,6 +1634,10 @@ fn sync_full(
     let mut trace = crate::steady::Trace::default();
     // What a record of a sync with nothing to do needs: that nothing came before the merge either.
     let recovered = !report.events.is_empty();
+    let read_only = client.read_only();
+    report.read_only = read_only;
+    // Rounds that ended with something to send up from a folder that takes nothing: see the push.
+    let mut read_only_rounds = 0;
     let inputs = crate::steady::inputs(&root, &selection, opts);
     let cursor_op = root.state.cursor_op()?;
     if let Some(why) = check_history(&client, root.state.cursor()?, cursor_op)? {
@@ -1716,6 +1749,7 @@ fn sync_full(
                 first,
                 (check, again),
                 (scope.as_ref(), &widened),
+                (read_only, opts.allow_mass_delete),
             )? {
                 Ok(r) => {
                     part = Some(r);
@@ -1976,6 +2010,28 @@ fn sync_full(
                 };
                 return Ok((report, trace));
             }
+            // In a folder this device may only read, what was deleted here comes back.
+            if read_only {
+                let (given_up, lines) = crate::readonly::give_up_deleted(
+                    &mut identified,
+                    &view.base,
+                    &view.remote,
+                    rows,
+                );
+                if !given_up.is_empty() {
+                    if !opts.dry_run {
+                        let list: Vec<(ObjectId, &Row)> =
+                            given_up.iter().map(|id| (*id, &rows[id])).collect();
+                        root.state.store_rows(&list, &[])?;
+                    }
+                    view.settle(rows);
+                }
+                for line in lines {
+                    if seen_events.insert(line.clone()) {
+                        report.events.push(line);
+                    }
+                }
+            }
 
             // A name the server has in another form goes up as a second name, unless it waits here.
             report.skips.extend(crate::twins::hold_back_twins(
@@ -1984,6 +2040,17 @@ fn sync_full(
                 base,
                 remote,
             ));
+            // Nor does anything go up from a folder this device may only read.
+            if read_only {
+                let (skips, lines) =
+                    crate::readonly::hold_back(&mut identified, &view.base, &view.remote);
+                report.skips.extend(skips);
+                for line in lines {
+                    if seen_events.insert(line.clone()) {
+                        report.events.push(line);
+                    }
+                }
+            }
             seen_now = crate::incr::seen_of(&identified.scanned);
 
             let host = root.config.device_name.clone();
@@ -2140,7 +2207,8 @@ fn sync_full(
         // The loser of a metadata conflict goes in the log even when nothing else is to be pushed.
         // Unless applying failed: the conflict stands, and would be logged on every run. A run killed
         // after applying the winner left its notes noted, and they go now.
-        if !failed || !ops.is_empty() {
+        // A folder that takes nothing from here takes no notes either: what they say is in the events.
+        if !read_only && (!failed || !ops.is_empty()) {
             for note in &plan.notes {
                 if noted.insert(note.clone()) {
                     notes.push(note.clone());
@@ -2157,6 +2225,40 @@ fn sync_full(
             object: *object,
             text: text.clone(),
         }));
+        if read_only && !ops.is_empty() {
+            // What the merge decided where both sides changed something is on disk now: the copies it
+            // kept beside the server's are new here, which the next round holds back.
+            if read_only_rounds < READ_ONLY_ROUNDS {
+                read_only_rounds += 1;
+                journal = Journal::Pinned;
+                continue;
+            }
+            // Still something only a commit would settle: it stays here, said, and this sync agrees
+            // on nothing, so that the next one looks at all of it again.
+            for a in up_activity(&view.remote, &plan, &ops) {
+                let what = match a.change {
+                    Change::Added => "added",
+                    Change::Changed => "changed",
+                    Change::Metadata => "metadata changed",
+                    Change::Moved => "moved",
+                    Change::Removed => "deleted",
+                    Change::Conflict => "kept as a conflict copy",
+                };
+                let detail = match a.to {
+                    Some(to) => format!("{what} here, to {to}"),
+                    None => format!("{what} here"),
+                };
+                let s = Skip {
+                    path: a.path,
+                    kind: cairn_protocol::SkipKind::ReadOnly,
+                    detail: Some(detail),
+                };
+                if !report.skips.contains(&s) {
+                    report.skips.push(s);
+                }
+            }
+            break SyncOutcome::Partial;
+        }
         if ops.is_empty() {
             if failed {
                 break SyncOutcome::Partial;
@@ -2495,6 +2597,7 @@ fn incremental_head(
     first: bool,
     (check, again): (bool, bool),
     (scope, widened): (Option<&crate::scope::Source>, &crate::scope::Folders),
+    (read_only, allow_mass_delete): (bool, bool),
 ) -> Result<std::result::Result<Ready, Declined>> {
     use crate::incr::{self, Before};
     // The state as the full sync would read it, for the oracle, before this round writes anything.
@@ -2917,7 +3020,7 @@ fn incremental_head(
         if let Some(why) = c.misidentified(&reach, &identified) {
             return Ok(Err(Declined::Rebuild(why)));
         }
-        let changed = rows_after_scan(&mut rows, &identified, &view.base);
+        let mut changed = rows_after_scan(&mut rows, &identified, &view.base);
         view.settle(&rows);
         let vanished = check_vanished(
             &view.base,
@@ -2927,8 +3030,30 @@ fn incremental_head(
             &identified.refused,
             c.quiet_outside(&reach),
         );
+        let mut read_only_lines = Vec::new();
+        if read_only && gives_up(&vanished, allow_mass_delete) {
+            let (given_up, lines) = crate::readonly::give_up_deleted(
+                &mut identified,
+                &view.base,
+                &view.remote,
+                &mut rows,
+            );
+            if !given_up.is_empty() {
+                changed.extend(given_up);
+                changed.sort();
+                changed.dedup();
+                view.settle(&rows);
+            }
+            read_only_lines = lines;
+        }
         let before_twins = identified.local.clone();
-        let twins = crate::twins::hold_back_twins(root, &mut identified, &base, &remote);
+        let mut twins = crate::twins::hold_back_twins(root, &mut identified, &base, &remote);
+        if read_only {
+            let (skips, lines) =
+                crate::readonly::hold_back(&mut identified, &view.base, &view.remote);
+            twins.extend(skips);
+            read_only_lines.extend(lines);
+        }
         let plan = merge(MergeInput {
             base: &view.base,
             local: &identified.local,
@@ -2988,6 +3113,7 @@ fn incremental_head(
                     ids,
                     &host,
                     date,
+                    (read_only, allow_mass_delete),
                 )?;
                 // What the round made new is its own as much as what it loaded.
                 let held: BTreeSet<ObjectId> = reach
@@ -3062,6 +3188,11 @@ fn incremental_head(
         }
         hit("sync.identified");
         report.skips.extend(twins);
+        for line in read_only_lines {
+            if !report.events.contains(&line) {
+                report.events.push(line);
+            }
+        }
         hold(&loaded, &mut released);
         let seen = incr::seen_of(&identified.scanned);
         *round_work += thinking.elapsed();
@@ -3125,6 +3256,7 @@ fn oracle_full(
     ids: crate::incr::Ids,
     host: &str,
     date: &str,
+    (read_only, allow_mass_delete): (bool, bool),
 ) -> Result<OracleFull> {
     let mut remote = base.clone();
     for op in journal {
@@ -3224,7 +3356,17 @@ fn oracle_full(
         &identified.refused,
         0,
     );
-    let twins = crate::twins::hold_back_twins(root, &mut identified, base, &remote);
+    if read_only && gives_up(&vanished, allow_mass_delete) {
+        let (given_up, _) =
+            crate::readonly::give_up_deleted(&mut identified, &view.base, &view.remote, &mut rows);
+        if !given_up.is_empty() {
+            view.settle(&rows);
+        }
+    }
+    let mut twins = crate::twins::hold_back_twins(root, &mut identified, base, &remote);
+    if read_only {
+        twins.extend(crate::readonly::hold_back(&mut identified, &view.base, &view.remote).0);
+    }
     let plan = merge(MergeInput {
         base: &view.base,
         local: &identified.local,

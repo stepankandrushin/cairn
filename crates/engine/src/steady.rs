@@ -368,6 +368,16 @@ pub fn try_fast(
     if root.state.pending()? {
         return Ok(None);
     }
+    // What a folder that was read-only held back here goes up once it is not: what it may do is the
+    // server's to say, which no record of the tree knows.
+    let held_back = steady
+        .report
+        .skips
+        .iter()
+        .any(|s| s.kind == cairn_protocol::SkipKind::ReadOnly);
+    if held_back && !client.read_only() {
+        return Ok(None);
+    }
     // One entry, without its operations: the history is the same, and nothing came after it.
     let at = client.change_at(cursor)?;
     if crate::sync::history_gone(&at, cursor, cursor_op).is_some() || at.head != cursor {

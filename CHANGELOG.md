@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- Users. A server holds users, each with tokens of its own, one per device at best, and folders, each its own
+  tree, history and set of chunks. A user reaches only the folders given to it, at one of three levels:
+  `read`, `write`, or `manage`, which is write and also saying who else has access. A folder a user has no
+  access to answers as one that does not exist. The server's administrator manages all of it with
+  `cairn-server user`, `token`, `folder`, `grant` and `revoke`, while the server runs or not; a folder's
+  managers share it with `cairn access grant` and `revoke`, never leaving it without a manager. `cairn
+  folders` lists what a token reaches, `cairn init --folder` makes a root of one, and `cairn log` says which
+  user made each commit.
+- Read-only folders. Everything in one comes down, and nothing made on the reader's devices goes up or is lost
+  there: an edit, a new file or a rename stays as it is, listed by every sync as `read-only`, until it is
+  moved out of the root or the user may write, when it goes up like any change; something deleted there comes
+  back from the server; where the server changes something also changed there, both stay, the server's at the
+  name. Such a sync completes as any other and costs no more, and the daemon does not try it again for
+  nothing. A commit queued before a user lost write access is taken back, and what it held stays.
+
+**Changed:**
+
+- The server keeps tokens as their hashes, in its database, and no longer reads the data directory's `token`
+  file once it has been upgraded: the first start of this release makes that token the user `admin`'s,
+  managing every folder there is, so every device using it goes on as before. Clients from before this
+  release work with it unchanged, and are refused uploads to a folder they may only read, with the reason.
+- `cairn-server init` makes the user `admin` with the folder `default`, and refuses a directory that already
+  holds a server's data.
+
 ## 0.1.11 (2026-11-09)
 
 **Changed:**

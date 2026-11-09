@@ -89,7 +89,8 @@ enum Command {
         /// A file holding the access token. Or set CAIRN_TOKEN.
         #[arg(long)]
         token_file: Option<PathBuf>,
-        #[arg(long, default_value = "default")]
+        /// The folder on the server to sync here, from those `cairn folders` lists.
+        #[arg(long, visible_alias = "folder", default_value = "default")]
         namespace: String,
         /// This device's name in history and in conflict file names. Default: the hostname.
         #[arg(long)]
@@ -189,6 +190,24 @@ enum Command {
         /// request as JSON, as `{"op":"undelete","ids":["..."]}`.
         request: String,
     },
+    /// The folders on a server a token reaches, and what it may do in each: read, write, or manage,
+    /// which is write and also saying who else has access. Each is synced as a root of its own.
+    Folders {
+        /// The server. Default: this root's.
+        #[arg(long)]
+        server: Option<String>,
+        /// A file holding the token. Or set CAIRN_TOKEN. Default: this root's.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Allow plain HTTP beyond loopback, which sends the token in the clear.
+        #[arg(long)]
+        allow_http: bool,
+    },
+    /// Who has access to this root's folder on the server. A manager of it may also change that.
+    Access {
+        #[command(subcommand)]
+        what: Option<AccessCommand>,
+    },
     /// The change journal, newest last.
     Log {
         /// Only the last N entries.
@@ -262,6 +281,20 @@ enum Command {
         #[command(subcommand)]
         what: Option<UpdateCommand>,
     },
+}
+
+#[derive(Subcommand)]
+enum AccessCommand {
+    /// Who has access, at which level: the default.
+    List,
+    /// Give a user of the server access to this folder at a level, replacing the one it had.
+    Grant {
+        user: String,
+        /// read, write, or manage.
+        access: cairn_protocol::wire::Access,
+    },
+    /// Take all of a user's access to this folder away. Its devices keep what they hold.
+    Revoke { user: String },
 }
 
 #[derive(Subcommand)]
@@ -381,6 +414,18 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
             "tried requests again after the network failed them: {} time(s)",
             report.retries
         );
+    }
+    if report.read_only {
+        let held = report
+            .skips
+            .iter()
+            .filter(|s| s.kind == cairn_protocol::SkipKind::ReadOnly)
+            .count();
+        if held > 0 {
+            outln!(
+                "this folder is read-only for you: {held} change(s) here stay here, not uploaded"
+            );
+        }
     }
     match &report.outcome {
         SyncOutcome::Synced => {
@@ -859,16 +904,96 @@ fn run_inner() -> Result<u8> {
             print_sync(&report);
             Ok(status_code(&report))
         }
+        Command::Folders {
+            server,
+            token_file,
+            allow_http,
+        } => {
+            let here = || open_config(&find_root(cli.root.clone())?);
+            let token = match &token_file {
+                Some(f) => {
+                    std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?
+                }
+                None => match std::env::var("CAIRN_TOKEN") {
+                    Ok(t) => t,
+                    Err(_) => {
+                        here()
+                            .map_err(|e| {
+                                anyhow!(
+                                "give --token-file, set CAIRN_TOKEN, or run this in a root: {e:#}"
+                            )
+                            })?
+                            .token
+                    }
+                },
+            };
+            let (server, allow_http) = match server {
+                Some(s) => (s, allow_http),
+                None => {
+                    let c = here()
+                        .map_err(|e| anyhow!("give --server, or run this in a root: {e:#}"))?;
+                    (c.server, allow_http || c.allow_http)
+                }
+            };
+            let me = Client::of_server(&server, &token, allow_http)?.me()?;
+            if me.folders.is_empty() {
+                outln!(
+                    "user {} has access to no folder on {server} yet: one of its managers, or the server's administrator, gives it",
+                    me.user
+                );
+            } else {
+                outln!("user {} on {server}:", me.user);
+                for f in &me.folders {
+                    outln!("{:<24} {}", f.folder, f.access);
+                }
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Access { what } => {
+            let config = open_config(&find_root(cli.root)?)?;
+            let client = Client::new(&config, Retries::Short)?;
+            match what.unwrap_or(AccessCommand::List) {
+                AccessCommand::List => {
+                    for m in client.members()? {
+                        outln!("{:<24} {}", m.user, m.access);
+                    }
+                }
+                AccessCommand::Grant { user, access } => {
+                    client.set_member(&user, Some(access))?;
+                    outln!(
+                        "user {user} may now {} folder {}",
+                        match access {
+                            cairn_protocol::wire::Access::Read => "read",
+                            cairn_protocol::wire::Access::Write => "read and write",
+                            cairn_protocol::wire::Access::Manage => "read, write and manage",
+                        },
+                        config.namespace
+                    );
+                }
+                AccessCommand::Revoke { user } => {
+                    client.set_member(&user, None)?;
+                    outln!(
+                        "user {user} has no access to folder {} any more",
+                        config.namespace
+                    );
+                }
+            }
+            Ok(EXIT_OK)
+        }
         Command::Log { limit } => {
             let client = Client::new(&open_config(&find_root(cli.root)?)?, Retries::Short)?;
             let changes = restore::journal(&client)?;
             let skip = limit.map_or(0, |n| changes.len().saturating_sub(n));
             for c in &changes[skip..] {
+                let who = match &c.user {
+                    Some(u) => format!("{} ({u})", c.device_name),
+                    None => c.device_name.clone(),
+                };
                 outln!(
                     "{:>8}  {}  {:<16} {} op(s)",
                     c.seq,
                     date_time(c.time),
-                    c.device_name,
+                    who,
                     c.ops.len()
                 );
                 for op in &c.ops {

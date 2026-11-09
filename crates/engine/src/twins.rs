@@ -127,7 +127,11 @@ fn server_folder(
 /// waits with it, and what the server knows stands as the server has it, as if this scan had not seen
 /// it, so that nothing reads as deleted or moved.
 pub fn hold_back(identified: &mut Identified, twins: &[Twin], remote: &Tree) {
-    let mut gone: BTreeSet<ObjectId> = twins.iter().map(|t| t.object).collect();
+    hold_back_objects(identified, twins.iter().map(|t| t.object).collect(), remote);
+}
+
+/// As `hold_back`, for any objects new here.
+pub fn hold_back_objects(identified: &mut Identified, mut gone: BTreeSet<ObjectId>, remote: &Tree) {
     loop {
         let inside: Vec<ObjectId> = identified
             .local

@@ -4,7 +4,7 @@
 
 ```
 data/
-  token                  access token, 0600
+  token                  the first user's token, 0600: made by `init`, or one from before accounts
   lock                   flock held while a server has the directory
   meta.sqlite            metadata: WAL, synchronous=FULL
   ns/<hex of namespace name>/
@@ -48,6 +48,17 @@ refused.
 | `revisions` | Every revision of every object, body as JSON |
 | `journal` | Sequence, operation ID, device, time, operations as JSON; the source of truth |
 | `conflicts` | The inbox: which copy holds whose competing version |
+| `users` | Name and when made |
+| `tokens` | BLAKE3 of each token, never the token, with its user, label and when made |
+| `grants` | Namespace, user, and its level there: `read`, `write` or `manage` |
+
+The `journal` also says, from schema 2 on, the user whose token made each commit. Schema 2 brought accounts:
+the migration to it, in its one transaction, makes the `token` file's token, if there is one, the user
+`admin`'s, managing every namespace there is, so that a server upgraded in place keeps every device it had.
+After that the server never reads the file. An administrator's command (`cairn-server user`, `token`,
+`folder`, `grant`, `revoke`) takes the data directory's lock when it is free; when a server holds it, the
+command opens the database beside it, only at this binary's schema, and writes only accounts and namespaces,
+each in a transaction the server's own wait for.
 
 `cairn-server fsck` reads every chunk, follows every manifest reference, and checks `entries` and
 `objects` against a replay of `journal`. Chunks nothing refers to are reported and are not damage: they

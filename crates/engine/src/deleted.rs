@@ -793,6 +793,7 @@ mod tests {
                     device_name: device.into(),
                     time,
                     ops,
+                    user: None,
                 })
                 .unwrap();
             self.index.head = self.seq;
@@ -904,6 +905,7 @@ mod tests {
                     device_name: "a".into(),
                     time: 400,
                     ops: vec![op],
+                    user: None,
                 })
                 .unwrap();
         }

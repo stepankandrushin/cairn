@@ -8,9 +8,9 @@ pub mod repo;
 pub mod sqlite;
 
 pub use chunks::{ChunkStore, FsChunkStore};
-pub use meta::{CommitOutcome, MetaStore};
+pub use meta::{CommitOutcome, MetaStore, TokenInfo, UserInfo};
 pub use repo::Repo;
-pub use sqlite::SqliteStore;
+pub use sqlite::{token_hash, token_id, SqliteStore, FIRST_USER, SCHEMA};
 
 /// ENOSPC and EDQUOT, whose numbers differ between Unixes.
 #[cfg(target_os = "macos")]

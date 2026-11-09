@@ -333,6 +333,50 @@ fn an_idle_daemon_stays_idle() {
     assert_eq!(db.syncs(), before_b, "b kept syncing:\n{}", db.log());
 }
 
+/// In a folder its user may only read, a daemon brings each change on the server down, keeps what was
+/// changed here, says so, and then rests rather than trying again for nothing.
+#[test]
+fn a_readers_daemon_brings_changes_down_and_rests_with_its_own_held_back() {
+    let sb = Sandbox::on_disk("d-reader");
+    let server = Server::start(sb.path("server"));
+    let alice = server.user("alice");
+    let bob = server.user("bob");
+    server
+        .admin(&["folder", "add", "team", "--manager", "alice"])
+        .expect_ok();
+    server.admin(&["grant", "team", "bob", "read"]).expect_ok();
+    let a = Device::as_user(&sb, &server, "a", &alice, "team");
+    let b = Device::as_user(&sb, &server, "b", &bob, "team");
+    a.write("f", "one");
+    a.synced();
+    let db = Daemon::events_only(&b);
+    wait_file(&db, b.path("f"), b"one");
+
+    b.write("mine", "bob's");
+    let log = db.log.clone();
+    wait_for("the change made here to be listed", &log, || {
+        db.status()["skips"].as_array().is_some_and(|s| {
+            s.iter().any(|l| {
+                l.as_str()
+                    .is_some_and(|l| l.starts_with("mine: ") && l.contains("read-only for you"))
+            })
+        })
+    });
+    db.wait_rest();
+    assert_eq!(db.state(), "synced", "{}", db.log());
+    let before = db.syncs();
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(db.syncs(), before, "kept syncing:\n{}", db.log());
+
+    // The server's next change still comes down, and what is held back stays.
+    a.write("g", "two");
+    a.synced();
+    wait_file(&db, b.path("g"), b"two");
+    assert_eq!(b.read("mine"), b"bob's");
+    a.synced();
+    assert!(!a.exists("mine"));
+}
+
 /// Every event lost: the reconcile alone gets a change out. And without it, nothing does, which is what
 /// shows the watcher really is off in this test.
 #[test]

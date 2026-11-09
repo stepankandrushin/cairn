@@ -18,7 +18,7 @@ on the owner's own trees and machines.
 
 - **The repo is public**, so code, PLAN.md, this file, test data and commit subjects name no person,
   host, address or deployment: those would be served to anyone. Only agents/ and history/ stay off
-  GitHub and may name them.
+  GitHub and may name them, and sources/ (copies of other people's pages) stays off it too.
 - **Never lose data or metadata, and never fail silently**: PLAN.md's invariants outrank features and
   speed, because a sync tool that is wrong once is not trusted again. A change that touches them comes
   with a failure test (crash, full disk, lost event, missing mount).

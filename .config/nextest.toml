@@ -1,0 +1,91 @@
+# The tests under cargo-nextest, which `scripts/ci.sh --quick` runs them with: each test is a process of its
+# own, and the tests of every file share one pool, where cargo test runs one file after another. The
+# harness keeps those processes' servers on ports of their own (next_port, by NEXTEST_TEST_GLOBAL_SLOT).
+# The full suite stays cargo test's (ci.sh says why).
+
+[profile.default]
+# Slow is not failing: each test's own deadlines say when something hangs. Every failure is reported,
+# not only the first.
+slow-timeout = { period = "60s" }
+fail-fast = false
+final-status-level = "fail"
+
+# `scripts/ci.sh --quick`, before a commit: everything but the tests that sweep every step of a sync, or
+# a sync at every size, which take a minute or more each. The full suite runs on GitHub on every push,
+# and a release waits for it there.
+[profile.quick]
+fail-fast = true
+# Those over 20 s in a full run on a 16-core machine, 2026-11-09. A test renamed or added runs here too, until
+# it is listed: the list can only make this run longer, never leave out what it does not name.
+default-filter = """not (
+    test(=a_change_after_the_scan_that_agreed_still_wakes_the_daemon) |
+    test(=a_change_here_in_the_round_that_confirms_an_apply_is_sent_by_the_next_sync) |
+    test(=a_change_too_big_for_one_commit_goes_in_several) |
+    test(=a_copy_moved_aside_and_regenerated_at_once_both_stay_out) |
+    test(=a_copy_moved_onto_a_held_name_then_renamed_is_only_a_rename) |
+    test(=a_device_does_not_wake_itself_with_its_own_commits) |
+    test(=a_devices_own_delete_is_not_made_again_over_a_restore) |
+    test(=a_download_in_slices_killed_at_every_step_loses_nothing) |
+    test(=a_file_being_written_holds_back_nothing_else) |
+    test(=a_folder_deleted_and_regenerated_stays_excluded) |
+    test(=a_folder_moved_by_a_sync_keeps_what_its_rule_left_out) |
+    test(=a_folder_of_thousands_of_subfolders_is_watched_whole_under_a_low_limit) |
+    test(=a_folder_of_thousands_renamed_looks_at_what_is_in_it_and_no_more) |
+    test(=a_full_disk_at_every_client_write_loses_nothing) |
+    test(=a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing) |
+    test(=a_join_reads_again_only_what_its_apply_changed) |
+    test(=a_join_slower_than_a_busy_device_still_agrees) |
+    test(=a_kept_copy_is_not_forgotten_when_it_goes_out_of_sight_for_a_while) |
+    test(=a_kept_edit_is_in_the_conflict_inbox_however_its_sync_ends) |
+    test(=a_kill_anywhere_in_a_compaction_leaves_the_state_whole) |
+    test(=a_kill_anywhere_in_the_move_leaves_one_layout_or_the_other_whole) |
+    test(=a_kill_at_any_step_around_a_rule_loses_nothing) |
+    test(=a_kill_at_any_step_does_not_change_where_things_end_up) |
+    test(=a_kill_at_any_step_of_a_sync_with_nothing_to_do_changes_nothing) |
+    test(=a_kill_at_any_step_of_an_incremental_sync_loses_nothing) |
+    test(=a_long_offline_device_does_not_bring_back_what_was_deleted) |
+    test(=a_name_this_filesystem_refuses_is_left_out_and_holds_nothing_back) |
+    test(=a_new_folder_at_the_name_of_a_kept_copy_waits_for_a_person_then_merges_for_good) |
+    test(=a_private_folder_unreadable_when_it_next_changes_still_gets_its_mode) |
+    test(=a_refused_commit_with_a_kill_after_it_keeps_the_delete_in_it) |
+    test(=a_regenerated_copy_does_not_go_up_when_the_server_gets_that_name_too) |
+    test(=a_rename_storm_during_sync_loses_nothing) |
+    test(=a_revert_elsewhere_stands_while_the_tree_keeps_moving) |
+    test(=a_rewrite_in_place_meets_what_takes_a_name_beside_it) |
+    test(=a_rule_added_later_deletes_nothing_on_either_side) |
+    test(=a_rule_taken_off_what_is_here_holds_what_the_join_decides_about) |
+    test(=a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks) |
+    test(=a_small_state_is_left_with_its_free_pages) |
+    test(=a_state_of_version_1_is_moved_by_the_next_sync_and_holds_the_same) |
+    test(=a_subscriber_that_never_reads_does_not_stall_syncs) |
+    test(=a_sync_reads_its_state_through_in_order_before_it_loads_it) |
+    test(=a_sync_that_leaves_the_state_mostly_free_compacts_it_and_keeps_all_of_it) |
+    test(=after_the_watcher_stops_every_sync_lists_the_whole_tree) |
+    test(=an_edit_in_a_folder_not_watched_goes_with_the_next_sync) |
+    test(=an_edit_kept_while_the_tree_keeps_moving_is_one_copy) |
+    test(=an_edit_lost_in_an_overflow_is_found_by_the_next_sync) |
+    test(=an_edit_while_a_files_metadata_is_set_is_sent) |
+    test(=an_edit_whose_event_was_lost_waits_for_the_check_or_the_reconcile) |
+    test(=changes_that_meet_go_the_incremental_way) |
+    test(=every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device) |
+    test(=every_kind_of_change_is_seen_past_the_fast_path) |
+    test(=every_kind_of_change_reaches_the_other_device_by_itself) |
+    test(=every_kind_of_change_reaches_the_other_device_by_widening_alone) |
+    test(=every_kind_of_change_reaches_the_other_device_through_scoped_syncs) |
+    test(=excluding_a_folder_that_differs_underneath_is_refused) |
+    test(=excluding_a_path_renamed_here_is_refused_and_uploads_nothing) |
+    test(=files_changing_during_sync_never_arrive_torn) |
+    test(=hard_links_across_commits_of_a_big_change_all_stay) |
+    test(=killed_at_every_client_step_nothing_is_lost) |
+    test(=killed_at_every_server_step_acknowledged_commits_stay) |
+    test(=metadata_changed_after_new_content_was_killed_goes_up) |
+    test(=one_edit_in_a_big_tree_lists_a_few_folders_not_the_tree) |
+    test(=random_operations_on_three_devices_lose_nothing) |
+    test(=random_operations_with_rules_coming_and_going_on_one_device_lose_nothing) |
+    test(=remove_local_killed_at_any_step_then_included_deletes_nothing) |
+    test(=the_daemon_compacts_a_state_its_join_left_mostly_free) |
+    test(=the_losing_chmod_is_logged_once_after_a_kill) |
+    test(=the_pause_after_a_sync_counts_its_merge_up_to_30_s) |
+    test(=the_periodic_check_holds_little_more_than_the_round) |
+    test(=what_rules_leave_out_goes_the_incremental_way)
+)"""

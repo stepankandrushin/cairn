@@ -306,6 +306,7 @@ does not apply stays stored for those that do. `cairn export --exact` applies al
 ```sh
 cargo build --release -p cairn-cli -p cairn-server
 bash scripts/ci.sh              # format, lints, every test, the failure matrix; as root too, if sudo works
+bash scripts/ci.sh --quick      # the same in about a minute, less the tests that sweep every step of a sync
 bash scripts/release.sh         # static binaries and checksums in dist/, after a smoke test over TLS
 ```
 

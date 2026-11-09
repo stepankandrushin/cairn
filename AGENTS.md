@@ -40,9 +40,11 @@ on the owner's own trees and machines.
 
 - PLAN.md — the design and build order; before any design or code work.
 - docs/protocol.md, docs/format.md — the wire and on-disk formats; before changing either.
-- scripts/ci.sh — everything that must pass before a commit; on the real disk in /var/tmp, since tmpfs hid
-  a bug; about 30 minutes with GitHub's `CAIRN_SEEDS=200`, where `CAIRN_NO_SKIP=1` also makes a test that
-  cannot run fail instead of skipping (`skip` in the harness's common/). scripts/release.sh — a release,
+- scripts/ci.sh — the checks and every test, on the real disk in /var/tmp, since tmpfs hid a bug. `--quick`
+  must pass before a commit: all but the 70 tests over 20 s (.config/nextest.toml), about a minute, under
+  cargo-nextest (`cargo install cargo-nextest --locked`). The full run, about 20 minutes, is GitHub's on
+  every push, with `CAIRN_SEEDS=200` and `CAIRN_NO_SKIP=1`, which makes a test that cannot run fail instead
+  of skipping (`skip` in the harness's common/); a release waits for it. scripts/release.sh — a release,
   with release-macos.sh and release-windows.ps1 for those platforms, and release-update.sh for the signed
   update.json every installed copy checks before it updates itself (docs/protocol.md, "Updates").
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.

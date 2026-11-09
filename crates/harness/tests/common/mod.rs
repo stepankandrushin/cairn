@@ -120,12 +120,34 @@ pub struct Server {
 
 /// Below the range the kernel hands out. A restarted server needs its port back, and one from that
 /// range can go to any other test's connection or server the moment it is free.
+///
+/// Under `cargo test` the tests of a file share one process, and this counter keeps their ports apart.
+/// Under cargo-nextest each test is a process of its own, running beside tests of every file, so one
+/// test's stopped server could find its port taken by another's: there each test running at once has a
+/// slot, NEXTEST_TEST_GLOBAL_SLOT, and the slot a block of the range to itself.
 fn next_port() -> u16 {
     const FIRST: u32 = 20_000;
     const COUNT: u32 = 12_000;
+    // 187 ports for each of 64 tests at once: no test has that many servers up together, and its
+    // ports come round again only long after the servers that had them were stopped.
+    const SLOTS: u32 = 64;
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    (FIRST + (std::process::id().wrapping_mul(31).wrapping_add(n)) % COUNT) as u16
+    let spread = std::process::id().wrapping_mul(31).wrapping_add(n);
+    let slot = std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    match slot {
+        Some(slot) => {
+            assert!(
+                slot < SLOTS,
+                "nextest slot {slot}: more tests at once than next_port has blocks for"
+            );
+            let block = COUNT / SLOTS;
+            (FIRST + slot * block + spread % block) as u16
+        }
+        None => (FIRST + spread % COUNT) as u16,
+    }
 }
 
 impl Server {

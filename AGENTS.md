@@ -5,10 +5,10 @@ versioned history, and clients that sync a real filesystem without losing anythi
 modes, owners, xattrs, hard links, sparse files, filename bytes). Files only: no groupware, no app
 platform.
 
-**Status: 0.1.11 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
+**Status: 0.1.12 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
 CLI and a daemon; the same on macOS and Windows with a tray, ahead of milestone 7 and not in CI; each
 installed copy updates itself from signed releases. Users, tokens and per-folder read, write and manage
-access, ahead of milestone 5, are in the code and not yet released. The architecture, the decisions and their reasons,
+access, ahead of milestone 5, came in 0.1.12. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md: read it before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3's code and failure tests are in; what
 it still needs is its exit criterion, weeks on real trees with no silent loss, a run begun in November 2026

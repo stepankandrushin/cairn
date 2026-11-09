@@ -4,8 +4,8 @@ Self-hosted file sync with versioned history that keeps everything about your fi
 owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes. A central server keeps
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
-**Status: 0.1.11, early.** Clients for Linux, macOS and Windows, with only Linux in CI; the server on Linux;
-users with their own folders and shared ones, read-only or not, in the code but not yet in a release. It has
+**Status: 0.1.12, early.** Clients for Linux, macOS and Windows, with only Linux in CI; the server on Linux;
+users with their own folders and shared ones, read-only or not. It has
 been through a harsh failure harness and now syncs real trees, but for days, not yet weeks, so keep another
 copy of anything you put through it. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.

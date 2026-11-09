@@ -431,7 +431,47 @@ fn router(app: Arc<App>) -> Router {
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .layer(middleware::from_fn_with_state(app, authorize))
+        // After the layer, so outside it: the one answer without a token.
+        .route("/", get(home))
 }
+
+/// What a browser gets at the server's address, which the tray's "Open in browser" opens: a page saying
+/// what is here, rather than a 401 that reads as a broken client. It names no version, user or folder.
+async fn home() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        HOME_PAGE,
+    )
+        .into_response()
+}
+
+const HOME_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cairn</title>
+<style>
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em; color: #222; }
+@media (prefers-color-scheme: dark) { body { background: #1b1b1b; color: #ddd; } }
+h1 { font-size: 1.6em; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Cairn</h1>
+<p>This is a Cairn file sync server. It has no web interface yet: your files are in the folder Cairn syncs
+on each of your devices, where <code>cairn history</code> lists a file's earlier versions and
+<code>cairn restore</code> brings one back.</p>
+</body>
+</html>
+"#;
 
 #[derive(Parser)]
 #[command(name = "cairn-server", version, about = "The Cairn file sync server")]

@@ -475,3 +475,71 @@ fn a_readers_emptied_tree_pauses_rather_than_filling_the_empty_folder() {
     a.synced();
     assert_eq!(a.read("d/19"), b"19");
 }
+
+/// One plain HTTP/1.1 request to the server, as a browser or a stray client would make it: the status
+/// line's code, the headers in lower case, and the body.
+fn http(server: &Server, method: &str, path: &str, token: Option<&str>) -> (u16, String, String) {
+    use std::io::{Read, Write};
+    let addr = server.url.strip_prefix("http://").unwrap();
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    write!(
+        conn,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/html\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer).unwrap();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+    let code = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (code, head.to_lowercase(), body.to_string())
+}
+
+#[test]
+fn a_browser_at_the_servers_address_gets_a_page_and_nothing_else_without_a_token() {
+    let sb = Sandbox::fast("accounts-browser");
+    let server = Server::start(sb.path("data"));
+    let a = Device::new(&sb, &server, "a");
+    a.write("secret.txt", "a's");
+    a.synced();
+
+    // The address itself, as the tray's "Open in browser" opens it: a page saying what is here.
+    let (code, head, body) = http(&server, "GET", "/", None);
+    assert_eq!(code, 200, "{head}\n{body}");
+    assert!(head.contains("content-type: text/html"), "{head}");
+    assert!(
+        head.contains("content-security-policy: default-src 'none'"),
+        "{head}"
+    );
+    assert!(body.contains("This is a Cairn file sync server"), "{body}");
+    // It names nothing a stranger could use: no version, user, folder, device or file.
+    for named in [env!("CARGO_PKG_VERSION"), "admin", "default", "secret"] {
+        assert!(!body.contains(named), "the page names {named:?}: {body}");
+    }
+    let (code, ..) = http(&server, "HEAD", "/", None);
+    assert_eq!(code, 200);
+    // Only to read it: anything else there is no request the server knows.
+    let (code, ..) = http(&server, "POST", "/", None);
+    assert_eq!(code, 405);
+
+    // Everything else still wants a token, and the right one.
+    let token = std::fs::read_to_string(&server.token_file).unwrap();
+    let token = token.trim();
+    for path in [
+        "/v1/me",
+        "/v1/ns/default/info",
+        "/favicon.ico",
+        "/index.html",
+    ] {
+        for wrong in [None, Some("not-the-token")] {
+            let (code, head, body) = http(&server, "GET", path, wrong);
+            assert_eq!(code, 401, "{path} with {wrong:?}: {head}\n{body}");
+            assert_eq!(body, "missing or wrong token", "{path}");
+        }
+    }
+    let (code, _, body) = http(&server, "GET", "/v1/me", Some(token));
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"default\""), "{body}");
+}

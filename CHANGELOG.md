@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- The tray's "Open in browser" opened a page saying only `missing or wrong token`, which read as a client
+  that had lost its token. The server's address now answers a browser with a page saying it is a Cairn
+  server, that there is no web interface yet, and where the files and their history are; it names no
+  version, user or folder. Everything else on the server still needs a token.
+
 ## 0.1.12 (2026-11-09)
 
 **Added:**

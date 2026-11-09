@@ -3,6 +3,8 @@
 HTTP with JSON bodies, except chunk batches. Every path below but `/v1/me` is under `/v1/ns/{namespace}`,
 and every request needs `Authorization: Bearer <token>`. The types are defined once, in `crates/protocol`;
 this page explains them. `Info.protocol` is the version: a client refuses a server that speaks another one.
+The one answer without a token is `GET /`, the server's address as a browser opens it: a page saying this is
+a Cairn server, which names no version, user or folder.
 
 The server in this release speaks plain HTTP on loopback; beyond loopback it refuses to start without
 `--behind-tls-proxy`, and the client refuses `http://` beyond loopback without an explicit opt-in.

@@ -4,10 +4,8 @@
 
 **Fixed:**
 
-- The web's Recently deleted opens at once, and lists all of the last 30 days. The server read the journal
-  back from the head on each request, which on a store with large commits took minutes of a busy disk, held
-  every device's sync up meanwhile, and reached only the last day or two. It now keeps an index of what is
-  deleted, replayed from the journal when it starts and kept up after each commit.
+- The web's Recently deleted opens at once and lists all of the last 30 days, from an index the server
+  keeps in memory, rather than reading the journal back on each request, which took minutes on a busy disk.
 
 ## 0.1.14 (2026-11-10)
 

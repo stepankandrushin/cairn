@@ -2,8 +2,7 @@
 //! object linked again to the entry it last had, as itself, with nothing reverted or replaced.
 //!
 //! Both are answered from an index of each namespace's journal, replayed when the server starts and
-//! kept up with every commit, so that a list reads nothing of the store but what is new since the
-//! last: reading it from the journal on each request took minutes of a busy disk.
+//! kept up with every commit, so that a list reads nothing of the store but what is new.
 
 use super::edit::commit;
 use super::{conflict, display_name, View};
@@ -54,7 +53,7 @@ struct Gone {
 
 /// One namespace's journal, replayed: each object's kind, size and number of entries, where each live
 /// folder is, and for each object with no entry the unlink that left it so. About 90 bytes an
-/// object in all: 51 MB for a namespace of 590,000.
+/// object.
 struct Replayed {
     /// The last sequence replayed.
     seq: u64,

@@ -377,12 +377,8 @@ itself with what it last held: nothing is reverted, nothing replaced, and a name
 copy's name beside what has it. One commit, so a kill leaves nothing or all of it. Until the server keeps
 a trash of its own (milestone 4), the client reads it from the journal, into an index of every object's
 kind, size and entries without their bodies, a fraction of a replayed tree's memory; a daemon keeps it
-ten minutes after the last request, taking only what is new to answer the next. The server keeps one of
-its own for the web, smaller, about 90 bytes an object (each object's kind, size and number of entries,
-each live folder's place, and the unlink that left each deleted object with none), replayed from each
-namespace's journal when it starts and kept up after every commit, so the list reads nothing of the store
-but what is new: reading the journal back on each request took minutes of a busy disk, and reached only a
-day or two.
+ten minutes after the last request, taking only what is new to answer the next. The server keeps a smaller
+one for the web in memory, replayed when it starts and kept up after each commit.
 
 Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
 Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.

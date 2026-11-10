@@ -33,13 +33,13 @@ filesystem and privileges.
 | Keep both sides of a conflict | ✅ Three-way merge; both versions kept, with an inbox | ⚠️ Local conflict copy; not uploaded by default | ✅ Both versions kept; one renamed as a conflict file | ✅ Both versions kept; one renamed as a conflict file |
 | Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
-[^macos-size]: Installed bundles measured on an Apple Silicon Mac on 2026-11-07:
+[^macos-size]: Installed bundles measured on an Apple Silicon Mac:
     Cairn 0.1.5 — `Cairn.app` 9.1 MB + `Cairn Sync.app` 8.0 MB; Nextcloud 34.0.5 — `Nextcloud.app` 414.4 MB.
     Sizes sum regular-file bytes inside each bundle, excluding symlinks, with 1 MB = 1,000,000 bytes.
     These are installed application files, not download sizes or allocated disk space; user data and
     server components are excluded. Nextcloud's executable is universal (Intel + Apple Silicon), while
     these Cairn builds are Apple Silicon only. Seafile and Syncthing were not installed for measurement.
-[^downloads]: Download sizes checked on 2026-11-07: [Cairn 0.1.5](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.5),
+[^downloads]: Download sizes: [Cairn 0.1.5](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.5),
     [Nextcloud Desktop 35.0.3](https://download.nextcloud.com/desktop/releases/Linux/),
     [Seafile Client 9.0.22](https://github.com/haiwen/seafile-client/releases/tag/v9.0.22),
     [Syncthing 2.1.7](https://github.com/syncthing/syncthing/releases/tag/v2.1.7).

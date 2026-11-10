@@ -213,8 +213,9 @@ over 64 MiB, 507 a full disk.
 **Deleted.** `GET /v1/ns/{ns}/deleted?days=D` lists what is still deleted of what was deleted in the last `D`
 days (30 if not given): `{items, complete}`, newest first, each `{object, kind, display, path, seq, time, user?,
 device_name, size, files}`, where `path` is the folder it was in, as it is now, and a folder deleted in one
-commit with what was in it is one item, `files` and `size` counting what it held. The server reads it from the
-journal back from the head, and stops after about 64 MiB of operations with `complete: false`. `POST
+commit with what was in it is one item, `files` and `size` counting what it held. The server answers it from an
+index of the whole journal, replayed when it starts and kept up after each commit, so `complete` is true; a
+list asked for while that replay runs waits for it, and a journal that does not replay is an error. `POST
 /v1/ns/{ns}/undelete` with `{objects}` brings each back in one commit, as `cairn undelete` does: to the entry it
 last had, a deleted folder above it first, what was deleted with a folder with it, and to `name (conflict
 restored seq N).ext` where the name is taken. It answers `{seq, items}`, each `{object, display, path,

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 mod assets;
 mod content;
-mod deleted;
+pub(crate) mod deleted;
 mod edit;
 pub(crate) mod session;
 mod shares;

@@ -29,6 +29,8 @@ struct App {
     uploads: web::upload::Uploads,
     /// What signs a browser's session, and the sign-in tickets waiting.
     sessions: web::session::Sessions,
+    /// What is deleted in each namespace, replayed from its journal and kept up with each commit.
+    deleted: web::deleted::Indexes,
     /// Where a public link is opened, when that is another address than this server's own:
     /// `serve --link-url`.
     link_url: Option<String>,
@@ -639,6 +641,7 @@ async fn serve(
         repo,
         uploads: web::upload::Uploads::open(&data)?,
         sessions: web::session::Sessions::open(&data)?,
+        deleted: web::deleted::Indexes::default(),
         link_url,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
@@ -650,6 +653,27 @@ async fn serve(
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             let app = sweeper.clone();
             let _ = tokio::task::spawn_blocking(move || app.uploads.sweep()).await;
+        }
+    });
+    // What is deleted, replayed from every namespace's journal now rather than when someone first
+    // asks, and kept up after each commit, a page at a time while devices sync.
+    let keeper = app.clone();
+    tokio::spawn(async move {
+        let mut commits = keeper.commits.subscribe();
+        let mut every_namespace = true;
+        loop {
+            let app = keeper.clone();
+            let kept =
+                tokio::task::spawn_blocking(move || web::deleted::keep_up(&app, every_namespace));
+            match kept.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("error: {e:#}"),
+                Err(e) => eprintln!("error: the index of what is deleted: {e}"),
+            }
+            every_namespace = false;
+            if commits.changed().await.is_err() {
+                break;
+            }
         }
     });
     let listener = tokio::net::TcpListener::bind(listen)

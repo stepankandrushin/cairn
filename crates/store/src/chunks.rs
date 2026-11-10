@@ -124,6 +124,25 @@ impl FsChunkStore {
         let h = hash.to_string();
         self.root.join("chunks").join(&h[..2]).join(h)
     }
+
+    /// As `get`, for a pass over every chunk: the bytes are checked and not kept, and on Linux their
+    /// pages are let go of the page cache, so that the pass does not push out what the server reads
+    /// often, its database above all. `Ok(false)`: not here.
+    pub fn check_passing(&self, hash: &Hash) -> Result<bool> {
+        let mut file = match File::open(self.path(hash)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut data)?;
+        #[cfg(target_os = "linux")]
+        let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed);
+        if Hash::of(&data) != *hash {
+            bail!("chunk {hash} is damaged on disk: its content does not match its hash");
+        }
+        Ok(true)
+    }
 }
 
 impl ChunkStore for FsChunkStore {

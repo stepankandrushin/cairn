@@ -91,7 +91,7 @@ fn check_namespace(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<()>
     }
     for hash in &stored {
         report.chunks += 1;
-        if let Err(e) = store.get(hash) {
+        if let Err(e) = store.check_passing(hash) {
             report.errors.push(format!("{ns}: {e}"));
         }
         if !referenced.contains(hash) {

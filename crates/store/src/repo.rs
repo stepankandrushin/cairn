@@ -438,6 +438,13 @@ mod tests {
         let s = h.to_string();
         std::fs::write(dir.join("chunks").join(&s[..2]).join(&s), b"y").unwrap();
         assert!(store.get(&h).is_err());
+        // fsck's pass, which lets the pages go, finds it the same; an intact one passes, a gone one is
+        // not there.
+        assert!(store.check_passing(&h).is_err());
+        let ok = Hash::of(b"z");
+        store.put(&ok, b"z").unwrap();
+        assert!(store.check_passing(&ok).unwrap());
+        assert!(!store.check_passing(&Hash::of(b"none")).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

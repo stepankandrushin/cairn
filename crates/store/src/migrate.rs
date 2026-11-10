@@ -705,14 +705,20 @@ mod tests {
             commit(&mut s, ns, ops);
             let notes: Vec<Op> = [f, g, d, f]
                 .iter()
-                .map(|o| Op::Note {
-                    object: *o,
-                    text: "mode: kept 664 from the server; this device had 644".into(),
+                .map(|o| {
+                    Op::note(
+                        *o,
+                        "mode: kept 664 from the server; this device had 644".into(),
+                    )
                 })
-                .chain([Op::Note {
-                    object: g,
-                    text: "owner: kept a from the server; this device had b".into(),
-                }])
+                .chain([
+                    Op::note(g, "owner: kept a from the server; this device had b".into()),
+                    Op::Note {
+                        object: d,
+                        text: "owner: kept a from the server; this device had c".into(),
+                        also: vec![f, g],
+                    },
+                ])
                 .collect();
             commit(&mut s, ns, notes);
             let rf2 = RevisionId::random();

@@ -39,7 +39,7 @@ const MOVE: u8 = 3;
 const UPDATE: u8 = 4;
 const NOTE: u8 = 5;
 /// The op's one optional field is there: a create's `conflict_of`, an unlink's `base`, an
-/// update's `restored_from`.
+/// update's `restored_from`, a note's `also`: its count, at least one, then each object.
 const HAS_OPTION: u8 = 1 << 3;
 /// A create's or update's body is here, after the rest, rather than in `revisions` under its
 /// revision. Only a move from an older schema writes it, for a revision whose row there does not
@@ -118,8 +118,8 @@ pub fn encode_ops(ops: &[Op], body_here: impl Fn(usize) -> bool) -> Vec<u8> {
                     w.raw(&r.0);
                 }
             }
-            Op::Note { object, text } => {
-                w.u8(flags(NOTE, false));
+            Op::Note { object, text, also } => {
+                w.u8(flags(NOTE, !also.is_empty()));
                 w.raw(&object.0);
                 match texts.get(text.as_str()) {
                     Some(n) => w.uv(*n),
@@ -128,6 +128,12 @@ pub fn encode_ops(ops: &[Op], body_here: impl Fn(usize) -> bool) -> Vec<u8> {
                         w.bytes(text.as_bytes());
                         let n = texts.len() as u64 + 1;
                         texts.insert(text, n);
+                    }
+                }
+                if !also.is_empty() {
+                    w.uv(also.len() as u64);
+                    for o in also {
+                        w.raw(&o.0);
                     }
                 }
             }
@@ -243,7 +249,7 @@ pub fn decode_ops(b: &[u8]) -> Result<Decoded> {
                     from: get_link(&mut r)?,
                     to: get_link(&mut r)?,
                 },
-                NOTE if !option => {
+                NOTE => {
                     let text = match r.uv()? {
                         0 => {
                             let t = String::from_utf8(r.bytes()?.to_vec()).ok()?;
@@ -252,7 +258,21 @@ pub fn decode_ops(b: &[u8]) -> Result<Decoded> {
                         }
                         k => texts.get(usize::try_from(k - 1).ok()?)?.clone(),
                     };
-                    Op::Note { object, text }
+                    let also = match option {
+                        true => {
+                            let n = r.count(16)?;
+                            if n == 0 {
+                                return None;
+                            }
+                            let mut also = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                also.push(ObjectId(r.array::<16>()?));
+                            }
+                            also
+                        }
+                        false => Vec::new(),
+                    };
+                    Op::Note { object, text, also }
                 }
                 _ => return None,
             };
@@ -416,21 +436,28 @@ mod tests {
                 body: b[1].clone(),
                 restored_from: Some(RevisionId(id(2))),
             },
+            Op::note(
+                ObjectId(id(1)),
+                "mode: kept 664 from the server; this device had 644".into(),
+            ),
+            Op::note(
+                ObjectId(id(3)),
+                "mode: kept 664 from the server; this device had 644".into(),
+            ),
+            Op::note(ObjectId(id(3)), String::new()),
+            Op::note(
+                ObjectId(id(1)),
+                "mode: kept 664 from the server; this device had 644".into(),
+            ),
             Op::Note {
-                object: ObjectId(id(1)),
+                object: ObjectId(id(5)),
                 text: "mode: kept 664 from the server; this device had 644".into(),
+                also: vec![ObjectId(id(1)), ObjectId(id(3))],
             },
             Op::Note {
-                object: ObjectId(id(3)),
-                text: "mode: kept 664 from the server; this device had 644".into(),
-            },
-            Op::Note {
-                object: ObjectId(id(3)),
-                text: String::new(),
-            },
-            Op::Note {
-                object: ObjectId(id(1)),
-                text: "mode: kept 664 from the server; this device had 644".into(),
+                object: ObjectId(id(6)),
+                text: "mode: kept 775 from the server; this device had 755".into(),
+                also: vec![ObjectId(id(7))],
             },
         ]
     }
@@ -486,13 +513,51 @@ mod tests {
 
     #[test]
     fn a_repeated_note_is_a_few_bytes() {
-        let note = |o: u8| Op::Note {
-            object: ObjectId(id(o)),
-            text: "mode: kept 664 from the server; this device had 644".into(),
+        let note = |o: u8| {
+            Op::note(
+                ObjectId(id(o)),
+                "mode: kept 664 from the server; this device had 644".into(),
+            )
         };
         let one = encode_ops(&[note(1)], |_| false).len();
         let many = encode_ops(&(0..100).map(note).collect::<Vec<_>>(), |_| false).len();
         assert!(many < one + 99 * 19, "{one} for one, {many} for a hundred");
+        // Grouped, sixteen bytes to each object after the first.
+        let grouped = cairn_protocol::group_notes(&(0..100).map(note).collect::<Vec<_>>());
+        assert_eq!(grouped.len(), 1);
+        let bytes = encode_ops(&grouped, |_| false).len();
+        assert!(
+            bytes <= one + 2 + 99 * 16,
+            "{one} for one, {bytes} for a hundred grouped"
+        );
+    }
+
+    /// A note as the store wrote it before notes named more than one object, byte by byte: it reads
+    /// as it did, and writes the same bytes again.
+    #[test]
+    fn a_note_written_before_groups_reads_as_it_did() {
+        let text = "mode: kept 664 from the server; this device had 644";
+        let mut w = W(vec![FORMAT, 2, NOTE]);
+        w.raw(&id(1));
+        w.uv(0);
+        w.bytes(text.as_bytes());
+        w.u8(NOTE);
+        w.raw(&id(2));
+        w.uv(1);
+        let d = decode_ops(&w.0).unwrap();
+        let want = vec![
+            Op::note(ObjectId(id(1)), text.into()),
+            Op::note(ObjectId(id(2)), text.into()),
+        ];
+        assert_eq!(d.ops, want);
+        assert_eq!(encode_ops(&want, |_| false), w.0);
+        assert_eq!(
+            serde_json::to_string(&d.ops[0]).unwrap(),
+            format!(
+                r#"{{"op":"note","object":"{}","text":"{text}"}}"#,
+                ObjectId(id(1))
+            )
+        );
     }
 
     #[test]
@@ -516,6 +581,13 @@ mod tests {
         let mut w = W(vec![FORMAT, 1, NOTE]);
         w.raw(&id(1));
         w.uv(1);
+        assert!(decode_ops(&w.0).is_err());
+        // A note said to name more objects, naming none: not how one is written.
+        let mut w = W(vec![FORMAT, 1, NOTE | HAS_OPTION]);
+        w.raw(&id(1));
+        w.uv(0);
+        w.bytes(b"t");
+        w.uv(0);
         assert!(decode_ops(&w.0).is_err());
         // A kind with no body, said to carry one.
         let mut w = W(vec![FORMAT, 1, LINK | BODY_HERE]);

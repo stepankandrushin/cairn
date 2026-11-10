@@ -17,6 +17,10 @@ pub struct Info {
     /// token may do everything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<Access>,
+    /// That a note may name more objects than one (`Op::Note`'s `also`). Absent from a server
+    /// before them, which would keep only the first: a client sends such a server a note to each.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note_groups: bool,
 }
 
 /// What a user may do in a namespace, which a person knows as a folder: each level holds the one

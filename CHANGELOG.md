@@ -11,6 +11,11 @@
   for room, and gives the freed space back; `cairn-server downgrade` moves it back to schema 3, for a server
   from before.
 - `cairn-server fsck` also checks that each revision is named by the commit that made it.
+- A commit's notes of one text, the losers of a merge, go as one note naming each object, where they went
+  as one to each: a device joining on another umask wrote the same "mode: kept 664 from the server; this
+  device had 644" for every file. `cairn log` says how many each names. A client sends them so only to a
+  server of this release, which says it takes them (`/info`'s `note_groups`); to an older one, a note to
+  each object as before. A client from before reads one as a note of its first object.
 
 **Fixed:**
 

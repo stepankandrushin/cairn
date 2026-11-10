@@ -851,10 +851,10 @@ impl Journal {
             Op::Create { object, .. }
             | Op::Link { object, .. }
             | Op::Unlink { object, .. }
-            | Op::Move { object, .. }
-            | Op::Note { object, .. } => {
+            | Op::Move { object, .. } => {
                 self.named.insert(*object);
             }
+            Op::Note { .. } => self.named.extend(op.noted()),
         }
         let mut link = |object: ObjectId, l: &Link, into: bool| {
             self.links.entry(object).or_default().push(l.clone());
@@ -890,9 +890,10 @@ impl Journal {
                 self.moved.insert(*object);
                 self.touched.insert(*object);
             }
-            Op::Update { object, .. } | Op::Note { object, .. } => {
+            Op::Update { object, .. } => {
                 self.touched.insert(*object);
             }
+            Op::Note { .. } => self.touched.extend(op.noted()),
         }
         self.ops.push(op.clone());
     }

@@ -10,7 +10,7 @@ use cairn_protocol::wire::{
     self, ChangesResponse, CommitRequest, CommitResponse, ConflictEntry, HashList, Info,
 };
 use cairn_protocol::wire::{Access, Grant, Me, Member};
-use cairn_protocol::Hash;
+use cairn_protocol::{Hash, Op};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,6 +269,9 @@ pub struct Client {
     /// What this token may do in the namespace, as the server said when this client was made. `None`
     /// from a server before accounts, whose one token may do everything.
     access: Option<Access>,
+    /// That the server takes a note naming more objects than one: a commit's notes of one text go
+    /// as one.
+    note_groups: bool,
     /// How hard a request the network failed is tried again.
     retries: Retries,
     /// How many times a request was tried again, for the sync's report.
@@ -303,6 +306,7 @@ impl Client {
             );
         }
         client.access = info.access;
+        client.note_groups = info.note_groups;
         Ok(client)
     }
 
@@ -373,6 +377,7 @@ impl Client {
             base: format!("{url}/v1/ns/{}", config.namespace),
             auth: format!("Bearer {}", config.token),
             access: None,
+            note_groups: false,
             retries,
             retried: Arc::new(AtomicU64::new(0)),
         };
@@ -578,7 +583,16 @@ impl Client {
         Ok(frames.into_iter().map(|(h, d)| (h, d.to_vec())).collect())
     }
 
+    /// A commit as queued, a note to each object; to a server that takes them, its notes of one text
+    /// go as one. The same ID either way, so a commit sent once each way lands once.
     pub fn commit(&self, req: &CommitRequest) -> Result<CommitResponse> {
+        if self.note_groups && req.ops.iter().any(|op| matches!(op, Op::Note { .. })) {
+            let grouped = CommitRequest {
+                ops: cairn_protocol::group_notes(&req.ops),
+                ..req.clone()
+            };
+            return self.post_json("committing", "client.commit", "/commit", &grouped);
+        }
         self.post_json("committing", "client.commit", "/commit", req)
     }
 

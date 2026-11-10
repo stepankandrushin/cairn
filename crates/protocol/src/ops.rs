@@ -97,7 +97,15 @@ pub enum Op {
         restored_from: Option<RevisionId>,
     },
     /// An entry in the activity log with no effect on the tree: the loser of a metadata conflict.
-    Note { object: ObjectId, text: String },
+    /// `also` names more objects whose loser the same text says, as a join gives a hundred thousand
+    /// files one text: sent only to a server that says it takes them (`Info::note_groups`), and
+    /// absent, not empty, otherwise, so that a note of one object is what it always was.
+    Note {
+        object: ObjectId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        also: Vec<ObjectId>,
+    },
 }
 
 impl Op {
@@ -107,6 +115,58 @@ impl Op {
             _ => None,
         }
     }
+
+    /// A note of one object.
+    pub fn note(object: ObjectId, text: String) -> Op {
+        Op::Note {
+            object,
+            text,
+            also: Vec::new(),
+        }
+    }
+
+    /// Every object a note names, the first one first; none for another operation.
+    pub fn noted(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        let (first, also): (Option<ObjectId>, &[ObjectId]) = match self {
+            Op::Note { object, also, .. } => (Some(*object), also),
+            _ => (None, &[]),
+        };
+        first.into_iter().chain(also.iter().copied())
+    }
+}
+
+/// The notes of a commit's operations with the same text made one, naming every object of them, at the
+/// place of the last: each object exists by then, as the earlier ones did at theirs, since an object
+/// once made is never gone. Everything else stays in its order, and a commit of no two notes alike is
+/// returned as it was.
+pub fn group_notes(ops: &[Op]) -> Vec<Op> {
+    use std::collections::HashMap;
+    let mut objects: HashMap<&str, Vec<ObjectId>> = HashMap::new();
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Note { text, .. } = op {
+            objects.entry(text).or_default().extend(op.noted());
+            last.insert(text, i);
+        }
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            Op::Note { text, .. } if last[text.as_str()] == i => {
+                let mut all =
+                    std::mem::take(objects.get_mut(text.as_str()).expect("counted above"));
+                let rest = all.split_off(1);
+                out.push(Op::Note {
+                    object: all[0],
+                    text: text.clone(),
+                    also: rest,
+                });
+            }
+            Op::Note { .. } => {}
+            _ => out.push(op.clone()),
+        }
+    }
+    out
 }
 
 /// A reason to refuse a commit. Nothing was applied; the client rebases and retries.
@@ -295,11 +355,157 @@ pub fn check_and_apply<S: TreeStore>(s: &mut S, op: &Op) -> Result<(), S::Err> {
             }
             s.set_head(*object, *base, *revision, body)
         }
-        Op::Note { object, .. } => {
-            if s.object(*object)?.is_none() {
-                return Err(OpReject::NoSuchObject(*object).into());
+        Op::Note { .. } => {
+            for object in op.noted() {
+                if s.object(object)?.is_none() {
+                    return Err(OpReject::NoSuchObject(object).into());
+                }
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Metadata, Name, Tree};
+
+    fn create(t: &mut Tree, n: &str) -> (ObjectId, Op) {
+        let object = ObjectId::random();
+        let op = Op::Create {
+            object,
+            revision: RevisionId::random(),
+            body: RevisionBody {
+                content: Content::Dir,
+                metadata: Metadata::default(),
+            },
+            link: Link {
+                parent: ObjectId::ROOT,
+                name: Name::new(n.as_bytes().to_vec()).unwrap(),
+            },
+            conflict_of: None,
+        };
+        t.apply(&op).unwrap();
+        (object, op)
+    }
+
+    const T1: &str = "mode: kept 664 from the server; this device had 644";
+    const T2: &str = "mode: kept 775 from the server; this device had 755";
+
+    /// Notes of one text become one, at the place of the last, naming each object in the order they
+    /// came; another text stays apart; the rest keeps its order; and the commit applies the same.
+    #[test]
+    fn notes_of_one_text_go_as_one_at_the_last_place() {
+        let mut t = Tree::new();
+        let (a, ca) = create(&mut t, "a");
+        let (b, cb) = create(&mut t, "b");
+        let (c, cc) = create(&mut t, "c");
+        let ops = vec![
+            ca.clone(),
+            Op::note(a, T1.into()),
+            cb.clone(),
+            Op::note(b, T2.into()),
+            Op::note(b, T1.into()),
+            cc.clone(),
+            Op::note(c, T1.into()),
+        ];
+        let grouped = group_notes(&ops);
+        assert_eq!(
+            grouped,
+            vec![
+                ca,
+                cb,
+                Op::note(b, T2.into()),
+                cc,
+                Op::Note {
+                    object: a,
+                    text: T1.into(),
+                    also: vec![b, c],
+                },
+            ]
+        );
+        assert_eq!(
+            grouped[4].noted().collect::<Vec<_>>(),
+            vec![a, b, c],
+            "every object, the first first"
+        );
+        // Each note's object exists where the group stands, as it did where each note stood: a
+        // fresh tree takes the grouped commit as it takes the one it came from.
+        let mut fresh = Tree::new();
+        for op in &grouped {
+            fresh.apply(op).unwrap();
+        }
+        // No two alike: as it was.
+        let single = vec![Op::note(a, T1.into()), Op::note(b, T2.into())];
+        assert_eq!(group_notes(&single), single);
+        assert_eq!(group_notes(&[]), vec![]);
+    }
+
+    /// A note of one object is the JSON it always was, without `also`; one of more says each.
+    #[test]
+    fn a_note_of_one_object_is_the_json_it_was() {
+        let a = ObjectId([1; 16]);
+        let b = ObjectId([2; 16]);
+        assert_eq!(
+            serde_json::to_string(&Op::note(a, T1.into())).unwrap(),
+            format!(r#"{{"op":"note","object":"{a}","text":"{T1}"}}"#)
+        );
+        let grouped = Op::Note {
+            object: a,
+            text: T1.into(),
+            also: vec![b],
+        };
+        let json = serde_json::to_string(&grouped).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"op":"note","object":"{a}","text":"{T1}","also":["{b}"]}}"#)
+        );
+        assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), grouped);
+    }
+
+    /// What a build before groups reads of one, its `Op::Note` as it was: the first object and the
+    /// text, and no error. Its other readers of a note are the log and the objects a journal names.
+    #[test]
+    fn a_build_before_groups_reads_one_as_a_note_of_its_first_object() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum Before {
+            Note { object: ObjectId, text: String },
+        }
+        let a = ObjectId([1; 16]);
+        let json = serde_json::to_string(&Op::Note {
+            object: a,
+            text: T1.into(),
+            also: vec![ObjectId([2; 16]), ObjectId([3; 16])],
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Before>(&json).unwrap(),
+            Before::Note {
+                object: a,
+                text: T1.into()
+            }
+        );
+    }
+
+    /// A note naming an object that does not exist is refused, wherever in the group it is.
+    #[test]
+    fn a_group_naming_an_object_that_does_not_exist_is_refused() {
+        let mut t = Tree::new();
+        let (a, _) = create(&mut t, "a");
+        let missing = ObjectId::random();
+        let r = t.apply(&Op::Note {
+            object: a,
+            text: T1.into(),
+            also: vec![ObjectId::ROOT, missing],
+        });
+        assert_eq!(r, Err(OpReject::NoSuchObject(missing)));
+        t.apply(&Op::Note {
+            object: a,
+            text: T1.into(),
+            also: vec![ObjectId::ROOT],
+        })
+        .unwrap();
     }
 }

@@ -239,9 +239,101 @@ fn a_join_too_big_for_one_commit_logs_every_loser() {
         "more than one commit holds: {}",
         run.stdout.lines().last().unwrap_or_default()
     );
+    // Each loser once, the notes of one text in a commit made one, and the log says how many.
+    let (losers, notes) = notes_in_journal(&server.data);
+    assert_eq!(losers.len(), FILES * (1 + CLASHES));
+    let distinct: std::collections::BTreeSet<_> = losers.iter().collect();
+    assert_eq!(distinct.len(), losers.len(), "a loser logged twice");
+    assert!(
+        notes <= 2 * (1 + CLASHES),
+        "{notes} notes for {} losers",
+        losers.len()
+    );
     let log = b.cairn(&["log"]).expect_ok();
-    let notes = log.stdout.lines().filter(|l| l.contains("note: ")).count();
-    assert_eq!(notes, FILES * (1 + CLASHES));
+    assert_eq!(
+        losers_in_log(&log.stdout),
+        FILES * (1 + CLASHES),
+        "{}",
+        log.text()
+    );
+}
+
+/// A join's losers as notes: on a device on another umask, each file's mode. Returns the files.
+#[cfg(unix)]
+fn join_on_another_umask(sb: &Sandbox, server: &Server, a: &Device, files: usize) -> Device {
+    for i in 0..files {
+        let path = format!("d{}/f{i}", i % 5);
+        a.write(&path, format!("{i}"));
+        chmod(&a.path(&path), 0o664);
+    }
+    a.synced();
+    let b = Device::new(sb, server, "b");
+    for i in 0..files {
+        let path = format!("d{}/f{i}", i % 5);
+        b.write(&path, format!("{i}"));
+        chmod(&b.path(&path), 0o644);
+    }
+    b
+}
+
+#[cfg(unix)]
+#[track_caller]
+fn every_loser_once(server: &Server, files: usize, most_notes: usize) {
+    let (losers, notes) = notes_in_journal(&server.data);
+    let text = "mode: kept 664 from the server; this device had 644";
+    assert!(losers.iter().all(|(_, t)| t == text), "{losers:?}");
+    let distinct: std::collections::BTreeSet<_> = losers.iter().map(|(o, _)| o).collect();
+    assert_eq!(distinct.len(), files, "every file once: {losers:?}");
+    assert_eq!(losers.len(), files, "no file twice: {losers:?}");
+    assert!(notes <= most_notes, "{notes} notes for {files} files");
+}
+
+/// A join's losers of one text go as one note to each commit, however the run that queued and sent
+/// them ends: killed with them noted and not queued, queued and not sent, or sent and answered and not
+/// yet out of the queue, the next run logs each file's loser once. Commits of 8 operations, so that
+/// the notes take several. Not on Windows, which holds of a mode only the write bits.
+#[cfg(unix)]
+#[test]
+fn a_join_s_notes_go_grouped_and_once_after_a_kill() {
+    const FILES: usize = 30;
+    for point in ["apply.noted", "sync.enqueued", "sync.committed"] {
+        let (sb, server, a) = seed("join-grouped");
+        let b = join_on_another_umask(&sb, &server, &a, FILES);
+        let run = b.sync_env(&[
+            ("CAIRN_FP_CRASH", point),
+            ("CAIRN_FP_TUNE", "sync.ops_a_commit=8"),
+        ]);
+        assert!(run.was_killed(), "never reached {point}: {}", run.text());
+        b.sync_env(&[("CAIRN_FP_TUNE", "sync.ops_a_commit=8")])
+            .expect_ok();
+        converge(&[&a, &b]);
+        assert_eq!(mode_of(&b.path("d0/f0")) & 0o777, 0o664, "{point}");
+        // Each commit of 8 notes is one of them.
+        every_loser_once(&server, FILES, FILES.div_ceil(8) + 1);
+        let log = b.cairn(&["log"]).expect_ok();
+        assert_eq!(losers_in_log(&log.stdout), FILES, "{point}: {}", log.text());
+    }
+}
+
+/// A server before note groups says nothing of them, and would keep a note's first object alone: to
+/// it a join sends a note to each file, as before.
+#[cfg(unix)]
+#[test]
+fn a_server_before_note_groups_gets_a_note_to_each_object() {
+    const FILES: usize = 12;
+    let sb = Sandbox::on_disk("join-ungrouped");
+    let server = Server::start_with(
+        sb.path("server"),
+        vec![("CAIRN_FP_UNSUPPORTED".into(), "server.note_groups".into())],
+    );
+    let a = Device::new(&sb, &server, "a");
+    let b = join_on_another_umask(&sb, &server, &a, FILES);
+    b.synced();
+    every_loser_once(&server, FILES, FILES);
+    let (_, notes) = notes_in_journal(&server.data);
+    assert_eq!(notes, FILES);
+    let log = b.cairn(&["log"]).expect_ok();
+    assert!(!log.stdout.contains("files and folders)"), "{}", log.text());
 }
 
 fn steps(log: &std::path::Path) -> Vec<String> {

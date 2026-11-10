@@ -1342,6 +1342,45 @@ pub fn journal_json(data: &Path) -> Vec<String> {
     out
 }
 
+/// Every note in a server's journal, read beside it: a pair of object and text for each object a note
+/// names, and how many notes there are.
+pub fn notes_in_journal(data: &Path) -> (Vec<(cairn_protocol::ObjectId, String)>, usize) {
+    use cairn_store::MetaStore;
+    let mut store = cairn_store::SqliteStore::open_with(
+        &data.join("meta.sqlite"),
+        cairn_store::sqlite::Opening {
+            first_token: None,
+            beside_server: true,
+        },
+    )
+    .unwrap();
+    let (mut pairs, mut notes) = (Vec::new(), 0);
+    for ns in store.namespaces().unwrap() {
+        for c in store.changes(&ns, 0, u32::MAX, usize::MAX).unwrap() {
+            for op in &c.ops {
+                if let cairn_protocol::Op::Note { text, .. } = op {
+                    notes += 1;
+                    pairs.extend(op.noted().map(|o| (o, text.clone())));
+                }
+            }
+        }
+    }
+    (pairs, notes)
+}
+
+/// How many losers the notes in `cairn log`'s lines say: one to a line, or the count a line of a
+/// note naming more says.
+pub fn losers_in_log(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains("note: "))
+        .map(|l| {
+            l.strip_suffix(" files and folders)")
+                .and_then(|l| l.rsplit_once(" ("))
+                .map_or(1, |(_, n)| n.parse().unwrap())
+        })
+        .sum()
+}
+
 pub fn wal_len(state: &Path) -> u64 {
     let mut wal = state.as_os_str().to_owned();
     wal.push("-wal");

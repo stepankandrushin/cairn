@@ -23,7 +23,8 @@ pub use metadata::{
 };
 pub use name::{conflict_name, in_git_dir, is_git_dir, FilenamePolicy, Name, NameError};
 pub use ops::{
-    check_and_apply, ConflictOf, Content, Link, ObjectKind, Op, OpReject, RevisionBody, TreeStore,
+    check_and_apply, group_notes, ConflictOf, Content, Link, ObjectKind, Op, OpReject,
+    RevisionBody, TreeStore,
 };
 pub use skip::{Skip, SkipKind};
 pub use tree::{Node, Tree};

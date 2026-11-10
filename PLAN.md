@@ -179,7 +179,7 @@ made it logs "this device had 700" once the rule goes.
 |---|---|
 | One side only | Apply it |
 | Metadata on both, different fields | Merge field by field |
-| Metadata on both, same field | Server order wins; the loser is in the activity log |
+| Metadata on both, same field | Server order wins; the loser is in the activity log, a commit's losers of one text one entry naming each object |
 | Content on one, metadata or rename on the other | Apply both |
 | Content on both | Keep both: a competing revision, a deterministic copy `name (conflict hostname 2026-10-31).ext`, an entry in the conflict inbox, open until the copy is deleted, renamed or moved, which is how a person deals with one. Inside a git directory the copy is `name.conflict-hostname-2026-10-31`, a name git takes: a copy of a branch is a branch to merge, where a space in `refs/` breaks the repository |
 | Edit against delete | The edit survives, and it is reported. This includes each side removing a different hard link of a file someone edited |

@@ -193,6 +193,8 @@ async fn info(
         head,
         max_batch_bytes: MAX_CHUNK_BATCH_BYTES as u64,
         access: Some(allowed.0),
+        // A harness build can say what a server before them says.
+        note_groups: !cairn_failpoint::unsupported("server.note_groups"),
     }))
 }
 

@@ -1500,6 +1500,14 @@ fn up_activity(remote: &Tree, plan: &Plan, ops: &[Op]) -> Vec<Activity> {
     out
 }
 
+/// A note as the log says it: one that names more than one object says how many.
+pub fn note_line(text: &str, also: usize) -> String {
+    match also {
+        0 => format!("note: {text}"),
+        n => format!("note: {text} ({} files and folders)", n + 1),
+    }
+}
+
 fn describe_op(op: &Op) -> String {
     match op {
         Op::Create { link, .. } => format!("create {}", link.name),
@@ -1507,7 +1515,7 @@ fn describe_op(op: &Op) -> String {
         Op::Unlink { link, .. } => format!("delete {}", link.name),
         Op::Move { from, to, .. } => format!("move {} -> {}", from.name, to.name),
         Op::Update { object, .. } => format!("update {object:?}"),
-        Op::Note { text, .. } => format!("note: {text}"),
+        Op::Note { text, also, .. } => note_line(text, also.len()),
     }
 }
 
@@ -2221,10 +2229,11 @@ fn sync_full(
                 }
             }
         }
-        ops.extend(notes.iter().map(|(object, text)| Op::Note {
-            object: *object,
-            text: text.clone(),
-        }));
+        ops.extend(
+            notes
+                .iter()
+                .map(|(object, text)| Op::note(*object, text.clone())),
+        );
         if read_only && !ops.is_empty() {
             // What the merge decided where both sides changed something is on disk now: the copies it
             // kept beside the server's are new here, which the next round holds back.
@@ -2358,20 +2367,8 @@ fn sync_full(
             let pushed = mark_synced(rows, &mut landed, &cur, &req);
             let list: Vec<(ObjectId, &Row)> = pushed.iter().map(|id| (*id, &rows[id])).collect();
             // The queue delivers the notes in it from here on.
-            let delivered: Vec<String> = req
-                .ops
-                .iter()
-                .filter_map(|op| match op {
-                    Op::Note { object, text } => Some(
-                        NoteIntent {
-                            object: *object,
-                            text: text.clone(),
-                        }
-                        .key(),
-                    ),
-                    _ => None,
-                })
-                .collect();
+            let delivered: Vec<String> =
+                note_intents(&req).into_iter().map(|(key, _)| key).collect();
             root.state.enqueue(&req, &list, &delivered)?;
             hit("sync.enqueued");
             crate::progress::phase(Phase::Committing);
@@ -3493,21 +3490,26 @@ fn mark_synced(
 /// A refused commit said nothing: what its deletes gave up is still this device's to delete.
 /// The notes of a refused commit, noted again: the queue no longer carries them.
 fn notes_back(root: &mut Root, req: &CommitRequest) -> Result<()> {
-    let notes: Vec<(String, NoteIntent)> = req
-        .ops
-        .iter()
-        .filter_map(|op| match op {
-            Op::Note { object, text } => {
+    root.state.put_intents(&note_intents(req))
+}
+
+/// Each object's note in a commit, as the intent that holds it until the commit is queued. The queue
+/// keeps a note to each object, as an older build reads the queue and keeps only a note's first
+/// object: the notes are made one only as the commit is sent (`Client::commit`).
+fn note_intents(req: &CommitRequest) -> Vec<(String, NoteIntent)> {
+    let mut out = Vec::new();
+    for op in &req.ops {
+        if let Op::Note { text, .. } = op {
+            for object in op.noted() {
                 let note = NoteIntent {
-                    object: *object,
+                    object,
                     text: text.clone(),
                 };
-                Some((note.key(), note))
+                out.push((note.key(), note));
             }
-            _ => None,
-        })
-        .collect();
-    root.state.put_intents(&notes)
+        }
+    }
+    out
 }
 
 fn take_back_refused(req: &CommitRequest, rows: &mut BTreeMap<ObjectId, Row>) -> Vec<ObjectId> {
@@ -3559,10 +3561,7 @@ mod tests {
     }
 
     fn note() -> Op {
-        Op::Note {
-            object: ObjectId::ROOT,
-            text: String::new(),
-        }
+        Op::note(ObjectId::ROOT, String::new())
     }
 
     #[test]

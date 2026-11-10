@@ -1036,8 +1036,11 @@ fn run_inner() -> Result<u8> {
                     c.ops.len()
                 );
                 for op in &c.ops {
-                    if let cairn_protocol::Op::Note { text, .. } = op {
-                        outln!("          note: {text}");
+                    if let cairn_protocol::Op::Note { text, also, .. } = op {
+                        outln!(
+                            "          {}",
+                            cairn_engine::sync::note_line(text, also.len())
+                        );
                     }
                 }
             }

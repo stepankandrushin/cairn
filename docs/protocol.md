@@ -27,7 +27,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | Method and path | Body | Answer |
 |---|---|---|
 | `GET /v1/me` | | `{user, folders: [{folder, access}]}`: whose the token is, and every namespace it reaches |
-| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything |
+| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups`, absent before them, says that a note may name more objects than one |
 | `POST /chunks/missing` | `{hashes}` | `{hashes}`: those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
 | `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept. Needs `write` |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
@@ -85,7 +85,7 @@ that later replays them (`check_and_apply` in `crates/protocol/src/ops.rs`):
 | `unlink` | `object, link, base?` | The entry is not this object's; a directory that is not empty; `base`, the revision the device saw when it decided to delete, is not the head (`stale_base`): the delete has not seen an edit |
 | `move` | `object, from, to` | As `unlink` for `from` without the emptiness rule, and `link` for `to` |
 | `update` | `object, base, revision, body, restored_from?` | `base` is not the head (`stale_base`): another device changed it first; the kind would change; the object is deleted (`deleted`): the edit has not seen the delete. Bringing an object back links it first, in the same commit |
-| `note` | `object, text` | The object does not exist. Otherwise it has no effect; it is the activity log's entry for the loser of a metadata conflict |
+| `note` | `object, text, also?` | The object, or one in `also`, does not exist. Otherwise it has no effect; it is the activity log's entry for the loser of a metadata conflict, the same text for `object` and each of `also`. A client puts a commit's notes of one text in one, at the place of the last, only for a server whose `/info` says `note_groups`: a server before them keeps the first object alone. A client before them reads one as a note of its first object |
 
 The root cannot be linked, moved or removed, and `.cairn` directly in the root is refused: that one
 name holds each client's state. An object with no entries is deleted: it keeps its last state for

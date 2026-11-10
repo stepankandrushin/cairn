@@ -377,6 +377,9 @@ pub enum Request {
     Undelete {
         ids: Vec<String>,
     },
+    /// An address that opens this root's folder on the server's web page, signed in as this root's
+    /// token without typing it: [`Reply::SignInLink`]. It signs a browser in once, within two minutes.
+    SignInLink,
 }
 
 pub const DEFAULT_DELETED_DAYS: u32 = 30;
@@ -402,6 +405,9 @@ pub enum Reply {
         items: Vec<UndeletedItem>,
         /// Asked for but not deleted now, each where it is, relative to the root.
         already: Vec<String>,
+    },
+    SignInLink {
+        url: String,
     },
     Error {
         text: String,

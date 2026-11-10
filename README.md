@@ -154,8 +154,9 @@ user may write, what was held back goes up like any change. `cairn log` says whi
 
 ## The web interface
 
-The server's address opens it in a browser. Sign in with a token: `cairn-server token add alice --label
-browser --data ~/cairn-data` makes one. Each folder is there to browse, with uploads of files and folders,
+The server's address opens it in a browser. From a computer that syncs, the tray's Open in browser, or `cairn
+web` in a synced folder, opens it signed in as that device, with nothing to type; elsewhere, sign in with a
+token, which `cairn-server token add alice --label browser --data ~/cairn-data` makes. Each folder is there to browse, with uploads of files and folders,
 downloads of a file or of a folder as a zip, previews, a file's history with any revision restored, what was
 deleted brought back, who has access, and, for a folder's managers, shares of any file or folder in it: with
 another user of the server, to read or to write, or by a public link that needs no account, reads only and

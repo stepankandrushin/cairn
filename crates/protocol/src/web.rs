@@ -8,8 +8,15 @@ use crate::ops::{Link, ObjectKind};
 use crate::wire::Access;
 use serde::{Deserialize, Serialize};
 
-/// The cookie a browser is signed in by: the token itself, which no script on the page can read.
+/// The cookie a browser is signed in by, which no script on the page can read: a session the server
+/// signed, naming the token that signed the browser in and when it ends, never the token itself.
 pub const SESSION_COOKIE: &str = "cairn";
+
+/// How long a browser stays signed in.
+pub const SESSION_SECS: u64 = 30 * 86_400;
+
+/// How long a [`SignInTicket`] may wait to be taken, and it is taken once.
+pub const TICKET_SECS: u64 = 120;
 
 /// What a request signed in by the cookie must carry unless it only reads: no other site's page can
 /// make a browser send it.
@@ -21,10 +28,41 @@ pub const MAX_UPLOAD_PART: usize = 64 * 1024 * 1024;
 /// The device name every web commit has.
 pub const WEB_DEVICE: &str = "web";
 
-/// `POST /v1/session`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `POST /v1/session`: a token, or a ticket a client asked for with one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SignIn {
-    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+}
+
+/// `POST /v1/session/ticket`: what signs a browser in once, as the token that asked, within
+/// [`TICKET_SECS`]. A program that has a token opens [`sign_in_url`] with it, so nobody types one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInTicket {
+    pub ticket: String,
+    /// Seconds it may still wait.
+    pub expires_in: u64,
+}
+
+/// The page at `server`, signed in by `ticket` and open at `folder`'s top. The ticket goes in the
+/// fragment, which no browser sends to a server or in a `Referer`; the page takes it out of the address
+/// before using it.
+pub fn sign_in_url(server: &str, ticket: &str, folder: Option<&str>) -> String {
+    let mut url = format!("{}/#/signin/{ticket}", server.trim_end_matches('/'));
+    if let Some(folder) = folder.filter(|f| !f.is_empty()) {
+        url.push_str("/f/");
+        for b in folder.bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                url.push(b as char);
+            } else {
+                url.push_str(&format!("%{b:02X}"));
+            }
+        }
+        url.push_str("/root");
+    }
+    url
 }
 
 /// An object as a person sees it in a listing.
@@ -325,4 +363,22 @@ pub struct LinkInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Users {
     pub users: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sign_in_url;
+
+    #[test]
+    fn a_sign_in_url_keeps_its_ticket_in_the_fragment_and_escapes_the_folder() {
+        assert_eq!(
+            sign_in_url("https://h:1/", "T-k_1", Some("default")),
+            "https://h:1/#/signin/T-k_1/f/default/root"
+        );
+        assert_eq!(
+            sign_in_url("https://h", "t", Some("my files/é")),
+            "https://h/#/signin/t/f/my%20files%2F%C3%A9/root"
+        );
+        assert_eq!(sign_in_url("https://h", "t", None), "https://h/#/signin/t");
+    }
 }

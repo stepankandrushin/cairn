@@ -27,6 +27,8 @@ struct App {
     repo: Repo,
     /// The web's uploads in progress.
     uploads: web::upload::Uploads,
+    /// What signs a browser's session, and the sign-in tickets waiting.
+    sessions: web::session::Sessions,
     /// Where a public link is opened, when that is another address than this server's own:
     /// `serve --link-url`.
     link_url: Option<String>,
@@ -111,27 +113,34 @@ async fn authorize(State(app): State<Arc<App>>, mut req: Request, next: Next) ->
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.strip_prefix("Bearer ").map(str::to_string));
-    let token = match presented {
-        Some(Some(token)) => token,
+    // Looked up by its hash, which a guess cannot steer: a stored hash is no token, and timing the
+    // lookup says nothing about any token there is.
+    let hash = match presented {
+        Some(Some(token)) => token_hash(&token),
         Some(None) => return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
-        // A browser signed in: its cookie, which changes something only with the web's header.
-        None => match web::cookie_token(&req) {
-            Some(token) => {
+        // A browser signed in: its session, which names a token and changes something only with the
+        // web's header.
+        None => match web::session::cookie_value(&req) {
+            Some(cookie) => {
                 if let Some(refused) = web::cookie_request_refused(&req) {
                     return refused;
                 }
-                token
+                match app.sessions.verify(&cookie) {
+                    Some(hash) => hash,
+                    None => {
+                        return (StatusCode::UNAUTHORIZED, "signed out: sign in again")
+                            .into_response()
+                    }
+                }
             }
             None => return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
         },
     };
-    // Looked up by its hash, which a guess cannot steer: a stored hash is no token, and timing the
-    // lookup says nothing about any token there is.
-    let hash = token_hash(&token);
     let found = blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await;
     match found {
         Ok(Some(user)) => {
             req.extensions_mut().insert(Caller { user });
+            req.extensions_mut().insert(web::session::Presented(hash));
             next.run(req).await
         }
         Ok(None) => (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
@@ -629,6 +638,7 @@ async fn serve(
     let app = Arc::new(App {
         repo,
         uploads: web::upload::Uploads::open(&data)?,
+        sessions: web::session::Sessions::open(&data)?,
         link_url,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,

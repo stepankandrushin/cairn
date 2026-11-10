@@ -480,15 +480,21 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
                 }
             });
         }
-        "folder" | "web" => {
-            let r = match what.as_str() {
-                "folder" => open_folder_of(&root),
-                _ => open_server_of(&root),
-            };
-            if let Err(e) = r {
+        "folder" => {
+            if let Err(e) = open_folder_of(&root) {
                 hub().notice(e);
                 show_window(app, "status");
             }
+        }
+        "web" => {
+            // Off the event loop: it waits on the daemon, which asks the server.
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = open_server_of(&root) {
+                    hub().notice(e);
+                    show_window(&app, "status");
+                }
+            });
         }
         _ => {}
     }
@@ -535,6 +541,16 @@ fn open_server_of(root_id: &str) -> Result<(), String> {
         (_, Link::Up(st)) if !st.server.is_empty() => st.server.clone(),
         _ => return Err("this root names no server".into()),
     };
+    // Signed in as this root's token, which the daemon asks the server for, so the page asks for none.
+    let why = match link::ask(root_id, Request::SignInLink, Duration::from_secs(20)) {
+        Ok(Reply::SignInLink { url }) => return actions::open_url(&url),
+        Ok(Reply::Error { text }) => text,
+        Ok(other) => format!("the daemon answered {other:?}"),
+        Err(e) => e.to_string(),
+    };
+    hub().notice(format!(
+        "The server's page opened without signing in, so it asks for a token: {why}"
+    ));
     actions::open_url(&url)
 }
 

@@ -21,6 +21,7 @@ cairn-failpoint.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
+blake3.workspace = true
 clap.workspace = true
 fastcdc.workspace = true
 futures-util = { version = "0.3", default-features = false }

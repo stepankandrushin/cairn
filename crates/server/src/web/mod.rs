@@ -1,6 +1,6 @@
 //! What the web interface asks of the server, and any other client may (docs/protocol.md, "Web"): three
 //! views of a tree, by a folder's grant, a share with a user, or a public link, each reaching no further
-//! than its root; sessions; and the page itself.
+//! than its root; sessions (session.rs); and the page itself.
 
 use crate::{blocking, now, ApiResult, App, Caller};
 use anyhow::{anyhow, Result};
@@ -21,6 +21,7 @@ mod assets;
 mod content;
 mod deleted;
 mod edit;
+pub(crate) mod session;
 mod shares;
 pub(crate) mod upload;
 mod zip;
@@ -521,11 +522,12 @@ pub(crate) fn namespace_routes() -> Router<Arc<App>> {
         .route("/shares/{share}", axum::routing::delete(shares::remove))
 }
 
-/// The routes that need a token: a user's shares, and the users there are.
+/// The routes that need a token: a user's shares, the users there are, and a sign-in ticket.
 pub(crate) fn user_routes(app: &Arc<App>) -> Router {
     Router::new()
         .route("/v1/users", get(shares::users))
         .route("/v1/shared", get(shares::shared_with_me))
+        .route("/v1/session/ticket", post(session::ticket))
         .nest(
             "/v1/shared/{share}",
             tree_routes().route_layer(middleware::from_fn_with_state(app.clone(), check_share)),
@@ -539,7 +541,10 @@ pub(crate) fn public_routes(app: &Arc<App>) -> Router {
         .route("/", get(assets::page))
         .route("/s/{link}", get(assets::page))
         .route("/web/{file}", get(assets::file))
-        .route("/v1/session", post(sign_in).delete(sign_out))
+        .route(
+            "/v1/session",
+            post(session::sign_in).delete(session::sign_out),
+        )
         .nest(
             "/v1/links/{link}",
             Router::new()
@@ -548,60 +553,6 @@ pub(crate) fn public_routes(app: &Arc<App>) -> Router {
                 .route_layer(middleware::from_fn_with_state(app.clone(), check_link)),
         )
         .with_state(app.clone())
-}
-
-const SESSION_DAYS: u64 = 30;
-
-fn session_cookie(value: &str, max_age: u64) -> HeaderValue {
-    HeaderValue::from_str(&format!(
-        "{}={value}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict",
-        w::SESSION_COOKIE
-    ))
-    .expect("a token is hex")
-}
-
-/// A token as a cookie, so that a browser's downloads and previews are signed in too. Only a token the
-/// server knows is set, so the cookie is always plain hex.
-async fn sign_in(State(app): State<Arc<App>>, Json(req): Json<w::SignIn>) -> ApiResult<Response> {
-    let token = req.token.trim().to_string();
-    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return Ok((StatusCode::UNAUTHORIZED, "missing or wrong token").into_response());
-    }
-    let hash = cairn_store::token_hash(&token);
-    let user = blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await?;
-    if user.is_none() {
-        return Ok((StatusCode::UNAUTHORIZED, "missing or wrong token").into_response());
-    }
-    Ok((
-        StatusCode::NO_CONTENT,
-        [(
-            header::SET_COOKIE,
-            session_cookie(&token, SESSION_DAYS * 86_400),
-        )],
-    )
-        .into_response())
-}
-
-async fn sign_out() -> Response {
-    (
-        StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session_cookie("", 0))],
-    )
-        .into_response()
-}
-
-/// The session cookie's token, if the request has one.
-pub(crate) fn cookie_token(req: &Request) -> Option<String> {
-    let prefix = format!("{}=", w::SESSION_COOKIE);
-    req.headers()
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .map(str::trim)
-        .find_map(|c| c.strip_prefix(&prefix))
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
 }
 
 /// A request signed in by the cookie changes something only with the header no other site can send.

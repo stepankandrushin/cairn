@@ -152,6 +152,33 @@ fn token(file: &std::path::Path) -> String {
     std::fs::read_to_string(file).unwrap().trim().to_string()
 }
 
+/// The session a sign-in's answer sets, as a browser would send it back.
+#[track_caller]
+fn session_of(signed: &Answer) -> String {
+    let cookie = signed
+        .header("set-cookie")
+        .expect("a sign-in sets the cookie");
+    let value = cookie
+        .strip_prefix("cairn=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(!value.is_empty(), "{cookie}");
+    value.to_string()
+}
+
+/// The ticket in a sign-in address, `<server>/#/signin/<ticket>/f/<folder>/root`.
+#[track_caller]
+fn ticket_in(url: &str, server: &Server) -> String {
+    let rest = url
+        .strip_prefix(&format!("{}/#/signin/", server.url))
+        .unwrap_or_else(|| panic!("{url} is no sign-in address of {}", server.url));
+    let (ticket, route) = rest.split_once('/').unwrap();
+    assert_eq!(route, "f/default/root", "{url}");
+    ticket.to_string()
+}
+
 /// The entry named `name` in a listing.
 #[track_caller]
 fn entry(listing: &Value, name: &str) -> Value {
@@ -1234,8 +1261,8 @@ fn read_zip(z: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// A browser signs in with its token as a cookie, which reads; changing anything needs the web's header
-/// too, so another site's page that makes the browser send a request changes nothing.
+/// A browser signs in with its token to a session cookie, which reads; changing anything needs the web's
+/// header too, so another site's page that makes the browser send a request changes nothing.
 #[test]
 fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     let sb = Sandbox::fast("web-session");
@@ -1251,6 +1278,11 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     assert!(wrong.header("set-cookie").is_none());
     let signed = post(&server, "/v1/session", Auth::None, json!({"token": t})).ok();
     let cookie = signed.header("set-cookie").unwrap();
+    let s = session_of(&signed);
+    assert!(
+        !cookie.contains(&t),
+        "the token itself is never in the browser: {cookie}"
+    );
     for part in ["httponly", "secure", "samesite=strict", "path=/"] {
         assert!(cookie.contains(part), "{cookie}");
     }
@@ -1260,29 +1292,31 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     );
 
     assert_eq!(
-        get(&server, "/v1/me", Auth::Cookie(&t, false)).ok().json()["user"],
+        get(&server, "/v1/me", Auth::Cookie(&s, false)).ok().json()["user"],
         "admin"
     );
-    assert_eq!(
-        get(&server, "/v1/me", Auth::Cookie("0123", false)).code,
-        401
-    );
+    for not_one in ["0123", &t] {
+        assert_eq!(
+            get(&server, "/v1/me", Auth::Cookie(not_one, false)).code,
+            401
+        );
+    }
     let forged = post(
         &server,
         "/v1/ns/default/mkdir",
-        Auth::Cookie(&t, false),
+        Auth::Cookie(&s, false),
         json!({"parent": ROOT, "name": b64("x")}),
     );
     assert_eq!(forged.code, 403, "{}", forged.text());
     let commit = post(
         &server,
         "/v1/ns/default/commit",
-        Auth::Cookie(&t, false),
+        Auth::Cookie(&s, false),
         json!({}),
     );
     assert_eq!(commit.code, 403);
     assert_eq!(
-        get(&server, "/v1/ns/default/info", Auth::Cookie(&t, false))
+        get(&server, "/v1/ns/default/info", Auth::Cookie(&s, false))
             .ok()
             .json()["head"],
         0
@@ -1290,12 +1324,12 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     post(
         &server,
         "/v1/ns/default/mkdir",
-        Auth::Cookie(&t, true),
+        Auth::Cookie(&s, true),
         json!({"parent": ROOT, "name": b64("x")}),
     )
     .ok();
     assert_eq!(
-        get(&server, "/v1/ns/default/info", Auth::Cookie(&t, false))
+        get(&server, "/v1/ns/default/info", Auth::Cookie(&s, false))
             .ok()
             .json()["head"],
         1
@@ -1315,4 +1349,230 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
         assert_eq!(get(&server, file, Auth::None).code, 200, "{file}");
     }
     assert_ne!(get(&server, "/web/../meta.sqlite", Auth::None).code, 200);
+}
+
+/// A program with a token, the tray or `cairn web`, signs a browser in by a ticket: once, and only by the
+/// server that made it. The session names the token and holds it nowhere, outlives a restart, and ends
+/// when the token is removed. A device's daemon gives the same address, as the tray asks for it.
+#[test]
+fn a_ticket_signs_a_browser_in_once_and_its_session_ends_with_its_token() {
+    let sb = Sandbox::fast("web-ticket");
+    let mut server = Server::start(sb.path("data"));
+    let admin = token(&server.token_file);
+    let other = sb.path("laptop.token");
+    server
+        .admin(&[
+            "token",
+            "add",
+            "admin",
+            "--label",
+            "laptop",
+            "--token-file",
+            other.to_str().unwrap(),
+        ])
+        .expect_ok();
+    let laptop = token(&other);
+
+    let none = post(&server, "/v1/session/ticket", Auth::None, json!({}));
+    assert_eq!(none.code, 401, "{}", none.text());
+    let asked = post(
+        &server,
+        "/v1/session/ticket",
+        Auth::Bearer(&laptop),
+        json!({}),
+    )
+    .ok()
+    .json();
+    assert_eq!(asked["expires_in"], 120, "{asked}");
+    let ticket = asked["ticket"].as_str().unwrap().to_string();
+    let signed = post(
+        &server,
+        "/v1/session",
+        Auth::None,
+        json!({ "ticket": ticket }),
+    )
+    .ok();
+    let session = session_of(&signed);
+    for secret in [&ticket, &laptop, &admin] {
+        assert!(!session.contains(secret.as_str()), "{session}");
+    }
+    let again = post(
+        &server,
+        "/v1/session",
+        Auth::None,
+        json!({ "ticket": ticket }),
+    );
+    assert_eq!(again.code, 401, "a ticket signs in once: {}", again.text());
+    assert!(
+        again.text().contains("used or has expired"),
+        "{}",
+        again.text()
+    );
+    assert!(again.header("set-cookie").is_none());
+    for wrong in [
+        json!({}),
+        json!({ "ticket": "x", "token": admin }),
+        json!({ "ticket": "nope" }),
+    ] {
+        assert_eq!(
+            post(&server, "/v1/session", Auth::None, wrong.clone()).code,
+            401,
+            "{wrong}"
+        );
+    }
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&session, false))
+            .ok()
+            .json()["user"],
+        "admin"
+    );
+    // Its end, or its token, changed by hand is no session.
+    let (hash, rest) = session.split_once('.').unwrap();
+    let (expires, mac) = rest.split_once('.').unwrap();
+    let longer = format!("{hash}.{}.{mac}", expires.parse::<u64>().unwrap() + 86_400);
+    let admins = format!(
+        "{}.{expires}.{mac}",
+        hex::encode(cairn_protocol::Hash::of(admin.as_bytes()).0)
+    );
+    for forged in [longer, admins] {
+        assert_eq!(
+            get(&server, "/v1/me", Auth::Cookie(&forged, false)).code,
+            401
+        );
+    }
+
+    // The key it was signed with is kept, readable by the server alone, so a restart signs nobody out.
+    let key = server.data.join("web/session.key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    server.restart();
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&session, false))
+            .ok()
+            .json()["user"],
+        "admin"
+    );
+    // A ticket waits only in memory: one asked for before a restart is gone after it.
+    let before = post(
+        &server,
+        "/v1/session/ticket",
+        Auth::Bearer(&laptop),
+        json!({}),
+    )
+    .ok()
+    .json()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.restart();
+    assert_eq!(
+        post(
+            &server,
+            "/v1/session",
+            Auth::None,
+            json!({ "ticket": before })
+        )
+        .code,
+        401
+    );
+
+    // The token removed, every browser it signed in is signed out; the other token's are not.
+    let by_admin = post(
+        &server,
+        "/v1/session/ticket",
+        Auth::Bearer(&admin),
+        json!({}),
+    )
+    .ok()
+    .json()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let admin_session = session_of(
+        &post(
+            &server,
+            "/v1/session",
+            Auth::None,
+            json!({ "ticket": by_admin }),
+        )
+        .ok(),
+    );
+    let list = server.admin(&["token", "list"]).expect_ok();
+    let id = list
+        .stdout
+        .lines()
+        .find(|l| l.contains("laptop"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{}", list.text()))
+        .to_string();
+    server.admin(&["token", "remove", &id]).expect_ok();
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&session, false)).code,
+        401
+    );
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&admin_session, false))
+            .ok()
+            .json()["user"],
+        "admin"
+    );
+
+    // `cairn web` gives the address it would open, at this root's folder.
+    let d = Device::new(&sb, &server, "d");
+    let printed = d.cairn(&["web", "--print"]).expect_ok();
+    let ticket = ticket_in(printed.stdout.trim(), &server);
+    post(
+        &server,
+        "/v1/session",
+        Auth::None,
+        json!({ "ticket": ticket }),
+    )
+    .ok();
+
+    // The daemon gives one too, as the tray asks it for its Open in browser.
+    let log = sb.path("daemon.log");
+    let out = std::fs::File::create(&log).unwrap();
+    let mut daemon = std::process::Command::new(CAIRN)
+        .arg("--root")
+        .arg(&d.root)
+        .arg("daemon")
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let reply = loop {
+        let run = d.cairn(&["ask", "sign_in_link"]);
+        if run.ok() {
+            break serde_json::from_str::<Value>(run.stdout.trim()).unwrap();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{}\n{}",
+            run.text(),
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert_eq!(reply["reply"], "sign_in_link", "{reply}");
+    let ticket = ticket_in(reply["url"].as_str().unwrap(), &server);
+    let signed = post(
+        &server,
+        "/v1/session",
+        Auth::None,
+        json!({ "ticket": ticket }),
+    )
+    .ok();
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&session_of(&signed), false))
+            .ok()
+            .json()["user"],
+        "admin"
+    );
 }

@@ -652,6 +652,32 @@ impl Client {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    /// An address of the server's web page that signs a browser in as this token, once and within two
+    /// minutes, open at `folder`'s top: what `cairn web` and the tray's Open in browser open.
+    pub fn sign_in_url(&self, folder: Option<&str>) -> Result<String> {
+        let url = format!("{}/v1/session/ticket", self.server);
+        let body = self
+            .exchange("asking for a sign-in to the web page", "client.ticket", || {
+                self.agent
+                    .post(&url)
+                    .header("Authorization", &self.auth)
+                    .send_empty()
+            })
+            .map_err(|e| {
+                if format!("{e:#}").contains("server answered 404") {
+                    anyhow!("this server's web page cannot be signed in to from here: upgrade the server, or sign in there with a token")
+                } else {
+                    e
+                }
+            })?;
+        let t: cairn_protocol::web::SignInTicket = serde_json::from_slice(&body)?;
+        Ok(cairn_protocol::web::sign_in_url(
+            &self.server,
+            &t.ticket,
+            folder,
+        ))
+    }
+
     /// Who has access to this folder, at which level.
     pub fn members(&self) -> Result<Vec<Member>> {
         self.get_json("reading who has access", "client.access", "/access")

@@ -15,6 +15,9 @@
   reads only and may expire: each reaches what it names and nothing above it, follows it when it moves, and
   stops when it is deleted or its maker no longer manages the folder. "Shared with me" lists what others
   shared with you.
+- Signing in from a device, with nothing to type: the tray's Open in browser, and `cairn web` in a synced
+  folder, open the web interface signed in as that device, by a ticket that works once within two minutes.
+  The browser keeps a session the server signed, never the token, and removing the token signs it out.
 - Endpoints for all of it, which any client may use (docs/protocol.md, "Web"), and schema 3 on the server,
   which adds the table of shares.
 

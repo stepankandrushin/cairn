@@ -530,6 +530,18 @@ fn handler(
                 },
             }
         }
+        Request::SignInLink => {
+            let url = read_config(&root).and_then(|config| {
+                crate::client::Client::of_server(&config.server, &config.token, config.allow_http)?
+                    .sign_in_url(Some(&config.namespace))
+            });
+            match url {
+                Ok(url) => Reply::SignInLink { url },
+                Err(e) => Reply::Error {
+                    text: format!("{e:#}"),
+                },
+            }
+        }
         Request::Conflicts => match open_conflicts(&root) {
             Ok(open) => Reply::Conflicts { open },
             Err(e) => Reply::Error {

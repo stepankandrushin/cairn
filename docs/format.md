@@ -11,6 +11,8 @@ data/
     chunks/ab/abcdef...  one file per chunk or manifest, named by its full hash
     incoming/            uploads in progress; emptied at startup
   web/uploads/<id>       a web upload's bytes as they arrive, until stored; emptied at startup
+  web/session.key        what browsers' sessions are signed with, 0600, made at the first start: removed, a
+                         new one is made at the next, and every browser signs in again
 ```
 
 **Backup:** snapshot `meta.sqlite` (the SQLite backup API, or stop the server), then rsync `ns/`.

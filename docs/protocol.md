@@ -149,9 +149,16 @@ The web interface is a thin client of the endpoints below, which any client may 
 scripts are in the server binary, at `GET /` and `/web/…`, and the same page at `GET /s/{link}` opens a
 public link. They name no version, user or folder, and answer without a token. In `cairn_protocol::web`.
 
-**Signing in.** `POST /v1/session` with `{token}` answers 204 and sets the cookie `cairn`, holding the token,
-`HttpOnly; Secure; SameSite=Strict`, for 30 days; a wrong token is 401. `DELETE /v1/session` clears it. A request
-with no `Authorization` header is taken as the cookie's token's, and one that is not `GET` or `HEAD` must then
+**Signing in.** `POST /v1/session` with `{token}`, or `{ticket}`, answers 204 and sets the cookie `cairn`,
+`HttpOnly; Secure; SameSite=Strict`, for 30 days; a wrong token or a ticket used or late is 401. The cookie is a
+session, `<token hash>.<end>.<mac>`: the BLAKE3 of the token that signed in, the second it ends, and a keyed
+BLAKE3 of both under the server's key, `web/session.key`. It never holds the token, it outlives a restart, and
+removing the token signs out every browser it signed in. `DELETE /v1/session` clears it. A ticket comes from
+`POST /v1/session/ticket` with a token, `{ticket, expires_in}`: 32 random bytes as base64url, in memory only,
+taken once within 120 s. A program with a token (the tray's Open in browser, `cairn web`) opens
+`<server>/#/signin/<ticket>/f/<folder>/root`; the ticket is in the fragment, which no browser sends, and the page
+takes it out of the address before it signs in with it, so nobody types a token. A request
+with no `Authorization` header is taken as the session's token's, and one that is not `GET` or `HEAD` must then
 also carry `X-Cairn-Web: 1`, or it is answered 403: no other site's page can send that header, so nothing it
 makes a browser send can change anything. Every answer says `Referrer-Policy: no-referrer`, so a link's token
 never leaves in a `Referer`.
@@ -230,6 +237,7 @@ database reads the files anyway.
 | `GET /v1/shared` | | `{shares}`: what is shared with the caller and works now, each `{id, item, by, access, expires?}` |
 | `GET /v1/links/{link}` | | `{item, expires?}`, without a token |
 | `GET /v1/users` | | `{users}`: every user's name, to share with |
+| `POST /v1/session/ticket` | | `{ticket, expires_in}`: signs a browser in once as the caller's token (Signing in, above) |
 
 A user's share reaches no further than what it names: the sync protocol's endpoints answer 404 to a user who
 has only shares in a folder, as they reveal the whole tree. Syncing a share as a root of its own waits for
@@ -267,6 +275,7 @@ over.
 | `update_now` | `done` at once: the daemon's updater asks the feed and installs what it offers whatever the policy (Updates, below), and the status's `update` says how it went |
 | `deleted { days }` | `deleted { head, items }`: what was deleted in the last `days` (30 if not given) and is still deleted, newest first, each `{ id, seq, time, device_name, path, kind, bytes, files, folder_gone }`. A folder is listed once, with `files` and `bytes` of what went with it, and what it held is not listed apart. The daemon replays the journal into an index of every object's kind, size and entries, with no bodies, keeps it for 10 minutes after the last request and takes only what is new to answer the next |
 | `undelete { ids }` | `undeleted { seqs, items, already }`, then a sync: each item `{ id, path, was, renamed, objects }`. `already` names what was asked for but is not deleted now. `error` if nothing came back |
+| `sign_in_link` | `sign_in_link { url }`: the server's page at this root's folder, signed in as its token once within two minutes (Web, "Signing in"), which the tray's Open in browser opens; an `error` if the server cannot say, and the tray then opens the page as it is |
 
 **Deleted, and brought back.** A delete is the unlink that leaves an object with no entry. The server keeps its
 last state, and `link` brings it back as itself, so `undelete` sends only `link`s: each object goes back

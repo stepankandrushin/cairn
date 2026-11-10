@@ -272,6 +272,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "blake3",
  "cairn-failpoint",
  "cairn-protocol",
  "cairn-store",

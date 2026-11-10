@@ -509,7 +509,8 @@ function showSignIn(message) {
     brand(false),
     h('h1', { text: 'Sign in' }),
     form,
-    h('p', { class: 'hint' }, 'Sign in with a token: ', h('code', { text: 'cairn-server token add <user> --label browser' }), ' on the server makes one.'))));
+    h('p', { class: 'hint' }, 'Opened from Cairn on a computer that syncs (its Open in browser, or ', h('code', { text: 'cairn web' }), ' in a synced folder), this page signs in by itself.'),
+    h('p', { class: 'hint' }, 'Or sign in with a token: ', h('code', { text: 'cairn-server token add <user> --label browser' }), ' on the server makes one.'))));
   input.focus();
 }
 
@@ -566,11 +567,37 @@ function renderSidebar(r) {
   shell.sidebar.replaceChildren(...items);
 }
 
-async function start() {
+/**
+ * Opened by a program with a token, as `#/signin/<ticket>` and the route to show: the ticket leaves the
+ * address before anything else runs, and signs this browser in once. What went wrong, if anything.
+ */
+async function signInByTicket() {
+  const m = location.hash.match(/^#\/signin\/([A-Za-z0-9_-]+)(\/.*)?$/);
+  if (!m) return null;
+  history.replaceState(null, '', location.pathname + (m[2] ? `#${m[2]}` : ''));
+  state.signingIn = true;
+  try {
+    const r = await fetch('/v1/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Cairn-Web': '1' },
+      body: JSON.stringify({ ticket: m[1] }),
+      credentials: 'same-origin',
+    });
+    if (r.ok) return null;
+    const text = (await r.text()).trim();
+    return text ? text.charAt(0).toUpperCase() + text.slice(1) + '.' : `The server answered ${r.status}.`;
+  } catch (e) {
+    return `The server could not be reached (${e.message}).`;
+  } finally {
+    state.signingIn = false;
+  }
+}
+
+async function start(message) {
   try {
     state.me = await api.get('/v1/me');
   } catch (e) {
-    if (e.status === 401) { showSignIn(); return; }
+    if (e.status === 401) { showSignIn(message); return; }
     $app().replaceChildren(h('div', { class: 'signin' }, errorBox(e)));
     return;
   }
@@ -611,7 +638,7 @@ function show(gen, el, title) {
 
 async function route() {
   if (IS_PUBLIC) return routePublic();
-  if (!shell || !state.me) return;
+  if (!shell || !state.me || state.signingIn) return;
   closeMenu();
   const r = parseRoute();
   if (r.name === 'home') {
@@ -1913,4 +1940,12 @@ window.addEventListener('resize', () => closeMenu());
 window.addEventListener('dragover', (ev) => { if ([...(ev.dataTransfer?.types || [])].includes('Files')) ev.preventDefault(); });
 window.addEventListener('drop', (ev) => { if ([...(ev.dataTransfer?.types || [])].includes('Files')) ev.preventDefault(); });
 
-if (IS_PUBLIC) startPublic(); else start();
+if (IS_PUBLIC) {
+  startPublic();
+} else {
+  // A page already open in this tab gets a sign-in address as a change of its fragment alone.
+  window.addEventListener('hashchange', () => {
+    if (location.hash.startsWith('#/signin/')) signInByTicket().then(start);
+  });
+  signInByTicket().then(start);
+}

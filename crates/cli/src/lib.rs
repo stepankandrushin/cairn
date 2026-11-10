@@ -186,8 +186,8 @@ enum Command {
     /// Send one request of the local API to this root's daemon and print what it answers, one JSON
     /// object per line: what the tray sees.
     Ask {
-        /// status, subscribe, sync_now, pause, resume, conflicts, deleted or update_now; or a whole
-        /// request as JSON, as `{"op":"undelete","ids":["..."]}`.
+        /// status, subscribe, sync_now, pause, resume, conflicts, deleted, update_now or sign_in_link;
+        /// or a whole request as JSON, as `{"op":"undelete","ids":["..."]}`.
         request: String,
     },
     /// The folders on a server a token reaches, and what it may do in each: read, write, or manage,
@@ -207,6 +207,13 @@ enum Command {
     Access {
         #[command(subcommand)]
         what: Option<AccessCommand>,
+    },
+    /// Open this root's folder on the server's web page in a browser, signed in as this root's token,
+    /// so nobody types one. The address it opens signs in once, within two minutes.
+    Web {
+        /// Print the address instead of opening it.
+        #[arg(long)]
+        print: bool,
     },
     /// The change journal, newest last.
     Log {
@@ -343,6 +350,38 @@ struct FeedArgs {
     /// A key that feed is signed with, base64, in place of the build's; may be given more than once.
     #[arg(long = "key")]
     keys: Vec<String>,
+}
+
+/// A web address in this user's browser. Only where a desktop is: without one, the address is printed,
+/// rather than handed to a browser that would take over the terminal.
+fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return Err("there is no desktop here to open a browser on".into());
+        }
+        std::process::Command::new("xdg-open")
+    };
+    let status = cmd
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot open a browser: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("the browser did not open ({status})"))
+    }
 }
 
 fn find_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -1110,7 +1149,7 @@ fn run_inner() -> Result<u8> {
             } else {
                 serde_json::from_value(serde_json::json!({ "op": request.replace('-', "_") }))
                     .map_err(|_| {
-                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts, deleted or update_now, or one as JSON")
+                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts, deleted, update_now or sign_in_link, or one as JSON")
                     })?
             };
             let root_id = cairn_engine::root::read_root_id(&root_path)
@@ -1124,6 +1163,7 @@ fn run_inner() -> Result<u8> {
                 Request::Conflicts | Request::Deleted { .. } | Request::Undelete { .. } => {
                     Some(Duration::from_secs(600))
                 }
+                Request::SignInLink => Some(Duration::from_secs(60)),
                 _ => Some(control::IO_WAIT),
             };
             c.set_wait(wait)?;
@@ -1213,6 +1253,29 @@ fn run_inner() -> Result<u8> {
                 return Ok(EXIT_OK);
             }
             run_sync(&root_path, SyncOptions::default())
+        }
+        Command::Web { print } => {
+            let config = open_config(&find_root(cli.root)?)?;
+            let url = Client::of_server(&config.server, &config.token, config.allow_http)?
+                .sign_in_url(Some(&config.namespace))?;
+            if print {
+                outln!("{url}");
+                return Ok(EXIT_OK);
+            }
+            match open_browser(&url) {
+                Ok(()) => outln!(
+                    "opened folder {} of {} in the browser, signed in",
+                    config.namespace,
+                    config.server
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "cairn: {e}: open this address within two minutes, which signs in once:"
+                    );
+                    outln!("{url}");
+                }
+            }
+            Ok(EXIT_OK)
         }
         Command::Conflicts { all } => {
             let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;

@@ -415,8 +415,10 @@ public link, which only reads and may expire. Either reaches the object and what
 beside it, by the object's identity, so a move keeps it; it stops while the object is deleted, and for good
 once its maker no longer manages the folder. A user's share is reached only through the web's endpoints,
 since the sync protocol's reveal the whole tree; syncing one waits with mounting a shared folder above. A
-browser signs in with a token, which the server sets as a cookie no script can read, and a request signed in
-by it changes nothing without a header no other site's page can send. Auth: local accounts, then OIDC.
+browser signs in with a token, or by a one-time ticket a device asks for with its own token, which the tray and
+`cairn web` open it with; either sets a session the server signed, naming the token and never holding it, in a
+cookie no script can read, and a request signed in by it changes nothing without a header no other site's page
+can send. Auth: local accounts, then OIDC.
 
 Dedup is scoped to an account or a shared namespace, never global: the "which chunks are missing"
 question would otherwise tell one user what another stores.

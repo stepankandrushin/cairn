@@ -1,11 +1,14 @@
 //! The default store: one SQLite file in WAL mode with full synchronous commits.
 
-use crate::meta::{CommitOutcome, MetaStore, StoredRevision, TokenInfo, TreeState, UserInfo};
+use crate::meta::{
+    Child, CommitOutcome, Head, MetaStore, Revisioned, ShareRow, StoredRevision, TokenInfo,
+    TreeState, UserInfo,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
 use cairn_protocol::{
-    check_and_apply, Content, Hash, Link, Metadata, ObjectId, ObjectKind, Op, OpReject,
+    check_and_apply, Content, Hash, Link, Metadata, Name, ObjectId, ObjectKind, Op, OpReject,
     RevisionBody, RevisionId, TreeStore,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -53,6 +56,18 @@ CREATE TABLE grants (
 ) WITHOUT ROWID;
 CREATE INDEX grants_user ON grants (user);
 ALTER TABLE journal ADD COLUMN user TEXT;
+"#,
+    r#"
+CREATE TABLE shares (
+    id BLOB PRIMARY KEY, ns INTEGER NOT NULL REFERENCES namespaces (id), object BLOB NOT NULL,
+    recipient INTEGER REFERENCES users (id) ON DELETE CASCADE, link TEXT UNIQUE,
+    access TEXT NOT NULL,
+    creator INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    created INTEGER NOT NULL, expires INTEGER,
+    CHECK ((recipient IS NULL) <> (link IS NULL))
+) WITHOUT ROWID;
+CREATE INDEX shares_object ON shares (ns, object);
+CREATE INDEX shares_recipient ON shares (recipient);
 "#,
 ];
 
@@ -175,6 +190,59 @@ fn kind_of(s: &str) -> Result<ObjectKind> {
         "symlink" => ObjectKind::Symlink,
         other => bail!("unknown object kind {other:?} in the database"),
     })
+}
+
+/// A name read back from the database, where only valid ones are ever written.
+fn stored_name(bytes: Vec<u8>) -> Result<Name> {
+    Name::new(bytes).map_err(|e| anyhow!("a stored name is not valid: {e}"))
+}
+
+const SHARE_SELECT: &str =
+    "SELECT s.id, n.name, s.object, r.name, s.link, s.access, c.name, s.created, s.expires
+     FROM shares s JOIN namespaces n ON n.id = s.ns JOIN users c ON c.id = s.creator
+     LEFT JOIN users r ON r.id = s.recipient";
+
+/// A share's row as SQLite gives it, before its IDs and level are checked.
+struct RawShare {
+    id: Vec<u8>,
+    ns: String,
+    object: Vec<u8>,
+    user: Option<String>,
+    link: Option<String>,
+    access: String,
+    by: String,
+    created: i64,
+    expires: Option<i64>,
+}
+
+fn share_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawShare> {
+    Ok(RawShare {
+        id: r.get(0)?,
+        ns: r.get(1)?,
+        object: r.get(2)?,
+        user: r.get(3)?,
+        link: r.get(4)?,
+        access: r.get(5)?,
+        by: r.get(6)?,
+        created: r.get(7)?,
+        expires: r.get(8)?,
+    })
+}
+
+impl RawShare {
+    fn into_row(self) -> Result<ShareRow> {
+        Ok(ShareRow {
+            id: blob16(self.id)?,
+            ns: self.ns,
+            object: ObjectId(blob16(self.object)?),
+            user: self.user,
+            link: self.link,
+            access: access_of(&self.access)?,
+            by: self.by,
+            created: self.created,
+            expires: self.expires,
+        })
+    }
 }
 
 impl SqliteStore {
@@ -830,6 +898,261 @@ impl MetaStore for SqliteStore {
                 .push((ObjectId(blob16(id)?), RevisionId(blob16(head)?)));
         }
         Ok(state)
+    }
+
+    fn children(&mut self, ns: &str, dir: ObjectId) -> Result<Vec<Child>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.name, e.object, o.kind, o.head, r.body FROM entries e
+             JOIN objects o ON o.ns = e.ns AND o.id = e.object
+             JOIN revisions r ON r.ns = o.ns AND r.id = o.head
+             WHERE e.ns = ?1 AND e.parent = ?2 ORDER BY e.name",
+        )?;
+        let rows = stmt.query_map(params![ns_id, dir.0], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, object, kind, head, body) = row?;
+            out.push(Child {
+                name: stored_name(name)?,
+                object: ObjectId(blob16(object)?),
+                head: Head {
+                    kind: kind_of(&kind)?,
+                    revision: RevisionId(blob16(head)?),
+                    body: serde_json::from_str(&body)?,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    fn object_head(&mut self, ns: &str, object: ObjectId) -> Result<Option<Head>> {
+        let ns_id = self.ns_id(ns)?;
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT o.kind, o.head, r.body FROM objects o
+                 JOIN revisions r ON r.ns = o.ns AND r.id = o.head
+                 WHERE o.ns = ?1 AND o.id = ?2",
+            )?
+            .query_row(params![ns_id, object.0], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((kind, head, body)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(Head {
+            kind: kind_of(&kind)?,
+            revision: RevisionId(blob16(head)?),
+            body: serde_json::from_str(&body)?,
+        }))
+    }
+
+    fn links_of(&mut self, ns: &str, object: ObjectId) -> Result<Vec<Link>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT parent, name FROM entries WHERE ns = ?1 AND object = ?2 ORDER BY parent, name",
+        )?;
+        let rows = stmt.query_map(params![ns_id, object.0], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (parent, name) = row?;
+            out.push(Link {
+                parent: ObjectId(blob16(parent)?),
+                name: stored_name(name)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn revision(&mut self, ns: &str, revision: RevisionId) -> Result<Option<StoredRevision>> {
+        let ns_id = self.ns_id(ns)?;
+        let row = self
+            .conn
+            .prepare_cached("SELECT object, seq, body FROM revisions WHERE ns = ?1 AND id = ?2")?
+            .query_row(params![ns_id, revision.0], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((object, seq, body)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(StoredRevision {
+            revision,
+            object: ObjectId(blob16(object)?),
+            seq: seq as u64,
+            body: serde_json::from_str(&body)?,
+        }))
+    }
+
+    fn history(&mut self, ns: &str, object: ObjectId) -> Result<Vec<Revisioned>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT r.id, r.seq, r.body, j.time, j.device_name, j.user FROM revisions r
+             LEFT JOIN journal j ON j.ns = r.ns AND j.seq = r.seq
+             WHERE r.ns = ?1 AND r.object = ?2 ORDER BY r.seq DESC, r.id",
+        )?;
+        let rows = stmt.query_map(params![ns_id, object.0], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, seq, body, time, device_name, user) = row?;
+            out.push(Revisioned {
+                revision: StoredRevision {
+                    revision: RevisionId(blob16(id)?),
+                    object,
+                    seq: seq as u64,
+                    body: serde_json::from_str(&body)?,
+                },
+                time: time.unwrap_or(0),
+                device_name: device_name.unwrap_or_default(),
+                user,
+            });
+        }
+        Ok(out)
+    }
+
+    fn changes_before(
+        &mut self,
+        ns: &str,
+        before: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Change>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, op_id, device, device_name, time, ops, user FROM journal
+             WHERE ns = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![ns_id, before.min(i64::MAX as u64) as i64, limit],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            if bytes >= max_bytes {
+                break;
+            }
+            let (seq, op_id, device, device_name, time, ops, user) = row?;
+            bytes += ops.len();
+            out.push(Change {
+                seq: seq as u64,
+                op_id: cairn_protocol::OpId(blob16(op_id)?),
+                device: cairn_protocol::DeviceId(blob16(device)?),
+                device_name,
+                time,
+                ops: serde_json::from_str(&ops)?,
+                user,
+            });
+        }
+        Ok(out)
+    }
+
+    fn add_share(&mut self, share: &ShareRow) -> Result<()> {
+        let ns_id = self.ns_id(&share.ns)?;
+        let creator = self.user_id(&share.by)?;
+        let recipient = share.user.as_deref().map(|u| self.user_id(u)).transpose()?;
+        if recipient.is_some() == share.link.is_some() {
+            bail!("a share names a user or is a link, one or the other");
+        }
+        self.conn.execute(
+            "INSERT INTO shares (id, ns, object, recipient, link, access, creator, created, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                share.id,
+                ns_id,
+                share.object.0,
+                recipient,
+                share.link,
+                share.access.as_str(),
+                creator,
+                share.created,
+                share.expires
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn shares(&mut self, ns: &str, object: Option<ObjectId>) -> Result<Vec<ShareRow>> {
+        let ns_id = self.ns_id(ns)?;
+        let sql = format!(
+            "{SHARE_SELECT} WHERE s.ns = ?1 AND (?2 IS NULL OR s.object = ?2) ORDER BY s.created, s.id"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![ns_id, object.map(|o| o.0)], share_row)?;
+        rows.map(|r| r?.into_row()).collect()
+    }
+
+    fn share(&mut self, id: &[u8; 16]) -> Result<Option<ShareRow>> {
+        let sql = format!("{SHARE_SELECT} WHERE s.id = ?1");
+        let row = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row([&id[..]], share_row)
+            .optional()?;
+        row.map(RawShare::into_row).transpose()
+    }
+
+    fn share_by_link(&mut self, link: &str) -> Result<Option<ShareRow>> {
+        let sql = format!("{SHARE_SELECT} WHERE s.link = ?1");
+        let row = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row([link], share_row)
+            .optional()?;
+        row.map(RawShare::into_row).transpose()
+    }
+
+    fn shares_to(&mut self, user: &str) -> Result<Vec<ShareRow>> {
+        let sql = format!("{SHARE_SELECT} WHERE r.name = ?1 ORDER BY s.created, s.id");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([user], share_row)?;
+        rows.map(|r| r?.into_row()).collect()
+    }
+
+    fn remove_share(&mut self, ns: &str, id: &[u8; 16]) -> Result<bool> {
+        let ns_id = self.ns_id(ns)?;
+        Ok(self.conn.execute(
+            "DELETE FROM shares WHERE ns = ?1 AND id = ?2",
+            params![ns_id, &id[..]],
+        )? > 0)
     }
 
     fn namespaces(&mut self) -> Result<Vec<String>> {

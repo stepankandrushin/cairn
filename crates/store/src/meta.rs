@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
-use cairn_protocol::{Hash, ObjectId, OpReject, RevisionBody, RevisionId};
+use cairn_protocol::{Hash, Link, Name, ObjectId, ObjectKind, OpReject, RevisionBody, RevisionId};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommitOutcome {
@@ -44,6 +44,48 @@ pub struct TokenInfo {
     pub user: String,
     pub label: String,
     pub created: i64,
+}
+
+/// An object's head: its kind, head revision and that revision's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub kind: ObjectKind,
+    pub revision: RevisionId,
+    pub body: RevisionBody,
+}
+
+/// One entry of a directory, with its object's head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub name: Name,
+    pub object: ObjectId,
+    pub head: Head,
+}
+
+/// A revision with the commit that made it: none for a namespace root's first, made with the namespace.
+#[derive(Debug, Clone)]
+pub struct Revisioned {
+    pub revision: StoredRevision,
+    pub time: i64,
+    pub device_name: String,
+    pub user: Option<String>,
+}
+
+/// An object shared with a user, or by a public link: one or the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRow {
+    pub id: [u8; 16],
+    pub ns: String,
+    pub object: ObjectId,
+    /// Whom it is shared with.
+    pub user: Option<String>,
+    /// A public link's token.
+    pub link: Option<String>,
+    pub access: Access,
+    /// The user who made it, a manager of the namespace then.
+    pub by: String,
+    pub created: i64,
+    pub expires: Option<i64>,
 }
 
 pub trait MetaStore: Send {
@@ -98,6 +140,36 @@ pub trait MetaStore: Send {
     /// Current entries and heads, for `fsck` to compare with a replay of the journal.
     fn tree_state(&mut self, ns: &str) -> Result<TreeState>;
     fn namespaces(&mut self) -> Result<Vec<String>>;
+
+    /// A directory's entries now, in name-byte order, each with its object's head.
+    fn children(&mut self, ns: &str, dir: ObjectId) -> Result<Vec<Child>>;
+    /// An object's head, deleted or not; `None` if there is no such object.
+    fn object_head(&mut self, ns: &str, object: ObjectId) -> Result<Option<Head>>;
+    /// The entries naming an object now: none for a deleted one or the root.
+    fn links_of(&mut self, ns: &str, object: ObjectId) -> Result<Vec<Link>>;
+    fn revision(&mut self, ns: &str, revision: RevisionId) -> Result<Option<StoredRevision>>;
+    /// Every revision of an object, newest first, each with the commit that made it.
+    fn history(&mut self, ns: &str, object: ObjectId) -> Result<Vec<Revisioned>>;
+    /// Up to `limit` entries before `before`, newest first, and no more once their operations pass
+    /// `max_bytes`: always at least one if there is one.
+    fn changes_before(
+        &mut self,
+        ns: &str,
+        before: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Change>>;
+
+    /// Shares. Removing a user removes the shares it made and those made with it.
+    fn add_share(&mut self, share: &ShareRow) -> Result<()>;
+    /// A namespace's shares, or one object's there, oldest first.
+    fn shares(&mut self, ns: &str, object: Option<ObjectId>) -> Result<Vec<ShareRow>>;
+    fn share(&mut self, id: &[u8; 16]) -> Result<Option<ShareRow>>;
+    fn share_by_link(&mut self, link: &str) -> Result<Option<ShareRow>>;
+    /// What is shared with a user, oldest first.
+    fn shares_to(&mut self, user: &str) -> Result<Vec<ShareRow>>;
+    /// Whether there was such a share in that namespace to remove.
+    fn remove_share(&mut self, ns: &str, id: &[u8; 16]) -> Result<bool>;
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -110,7 +182,7 @@ pub struct TreeState {
 #[cfg(test)]
 pub mod suite {
     use super::*;
-    use cairn_protocol::{Content, DeviceId, Link, Metadata, Name, Op, OpId};
+    use cairn_protocol::{Content, DeviceId, Metadata, Op, OpId};
 
     fn name(s: &str) -> Name {
         Name::new(s.as_bytes().to_vec()).unwrap()
@@ -240,7 +312,136 @@ pub mod suite {
         assert!(s.changes("m", 0, 100, usize::MAX).unwrap().is_empty());
         assert_eq!(s.namespaces().unwrap(), ["default", "m", "n"]);
 
+        tree_reads(s, a, c);
         accounts(s);
+        shares(s);
+    }
+
+    /// What the web interface reads: a folder's entries, an object's head, links and history, and the
+    /// journal read back from the head.
+    fn tree_reads(s: &mut dyn MetaStore, a: ObjectId, c: ObjectId) {
+        let root = s.children("n", ObjectId::ROOT).unwrap();
+        assert_eq!(
+            root.iter()
+                .map(|ch| (ch.name.as_bytes().to_vec(), ch.object))
+                .collect::<Vec<_>>(),
+            [(b"a".to_vec(), a)]
+        );
+        assert_eq!(root[0].head.kind, ObjectKind::Dir);
+        assert_eq!(s.children("n", a).unwrap()[0].object, c);
+        assert!(s.children("n", c).unwrap().is_empty());
+        let head = s.object_head("n", c).unwrap().unwrap();
+        assert_eq!(head.kind, ObjectKind::Dir);
+        assert_eq!(s.object_head("n", ObjectId::random()).unwrap(), None);
+        assert_eq!(
+            s.links_of("n", c).unwrap(),
+            [Link {
+                parent: a,
+                name: name("c")
+            }]
+        );
+        assert!(s.links_of("n", ObjectId::ROOT).unwrap().is_empty());
+        let stored = s.revision("n", head.revision).unwrap().unwrap();
+        assert_eq!((stored.object, stored.seq), (c, 2));
+        assert!(s.revision("m", head.revision).unwrap().is_none());
+
+        // An edit is a second revision, listed first, with the commit that made it.
+        let mut body = dir();
+        body.metadata.mode = 0o700;
+        let rev = RevisionId::random();
+        let edit = req(vec![Op::Update {
+            object: c,
+            base: head.revision,
+            revision: rev,
+            body,
+            restored_from: None,
+        }]);
+        assert!(matches!(
+            s.commit("n", &edit, 40, Some("u")).unwrap(),
+            CommitOutcome::Committed { seq: 3, .. }
+        ));
+        let history = s.history("n", c).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|h| (h.revision.revision, h.revision.seq, h.time, h.user.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (rev, 3, 40, Some("u".to_string())),
+                (head.revision, 2, 4, Some("u".to_string()))
+            ]
+        );
+        assert_eq!(s.history("n", ObjectId::ROOT).unwrap()[0].time, 0);
+
+        // Back from the head, newest first, within the budget.
+        let back = s.changes_before("n", u64::MAX, 100, usize::MAX).unwrap();
+        assert_eq!(back.iter().map(|c| c.seq).collect::<Vec<_>>(), [3, 2, 1]);
+        assert_eq!(s.changes_before("n", 3, 1, usize::MAX).unwrap()[0].seq, 2);
+        assert_eq!(s.changes_before("n", 4, 100, 1).unwrap().len(), 1);
+        assert!(s
+            .changes_before("n", 1, 100, usize::MAX)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn shares(s: &mut dyn MetaStore) {
+        s.add_user("carol", 50).unwrap();
+        s.add_user("dave", 51).unwrap();
+        let object = ObjectId::random();
+        let share = |id: u8, user: Option<&str>, link: Option<&str>| ShareRow {
+            id: [id; 16],
+            ns: "n".into(),
+            object,
+            user: user.map(str::to_string),
+            link: link.map(str::to_string),
+            access: Access::Read,
+            by: "carol".into(),
+            created: 60 + i64::from(id),
+            expires: None,
+        };
+        s.add_share(&share(1, Some("dave"), None)).unwrap();
+        s.add_share(&share(2, None, Some("tok"))).unwrap();
+        // A share is with a user or a link, never both or neither, and names users there are.
+        assert!(s.add_share(&share(3, Some("dave"), Some("t2"))).is_err());
+        assert!(s.add_share(&share(4, None, None)).is_err());
+        assert!(s.add_share(&share(5, Some("nobody"), None)).is_err());
+        assert!(
+            s.add_share(&share(6, None, Some("tok"))).is_err(),
+            "a link is one share"
+        );
+
+        assert_eq!(
+            s.shares("n", None).unwrap(),
+            [share(1, Some("dave"), None), share(2, None, Some("tok"))]
+        );
+        assert_eq!(s.shares("n", Some(object)).unwrap().len(), 2);
+        assert!(s.shares("n", Some(ObjectId::random())).unwrap().is_empty());
+        assert!(s.shares("m", None).unwrap().is_empty());
+        assert_eq!(
+            s.share(&[1; 16]).unwrap(),
+            Some(share(1, Some("dave"), None))
+        );
+        assert_eq!(s.share(&[9; 16]).unwrap(), None);
+        assert_eq!(
+            s.share_by_link("tok").unwrap(),
+            Some(share(2, None, Some("tok")))
+        );
+        assert_eq!(s.share_by_link("other").unwrap(), None);
+        assert_eq!(s.shares_to("dave").unwrap(), [share(1, Some("dave"), None)]);
+        assert!(s.shares_to("carol").unwrap().is_empty());
+
+        // Removed only from its own namespace.
+        assert!(!s.remove_share("m", &[1; 16]).unwrap());
+        assert!(s.remove_share("n", &[1; 16]).unwrap());
+        assert!(!s.remove_share("n", &[1; 16]).unwrap());
+
+        // A user removed takes the shares made with it and by it.
+        s.add_share(&share(7, Some("dave"), None)).unwrap();
+        s.remove_user("dave").unwrap();
+        assert_eq!(s.shares("n", None).unwrap(), [share(2, None, Some("tok"))]);
+        s.remove_user("carol").unwrap();
+        assert!(s.shares("n", None).unwrap().is_empty());
+        assert_eq!(s.share_by_link("tok").unwrap(), None);
     }
 
     fn accounts(s: &mut dyn MetaStore) {

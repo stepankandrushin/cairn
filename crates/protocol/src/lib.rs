@@ -10,6 +10,7 @@ pub mod ops;
 pub mod skip;
 pub mod tree;
 pub mod update;
+pub mod web;
 pub mod wire;
 
 pub use ids::{DeviceId, Hash, ObjectId, OpId, RevisionId};
@@ -19,7 +20,7 @@ pub use metadata::{
     NS_MACOS_FINDER_INFO, NS_MACOS_RESOURCE_FORK, NS_MACOS_XATTR, NS_WINDOWS_ACL, NS_WINDOWS_ADS,
     NS_WINDOWS_ATTRIBUTES,
 };
-pub use name::{FilenamePolicy, Name, NameError};
+pub use name::{conflict_name, in_git_dir, is_git_dir, FilenamePolicy, Name, NameError};
 pub use ops::{
     check_and_apply, ConflictOf, Content, Link, ObjectKind, Op, OpReject, RevisionBody, TreeStore,
 };

@@ -10,6 +10,7 @@ data/
   ns/<hex of namespace name>/
     chunks/ab/abcdef...  one file per chunk or manifest, named by its full hash
     incoming/            uploads in progress; emptied at startup
+  web/uploads/<id>       a web upload's bytes as they arrive, until stored; emptied at startup
 ```
 
 **Backup:** snapshot `meta.sqlite` (the SQLite backup API, or stop the server), then rsync `ns/`.
@@ -51,6 +52,7 @@ refused.
 | `users` | Name and when made |
 | `tokens` | BLAKE3 of each token, never the token, with its user, label and when made |
 | `grants` | Namespace, user, and its level there: `read`, `write` or `manage` |
+| `shares` | An object of a namespace shared with a user at `read` or `write`, or by a public link's token, which reads only; who made it, when, and when it expires |
 
 The `journal` also says, from schema 2 on, the user whose token made each commit. Schema 2 brought accounts:
 the migration to it, in its one transaction, makes the `token` file's token, if there is one, the user
@@ -59,6 +61,12 @@ After that the server never reads the file. An administrator's command (`cairn-s
 `folder`, `grant`, `revoke`) takes the data directory's lock when it is free; when a server holds it, the
 command opens the database beside it, only at this binary's schema, and writes only accounts and namespaces,
 each in a transaction the server's own wait for.
+
+Schema 3 added `shares` alone, so a binary before it refuses the database only for its number: dropping
+the table and setting `user_version` back to 2 gives that binary the store as it was. A share or link goes
+with the user who made it and with the user it names. A link's token is kept as it is, not hashed as a
+user's tokens are, so that a manager can copy the link again: it reads only what it names, which whoever
+reads the database can read anyway.
 
 `cairn-server fsck` reads every chunk, follows every manifest reference, and checks `entries` and
 `objects` against a replay of `journal`. Chunks nothing refers to are reported and are not damage: they

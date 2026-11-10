@@ -5,7 +5,8 @@ owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
 **Status: 0.1.13, early.** Clients for Linux, macOS and Windows, with only Linux in CI; the server on Linux;
-users with their own folders and shared ones, read-only or not. It has
+users with their own folders and shared ones, read-only or not; since 0.1.13, not yet released, a web
+interface in the server, with shares of any file or folder and public links. It has
 been through a harsh failure harness and now syncs real trees, but for days, not yet weeks, so keep another
 copy of anything you put through it. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
@@ -23,7 +24,7 @@ filesystem and privileges.
 | Installed application size (macOS)[^macos-size] | **17.1 MB** — tray + sync daemon, Apple Silicon | **414.4 MB** — desktop client, universal Intel + Apple Silicon | Not measured | Not measured |
 | Application download size (Linux x86-64)[^downloads] | **6.3 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
 | RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
-| Implementation languages | **Rust** — CLI, daemon and server | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
+| Implementation languages | **Rust** — CLI, daemon and server; HTML/JavaScript web UI | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
 | Run without a separate database server or language runtime | ✅ Native binaries with embedded SQLite | ❌ PHP and a web server; usually a separate database | ❌ Server stack includes a database, cache and web services | ✅ Native binary; no central server required |
 | Preserve symlinks | ✅ Preserved as links | ❌ Skipped | ❌ Targets copied instead of preserving links | ⚠️ Preserved, except on Windows |
 | Preserve full filesystem metadata | ✅ Modes, owners, xattrs, ACLs, hard links and sparse layout | ❌ No full Unix metadata round-trip | ⚠️ Executable bit on Unix; not full modes or ownership | ⚠️ Modes; owners and xattrs opt-in; hard links not preserved |
@@ -150,6 +151,17 @@ there: an edit, a new file, a rename stay as they are, listed by every sync as `
 there comes back from the server; where the server changes something also changed there, both stay, the
 server's at the name. Moved out of the root, a change is kept and the server's version comes back; once the
 user may write, what was held back goes up like any change. `cairn log` says which user made each commit.
+
+## The web interface
+
+The server's address opens it in a browser. Sign in with a token: `cairn-server token add alice --label
+browser --data ~/cairn-data` makes one. Each folder is there to browse, with uploads of files and folders,
+downloads of a file or of a folder as a zip, previews, a file's history with any revision restored, what was
+deleted brought back, who has access, and, for a folder's managers, shares of any file or folder in it: with
+another user of the server, to read or to write, or by a public link that needs no account, reads only and
+may expire. A change made there is a commit like any device's, refused rather than forced when something
+changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
+a user is seen in the web interface, not synced yet. The endpoints are in docs/protocol.md, "Web".
 
 ## The daemon
 

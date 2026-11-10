@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- A web interface, at the server's address. Sign in with a token, then browse each folder; upload files and
+  folders, in parts any proxy passes; download a file, or a folder as a zip; preview images, video, audio,
+  PDFs and text; see a file's history and restore any revision; bring back what was deleted lately; make
+  folders, rename, move and delete. A change made there is a commit like any device's: refused, with the
+  reason, when the file or folder changed since it was looked at, never forced over it. A file replaced from a
+  browser keeps its mode, owners, extended attributes and streams.
+- Sharing from the web. A folder's members are listed, and its managers change them. A manager shares any
+  file or folder in it with another user, to read or to write, or by a public link that needs no account,
+  reads only and may expire: each reaches what it names and nothing above it, follows it when it moves, and
+  stops when it is deleted or its maker no longer manages the folder. "Shared with me" lists what others
+  shared with you.
+- Endpoints for all of it, which any client may use (docs/protocol.md, "Web"), and schema 3 on the server,
+  which adds the table of shares.
+
 ## 0.1.13 (2026-11-09)
 
 **Fixed:**

@@ -8,7 +8,8 @@ platform.
 **Status: 0.1.13 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
 CLI and a daemon; the same on macOS and Windows with a tray, ahead of milestone 7 and not in CI; each
 installed copy updates itself from signed releases. Users, tokens and per-folder read, write and manage
-access, ahead of milestone 5, came in 0.1.12. The architecture, the decisions and their reasons,
+access, ahead of milestone 5, came in 0.1.12; the web interface, ahead of milestone 6 (browsing, uploads,
+history, recently deleted, members, shares with users and public links), is in main, not yet released. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md: read it before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3's code and failure tests are in; what
 it still needs is its exit criterion, weeks on real trees with no silent loss, a run begun in November 2026
@@ -27,7 +28,8 @@ on the owner's own trees and machines.
   `cairn status --all` show, so a scratch root made without it shows up to the person whose machine it is.
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
-  Windows, the tray on them, updates and accounts are the exceptions, at the owner's asking.
+  Windows, the tray on them, updates, accounts and the web interface are the exceptions, at the owner's
+  asking.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
 - **The status lines say what is true now**: README.md's status, this file's, and, in the maintainer's

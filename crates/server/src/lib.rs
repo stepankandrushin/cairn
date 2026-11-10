@@ -21,9 +21,12 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 mod admin;
+mod web;
 
 struct App {
     repo: Repo,
+    /// The web's uploads in progress.
+    uploads: web::upload::Uploads,
     /// Moves after every durable commit, in any namespace: what a waiting `GET /changes` sleeps on.
     commits: tokio::sync::watch::Sender<u64>,
     /// Set when the server is stopping, so that no waiting request holds the shutdown up.
@@ -104,13 +107,24 @@ async fn authorize(State(app): State<Arc<App>>, mut req: Request, next: Next) ->
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let Some(token) = presented else {
-        return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response();
+        .map(|v| v.strip_prefix("Bearer ").map(str::to_string));
+    let token = match presented {
+        Some(Some(token)) => token,
+        Some(None) => return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
+        // A browser signed in: its cookie, which changes something only with the web's header.
+        None => match web::cookie_token(&req) {
+            Some(token) => {
+                if let Some(refused) = web::cookie_request_refused(&req) {
+                    return refused;
+                }
+                token
+            }
+            None => return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
+        },
     };
     // Looked up by its hash, which a guess cannot steer: a stored hash is no token, and timing the
     // lookup says nothing about any token there is.
-    let hash = token_hash(token);
+    let hash = token_hash(&token);
     let found = blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await;
     match found {
         Ok(Some(user)) => {
@@ -139,6 +153,8 @@ async fn check_namespace(
     match blocking(move || app.repo.with_meta(|m| m.access(&name, &user))).await {
         Ok(Some(access)) => {
             req.extensions_mut().insert(Allowed(access));
+            req.extensions_mut()
+                .insert(web::View::member(&ns, &caller.user, access));
             next.run(req).await
         }
         // The same answer whether it exists or not.
@@ -423,55 +439,21 @@ fn router(app: Arc<App>) -> Router {
         .route("/conflicts", get(conflicts))
         .route("/access", get(members))
         .route("/access/{user}", put(grant).delete(revoke))
-        .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
+        .merge(web::namespace_routes())
+        .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .with_state(app.clone());
     Router::new()
         .route("/v1/me", get(me))
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
-        .layer(middleware::from_fn_with_state(app, authorize))
-        // After the layer, so outside it: the one answer without a token.
-        .route("/", get(home))
+        .merge(web::user_routes(&app))
+        .fallback(|| async { (StatusCode::NOT_FOUND, "no such endpoint") })
+        .layer(middleware::from_fn_with_state(app.clone(), authorize))
+        // After the layer, so outside it: what answers without a token.
+        .merge(web::public_routes(&app))
+        .layer(middleware::map_response(web::no_referrer))
 }
-
-/// What a browser gets at the server's address, which the tray's "Open in browser" opens: a page saying
-/// what is here, rather than a 401 that reads as a broken client. It names no version, user or folder.
-async fn home() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-            ),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        HOME_PAGE,
-    )
-        .into_response()
-}
-
-const HOME_PAGE: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cairn</title>
-<style>
-body { font: 16px/1.5 system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em; color: #222; }
-@media (prefers-color-scheme: dark) { body { background: #1b1b1b; color: #ddd; } }
-h1 { font-size: 1.6em; font-weight: 600; }
-</style>
-</head>
-<body>
-<h1>Cairn</h1>
-<p>This is a Cairn file sync server. It has no web interface yet: your files are in the folder Cairn syncs
-on each of your devices, where <code>cairn history</code> lists a file's earlier versions and
-<code>cairn restore</code> brings one back.</p>
-</body>
-</html>
-"#;
 
 #[derive(Parser)]
 #[command(name = "cairn-server", version, about = "The Cairn file sync server")]
@@ -617,8 +599,18 @@ async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Res
     }
     let app = Arc::new(App {
         repo,
+        uploads: web::upload::Uploads::open(&data)?,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
+    });
+    // Uploads given up on are removed, with their bytes.
+    let sweeper = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            let app = sweeper.clone();
+            let _ = tokio::task::spawn_blocking(move || app.uploads.sweep()).await;
+        }
     });
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -629,6 +621,13 @@ async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Res
         .with_graceful_shutdown(shutdown_signal(app))
         .await?;
     Ok(())
+}
+
+/// The manifest a web upload makes of these bytes: for the failure tests, which hold it to a client's.
+#[doc(hidden)]
+pub fn web_manifest(data: &[u8]) -> cairn_protocol::Manifest {
+    web::upload::chunk_file(data, data.len() as u64, &mut |_, _| Ok(()))
+        .expect("bytes in memory are read whole")
 }
 
 /// The whole server program; `main` of the release binary and of the harness's build.

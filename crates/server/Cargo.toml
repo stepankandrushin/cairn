@@ -20,7 +20,10 @@ cairn-store.workspace = true
 cairn-failpoint.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
+fastcdc.workspace = true
+futures-util = { version = "0.3", default-features = false }
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true

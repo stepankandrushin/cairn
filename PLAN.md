@@ -57,7 +57,7 @@ These outrank features and speed; each has failure tests.
 | Transport | HTTPS: batched idempotent operations plus a persistent change feed | Passes through any reverse proxy and still gives instant push; QUIC only if measurements later ask for it |
 | Linux watcher | inotify as the baseline, fanotify with `FAN_REPORT_FID` when privileged | The daemon runs without root, and fanotify's mount and filesystem marks need `CAP_SYS_ADMIN` |
 | Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: a sync lists where events were, so a lost event waits for the reconcile's scan of the whole tree, the safety net |
-| Web UI | TypeScript + Svelte, static build embedded in the binary | Thin client of the same API; stays out of the server's hot path |
+| Web UI | Plain HTML, CSS and JavaScript modules, embedded in the server binary, with no build step | Thin client of the same API; stays out of the server's hot path. Building the server needs cargo alone, and no npm package runs in a page that holds a session |
 | Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with. On macOS the tray and the daemon are each a signed app bundle, Cairn.app and Cairn Sync.app | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed. A bundle is how macOS names a background program and shows its icon: in System Settings, and in Activity Monitor once the daemon has checked itself in with LaunchServices, as a background-only app, which nothing can bring to the front. Windows takes the name and icon from the program's file, so `cairn.exe` carries them as resources. One signature across builds keeps its permissions through upgrades |
 | Updates | Each daemon asks its release's feed about once an hour and installs a newer release itself, `cairn` and the tray beside it, restarting into it between syncs; a person can also ask, by `cairn update now` or in the tray, or set it to only notify, or off. What it installs is an Ed25519-signed list of every file's size and SHA-256, and on macOS also a bundle signed by the team of the one it replaces. The server is not among them | A fix reaches every device within the hour, and nobody stays on an old version by forgetting. No permission is asked again: macOS keeps them for the signing team, which Developer ID gives every release, and Windows by path. A key of the project's own rather than an OS certificate is what is trusted, so Linux is covered alike, and a build from source updates from nobody's releases but its builder's. The server goes first by hand, because a client takes a release on a new protocol only once its server speaks it |
 | Mobile | Swift/SwiftUI and Kotlin, Rust core through uniffi | Native file-provider and background-task integration |
@@ -377,7 +377,9 @@ itself with what it last held: nothing is reverted, nothing replaced, and a name
 copy's name beside what has it. One commit, so a kill leaves nothing or all of it. Until the server keeps
 a trash of its own (milestone 4), the client reads it from the journal, into an index of every object's
 kind, size and entries without their bodies, a fraction of a replayed tree's memory; a daemon keeps it
-ten minutes after the last request, taking only what is new to answer the next.
+ten minutes after the last request, taking only what is new to answer the next. The web's list is the
+server reading the journal back from the head, as far as about 64 MiB of operations, and saying when it
+stopped short.
 
 Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
 Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.
@@ -406,7 +408,15 @@ unreadable does, with its row keeping its baseline, so that the next sync sees i
 there is given up, so that it comes back; where both sides changed something the merge keeps both, the
 server's at the name. A sync completes and records its agreement as any other, so a reader costs no more,
 and every held-back change is listed until it is moved out of the root or the user may write, when it goes
-up. Public links are expiring tokens to a namespace or a single manifest. Auth: local accounts, then OIDC.
+up.
+
+A folder's managers also share any object in it, its root too: with a user at `read` or `write`, or by a
+public link, which only reads and may expire. Either reaches the object and what is in it and nothing above or
+beside it, by the object's identity, so a move keeps it; it stops while the object is deleted, and for good
+once its maker no longer manages the folder. A user's share is reached only through the web's endpoints,
+since the sync protocol's reveal the whole tree; syncing one waits with mounting a shared folder above. A
+browser signs in with a token, which the server sets as a cookie no script can read, and a request signed in
+by it changes nothing without a header no other site's page can send. Auth: local accounts, then OIDC.
 
 Dedup is scoped to an account or a shared namespace, never global: the "which chunks are missing"
 question would otherwise tell one user what another stores.
@@ -440,7 +450,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
 | 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal until this API holds it | GC under load never removes a reachable chunk |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite. Accounts came early, at the owner's asking: users, their tokens, folders as namespaces with read, write and manage access, sharing by a folder's managers, and read-only folders on the client, with their failure tests; OIDC, PostgreSQL and mounting a share into another root wait here |
-| 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API |
+| 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API. Most of it came early, at the owner's asking: browsing, uploads, downloads and folders as zips, previews, history and restore, recently deleted, a folder's members, and shares with users and public links, each through endpoints any client may use, with failure tests for uploads killed or starved of disk; activity and the conflict inbox wait here |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3's devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. Installers wait here |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |
 | 9 | WebDAV gateway, Nextcloud importer (files, versions, trash), E2EE, LAN/P2P transfers | |

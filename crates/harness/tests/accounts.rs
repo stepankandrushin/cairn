@@ -498,22 +498,24 @@ fn http(server: &Server, method: &str, path: &str, token: Option<&str>) -> (u16,
 }
 
 #[test]
-fn a_browser_at_the_servers_address_gets_a_page_and_nothing_else_without_a_token() {
+fn a_browser_at_the_servers_address_gets_the_page_and_no_data_without_a_token() {
     let sb = Sandbox::fast("accounts-browser");
     let server = Server::start(sb.path("data"));
     let a = Device::new(&sb, &server, "a");
     a.write("secret.txt", "a's");
     a.synced();
 
-    // The address itself, as the tray's "Open in browser" opens it: a page saying what is here.
+    // The address itself, as the tray's "Open in browser" opens it: the web interface's page, which
+    // says what is here and loads only this server's own script and style.
     let (code, head, body) = http(&server, "GET", "/", None);
     assert_eq!(code, 200, "{head}\n{body}");
     assert!(head.contains("content-type: text/html"), "{head}");
     assert!(
-        head.contains("content-security-policy: default-src 'none'"),
+        head.contains("content-security-policy: default-src 'none'; script-src 'self'"),
         "{head}"
     );
     assert!(body.contains("This is a Cairn file sync server"), "{body}");
+    assert!(body.contains("/web/app.js"), "{body}");
     // It names nothing a stranger could use: no version, user, folder, device or file.
     for named in [env!("CARGO_PKG_VERSION"), "admin", "default", "secret"] {
         assert!(!body.contains(named), "the page names {named:?}: {body}");

@@ -194,78 +194,7 @@ pub fn merge_metadata(b: &Metadata, l: &Metadata, r: &Metadata) -> (Metadata, Ve
     (out, notes)
 }
 
-/// Whether a folder is a git directory: `.git`, or a bare repository's `name.git`.
-pub fn is_git_dir(name: &Name) -> bool {
-    name.as_bytes().ends_with(b".git")
-}
-
-/// Whether something in this folder, given by its names from the root, is inside a git directory.
-pub fn in_git_dir(folder: &[Name]) -> bool {
-    folder.iter().any(is_git_dir)
-}
-
-/// `name (conflict host 2026-10-31).ext`, within the 255 bytes filesystems allow. Inside a git
-/// directory it is `name.conflict-host-2026-10-31`, a name git takes: a copy of a branch is a branch,
-/// and of its reflog that branch's reflog, so `git log --all` shows both commits and `git merge`
-/// joins them. A space in a name in `refs/` makes git fail on the whole repository.
-pub fn conflict_name(name: &Name, host: &str, date: &str, attempt: u32, in_git: bool) -> Name {
-    if in_git {
-        return git_conflict_name(name, host, date, attempt);
-    }
-    let bytes = name.as_bytes();
-    let split = bytes
-        .iter()
-        .rposition(|&b| b == b'.')
-        .filter(|&i| i > 0)
-        .unwrap_or(bytes.len());
-    let (stem, ext) = bytes.split_at(split);
-    let mut tag = format!(" (conflict {host} {date}").into_bytes();
-    if attempt > 0 {
-        tag.extend_from_slice(format!(" {}", attempt + 1).as_bytes());
-    }
-    tag.push(b')');
-    // An extension too long to keep beside the tag is just part of the name.
-    let (stem, ext) = if tag.len() + ext.len() + 1 > 255 {
-        (bytes, &bytes[0..0])
-    } else {
-        (stem, ext)
-    };
-    let room = 255usize.saturating_sub(tag.len() + ext.len());
-    let mut out = stem[..stem.len().min(room)].to_vec();
-    out.extend_from_slice(&tag);
-    out.extend_from_slice(ext);
-    Name::new(
-        out.into_iter()
-            .map(|b| if b == b'/' { b'_' } else { b })
-            .collect::<Vec<u8>>(),
-    )
-    .expect("a conflict name is built from a valid name")
-}
-
-/// The suffix keeps to what any ref name may hold, and is appended whole: an `.idx` or `.pack` that
-/// kept its extension would be taken for part of a pack.
-fn git_conflict_name(name: &Name, host: &str, date: &str, attempt: u32) -> Name {
-    let mut tag = format!("conflict-{host}-{date}");
-    if attempt > 0 {
-        tag.push_str(&format!("-{}", attempt + 1));
-    }
-    let mut tag: Vec<u8> = tag
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
-                b
-            } else {
-                b'-'
-            }
-        })
-        .collect();
-    tag.insert(0, b'.');
-    let bytes = name.as_bytes();
-    let room = 255usize.saturating_sub(tag.len());
-    let mut out = bytes[..bytes.len().min(room)].to_vec();
-    out.extend_from_slice(&tag);
-    Name::new(out).expect("a conflict name is built from a valid name")
-}
+pub use cairn_protocol::name::{conflict_name, in_git_dir, is_git_dir};
 
 /// Whether a folder, by its object, is inside a git directory, going up by its first entry.
 fn folder_in_git(

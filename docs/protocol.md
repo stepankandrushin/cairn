@@ -1,10 +1,10 @@
 # Cairn protocol, version 1
 
-HTTP with JSON bodies, except chunk batches. Every path below but `/v1/me` is under `/v1/ns/{namespace}`,
-and every request needs `Authorization: Bearer <token>`. The types are defined once, in `crates/protocol`;
-this page explains them. `Info.protocol` is the version: a client refuses a server that speaks another one.
-The one answer without a token is `GET /`, the server's address as a browser opens it: a page saying this is
-a Cairn server, which names no version, user or folder.
+HTTP with JSON bodies, except chunk batches and file contents. Every path in Endpoints but `/v1/me` is under
+`/v1/ns/{namespace}`, and every request needs `Authorization: Bearer <token>`, or the session cookie the web
+interface signs in with ([Web](#web)). The types are defined once, in `crates/protocol`; this page explains
+them. `Info.protocol` is the version: a client refuses a server that speaks another one. What answers without
+a token is the web interface's own files, and a public link's view of what it shares.
 
 The server in this release speaks plain HTTP on loopback; beyond loopback it refuses to start without
 `--behind-tls-proxy`, and the client refuses `http://` beyond loopback without an explicit opt-in.
@@ -142,6 +142,96 @@ A server that ignores `wait`, or a proxy that answers for it, only makes a clien
 when it gets no news without having waited. A reverse proxy's read timeout has to be longer than the wait
 to be of use; the daemon waits 25 seconds, under nginx's default 60, and when something cuts its requests off
 it waits for less from then on.
+
+## Web
+
+The web interface is a thin client of the endpoints below, which any client may use: the page and its
+scripts are in the server binary, at `GET /` and `/web/…`, and the same page at `GET /s/{link}` opens a
+public link. They name no version, user or folder, and answer without a token. In `cairn_protocol::web`.
+
+**Signing in.** `POST /v1/session` with `{token}` answers 204 and sets the cookie `cairn`, holding the token,
+`HttpOnly; Secure; SameSite=Strict`, for 30 days; a wrong token is 401. `DELETE /v1/session` clears it. A request
+with no `Authorization` header is taken as the cookie's token's, and one that is not `GET` or `HEAD` must then
+also carry `X-Cairn-Web: 1`, or it is answered 403: no other site's page can send that header, so nothing it
+makes a browser send can change anything. Every answer says `Referrer-Policy: no-referrer`, so a link's token
+never leaves in a `Referer`.
+
+**Three views of a tree**, each a base path `B` with the same endpoints below:
+
+| `B` | Who | Reaches | Level |
+|---|---|---|---|
+| `/v1/ns/{ns}` | a user given the folder | the whole namespace | the grant's |
+| `/v1/shared/{id}` | the user a share names | the shared object and, for a folder, what is in it | the share's, `read` or `write` |
+| `/v1/links/{link}` | anyone holding the link | the same, by a public link | `read` |
+
+`{object}` is an `ObjectId`, or `root` for the view's own root: the namespace's root directory, or the shared
+object. An object outside the view, deleted, or not there answers 404 alike. A share or link answers 404 too
+once it expires, its object is deleted, or the user who made it no longer manages the folder; it works again if
+the object is brought back or that user given `manage` again.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `GET B/item/{object}` | | `{item, path, access}` |
+| `GET B/dir/{object}` | | `{dir, path, entries, access}`: `entries` are the directory's items in name-byte order |
+| `GET B/content/{object}?revision=R&download=1` | | The file's bytes, at `R` (a revision of that object) or its head; one `Range: bytes=` range is answered 206. `download=1` asks for `Content-Disposition: attachment` |
+| `GET B/zip/{object}` | | A folder and everything in it as a zip, stored uncompressed, streamed. Symbolic links are left out |
+| `GET B/history/{object}` | | `{revisions}`, newest first, each `{revision, seq, time, user?, device_name, kind, size?, mode, mtime}`. Not by link |
+| `POST B/mkdir` | `{parent, name}` | `{object, seq}`. Needs `write` |
+| `POST B/move` | `{object, from, to}` | `{seq}`: `from` and `to` are links `{parent, name}`; a rename is a move in one folder. Needs `write` |
+| `POST B/delete` | `{object, link, base?}` | `{seq, objects}`: a folder goes with everything in it, deepest first, in one commit. With `base`, refused unless the object's head is still that revision. Needs `write` |
+| `POST B/restore` | `{object, revision}` | `{seq, revision}`: a new revision with that one's content and metadata (invariant 7). Needs `write` |
+| `POST B/uploads` | `{parent, name, size, mtime?, replace?}` | `{id}`: an upload begun. `replace` is the revision of the file at that name the client saw, which becomes the base of an update; without it the name must be free. Needs `write` |
+| `PUT B/uploads/{id}?offset=N` | bytes | `{received}`. `N` must be what was received so far, or 409 answers `{received}` to go on from |
+| `POST B/uploads/{id}/commit` | | 202 `{state}`: once `received` is `size`, the server stores it |
+| `GET B/uploads/{id}` | | `{id, size, received, state, stored, done?, error?}`, `state` one of `receiving`, `storing`, `done` and `failed`; `done` is `{object, revision, seq}` |
+| `DELETE B/uploads/{id}` | | 204: given up, and its bytes removed |
+
+Every view of a share or link stops at its root: `path` runs from the view's root, as `path[0]`, to the item
+itself, each step `{object, display}`, and no further up. An `item` is `{object, revision, kind, name?,
+display, size?, mtime, mode, target?, target_display?}`: `name` is the bytes, as base64, absent for a
+namespace's root; `display` the name as text, invalid UTF-8 as `\xNN`, and for a namespace's root its name.
+`access` is what this caller may do in the view.
+
+A web commit is like any device's: its device is `web`, its ID the first half of BLAKE3 of `cairn web device
+<user>`, and the journal names the user. An upload is received into a file of its own under the data directory's `web/uploads/` (emptied at
+startup, and of an upload left alone for 6 hours), then cut and hashed as a client reads a file without holes,
+so its manifest is the one a client makes of the same bytes; its chunks are made durable before the commit
+that names them, which is checked against what the client saw: a name taken since, or a file changed since,
+is refused and nothing is replaced. A new file has mode 0644 and the `mtime` given, or now; a replaced one keeps
+everything of its metadata but its `mtime`, owners, extended attributes and streams included (invariant 2). A
+new folder has mode 0755. Errors answer as elsewhere, the reason as text: 400 a malformed request, 403 a level
+too low, 404 as above, 409 a commit refused because the tree is not as the request saw it, 413 an upload part
+over 64 MiB, 507 a full disk.
+
+**Deleted.** `GET /v1/ns/{ns}/deleted?days=D` lists what is still deleted of what was deleted in the last `D`
+days (30 if not given): `{items, complete}`, newest first, each `{object, kind, display, path, seq, time, user?,
+device_name, size, files}`, where `path` is the folder it was in, as it is now, and a folder deleted in one
+commit with what was in it is one item, `files` and `size` counting what it held. The server reads it from the
+journal back from the head, and stops after about 64 MiB of operations with `complete: false`. `POST
+/v1/ns/{ns}/undelete` with `{objects}` brings each back in one commit, as `cairn undelete` does: to the entry it
+last had, a deleted folder above it first, what was deleted with a folder with it, and to `name (conflict
+restored seq N).ext` where the name is taken. It answers `{seq, items}`, each `{object, display, path,
+renamed}`. Needs `write`.
+
+**Sharing.** A folder's managers share any object in it, the folder's root too: with a user of the server at
+`read` or `write`, or as a public link, which reads only. Each share is `{id, object, kind, path?, user?,
+access, by, created, expires?, link?}`: `path` where the object is now, absent while it is deleted; `user` the
+user it is shared with, absent for a link; `link` a link's token, which `/s/{link}` opens. The token is 32
+random bytes as base64url, and kept as it is, so that a manager can copy the link again: whoever reads the
+database reads the files anyway.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `GET /v1/ns/{ns}/shares?object=O` | | `{shares}`: every share in the folder, or those of `O`. Needs `manage` |
+| `POST /v1/ns/{ns}/shares` | `{object, user?, access?, expires?}` | The share. `access` is `read` if not given, and only `read` for a link; `expires` is a time in seconds. Needs `manage` |
+| `DELETE /v1/ns/{ns}/shares/{id}` | | 204. Needs `manage` |
+| `GET /v1/shared` | | `{shares}`: what is shared with the caller and works now, each `{id, item, by, access, expires?}` |
+| `GET /v1/links/{link}` | | `{item, expires?}`, without a token |
+| `GET /v1/users` | | `{users}`: every user's name, to share with |
+
+A user's share reaches no further than what it names: the sync protocol's endpoints answer 404 to a user who
+has only shares in a folder, as they reveal the whole tree. Syncing a share as a root of its own waits for
+mounting one into another root's tree (PLAN.md, "Sharing and access").
 
 ## Local API
 

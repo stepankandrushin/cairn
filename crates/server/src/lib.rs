@@ -27,6 +27,9 @@ struct App {
     repo: Repo,
     /// The web's uploads in progress.
     uploads: web::upload::Uploads,
+    /// Where a public link is opened, when that is another address than this server's own:
+    /// `serve --link-url`.
+    link_url: Option<String>,
     /// Moves after every durable commit, in any namespace: what a waiting `GET /changes` sleeps on.
     commits: tokio::sync::watch::Sender<u64>,
     /// Set when the server is stopping, so that no waiting request holds the shutdown up.
@@ -512,6 +515,10 @@ enum Command {
         /// TLS-terminating reverse proxy in front of it.
         #[arg(long)]
         behind_tls_proxy: bool,
+        /// The address public links are opened at, such as a proxy's port that passes only them, open
+        /// to anyone while the server's own address is not: each link is this followed by `/s/<link>`.
+        #[arg(long, value_name = "URL")]
+        link_url: Option<String>,
     },
     /// Check every chunk hash, every manifest reference, and the tables against the journal.
     Fsck {
@@ -579,7 +586,29 @@ async fn shutdown_signal(app: Arc<App>) {
     app.closing.send_replace(true);
 }
 
-async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Result<()> {
+/// A `--link-url` as links are made from it: `http(s)://host[:port][/path]`, without a trailing `/`.
+fn link_base(url: &str) -> Result<String> {
+    let base = url.trim().trim_end_matches('/');
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or("");
+    if rest.is_empty()
+        || rest.starts_with('/')
+        || base.contains(['?', '#', ' ', '"', '<', '>', '\\'])
+    {
+        bail!("--link-url {url:?} is not an http:// or https:// address, such as https://files.example:8443");
+    }
+    Ok(base.to_string())
+}
+
+async fn serve(
+    data: PathBuf,
+    listen: SocketAddr,
+    behind_tls_proxy: bool,
+    link_url: Option<String>,
+) -> Result<()> {
+    let link_url = link_url.as_deref().map(link_base).transpose()?;
     if !listen.ip().is_loopback() && !behind_tls_proxy {
         bail!(
             "{listen} is beyond loopback and this server speaks plain HTTP: put a TLS proxy in front and pass --behind-tls-proxy"
@@ -600,6 +629,7 @@ async fn serve(data: PathBuf, listen: SocketAddr, behind_tls_proxy: bool) -> Res
     let app = Arc::new(App {
         repo,
         uploads: web::upload::Uploads::open(&data)?,
+        link_url,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
     });
@@ -659,11 +689,12 @@ fn run_inner() -> Result<std::process::ExitCode> {
             data,
             listen,
             behind_tls_proxy,
+            link_url,
         } => {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(serve(data, listen, behind_tls_proxy))?;
+                .block_on(serve(data, listen, behind_tls_proxy, link_url))?;
         }
         Command::Fsck { data } => {
             let repo = Repo::open(&data)?;
@@ -687,4 +718,28 @@ fn run_inner() -> Result<std::process::ExitCode> {
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_base;
+
+    #[test]
+    fn a_link_url_is_an_address_links_go_on_from() {
+        assert_eq!(
+            link_base("https://files.example:8443/").unwrap(),
+            "https://files.example:8443"
+        );
+        assert_eq!(link_base(" http://h/share ").unwrap(), "http://h/share");
+        for bad in [
+            "files.example",
+            "https://",
+            "https:///x",
+            "ftp://h",
+            "https://h/?a",
+            "https://h#x",
+        ] {
+            assert!(link_base(bad).is_err(), "{bad}");
+        }
+    }
 }

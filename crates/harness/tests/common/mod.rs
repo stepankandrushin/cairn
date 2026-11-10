@@ -116,6 +116,8 @@ pub struct Server {
     port: u16,
     child: Option<Child>,
     env: Vec<(String, String)>,
+    /// More arguments to `serve`.
+    args: Vec<String>,
 }
 
 /// Below the range the kernel hands out. A restarted server needs its port back, and one from that
@@ -175,6 +177,7 @@ impl Server {
             port: 0,
             child: None,
             env,
+            args: Vec::new(),
         };
         s.spawn();
         s
@@ -194,6 +197,7 @@ impl Server {
                 .arg(&self.data)
                 .arg("--listen")
                 .arg(format!("127.0.0.1:{port}"))
+                .args(&self.args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             for (k, v) in &self.env {
@@ -220,6 +224,11 @@ impl Server {
 
     pub fn set_env(&mut self, env: Vec<(String, String)>) {
         self.env = env;
+    }
+
+    /// More arguments to `serve`, from the next start on.
+    pub fn set_args(&mut self, args: &[&str]) {
+        self.args = args.iter().map(|a| a.to_string()).collect();
     }
 
     /// `kill -9`.

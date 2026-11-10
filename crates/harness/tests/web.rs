@@ -797,7 +797,7 @@ fn deleted_from_the_web_comes_back_and_a_restore_is_a_new_revision() {
 #[test]
 fn a_share_or_link_reaches_what_it_names_and_nothing_else() {
     let sb = Sandbox::fast("web-shares");
-    let server = Server::start(sb.path("data"));
+    let mut server = Server::start(sb.path("data"));
     let alice_file = server.user("alice");
     let bob_file = server.user("bob");
     server
@@ -1063,6 +1063,32 @@ fn a_share_or_link_reaches_what_it_names_and_nothing_else() {
             .body,
         b"for bob, again"
     );
+
+    // Opened at the server's own address, unless it was told one for links: a door that passes only them.
+    assert!(link.get("url").is_none(), "{link}");
+    server.set_args(&["--link-url", "https://links.example:8443/"]);
+    server.restart();
+    let listed = get(&server, &format!("{base}/shares?object={shared_id}"), al)
+        .ok()
+        .json();
+    let ours = listed["shares"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == link["id"])
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ours["url"],
+        format!("https://links.example:8443/s/{token_part}")
+    );
+    assert!(listed["shares"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["user"].is_null() || s.get("url").is_none()));
+    server.set_args(&[]);
+    server.restart();
 
     // Listed for alice, and gone once removed.
     let all = get(&server, &format!("{base}/shares"), al).ok().json();

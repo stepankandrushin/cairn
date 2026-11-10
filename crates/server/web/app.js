@@ -1580,7 +1580,8 @@ function madeText(s) {
   return `${s.by ? `by ${s.by}` : ''}${s.created ? `${s.by ? ', ' : ''}${fmtDate(s.created)}` : ''}${s.expires ? ` · until ${fmtDate(s.expires)}` : ''}`;
 }
 
-const linkUrl = (s) => `${location.origin}/s/${s.link}`;
+// The server names a link's address when links open somewhere other than here, such as a door open to anyone.
+const linkUrl = (s) => s.url || `${location.origin}/s/${s.link}`;
 
 async function copyText(text, input) {
   try {

@@ -273,6 +273,10 @@ pub struct Share {
     /// A public link's token, which `/s/{link}` opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// Where a public link is opened, when the server was told an address for links: that, then
+    /// `/s/{link}`. Absent, a link opens at the server's own address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

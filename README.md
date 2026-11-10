@@ -163,6 +163,23 @@ may expire. A change made there is a commit like any device's, refused rather th
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
 a user is seen in the web interface, not synced yet. The endpoints are in docs/protocol.md, "Web".
 
+A public link needs only `/s/`, `/web/` and `/v1/links/`. Where the server's address is open to some addresses
+alone, a second door in the proxy, open to anyone, can pass just those, and `cairn-server serve --link-url
+https://files.example:8443` makes every link name it:
+
+```nginx
+server {
+    listen 8443 ssl;                         # the same certificate as the server's own door
+    client_max_body_size 1k;
+    location ~ ^/(s|web|v1/links)/ {
+        limit_except GET { deny all; }
+        proxy_pass http://127.0.0.1:8733;
+        proxy_buffering off;
+    }
+    location / { return 404; }
+}
+```
+
 ## The daemon
 
 ```sh

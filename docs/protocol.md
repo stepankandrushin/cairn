@@ -215,8 +215,10 @@ renamed}`. Needs `write`.
 
 **Sharing.** A folder's managers share any object in it, the folder's root too: with a user of the server at
 `read` or `write`, or as a public link, which reads only. Each share is `{id, object, kind, path?, user?,
-access, by, created, expires?, link?}`: `path` where the object is now, absent while it is deleted; `user` the
-user it is shared with, absent for a link; `link` a link's token, which `/s/{link}` opens. The token is 32
+access, by, created, expires?, link?, url?}`: `path` where the object is now, absent while it is deleted; `user`
+the user it is shared with, absent for a link; `link` a link's token, which `/s/{link}` opens; `url` where it
+opens, when the server was started with `--link-url`, which is then followed by `/s/{link}`: a proxy's door that
+passes only `/s/`, `/web/` and `/v1/links/`, open to anyone while the server's own address is not. The token is 32
 random bytes as base64url, and kept as it is, so that a manager can copy the link again: whoever reads the
 database reads the files anyway.
 

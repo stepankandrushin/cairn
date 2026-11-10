@@ -16,7 +16,11 @@ use cairn_store::{MetaStore, ShareRow};
 use serde::Deserialize;
 use std::sync::Arc;
 
-fn shown(m: &mut dyn MetaStore, row: &ShareRow) -> anyhow::Result<w::Share> {
+fn shown(
+    m: &mut dyn MetaStore,
+    row: &ShareRow,
+    link_url: Option<&str>,
+) -> anyhow::Result<w::Share> {
     let kind = m
         .object_head(&row.ns, row.object)?
         .map(|h| h.kind)
@@ -31,6 +35,10 @@ fn shown(m: &mut dyn MetaStore, row: &ShareRow) -> anyhow::Result<w::Share> {
         by: row.by.clone(),
         created: row.created,
         expires: row.expires,
+        url: row
+            .link
+            .as_ref()
+            .and_then(|l| link_url.map(|base| format!("{base}/s/{l}"))),
         link: row.link.clone(),
     })
 }
@@ -57,10 +65,11 @@ pub(super) async fn list(
         },
     };
     let shares = blocking(move || {
+        let base = app.link_url.as_deref();
         app.repo.with_meta(|m| {
             let rows = m.shares(&view.ns, object)?;
             rows.iter()
-                .map(|r| shown(m, r))
+                .map(|r| shown(m, r, base))
                 .collect::<anyhow::Result<Vec<_>>>()
         })
     })
@@ -113,7 +122,8 @@ pub(super) async fn create(
                 expires: req.expires,
             };
             m.add_share(&row)?;
-            Ok((StatusCode::CREATED, Json(shown(m, &row)?)).into_response())
+            let shown = shown(m, &row, app.link_url.as_deref())?;
+            Ok((StatusCode::CREATED, Json(shown)).into_response())
         })
     })
     .await?;

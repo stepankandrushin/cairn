@@ -202,7 +202,9 @@ or row any build writes, so the ledger speaks for an object only until something
 change set is:
 
 - from the journal since the cursor, every object an operation names and every folder an entry it gives or
-  takes is in;
+  takes is in, but not what a note names: a note changes nothing in the tree, however many objects it
+  names, as a join's names nearly every one, and the round's replay of the journal passes over it, the
+  server having checked its objects as it took the commit;
 - from the scan, every object the ledger has that the scan did not find at the same entries, by its folders'
   inodes, with the same fingerprint and, for a folder or link, the same digest; every inode the ledger does
   not account for; everything marked, everything this filesystem cannot hold, and the whole of what the scan
@@ -232,8 +234,8 @@ writes the ledger whole. A round on a ledger kept that finds one inode at two pl
 something moves while it walks, or that identification takes a folder for another object than its inode
 says, goes again on a fresh scan and the ledger rebuilt. The full sync runs instead, said too, on a first
 sync, with no base to rebuild from; on a dry run; with copies kept by `cairn exclude`, found by inode; with
-a leftover of a run that did not finish; when the journal, the set or what a rebuild finds unsettled comes
-to more than a quarter of the tree, the set counting only what the state holds something of, so not the
+a leftover of a run that did not finish; when the journal's operations besides notes, the set or what a
+rebuild finds unsettled comes to more than a quarter of the tree, the set counting only what the state holds something of, so not the
 ID a join's adoption leaves behind for each file it took in; when the journal does not replay on the part
 loaded; when a round on a
 rebuilt ledger cannot go on either, or a rebuild finds records going out of view while the journal moves things;

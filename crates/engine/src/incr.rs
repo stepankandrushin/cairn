@@ -803,11 +803,13 @@ impl Before<'_> {
     }
 }
 
-/// The journal since the cursor, by what it touches.
+/// The journal since the cursor, by what it touches. A note touches nothing: it changes no object's
+/// content, metadata or entries, so it is no part of the set, however many objects it names, as a join
+/// on another umask names nearly every one. It stays in `ops`, which a full sync replays.
 #[derive(Default)]
 pub struct Journal {
     pub ops: Vec<Op>,
-    /// Every object an operation names.
+    /// Every object an operation besides a note names.
     pub touched: BTreeSet<ObjectId>,
     /// Every entry an operation gives or takes, by object.
     pub links: HashMap<ObjectId, Vec<Link>>,
@@ -817,9 +819,11 @@ pub struct Journal {
     pub kinds: HashMap<ObjectId, ObjectKind>,
     /// Objects moved, or linked back.
     pub moved: BTreeSet<ObjectId>,
-    /// The commit of every update of each object, and the objects anything but an update names.
+    /// The commit of every update of each object, and the objects anything but an update or a note
+    /// names.
     updates: HashMap<ObjectId, Vec<cairn_protocol::OpId>>,
     named: HashSet<ObjectId>,
+    notes: usize,
 }
 
 impl Journal {
@@ -854,7 +858,7 @@ impl Journal {
             | Op::Move { object, .. } => {
                 self.named.insert(*object);
             }
-            Op::Note { .. } => self.named.extend(op.noted()),
+            Op::Note { .. } => self.notes += 1,
         }
         let mut link = |object: ObjectId, l: &Link, into: bool| {
             self.links.entry(object).or_default().push(l.clone());
@@ -893,13 +897,18 @@ impl Journal {
             Op::Update { object, .. } => {
                 self.touched.insert(*object);
             }
-            Op::Note { .. } => self.touched.extend(op.noted()),
+            Op::Note { .. } => {}
         }
         self.ops.push(op.clone());
     }
 
     pub fn len(&self) -> usize {
         self.ops.len()
+    }
+
+    /// The operations that change something: all but the notes.
+    pub fn changes(&self) -> usize {
+        self.ops.len() - self.notes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2110,6 +2119,11 @@ pub fn world(
     let base = Tree::from_nodes(nodes);
     let mut remote = base.clone();
     for op in &b.journal.ops {
+        // A note changes nothing in a tree, and names objects the part need not hold: the server
+        // checked that each exists as it took the commit, and a full sync's replay checks it again.
+        if matches!(op, Op::Note { .. }) {
+            continue;
+        }
         if let Err(e) = remote.apply(op) {
             return Ok(Err(format!(
                 "the journal since the cursor does not replay on the part of the tree loaded for it ({e})"
@@ -2959,6 +2973,56 @@ mod tests {
         let (_, r) = decide(&a, a.nodes.clone(), &[], journal, true);
         for n in ["d", "x", "y", "e", "z"] {
             assert!(r.core.contains(&a.ids[n]), "{n}");
+        }
+    }
+
+    /// A note changes nothing, so however many objects it names, the round takes what it would with no
+    /// note at all, and the journal counts no change; an update in it of one of them still counts.
+    #[test]
+    fn a_note_takes_nothing_into_the_set_and_an_update_beside_it_still_does() {
+        use cairn_protocol::{Metadata, RevisionBody, RevisionId};
+        let a = agreed();
+        let note = Op::Note {
+            object: a.ids["x"],
+            text: "mode: kept 664 from the server; this device had 644".into(),
+            also: ["y", "z", "f", "d", "e"].map(|n| a.ids[n]).to_vec(),
+        };
+        let mut journal = Journal::default();
+        journal.add(&note);
+        assert!(journal.touched.is_empty());
+        assert_eq!((journal.len(), journal.changes()), (1, 0));
+        let (quiet, r) = decide(&a, a.nodes.clone(), &[], journal, false);
+        assert!(quiet.iter().all(|q| *q), "{quiet:?}");
+        assert_eq!(
+            r.all,
+            BTreeSet::from([ObjectId::ROOT, a.ids["d"], a.ids["f"]])
+        );
+
+        let commit = cairn_protocol::OpId([3; 16]);
+        let mut journal = Journal::default();
+        journal.add_of(
+            &Op::Update {
+                object: a.ids["z"],
+                base: RevisionId([1; 16]),
+                revision: RevisionId([2; 16]),
+                body: RevisionBody {
+                    content: file(),
+                    metadata: Metadata::default(),
+                },
+                restored_from: None,
+            },
+            commit,
+        );
+        journal.add_of(&note, commit);
+        assert_eq!(journal.touched, BTreeSet::from([a.ids["z"]]));
+        assert_eq!((journal.len(), journal.changes()), (2, 1));
+        // Updated alone, as if the note were not there.
+        assert!(journal.only_updated(&a.ids["z"], Some(commit)));
+        assert!(!journal.only_updated(&a.ids["x"], None));
+        let (_, r) = decide(&a, a.nodes.clone(), &[], journal, false);
+        assert!(r.all.contains(&a.ids["z"]));
+        for n in ["x", "y"] {
+            assert!(!r.all.contains(&a.ids[n]), "{n}");
         }
     }
 

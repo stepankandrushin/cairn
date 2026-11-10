@@ -2,7 +2,7 @@
 # What must hold before a change goes in. Run by .github/workflows/ci.yml, and by hand:
 #   bash scripts/ci.sh           the full suite, about 20 minutes: GitHub runs it on every push, and a release
 #                                waits for it there
-#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 70 tests over 20 s, most
+#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 71 tests over 20 s, most
 #                                of them sweeping every step of a sync (.config/nextest.toml, "quick")
 # CAIRN_NO_SKIP=1, which the workflow sets, turns a test that cannot run here into a failure.
 set -euo pipefail

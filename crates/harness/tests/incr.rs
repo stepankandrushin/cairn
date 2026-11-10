@@ -826,6 +826,198 @@ fn a_rule_taken_off_what_is_here_already_goes_the_incremental_way() {
     same_trees(&a, &b, "after the rule came off");
 }
 
+/// Where a file of `umask_join` is: a hundred to a folder.
+#[cfg(unix)]
+fn joined_path(i: usize) -> String {
+    format!("d{}/f{i}", i / 100)
+}
+
+/// A tree made on one umask, the devices `others` with all of it, each through a sync that wrote its
+/// ledger, and then `b` joining it with the same bytes and times on another umask, as a Mac on 022 joins
+/// a tree made on 002: the join keeps the server's modes, 664 and 775, and says this device's 644 and
+/// 755 in a note naming every file and folder, one to each text in a commit, or without `groups`, to a
+/// server from before them, a note to each. The first `extra` files on `b` also have an xattr the server
+/// lacks, which goes up in an update of the same file its note names.
+#[cfg(unix)]
+fn umask_join(
+    label: &str,
+    files: usize,
+    extra: usize,
+    others: &[&str],
+    groups: bool,
+) -> (Sandbox, Server, Device, Device, Vec<Device>) {
+    let sb = Sandbox::on_disk(label);
+    let env = match groups {
+        true => vec![],
+        false => vec![("CAIRN_FP_UNSUPPORTED".into(), "server.note_groups".into())],
+    };
+    let server = Server::start_with(sb.path("server"), env);
+    let a = Device::new(&sb, &server, "a");
+    let folders = files.div_ceil(100);
+    for i in 0..files {
+        a.write(&joined_path(i), format!("file {i}"));
+        chmod(&a.path(&joined_path(i)), 0o664);
+    }
+    for d in 0..folders {
+        chmod(&a.path(&format!("d{d}")), 0o775);
+    }
+    a.synced();
+    let others: Vec<Device> = others
+        .iter()
+        .map(|name| Device::new(&sb, &server, name))
+        .collect();
+    for d in &others {
+        d.synced();
+        incremental(d);
+    }
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..files {
+        let path = b.path(&joined_path(i));
+        b.write(&joined_path(i), format!("file {i}"));
+        chmod(&path, 0o644);
+        let (sec, nsec) = mtime_of(&a.path(&joined_path(i)));
+        set_mtime(&path, sec, nsec);
+        if i < extra {
+            set_xattr(&path, "user.only-here", b"from b");
+        }
+    }
+    for d in 0..folders {
+        chmod(&b.path(&format!("d{d}")), 0o755);
+    }
+    let run = b.synced();
+    assert!(
+        run.stdout.contains(" 0 chunks (0 bytes) uploaded"),
+        "the join sent bytes: {}",
+        run.text()
+    );
+    // Every file's mode and every folder's, each once, in a few notes or one to each.
+    let (losers, notes) = notes_in_journal(&server.data);
+    assert_eq!(losers.len(), files + folders, "{}", run.text());
+    let distinct: std::collections::BTreeSet<_> = losers.iter().map(|(o, _)| o).collect();
+    assert_eq!(distinct.len(), losers.len(), "a loser noted twice");
+    if groups {
+        assert!(notes <= 2 * files.div_ceil(20_000), "{notes} notes");
+    } else {
+        assert_eq!(notes, losers.len());
+    }
+    (sb, server, a, b, others)
+}
+
+/// What `umask_join` leaves for a device synced before it: notes naming every file and folder, which
+/// change nothing, so the device's next sync takes what changed alone, which is nothing, under `limit`
+/// or the one a release build has, both below what the notes name. Counted as changed, a join's note of
+/// 367,526 objects sent every other device to the whole tree, for minutes and gigabytes, to apply
+/// nothing, and a note to each, from a server before groups, did by their number. `cairn log` there
+/// still shows the notes and every object they name.
+#[cfg(unix)]
+fn a_join_s_notes_leave_the_others_incremental(
+    label: &str,
+    files: usize,
+    limit: Option<&str>,
+    groups: bool,
+) {
+    let (_sb, server, a, b, others) = umask_join(label, files, 0, &["c"], groups);
+    let c = &others[0];
+    let env: Vec<(&str, &str)> = limit
+        .map(|l| ("CAIRN_FP_INCR_LIMIT", l))
+        .into_iter()
+        .collect();
+    let run = incremental_env(c, &env);
+    // The root and what is in it, as with nothing in the journal.
+    let (took, of) = looked_at(&run);
+    assert!(
+        took <= files.div_ceil(100) as u64 + 1 && of > files as u64,
+        "{took} of {of}: {}",
+        run.text()
+    );
+    assert!(
+        run.stdout.contains(" 0 steps applied here"),
+        "{}",
+        run.text()
+    );
+    let (losers, notes) = notes_in_journal(&server.data);
+    let log = c.cairn(&["log"]).expect_ok();
+    assert_eq!(losers_in_log(&log.stdout), losers.len(), "{}", log.text());
+    let lines: Vec<&str> = log
+        .stdout
+        .lines()
+        .filter(|l| l.contains("note: "))
+        .collect();
+    assert_eq!(lines.len(), notes, "{}", log.text());
+    if groups && files <= 20_000 {
+        for (text, n) in [
+            ("mode: kept 664 from the server; this device had 644", files),
+            (
+                "mode: kept 775 from the server; this device had 755",
+                files / 100,
+            ),
+        ] {
+            let line = format!("note: {text} ({n} files and folders)");
+            assert!(
+                lines.iter().any(|l| l.trim() == line),
+                "{line}: {}",
+                log.text()
+            );
+        }
+    }
+    let p = converge(&[&a, &b, c]);
+    assert_eq!(p.entries[joined_path(0).as_bytes()].mode & 0o777, 0o664);
+    assert_eq!(p.entries[&b"d0"[..]].mode & 0o777, 0o775);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_join_s_notes_of_every_file_leave_the_other_devices_incremental() {
+    for groups in [true, false] {
+        a_join_s_notes_leave_the_others_incremental("incr-join-note", 500, Some("100"), groups);
+    }
+}
+
+/// As the joins that found this did it, at a size where every note takes several commits and the
+/// limit is a release build's own, a quarter of the tree.
+#[cfg(unix)]
+#[test]
+fn a_join_of_50_000_files_leaves_the_other_devices_incremental() {
+    a_join_s_notes_leave_the_others_incremental("incr-join-note-big", 50_000, None, true);
+}
+
+/// Files a join's note names that also changed in the same commit, by an xattr only the joining device
+/// had, still count: under a limit above them, the next sync elsewhere looks at them and the folders
+/// above, and not at the rest the note names, and every one arrives, the oracle agreeing; under a limit
+/// below them, the whole tree, for the journal's updates alone, the notes counted nowhere.
+#[cfg(unix)]
+#[test]
+fn files_a_join_s_note_names_that_also_changed_still_count() {
+    const FILES: usize = 500;
+    const EXTRA: usize = 60;
+    let (_sb, _server, a, b, others) =
+        umask_join("incr-join-changed", FILES, EXTRA, &["c", "d"], true);
+    let has_it = |d: &Device| {
+        let p = Picture::of(&d.root);
+        (0..FILES)
+            .filter(|i| {
+                p.entries[joined_path(*i).as_bytes()]
+                    .xattrs
+                    .get(&b"user.only-here"[..])
+                    .is_some_and(|v| v == b"from b")
+            })
+            .count()
+    };
+    let (c, d) = (&others[0], &others[1]);
+    let run = incremental_env(c, &[("CAIRN_FP_INCR_LIMIT", "200")]);
+    let (took, of) = looked_at(&run);
+    assert!(
+        took >= EXTRA as u64 && took < EXTRA as u64 + 20 && of > FILES as u64,
+        "{took} of {of}: {}",
+        run.text()
+    );
+    assert_eq!(has_it(c), EXTRA, "{}", run.text());
+    let run = d.sync_env(&[("CAIRN_FP_INCR_LIMIT", "59")]);
+    whole(&run, "the server's journal brings 60 operations,");
+    assert_eq!(has_it(d), EXTRA, "{}", run.text());
+    converge(&[&a, &b, c, d]);
+}
+
 /// Where the ledger cannot vouch for a sync, it is rebuilt from the state, or, with nothing to rebuild it
 /// from or no part of the tree to take, the whole tree is taken; either is said.
 #[test]

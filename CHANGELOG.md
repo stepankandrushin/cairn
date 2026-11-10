@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- After a device joined on another umask, every other device's next sync took the whole tree, for minutes
+  and several GB of memory, to apply nothing: it counted each file the join's note named as changed. A note
+  changes nothing, so it now counts as no change, grouped or one to each file; the sync takes only what
+  did change, and `cairn log` shows the note as before.
+
 ## 0.1.15 (2026-11-11)
 
 **Changed:**

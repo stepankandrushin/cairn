@@ -1727,11 +1727,13 @@ fn sync_full(
             }
         }
         report.head = seq;
+        // Its notes change nothing, so a join's 20,000 to a commit, as a build before groups sends them,
+        // cost nothing either.
         if let Some(s) = &session {
-            if s.journal.len() > s.limit() {
+            if s.journal.changes() > s.limit() {
                 let why = format!(
                     "the server's journal brings {} operations, more than taking the whole tree costs",
-                    s.journal.len()
+                    s.journal.changes()
                 );
                 decline(&root, &mut session, &mut whole, &mut report, why)?;
             }

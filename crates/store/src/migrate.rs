@@ -887,6 +887,11 @@ mod tests {
             let ops: Vec<Vec<Op>> = serde_json::from_str(&joined).unwrap();
             assert_eq!(ops.len(), 4);
             assert!(texts[0].contains(r#""body":{"content""#), "{}", texts[0]);
+            // A note of several objects says each in schema 3's JSON too.
+            assert!(
+                texts.iter().any(|t| t.contains(r#""also":[""#)),
+                "{texts:?}"
+            );
             let body: String = conn
                 .query_row(
                     "SELECT body FROM revisions WHERE ns = 1 AND seq = 1 LIMIT 1",

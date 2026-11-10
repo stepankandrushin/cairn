@@ -15,6 +15,9 @@ data/
                          new one is made at the next, and every browser signs in again
 ```
 
+Nothing is renamed or linked between `ns/` and the rest, so `ns/` may be a mount of another filesystem:
+the chunks on large, slow disks and the database on a fast one.
+
 **Backup:** snapshot `meta.sqlite` (the SQLite backup API, or stop the server), then rsync `ns/`.
 Chunks are immutable and named by content, and this release never removes one. After a restore, each
 device notices that the server no longer has what it last saw and pauses. Removing that root's `.cairn`

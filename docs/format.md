@@ -51,8 +51,8 @@ refused.
 | `namespaces` | Name and journal head |
 | `objects` | Identity, kind, head revision |
 | `entries` | Parent object + name bytes → object |
-| `revisions` | Every revision of every object, body as JSON |
-| `journal` | Sequence, operation ID, device, time, operations as JSON; the source of truth |
+| `revisions` | Every revision of every object: its object, base, the commit that made it, and its body, a binary record, kept here alone |
+| `journal` | Sequence, operation ID, device, time, user, the operations as a binary record, and their length as JSON; the source of truth, with the bodies its creates and updates name |
 | `conflicts` | The inbox: which copy holds whose competing version |
 | `users` | Name and when made |
 | `tokens` | BLAKE3 of each token, never the token, with its user, label and when made |
@@ -73,9 +73,41 @@ with the user who made it and with the user it names. A link's token is kept as 
 user's tokens are, so that a manager can copy the link again: it reads only what it names, which whoever
 reads the database can read anyway.
 
-`cairn-server fsck` reads every chunk, follows every manifest reference, and checks `entries` and
-`objects` against a replay of `journal`. Chunks nothing refers to are reported and are not damage: they
-are what an interrupted upload leaves behind.
+Schema 4 keeps each revision's body once. Up to schema 3 a create's or update's body was JSON twice, in
+the commit's operations and in `revisions`; from 4 on it is a binary record in `revisions` alone, and the
+operation in `journal` names its revision. Reading a commit puts each body back from there, where the
+revision must be that object's and made by that commit, or the read is an error, never another body; so
+what the server sends, the journal, a folder, a history, is the JSON it always was, byte for byte, and only
+the storage changed. A real store of 2.9 million operations and 950,000 revisions went from 1.3 GB to 361 MB.
+
+The records are the client state's encoding (the Records paragraph below, in `cairn_protocol::record`). A
+body is a format byte (1), the content and the metadata, unknown metadata fields kept as the JSON they came
+in. A commit's operations are a format byte (1), their count, and each: a byte whose low three bits are the
+kind (create, link, unlink, move, update, note), bit 3 that its one optional field is there (a create's
+`conflict_of`, an unlink's `base`, an update's `restored_from`) and bit 4 that its body follows here; then
+the object and the rest in the order of `crates/protocol/src/ops.rs`, each link a parent and a name. A
+note's text is written out the first time in a commit and is the number of that first time after it, as a
+join gives each of a hundred thousand files the same few texts. `json_len` is what a page of the journal
+is measured by (docs/protocol.md, `/changes`), so pages end where they always did.
+
+A binary of schema 4 moves a database of schema 3 when it opens it, before it serves, in one transaction:
+each table read in key order and written anew, every body and commit decoded again and checked against
+what it was read from, a body `revisions` does not hold for that commit kept in the commit itself (bit 4),
+then the old tables dropped. It first checks that the folder has room for the new tables, at most what the
+whole database holds, in the WAL and again in the file; short of it, or should the disk fill during it, the
+database stays at schema 3, the server does not start, and it says so. A kill at any point leaves schema 3
+or schema 4, each whole. The pages the old tables held are free after it: at each start, more than half of
+the file free and at least 16 MiB of it, the server rewrites it (VACUUM, as any transaction), given room in
+its folder and SQLite's temporary folder; short of room, or failing, it goes on as it is and tries at the
+next start. A binary before schema 4 refuses it ("newer than this binary"); `cairn-server downgrade --data
+<dir>`, with the server stopped, moves it back to schema 3 in one transaction, each body written out again
+in its commit and in `revisions` as such a binary wrote them: moved to 4 and back, a real store's every row
+was the same, byte for byte.
+
+`cairn-server fsck` reads every chunk, follows every manifest reference, checks `entries` and `objects`
+against a replay of `journal`, and that each revision is named by the commit that made it, but the first
+of a namespace's root, made with the namespace. Chunks nothing refers to are reported and are not damage:
+they are what an interrupted upload leaves behind.
 
 ## Client state
 

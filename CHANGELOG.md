@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**Changed:**
+
+- The server keeps each revision's body once, as a binary record, where it kept it twice as JSON: in the
+  commit and again in the table of revisions. Its database is schema 4, about a quarter of the size (a real
+  one, 1.3 GB, became 361 MB), and reading it is a little faster. What it sends is the same, byte for byte.
+  A server of this release moves a database of schema 3 when it starts, in one transaction, after checking
+  for room, and gives the freed space back; `cairn-server downgrade` moves it back to schema 3, for a server
+  from before.
+- `cairn-server fsck` also checks that each revision is named by the commit that made it.
+
 **Fixed:**
 
 - The web's Recently deleted opens at once and lists all of the last 30 days, from an index the server

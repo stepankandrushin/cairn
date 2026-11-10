@@ -4,8 +4,8 @@ use crate::chunks::ChunkStore;
 use crate::meta::TreeState;
 use crate::repo::Repo;
 use anyhow::Result;
-use cairn_protocol::{Content, Hash, Manifest, ObjectId, OpReject, Tree};
-use std::collections::BTreeSet;
+use cairn_protocol::{Content, Hash, Manifest, ObjectId, Op, OpReject, RevisionId, Tree};
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug, Default)]
 pub struct FsckReport {
@@ -99,16 +99,41 @@ fn check_namespace(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<()>
         }
     }
 
-    match replay(repo, ns, report) {
-        Ok(tree) => compare_tables(ns, &tree, &repo.with_meta(|m| m.tree_state(ns))?, report),
-        Err(e) => report
-            .errors
-            .push(format!("{ns}: journal does not replay: {e}")),
+    let mut named = HashSet::new();
+    let replayed = match replay(repo, ns, report, &mut named) {
+        Ok(tree) => {
+            compare_tables(ns, &tree, &repo.with_meta(|m| m.tree_state(ns))?, report);
+            true
+        }
+        Err(e) => {
+            report
+                .errors
+                .push(format!("{ns}: journal does not replay: {e:#}"));
+            false
+        }
+    };
+    // Each body is kept once, in `revisions`, and named by the commit that made it: one no commit
+    // names is not in the history, save the root's first, made with the namespace.
+    if replayed {
+        for r in &revisions {
+            let root = r.revision == RevisionId::ZERO && r.object == ObjectId::ROOT && r.seq == 0;
+            if !root && !named.contains(&r.revision) {
+                report.errors.push(format!(
+                    "{ns}: revision {} of object {} at commit {} is named by no commit",
+                    r.revision, r.object, r.seq
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn replay(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<Tree> {
+fn replay(
+    repo: &Repo,
+    ns: &str,
+    report: &mut FsckReport,
+    named: &mut HashSet<RevisionId>,
+) -> Result<Tree> {
     let mut tree = Tree::new();
     let mut after = 0;
     loop {
@@ -118,6 +143,9 @@ fn replay(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<Tree> {
         for change in &batch {
             report.commits += 1;
             for op in &change.ops {
+                if let Op::Create { revision, .. } | Op::Update { revision, .. } = op {
+                    named.insert(*revision);
+                }
                 tree.apply(op)
                     .map_err(|e: OpReject| anyhow::anyhow!("seq {}: {e}", change.seq))?;
             }

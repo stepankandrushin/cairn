@@ -470,6 +470,16 @@ fn root_str(p: &Path) -> String {
     p.to_str().unwrap().to_string()
 }
 
+/// `cairn-server` with these arguments and environment, run to its end.
+pub fn run_server(args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(SERVER);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    Run::from(cmd.output().unwrap())
+}
+
 pub fn run(args: &[&str], env: &[(&str, &str)]) -> Run {
     let mut cmd = Command::new(CAIRN);
     cmd.args(args);
@@ -1307,6 +1317,29 @@ pub fn same_state(got: &[(String, Vec<String>)], want: &[(String, Vec<String>)],
         counts(got),
         counts(want)
     );
+}
+
+/// Each commit's operations in a server's journal, as the server sends them: read beside it.
+pub fn journal_json(data: &Path) -> Vec<String> {
+    use cairn_store::MetaStore;
+    let mut store = cairn_store::SqliteStore::open_with(
+        &data.join("meta.sqlite"),
+        cairn_store::sqlite::Opening {
+            first_token: None,
+            beside_server: true,
+        },
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for ns in store.namespaces().unwrap() {
+        let changes = store.changes(&ns, 0, u32::MAX, usize::MAX).unwrap();
+        out.extend(
+            changes
+                .iter()
+                .map(|c| serde_json::to_string(&c.ops).unwrap()),
+        );
+    }
+    out
 }
 
 pub fn wal_len(state: &Path) -> u64 {

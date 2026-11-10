@@ -676,3 +676,96 @@ fn inner_migration_on_a_full_disk() {
     converge(&[&reader, &writer]);
     assert_eq!(reader.read("d0/after"), b"after the move");
 }
+
+/// A server's database of schema 3 moved to 4 on a disk short of room: told before it starts, and
+/// the server does not open it, saying why; untold, the disk fills partway through, and the database
+/// is schema 3 as it was, its WAL let go. Room again, the server moves it and the devices go on.
+#[test]
+fn a_move_of_the_servers_database_on_a_full_disk_leaves_schema_3_as_it_was() {
+    let sb = Sandbox::on_disk("full-server-move");
+    let dir = sb.path("small");
+    std::fs::create_dir(&dir).unwrap();
+    if let Some(ok) = on_small_disk("inner_server_move_on_a_full_disk", &dir, 64) {
+        assert!(ok, "see the output above");
+    }
+}
+
+#[test]
+#[ignore = "runs inside the namespace, through the test above"]
+fn inner_server_move_on_a_full_disk() {
+    let small = inner_dir();
+    let sb = Sandbox::fast("full-server-move-outer");
+    let mut server = Server::start(small.join("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..3000 {
+        a.write(&format!("d{}/f{i}", i % 20), format!("file {i}"));
+    }
+    a.synced();
+    b.synced();
+    server.kill();
+    let data = server.data.to_str().unwrap().to_string();
+    run_server(&["downgrade", "--data", &data], &[]).expect_ok();
+    let db = server.data.join("meta.sqlite");
+    let schema = |db: &std::path::Path| -> i64 {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(schema(&db), 3);
+    let kept = state_everything(&db);
+    let (count, free) = state_pages(&db);
+    let live = (count - free) * 4096;
+
+    // Less than the move asks for.
+    let ballast = small.join("ballast");
+    std::fs::write(&ballast, vec![1u8; (free_on(&small) - live) as usize]).unwrap();
+    let run = run_server(&["fsck", "--data", &data], &[]);
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr.contains("It stays at schema 3") && run.stderr.contains("free"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(schema(&db), 3);
+    same_state(&state_everything(&db), &kept, "not tried for want of room");
+
+    // Not told, and its pages spilling into the WAL: the disk fills partway through.
+    let room = free_on(&small);
+    let more = small.join("more");
+    std::fs::write(&more, vec![1u8; (room - 96 * 1024) as usize]).unwrap();
+    let run = run_server(
+        &["fsck", "--data", &data],
+        &[(
+            "CAIRN_FP_TUNE",
+            "server.migrate_room=0,server.migrate_cache_kib=64",
+        )],
+    );
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr.contains("ran out of room") && run.stderr.contains("stays at schema 3"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(schema(&db), 3);
+    same_state(&state_everything(&db), &kept, "the disk filled during it");
+    assert_eq!(wal_len(&db), 0, "what the failed move wrote is let go");
+    std::fs::remove_file(&more).unwrap();
+    assert!(
+        free_on(&small) + 64 * 1024 >= room,
+        "{} free after, {room} before",
+        free_on(&small)
+    );
+
+    // Room again.
+    std::fs::remove_file(&ballast).unwrap();
+    server.restart();
+    assert_eq!(schema(&db), 4);
+    a.write("d0/after", "after the move");
+    b.write("d1/f1", "edited on b");
+    converge(&[&a, &b]);
+    assert_eq!(b.read("d0/after"), b"after the move");
+    assert_eq!(a.read("d1/f1"), b"edited on b");
+    assert!(server.fsck().contains("clean"));
+}

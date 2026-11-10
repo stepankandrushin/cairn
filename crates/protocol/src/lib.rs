@@ -7,6 +7,7 @@ pub mod manifest;
 pub mod metadata;
 pub mod name;
 pub mod ops;
+pub mod record;
 pub mod skip;
 pub mod tree;
 pub mod update;

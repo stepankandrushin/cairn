@@ -1,5 +1,6 @@
 //! The default store: one SQLite file in WAL mode with full synchronous commits.
 
+use crate::codec::{decode_body, decode_ops, encode_body, encode_ops, json_len};
 use crate::meta::{
     Child, CommitOutcome, Head, MetaStore, Revisioned, ShareRow, StoredRevision, TokenInfo,
     TreeState, UserInfo,
@@ -14,7 +15,8 @@ use cairn_protocol::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 
-const MIGRATIONS: &[&str] = &[
+/// Schemas 1 to 3, each the SQL that moves the one before it to it. Schema 4 is `migrate::to_4`'s.
+pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
 CREATE TABLE namespaces (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, head INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE objects (
@@ -71,8 +73,10 @@ CREATE INDEX shares_recipient ON shares (recipient);
 "#,
 ];
 
-/// The schema this binary writes: `PRAGMA user_version` once every migration has run.
-pub const SCHEMA: usize = MIGRATIONS.len();
+/// The schema this binary writes: `PRAGMA user_version` once every migration has run. Schema 4 keeps
+/// each revision's body once, in `revisions`, and bodies and operations as binary records
+/// (`crate::codec`), with what is sent made from them as the JSON it always was.
+pub const SCHEMA: usize = MIGRATIONS.len() + 1;
 
 /// The user a data directory's one token from before accounts becomes, managing every namespace.
 pub const FIRST_USER: &str = "admin";
@@ -103,8 +107,15 @@ fn access_of(s: &str) -> Result<Access> {
         .map_err(|e: String| anyhow!("in the database: {e}"))
 }
 
+/// How a schema keeps a revision's body: JSON text up to schema 3, a binary record from 4 on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bodies {
+    Json,
+    Binary,
+}
+
 /// The namespace by that name, made if it is not there yet: its root directory at revision zero.
-fn ensure_namespace(conn: &Connection, ns: &str) -> Result<i64> {
+pub(crate) fn ensure_namespace(conn: &Connection, ns: &str, bodies: Bodies) -> Result<i64> {
     if let Some(id) = conn
         .query_row("SELECT id FROM namespaces WHERE name = ?1", [ns], |r| {
             r.get(0)
@@ -119,14 +130,13 @@ fn ensure_namespace(conn: &Connection, ns: &str) -> Result<i64> {
         "INSERT INTO objects (ns, id, kind, head) VALUES (?1, ?2, 'dir', ?3)",
         params![id, ObjectId::ROOT.0, RevisionId::ZERO.0],
     )?;
+    let body = match bodies {
+        Bodies::Json => rusqlite::types::Value::Text(serde_json::to_string(&root_body())?),
+        Bodies::Binary => rusqlite::types::Value::Blob(encode_body(&root_body())),
+    };
     conn.execute(
         "INSERT INTO revisions (ns, id, object, base, seq, body) VALUES (?1, ?2, ?3, NULL, 0, ?4)",
-        params![
-            id,
-            RevisionId::ZERO.0,
-            ObjectId::ROOT.0,
-            serde_json::to_string(&root_body())?
-        ],
+        params![id, RevisionId::ZERO.0, ObjectId::ROOT.0, body],
     )?;
     Ok(id)
 }
@@ -136,7 +146,7 @@ fn adopt_first_token(tx: &Transaction<'_>, token: Option<&str>, time: i64) -> Re
     let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
         return Ok(());
     };
-    ensure_namespace(tx, "default")?;
+    ensure_namespace(tx, "default", Bodies::Json)?;
     tx.execute(
         "INSERT INTO users (name, created) VALUES (?1, ?2)",
         params![FIRST_USER, time],
@@ -168,7 +178,7 @@ fn blob16(v: Vec<u8>) -> Result<[u8; 16]> {
         .map_err(|_| anyhow!("a stored ID is not 16 bytes"))
 }
 
-fn root_body() -> RevisionBody {
+pub(crate) fn root_body() -> RevisionBody {
     RevisionBody {
         content: Content::Dir,
         metadata: Metadata::default(),
@@ -255,14 +265,18 @@ impl SqliteStore {
             bail!("{} does not exist", path.display());
         }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        Self::with_connection(conn, how)
+        Self::with_connection(conn, how, Some(path))
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::with_connection(Connection::open_in_memory()?, Opening::default())
+        Self::with_connection(Connection::open_in_memory()?, Opening::default(), None)
     }
 
-    fn with_connection(mut conn: Connection, how: Opening<'_>) -> Result<Self> {
+    fn with_connection(
+        mut conn: Connection,
+        how: Opening<'_>,
+        file: Option<&Path>,
+    ) -> Result<Self> {
         // An administrator's command beside the server writes now and then: each waits for the other
         // rather than failing.
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
@@ -292,6 +306,12 @@ impl SqliteStore {
             }
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
+        }
+        if version < 4 {
+            crate::migrate::to_4(&mut conn, file, version == 0)?;
+        }
+        if let Some(file) = file {
+            crate::migrate::compact_if_due(&conn, file)?;
         }
         let mut store = Self { conn };
         store.create_namespace("default")?;
@@ -419,7 +439,7 @@ impl TreeStore for TxView<'_> {
             .execute(params![self.ns, o.0, kind_name(body.content.kind()), rev.0])?;
         self.tx
             .prepare_cached("INSERT INTO revisions (ns, id, object, base, seq, body) VALUES (?1, ?2, ?3, NULL, ?4, ?5)")?
-            .execute(params![self.ns, rev.0, o.0, self.seq, serde_json::to_string(body)?])?;
+            .execute(params![self.ns, rev.0, o.0, self.seq, encode_body(body)])?;
         Ok(())
     }
 
@@ -435,7 +455,7 @@ impl TreeStore for TxView<'_> {
             .execute(params![self.ns, o.0, rev.0])?;
         self.tx
             .prepare_cached("INSERT INTO revisions (ns, id, object, base, seq, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
-            .execute(params![self.ns, rev.0, o.0, base.0, self.seq, serde_json::to_string(body)?])?;
+            .execute(params![self.ns, rev.0, o.0, base.0, self.seq, encode_body(body)])?;
         Ok(())
     }
 
@@ -454,6 +474,55 @@ impl TreeStore for TxView<'_> {
             .execute(params![self.ns, link.parent.0, link.name.as_bytes()])?;
         Ok(())
     }
+}
+
+/// A commit's operations as `journal` keeps them, each create's and update's body put in from
+/// `revisions`, where the revision it names must be that object's and made by this commit.
+pub(crate) fn ops_of(conn: &Connection, ns: i64, seq: i64, stored: &[u8]) -> Result<Vec<Op>> {
+    let decoded = decode_ops(stored).with_context(|| format!("commit {seq}"))?;
+    let mut ops = decoded.ops;
+    if decoded.bodies_wanted.is_empty() {
+        return Ok(ops);
+    }
+    let mut stmt =
+        conn.prepare_cached("SELECT object, seq, body FROM revisions WHERE ns = ?1 AND id = ?2")?;
+    for i in decoded.bodies_wanted {
+        let (object, revision, body) = match &mut ops[i] {
+            Op::Create {
+                object,
+                revision,
+                body,
+                ..
+            }
+            | Op::Update {
+                object,
+                revision,
+                body,
+                ..
+            } => (*object, *revision, body),
+            _ => bail!("commit {seq}: a body is wanted for an operation that has none"),
+        };
+        let row = stmt
+            .query_row(params![ns, revision.0], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((stored_object, stored_seq, stored_body)) = row else {
+            bail!("commit {seq} names revision {revision}, which the database does not hold");
+        };
+        if stored_object != object.0 || stored_seq != seq {
+            bail!(
+                "commit {seq} names revision {revision} of object {object}, and the database holds it for object {} at commit {stored_seq}",
+                hex::encode(&stored_object)
+            );
+        }
+        *body = decode_body(&stored_body).with_context(|| format!("revision {revision}"))?;
+    }
+    Ok(ops)
 }
 
 impl MetaStore for SqliteStore {
@@ -475,7 +544,7 @@ impl MetaStore for SqliteStore {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        ensure_namespace(&tx, ns)?;
+        ensure_namespace(&tx, ns, Bodies::Binary)?;
         tx.commit()?;
         Ok(())
     }
@@ -716,9 +785,10 @@ impl MetaStore for SqliteStore {
                 )?;
             }
         }
+        // Each body is in `revisions` now, under its revision, and only named here.
         tx.execute(
-            "INSERT INTO journal (ns, seq, op_id, device, device_name, time, ops, user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![ns_id, seq, req.op_id.0, req.device.0, req.device_name, time, serde_json::to_string(&req.ops)?, user],
+            "INSERT INTO journal (ns, seq, op_id, device, device_name, time, user, ops, json_len) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![ns_id, seq, req.op_id.0, req.device.0, req.device_name, time, user, encode_ops(&req.ops, |_| false), json_len(&req.ops)? as i64],
         )?;
         tx.execute(
             "UPDATE namespaces SET head = ?2 WHERE id = ?1",
@@ -743,7 +813,7 @@ impl MetaStore for SqliteStore {
     ) -> Result<Vec<Change>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, op_id, device, device_name, time, ops, user FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            "SELECT seq, op_id, device, device_name, time, ops, user, json_len FROM journal WHERE ns = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![ns_id, after as i64, limit], |r| {
             Ok((
@@ -752,8 +822,9 @@ impl MetaStore for SqliteStore {
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
-                r.get::<_, String>(5)?,
+                r.get::<_, Vec<u8>>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -762,15 +833,15 @@ impl MetaStore for SqliteStore {
             if bytes >= max_bytes {
                 break;
             }
-            let (seq, op_id, device, device_name, time, ops, user) = row?;
-            bytes += ops.len();
+            let (seq, op_id, device, device_name, time, ops, user, json_len) = row?;
+            bytes = bytes.saturating_add(usize::try_from(json_len).unwrap_or(usize::MAX));
             out.push(Change {
                 seq: seq as u64,
                 op_id: cairn_protocol::OpId(blob16(op_id)?),
                 device: cairn_protocol::DeviceId(blob16(device)?),
                 device_name,
                 time,
-                ops: serde_json::from_str(&ops)?,
+                ops: ops_of(&self.conn, ns_id, seq, &ops)?,
                 user,
             });
         }
@@ -850,7 +921,7 @@ impl MetaStore for SqliteStore {
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, Vec<u8>>(3)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -860,7 +931,7 @@ impl MetaStore for SqliteStore {
                 revision: RevisionId(blob16(id)?),
                 object: ObjectId(blob16(object)?),
                 seq: seq as u64,
-                body: serde_json::from_str(&body)?,
+                body: decode_body(&body)?,
             });
         }
         Ok(out)
@@ -914,7 +985,7 @@ impl MetaStore for SqliteStore {
                 r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, String>(4)?,
+                r.get::<_, Vec<u8>>(4)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -926,7 +997,7 @@ impl MetaStore for SqliteStore {
                 head: Head {
                     kind: kind_of(&kind)?,
                     revision: RevisionId(blob16(head)?),
-                    body: serde_json::from_str(&body)?,
+                    body: decode_body(&body)?,
                 },
             });
         }
@@ -946,7 +1017,7 @@ impl MetaStore for SqliteStore {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(2)?,
                 ))
             })
             .optional()?;
@@ -956,7 +1027,7 @@ impl MetaStore for SqliteStore {
         Ok(Some(Head {
             kind: kind_of(&kind)?,
             revision: RevisionId(blob16(head)?),
-            body: serde_json::from_str(&body)?,
+            body: decode_body(&body)?,
         }))
     }
 
@@ -988,7 +1059,7 @@ impl MetaStore for SqliteStore {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?,
                     r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(2)?,
                 ))
             })
             .optional()?;
@@ -999,7 +1070,7 @@ impl MetaStore for SqliteStore {
             revision,
             object: ObjectId(blob16(object)?),
             seq: seq as u64,
-            body: serde_json::from_str(&body)?,
+            body: decode_body(&body)?,
         }))
     }
 
@@ -1014,7 +1085,7 @@ impl MetaStore for SqliteStore {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
@@ -1028,7 +1099,7 @@ impl MetaStore for SqliteStore {
                     revision: RevisionId(blob16(id)?),
                     object,
                     seq: seq as u64,
-                    body: serde_json::from_str(&body)?,
+                    body: decode_body(&body)?,
                 },
                 time: time.unwrap_or(0),
                 device_name: device_name.unwrap_or_default(),
@@ -1047,7 +1118,7 @@ impl MetaStore for SqliteStore {
     ) -> Result<Vec<Change>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, op_id, device, device_name, time, ops, user FROM journal
+            "SELECT seq, op_id, device, device_name, time, ops, user, json_len FROM journal
              WHERE ns = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
@@ -1059,8 +1130,9 @@ impl MetaStore for SqliteStore {
                     r.get::<_, Vec<u8>>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
+                    r.get::<_, Vec<u8>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             },
         )?;
@@ -1070,15 +1142,15 @@ impl MetaStore for SqliteStore {
             if bytes >= max_bytes {
                 break;
             }
-            let (seq, op_id, device, device_name, time, ops, user) = row?;
-            bytes += ops.len();
+            let (seq, op_id, device, device_name, time, ops, user, json_len) = row?;
+            bytes = bytes.saturating_add(usize::try_from(json_len).unwrap_or(usize::MAX));
             out.push(Change {
                 seq: seq as u64,
                 op_id: cairn_protocol::OpId(blob16(op_id)?),
                 device: cairn_protocol::DeviceId(blob16(device)?),
                 device_name,
                 time,
-                ops: serde_json::from_str(&ops)?,
+                ops: ops_of(&self.conn, ns_id, seq, &ops)?,
                 user,
             });
         }
@@ -1189,7 +1261,7 @@ mod tests {
         let conn = Connection::open(db).unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         for ns in namespaces {
-            ensure_namespace(&conn, ns).unwrap();
+            ensure_namespace(&conn, ns, Bodies::Json).unwrap();
         }
         conn.pragma_update(None, "user_version", 1).unwrap();
     }

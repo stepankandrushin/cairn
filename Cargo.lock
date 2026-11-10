@@ -229,6 +229,7 @@ dependencies = [
  "cairn-failpoint",
  "cairn-protocol",
  "cairn-server",
+ "cairn-store",
  "hex",
  "libc",
  "rand",

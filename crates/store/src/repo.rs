@@ -119,6 +119,18 @@ impl Repo {
         }
     }
 
+    /// Moves the data directory's database from schema 4 back to 3, which a binary from before 4
+    /// reads, with the directory's lock held so that no server has it meanwhile; what it did.
+    pub fn downgrade_to_3(root: impl Into<PathBuf>) -> Result<String> {
+        let root = root.into();
+        let db = root.join("meta.sqlite");
+        if !db.exists() {
+            anyhow::bail!("{} is no data directory", root.display());
+        }
+        let _lock = lock(&root)?;
+        crate::migrate::to_3(&db)
+    }
+
     fn meta(&self) -> std::sync::MutexGuard<'_, Box<dyn MetaStore>> {
         self.meta.lock().expect("a store panic aborts the process")
     }

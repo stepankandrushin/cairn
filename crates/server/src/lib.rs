@@ -536,6 +536,13 @@ enum Command {
         #[arg(long)]
         data: PathBuf,
     },
+    /// Move the database back to schema 3, which a binary from before schema 4 reads (0.1.14 and
+    /// earlier), with the server stopped: the way back to one. This one moves it to 4 again when it
+    /// opens it.
+    Downgrade {
+        #[arg(long)]
+        data: PathBuf,
+    },
 }
 
 /// A new file only this user reads, holding `text`, synced. Fails if the file is there already.
@@ -729,6 +736,9 @@ fn run_inner() -> Result<std::process::ExitCode> {
                 .enable_all()
                 .build()?
                 .block_on(serve(data, listen, behind_tls_proxy, link_url))?;
+        }
+        Command::Downgrade { data } => {
+            println!("{}", Repo::downgrade_to_3(&data)?);
         }
         Command::Fsck { data } => {
             let repo = Repo::open(&data)?;

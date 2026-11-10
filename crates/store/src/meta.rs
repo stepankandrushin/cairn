@@ -118,8 +118,8 @@ pub trait MetaStore: Send {
     fn set_access(&mut self, ns: &str, user: &str, access: Option<Access>) -> Result<()>;
     fn members(&mut self, ns: &str) -> Result<Vec<Member>>;
     fn folders_of(&mut self, user: &str) -> Result<Vec<FolderAccess>>;
-    /// Up to `limit` entries after `after`, in order, and no more once their operations, as stored,
-    /// pass `max_bytes`: always at least one.
+    /// Up to `limit` entries after `after`, in order, and no more once their operations, as the JSON
+    /// they are sent as, pass `max_bytes`: always at least one.
     fn changes(
         &mut self,
         ns: &str,

@@ -20,6 +20,7 @@ cairn-cli = { workspace = true, features = ["failpoints"] }
 cairn-server = { workspace = true, features = ["failpoints"] }
 cairn-engine = { workspace = true, features = ["failpoints"] }
 cairn-protocol.workspace = true
+cairn-store.workspace = true
 cairn-failpoint.workspace = true
 anyhow.workspace = true
 base64.workspace = true

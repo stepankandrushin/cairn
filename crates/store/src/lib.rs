@@ -2,8 +2,10 @@
 //! PostgreSQL can later run the same suite as SQLite.
 
 pub mod chunks;
+pub mod codec;
 pub mod fsck;
 pub mod meta;
+pub mod migrate;
 pub mod repo;
 pub mod sqlite;
 

@@ -1601,13 +1601,7 @@ fn an_entry_moved_back_past_the_walk_is_no_delete() {
         assert!(run.ok(), "{}", run.text());
         assert_eq!(a.read("other"), b"from b");
         // What went up was a move, and no delete.
-        let conn = rusqlite::Connection::open(server.data.join("meta.sqlite")).unwrap();
-        let mut ops = conn.prepare("SELECT ops FROM journal").unwrap();
-        let all: Vec<String> = ops
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let all = journal_json(&server.data);
         assert!(
             !all.iter().any(|o| o.contains(r#""op":"unlink""#)),
             "a delete went up for what moved under the walk: {}\n{all:?}",

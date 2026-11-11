@@ -12,7 +12,7 @@ const enc = encodeURIComponent;
 // How this browser shows times (Settings), kept in its localStorage: the clock, and the order of a date.
 const SETTINGS_KEY = 'cairn.settings';
 const CLOCKS = ['24h', '12h'];
-const DATE_ORDERS = ['dd.mm.yyyy', 'yyyy-mm-dd', 'dd/mm/yyyy', 'mm/dd/yyyy', 'd mmm yyyy', 'mmm d, yyyy'];
+const DATE_ORDERS = ['yyyy-mm-dd', 'dd.mm.yyyy', 'dd/mm/yyyy', 'mm/dd/yyyy', 'd mmm yyyy', 'mmm d, yyyy'];
 
 /** What was chosen here, each setting the first of its list where nothing (or nothing known) was. */
 function loadSettings() {
@@ -30,6 +30,7 @@ const state = {
   shared: null, // GET /v1/shared, once asked
   users: null, // GET /v1/users, once asked
   current: null, // {view, listing} of the folder on screen
+  openFolder: null, // the folder whose own pages the sidebar lists
   sort: { key: 'name', dir: 1 },
   gen: 0, // the navigation a render belongs to: a stale one never paints
   routing: false,
@@ -96,6 +97,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 const ICONS = {
   folder: ['M3 7.5A2.5 2.5 0 0 1 5.5 5h3.8l2.2 2.2h7A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z'],
   'folder-plus': ['M3 7.5A2.5 2.5 0 0 1 5.5 5h3.8l2.2 2.2h7A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z', 'M12 10.5v6M9 13.5h6'],
+  'folder-upload': ['M3 7.5A2.5 2.5 0 0 1 5.5 5h3.8l2.2 2.2h7A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z', 'M12 17v-6.3M9.4 13.2l2.6-2.6 2.6 2.6'],
   file: ['M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z', 'M14 3v5h5'],
   link: ['M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1', 'M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1'],
   menu: ['M4 7h16M4 12h16M4 17h16'],
@@ -108,6 +110,9 @@ const ICONS = {
   close: ['M6 6l12 12M18 6L6 18'],
   chevron: ['M6 9l6 6 6-6'],
   people: ['M9 11a3.2 3.2 0 1 0 0-6.4A3.2 3.2 0 0 0 9 11z', 'M3 20a6 6 0 0 1 12 0', 'M16 4.8a3.2 3.2 0 0 1 0 6.2', 'M21 20a6 6 0 0 0-3.6-5.5'],
+  settings: ['M10.29 5.62L10.4 2.94L13.6 2.94L13.71 5.62A6.6 6.6 0 0 1 15.3 6.28L17.28 4.46L19.54 6.72L17.72 8.7A6.6 6.6 0 0 1 18.38 10.29L21.06 10.4L21.06 13.6L18.38 13.71A6.6 6.6 0 0 1 17.72 15.3L19.54 17.28L17.28 19.54L15.3 17.72A6.6 6.6 0 0 1 13.71 18.38L13.6 21.06L10.4 21.06L10.29 18.38A6.6 6.6 0 0 1 8.7 17.72L6.72 19.54L4.46 17.28L6.28 15.3A6.6 6.6 0 0 1 5.62 13.71L2.94 13.6L2.94 10.4L5.62 10.29A6.6 6.6 0 0 1 6.28 8.7L4.46 6.72L6.72 4.46L8.7 6.28A6.6 6.6 0 0 1 10.29 5.62z', 'M12 14.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2z'],
+  shared: ['M18 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M18 22a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M8.6 10.5l6.8-4M8.6 13.5l6.8 4'],
+  'sign-out': ['M10 4H6.5A2.5 2.5 0 0 0 4 6.5v11A2.5 2.5 0 0 0 6.5 20H10', 'M15 8l4 4-4 4M19 12H9'],
   globe: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M3 12h18', 'M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3z'],
 };
 
@@ -177,7 +182,7 @@ function humanSize(n) {
 }
 
 // Times are written here, on the clock and in the date order chosen in Settings, rather than by the
-// browser's locale: a 24-hour clock and day.month.year unless changed, as the tray shows them.
+// browser's locale: a 24-hour clock, as the tray's, and year-month-day unless changed.
 const pad2 = (n) => String(n).padStart(2, '0');
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -187,12 +192,12 @@ function dayText(d, order = state.settings.date) {
   const mm = pad2(d.getMonth() + 1);
   const y = d.getFullYear();
   switch (order) {
-    case 'yyyy-mm-dd': return `${y}-${mm}-${dd}`;
+    case 'dd.mm.yyyy': return `${dd}.${mm}.${y}`;
     case 'dd/mm/yyyy': return `${dd}/${mm}/${y}`;
     case 'mm/dd/yyyy': return `${mm}/${dd}/${y}`;
     case 'd mmm yyyy': return `${d.getDate()} ${MONTHS[d.getMonth()]} ${y}`;
     case 'mmm d, yyyy': return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${y}`;
-    default: return `${dd}.${mm}.${y}`;
+    default: return `${y}-${mm}-${dd}`;
   }
 }
 
@@ -519,6 +524,7 @@ function showSignIn(message) {
   closeMenu();
   state.me = null;
   state.current = null;
+  state.openFolder = null;
   shell = null;
   document.title = 'Cairn';
   const input = h('input', { type: 'password', id: 'token', name: 'token', autocomplete: 'current-password', required: true, spellcheck: 'false', autocapitalize: 'off' });
@@ -586,8 +592,8 @@ function buildShell() {
     brand(),
     h('span', { class: 'spacer' }),
     h('span', { class: 'who', text: state.me.user, title: 'Signed in as this user' }),
-    h('a', { class: 'btn subtle', href: '#/settings' }, 'Settings'),
-    h('button', { class: 'btn subtle', onclick: act(signOut) }, 'Sign out'));
+    h('a', { class: 'btn subtle settings-link', href: '#/settings', 'aria-label': 'Settings' }, icon('settings'), h('span', { class: 'btn-text', text: 'Settings' })),
+    h('button', { class: 'btn subtle', onclick: act(signOut) }, icon('sign-out'), 'Sign out'));
   $app().replaceChildren(top, layout);
   shell = { sidebar, main, layout };
 }
@@ -597,23 +603,27 @@ function navLink(href, children, active, sub = false) {
 }
 
 function renderSidebar(r) {
+  // A folder's own pages stay listed under it while a page of no folder is open (Shared with me,
+  // Settings), until another folder is opened; before any is, under the first.
+  if (r.ns) state.openFolder = r.ns;
+  const folders = state.me.folders;
+  const open = folders.some((f) => f.folder === state.openFolder) ? state.openFolder : folders[0]?.folder;
   const items = [h('div', { class: 'nav-title', text: 'Folders' })];
-  if (!state.me.folders.length) items.push(h('div', { class: 'nav-empty', text: 'No folder is yours yet' }));
-  for (const f of state.me.folders) {
+  if (!folders.length) items.push(h('div', { class: 'nav-empty', text: 'No folder is yours yet' }));
+  for (const f of folders) {
     const here = r.ns === f.folder;
     items.push(navLink(`#/f/${enc(f.folder)}/root`, [
       icon('folder', 't-folder'), h('span', { class: 'nav-label', text: f.folder }), h('span', { class: `badge ${f.access}`, text: f.access }),
     ], here && r.name === 'files'));
-    if (here) {
-      items.push(navLink(`#/deleted/${enc(f.folder)}`, h('span', { class: 'nav-label', text: 'Recently deleted' }), r.name === 'deleted', true));
-      items.push(navLink(`#/members/${enc(f.folder)}`, h('span', { class: 'nav-label', text: 'Members' }), r.name === 'members', true));
-      if (f.access === 'manage') {
-        items.push(navLink(`#/shares/${enc(f.folder)}`, h('span', { class: 'nav-label', text: 'Shares and links' }), r.name === 'shares', true));
-      }
+    if (f.folder === open) {
+      const sub = (page, glyph, text) => navLink(`#/${page}/${enc(f.folder)}`, [icon(glyph), h('span', { class: 'nav-label', text })], here && r.name === page, true);
+      items.push(sub('deleted', 'trash', 'Recently deleted'));
+      items.push(sub('members', 'people', 'Members'));
+      if (f.access === 'manage') items.push(sub('shares', 'link', 'Shares and links'));
     }
   }
   items.push(h('div', { class: 'nav-title', text: 'Shared' }));
-  items.push(navLink('#/shared', [icon('people'), h('span', { class: 'nav-label', text: 'Shared with me' })], r.name === 'shared' || r.name === 'sharedview'));
+  items.push(navLink('#/shared', [icon('shared'), h('span', { class: 'nav-label', text: 'Shared with me' })], r.name === 'shared' || r.name === 'sharedview'));
   shell.sidebar.replaceChildren(...items);
 }
 
@@ -773,7 +783,7 @@ function browser(view, listing) {
     breadcrumbs(view, listing.path),
     h('div', { class: 'actions' },
       ctx.canWrite && h('button', { class: 'btn primary', onclick: () => pickFiles(ctx, false) }, icon('upload'), 'Upload'),
-      ctx.canWrite && h('button', { class: 'btn', onclick: () => pickFiles(ctx, true) }, 'Upload folder'),
+      ctx.canWrite && h('button', { class: 'btn', onclick: () => pickFiles(ctx, true) }, icon('folder-upload'), 'Upload folder'),
       ctx.canWrite && h('button', { class: 'btn', onclick: act(() => newFolder(ctx)) }, icon('folder-plus'), 'New folder'),
       h('button', { class: 'btn', title: 'Download this folder and everything in it as a zip', onclick: () => download(zipUrl(view, dir.object)) },
         icon('download'), view.kind === 'link' ? 'Download all (zip)' : 'Download (zip)'),
@@ -1962,8 +1972,8 @@ function saveSetting(key, value) {
 }
 
 const DATE_WORDS = {
-  'dd.mm.yyyy': 'day.month.year',
   'yyyy-mm-dd': 'year-month-day',
+  'dd.mm.yyyy': 'day.month.year',
   'dd/mm/yyyy': 'day/month/year',
   'mm/dd/yyyy': 'month/day/year',
   'd mmm yyyy': 'day month year',

@@ -4,9 +4,13 @@
 
 **Changed:**
 
-- The web interface writes times on a 24-hour clock and dates as day.month.year (`11.11.2026 09:50`), where it
+- The web interface writes times on a 24-hour clock and dates as year-month-day (`2026-11-11 09:50`), where it
   followed the browser's locale. Its new Settings page, at the top of every page, chooses a 12-hour clock or
   another date order; the choice is kept in that browser.
+- The web's sidebar gives a folder's Recently deleted, Members, and Shares and links an icon each, and Shared
+  with me one of its own in place of Members' people. They stay listed under the folder while Shared with me
+  or Settings is open, until another folder is opened. Settings has a gear, on a phone the gear alone, Sign out a
+  door, and Upload folder a folder with an arrow.
 
 **Fixed:**
 

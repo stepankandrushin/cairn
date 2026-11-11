@@ -104,6 +104,8 @@ p { margin: 0 0 10px; }
 .nav-link:hover { background: var(--hover); }
 .nav-link.active { background: color-mix(in srgb, var(--accent) 15%, transparent); font-weight: 560; }
 .nav-link.sub { padding-left: 36px; font-size: 13px; }
+.nav-link.sub .icon { width: 16px; height: 16px; color: var(--muted); }
+.nav-link.sub.active .icon { color: var(--text); }
 .nav-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .badge {
@@ -132,6 +134,7 @@ p { margin: 0 0 10px; }
 @media (max-width: 420px) {
   .topbar { gap: 4px; padding: 0 8px; }
   .topbar .btn { padding: 0 8px; }
+  .settings-link .btn-text { display: none; }
 }
 
 /* Icons */

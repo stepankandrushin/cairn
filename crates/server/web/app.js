@@ -927,7 +927,7 @@ function row(ctx, e) {
         updateSelection(ctx);
       },
     })),
-    h('td', { class: 'col-name' }, h('div', { class: 'name-cell' },
+    h('td', { class: 'col-name link-cell' }, h('div', { class: 'name-cell' },
       fileIcon(e),
       name,
       e.kind === 'symlink' && h('span', { class: 'target', text: `→ ${e.target_display ?? ''}` }))),
@@ -1974,7 +1974,7 @@ async function renderSharedList(gen) {
   const shares = (r && r.shares) || [];
   state.shared = shares;
   const rows = shares.map((s) => h('tr', {},
-    h('td', {}, h('div', { class: 'name-cell' }, fileIcon(s.item), h('a', { class: 'name-link', href: `#/s/${enc(s.id)}/root`, text: s.item.display }))),
+    h('td', { class: 'link-cell' }, h('div', { class: 'name-cell' }, fileIcon(s.item), h('a', { class: 'name-link', href: `#/s/${enc(s.id)}/root`, text: s.item.display }))),
     h('td', { text: s.by || '' }),
     h('td', {}, h('span', { class: `badge ${s.access}`, text: LEVEL_TEXT[s.access] || s.access })),
     h('td', { class: 'muted', text: s.expires ? `until ${fmtDate(s.expires)}` : '' }),

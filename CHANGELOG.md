@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- In the web's file list and on Shared with me, a click anywhere in the name's cell opens the item: its icon and
+  the space around and beside the name too, where only the name itself did.
+
 ## 0.1.17 (2026-11-11)
 
 **Added:**

@@ -272,6 +272,9 @@ table.list tr.current td { background: color-mix(in srgb, var(--accent) 7%, tran
 .name-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .name-link, .name-text { color: var(--text); text-decoration: none; overflow-wrap: anywhere; min-width: 0; }
 .name-link:hover { text-decoration: underline; }
+/* The name's link covers its whole cell, the icon and the space around the name too. */
+td.link-cell { position: relative; }
+td.link-cell .name-link::after { content: ""; position: absolute; inset: 0; }
 .target { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 .row-actions { text-align: right; white-space: nowrap; }
 .row-actions .btn + .btn { margin-left: 6px; }

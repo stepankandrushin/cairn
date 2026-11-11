@@ -71,9 +71,10 @@ pub enum FolderCommand {
         #[arg(long)]
         data: PathBuf,
     },
-    /// Rename a folder, with the server stopped, as its chunks move. Its former name goes on reaching
-    /// it, so that every device, link and address made with it goes on working, and devices take the
-    /// new name up as they next sync; no other folder may take the former name.
+    /// Rename a folder, with the server stopped, which reads the former names as it starts. Its
+    /// chunks stay where they are, and its former name goes on reaching it, so that every device, link
+    /// and address made with it goes on working, and devices take the new name up as they next sync;
+    /// no other folder may take the former name.
     Rename {
         from: String,
         to: String,

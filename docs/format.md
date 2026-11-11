@@ -8,7 +8,7 @@ data/
   lock                   flock held while a server has the directory
   meta.sqlite            metadata: WAL, synchronous=FULL
   ns/<hex of namespace name>/
-                         by its name now; renamed with it (below)
+                         or, once it is renamed, of the name it had first (below)
     chunks/ab/abcdef...  one file per chunk or manifest, named by its full hash
     incoming/            uploads in progress; emptied at startup
   web/uploads/<id>       a web upload's bytes as they arrive, until stored; emptied at startup
@@ -109,17 +109,19 @@ was the same, byte for byte.
 
 Schema 5 adds `former_names` and `folder_names`, empty, in one transaction after any compaction, so a kill
 or a full disk leaves schema 4 or 5 whole. `cairn-server downgrade` moves the database one schema back each
-time it runs: from 5 to 4 by dropping both tables, the former names and each user's own names with them, so
-a renamed namespace answers to its name now alone; from 4 to 3 as above.
+time it runs: from 5 to 4 by dropping both tables and `namespaces.dir`, the former names and each user's own
+names with them, so a renamed namespace answers to its name now alone; from 4 to 3 as above. It refuses
+while a renamed namespace keeps its chunks under another name than its own, where schema 4 would not look:
+renamed back to its first name, and each device synced once so that it has taken that name up, it goes.
 
 A data directory with no namespace, as `cairn-server init` makes it, gets its first, `cloud`, managed by the
 first user; one from before keeps its `default`. `cairn-server folder rename <from> <to>`, with the server
-stopped, renames a namespace in one transaction, keeping the name it had in `former_names`, then moves its
-chunks' directory to its new name's; it refuses a name that is another namespace's, now or before, and a
-directory already there. A rename killed between the two leaves the chunks under the former name, where
-no namespace's own directory is: every open of the data directory, before anything else, moves the
-directory of the one former name of a namespace whose own is not there, and refuses to guess between two.
-A directory is made only for a namespace's name now, never a former one's.
+stopped, as it reads the former names when it starts, renames a namespace in one transaction, keeping the
+name it had in `former_names`; it refuses a name that is another namespace's, now or before. Its chunks
+stay where they are: `namespaces.dir`, empty until then, takes the hex of the name it had at its first
+rename, and its chunks are under that from then on, so a rename moves and copies nothing, and a backup that
+links each chunk to the last copy's by its path links them all again. A former name has no directory of
+its own.
 
 `cairn-server fsck` reads every chunk, follows every manifest reference, checks `entries` and `objects`
 against a replay of `journal`, and that each revision is named by the commit that made it, but the first

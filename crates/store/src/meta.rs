@@ -97,8 +97,11 @@ pub trait MetaStore: Send {
     /// former name it is is called now. `None` for none.
     fn resolve_namespace(&mut self, name: &str) -> Result<Option<String>>;
     /// Renames a namespace, all at once: its former name goes on reaching it, and so no other may
-    /// take that name. Its chunks' directory, named after it, is the caller's to move (`Repo`).
+    /// take that name. Its chunks stay in the directory they are in (`chunk_dir`).
     fn rename_namespace(&mut self, from: &str, to: &str) -> Result<()>;
+    /// The name of the directory under `ns/` a namespace keeps its chunks in: its name, hex-encoded,
+    /// or, once renamed, the name it had when first renamed.
+    fn chunk_dir(&mut self, ns: &str) -> Result<String>;
     /// The names a namespace had before, which still reach it.
     fn former_names(&mut self, ns: &str) -> Result<Vec<String>>;
     /// Sets a user's own name for a namespace, with `if_none` only if they have none, or with `None`
@@ -601,6 +604,13 @@ pub mod suite {
         assert_eq!(s.resolve_namespace("new").unwrap().as_deref(), Some("new"));
         assert_eq!(s.resolve_namespace("none").unwrap(), None);
         assert_eq!(s.former_names("new").unwrap(), ["old"]);
+        // Its chunks where they were, under the name it had.
+        assert_eq!(s.chunk_dir("new").unwrap(), hex::encode("old"));
+        assert_eq!(s.chunk_dir("taken").unwrap(), hex::encode("taken"));
+        assert!(
+            s.chunk_dir("old").is_err(),
+            "a former name has no chunks of its own"
+        );
         assert_eq!(s.head("new").unwrap(), head);
         assert_eq!(s.access("new", "erin").unwrap(), Some(Access::Write));
         assert_eq!(mine(s), ("new".into(), Some("Фото 2026".into())));
@@ -610,6 +620,7 @@ pub mod suite {
         // And back: its name its own again, and the one it left a former name in turn.
         s.rename_namespace("new", "old").unwrap();
         assert_eq!(s.former_names("old").unwrap(), ["new"]);
+        assert_eq!(s.chunk_dir("old").unwrap(), hex::encode("old"));
         assert_eq!(s.resolve_namespace("new").unwrap().as_deref(), Some("old"));
 
         // Their own name taken away, they see the folder's; a user removed takes theirs with them.

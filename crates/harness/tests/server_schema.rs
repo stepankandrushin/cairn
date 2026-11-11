@@ -271,13 +271,26 @@ fn a_server_moves_a_database_of_schema_3_when_it_starts_and_answers_the_same() {
     assert_eq!(b.read("d6/new"), b"new");
 }
 
-/// A state with what schema 5 adds taken out: what is left must be schema 4's as it was.
+/// A state with what schema 5 adds taken out, its two tables and `namespaces.dir`, empty in each row
+/// until a rename: what is left must be schema 4's as it was.
 fn without_5(mut state: Vec<(String, Vec<String>)>) -> Vec<(String, Vec<String>)> {
     let new = ["former_names", "folder_names"];
     state.retain(|(t, _)| !new.contains(&t.as_str()));
     for (t, rows) in &mut state {
         if t == "sqlite_master" {
             rows.retain(|r| !new.iter().any(|n| r.contains(n)));
+            for r in rows.iter_mut() {
+                *r = r.replace(", dir TEXT)", ")");
+            }
+            rows.sort();
+        }
+        if t == "namespaces" {
+            for r in rows.iter_mut() {
+                assert!(r.ends_with(", Null]"), "a namespace's dir set: {r}");
+                let keep = r.len() - ", Null]".len();
+                *r = format!("{}]", &r[..keep]);
+            }
+            rows.sort();
         }
     }
     state

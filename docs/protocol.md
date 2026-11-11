@@ -63,8 +63,9 @@ what it holds. A client that learns from `Info.access` that it may only read sen
 
 A namespace's name is what every path, device and link uses: 1 to 64 of ASCII letters, digits, `.`, `_`
 and `-`, not starting with `.` or `-`. A server's first is `cloud`; one made before this release has
-`default`. Its administrator renames one with the server stopped, `cairn-server folder rename`, as its
-chunks' directory is named after it (format.md). The former name goes on reaching it, for paths of every
+`default`. Its administrator renames one with the server stopped, `cairn-server folder rename`, as the
+server reads the former names when it starts; nothing of its tree or chunks moves (format.md). The former
+name goes on reaching it, for paths of every
 kind, so every device, link and address made with it goes on working, and no other namespace may take it.
 `Info.folder` says the name now, and a client keeps the one it is told from then on.
 

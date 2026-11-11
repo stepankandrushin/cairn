@@ -399,8 +399,9 @@ asking; too low a level answers 403. The server's administrator adds users, toke
 `cairn-server` on the data directory, while it serves too, and a folder's managers change who has access
 through the API. A folder's name is what paths, devices, links and commands use, and a server's first is
 `cloud`, which `cairn init` joins as the only one its token reaches. The administrator renames one with the
-server stopped, as its chunks' directory is named after it; the former name goes on reaching it and no
-other folder may take it, so nothing made with it breaks, and devices take the new name up as they sync.
+server stopped, its chunks left where they are, so a rename moves and copies nothing; the former name goes
+on reaching it and no other folder may take it, so nothing made with it breaks, and devices take the new
+name up as they sync.
 Each user may also have their own name for a folder, which only they see and which changes nothing else:
 the name of the directory their first device syncs it into, until they choose another. The journal says whose token made each commit. A data directory's one token from before
 accounts becomes the user `admin`'s, managing every folder there is, when the schema gains accounts.

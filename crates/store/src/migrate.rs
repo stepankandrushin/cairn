@@ -291,8 +291,10 @@ pub fn back_one(file: &Path) -> Result<String> {
     }
 }
 
-/// Schema 5 back to 4, in one transaction: its two tables dropped, and with them the folders' former
-/// names, which reach them no more, and each user's own names for them.
+/// Schema 5 back to 4, in one transaction: its two tables and `namespaces.dir` dropped, and with them
+/// the folders' former names, which reach them no more, and each user's own names for them. Refused
+/// while a renamed folder keeps its chunks under another name than its own, where a binary of schema 4
+/// would not look for them.
 fn from_5(file: &Path) -> Result<String> {
     let mut conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
@@ -303,6 +305,23 @@ fn from_5(file: &Path) -> Result<String> {
     let version: usize = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 5 {
         bail!("this database has schema {version}: only one of schema 5 is moved back to 4");
+    }
+    let mut elsewhere = Vec::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT name, dir FROM namespaces WHERE dir IS NOT NULL ORDER BY name")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (name, dir) = row?;
+            if dir != hex::encode(&name) {
+                elsewhere.push(format!("{name:?} keeps its chunks in ns/{dir}, where a binary of schema 4 would look in ns/{}", hex::encode(&name)));
+            }
+        }
+    }
+    if !elsewhere.is_empty() {
+        bail!(
+            "the database stays at schema 5: {}. Rename each back to the name it had first (`cairn-server folder rename`), let the server run until every device has synced once and so taken that name up, then move it back",
+            elsewhere.join("; ")
+        );
     }
     let mut former = Vec::new();
     {
@@ -316,7 +335,9 @@ fn from_5(file: &Path) -> Result<String> {
     }
     let own: i64 = tx.query_row("SELECT count(*) FROM folder_names", [], |r| r.get(0))?;
     hit("server.downgrade5.begun");
-    tx.execute_batch("DROP TABLE folder_names; DROP TABLE former_names;")?;
+    tx.execute_batch(
+        "DROP TABLE folder_names; DROP TABLE former_names; ALTER TABLE namespaces DROP COLUMN dir;",
+    )?;
     tx.pragma_update(None, "user_version", 4)?;
     hit("server.downgrade5.commit");
     check("server.downgrade5.write")?;
@@ -930,6 +951,38 @@ mod tests {
             all.push((t.to_string(), got));
         }
         all
+    }
+
+    /// Schema 5 goes back to 4 only while every folder keeps its chunks under its own name: one
+    /// renamed is renamed back first, and then every row is schema 4's again.
+    #[test]
+    fn a_renamed_folder_holds_the_move_back_to_schema_4_until_renamed_back() {
+        let dir = scratch();
+        let db = dir.join("meta.sqlite");
+        drop(SqliteStore::open(&db).unwrap());
+        from_5(&db).unwrap();
+        let four = rows(&db);
+        let mut s = SqliteStore::open(&db).unwrap();
+        s.rename_namespace(FIRST_FOLDER, "files").unwrap();
+        drop(s);
+        let err = format!("{:#}", from_5(&db).unwrap_err());
+        assert!(
+            err.contains("stays at schema 5")
+                && err.contains(&format!(
+                    "\"files\" keeps its chunks in ns/{}",
+                    hex::encode(FIRST_FOLDER)
+                )),
+            "{err}"
+        );
+        assert_eq!(version(&db), 5);
+        let mut s = SqliteStore::open(&db).unwrap();
+        s.rename_namespace("files", FIRST_FOLDER).unwrap();
+        drop(s);
+        let said = from_5(&db).unwrap();
+        assert!(said.contains("the former names files for cloud"), "{said}");
+        assert_eq!(version(&db), 4);
+        assert!(rows(&db) == four, "not the rows of schema 4");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// From the schema this binary writes back to 3, as `cairn-server downgrade` run twice.

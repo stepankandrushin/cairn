@@ -80,98 +80,45 @@ impl Repo {
             },
         )?;
         sync_dir(&root)?;
-        let repo = Self {
+        Ok(Self {
             root,
             meta: Mutex::new(Box::new(meta)),
             chunks: Mutex::new(BTreeMap::new()),
             _lock: Some(lock),
-        };
-        repo.finish_renames()?;
-        Ok(repo)
+        })
     }
 
     /// Where a namespace's chunks are: a directory named after it, hex-encoded so that no name can
-    /// address anything else.
-    fn ns_dir(&self, ns: &str) -> PathBuf {
-        self.root.join("ns").join(hex::encode(ns))
+    /// address anything else, or after the name it had when first renamed, which a rename leaves them in.
+    fn ns_dir(&self, ns: &str) -> Result<PathBuf> {
+        let dir = self.meta().chunk_dir(ns)?;
+        Ok(self.root.join("ns").join(dir))
     }
 
-    /// A rename that ended before it moved the namespace's chunks to its new name's directory, by a
-    /// kill or a failure, leaves them in the directory of the name it had: moved there now, before
-    /// anything asks for them.
-    fn finish_renames(&self) -> Result<()> {
-        let names = self.meta().namespaces()?;
-        for ns in names {
-            if self.ns_dir(&ns).exists() {
-                continue;
-            }
-            let former = self.meta().former_names(&ns)?;
-            let left: Vec<&String> = former.iter().filter(|f| self.ns_dir(f).exists()).collect();
-            match left[..] {
-                [] => {}
-                [was] => {
-                    std::fs::rename(self.ns_dir(was), self.ns_dir(&ns)).with_context(|| {
-                        format!("move the chunks of the folder {ns:?} from where its former name {was:?} had them")
-                    })?;
-                    sync_dir(&self.root.join("ns"))?;
-                    eprintln!(
-                        "cairn-server: the folder {was:?} was renamed {ns:?} and its chunks not moved yet: moved them from {} to {}",
-                        self.ns_dir(was).display(),
-                        self.ns_dir(&ns).display()
-                    );
-                }
-                _ => anyhow::bail!(
-                    "the folder {ns:?} has no directory of chunks, {}, and its former names {} each have one: which is its, a person must say",
-                    self.ns_dir(&ns).display(),
-                    left.iter().map(|f| format!("{f:?} ({})", self.ns_dir(f).display())).collect::<Vec<_>>().join(", ")
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    /// Renames a namespace, with no server on the data directory: in the database at once, its former
-    /// name reaching it still, then its chunks moved to its new name's directory, which a kill between
-    /// the two leaves to the next open. What it did.
+    /// Renames a namespace, with no server on the data directory, which reads the former names as it
+    /// starts: one transaction, its former name reaching it still. Its chunks stay where they are, so
+    /// nothing is moved or copied, and a backup's next copy links them as before. What it did.
     pub fn rename_namespace(&self, from: &str, to: &str) -> Result<String> {
         if self._lock.is_none() {
             anyhow::bail!(
-                "a server has {}: stop it first, as a rename moves the folder's chunks",
+                "a server has {}: stop it first, as it reads the folders' former names when it starts",
                 self.root.display()
             );
         }
         if !self.meta().namespace_exists(from)? {
             anyhow::bail!("no folder {from:?}");
         }
-        if self.ns_dir(to).exists() {
-            anyhow::bail!(
-                "{} is there already, where the folder {to:?} would keep its chunks: nothing renamed",
-                self.ns_dir(to).display()
-            );
-        }
         self.meta()
             .rename_namespace(from, to)
             .context("nothing renamed")?;
-        cairn_failpoint::hit("server.rename.committed");
         self.chunks
             .lock()
             .expect("a store panic aborts the process")
             .remove(from);
-        let moved = if self.ns_dir(from).exists() {
-            std::fs::rename(self.ns_dir(from), self.ns_dir(to)).with_context(|| {
-                format!("renamed {from:?} to {to:?}, but move its chunks to {}: the next start of the server moves them", self.ns_dir(to).display())
-            })?;
-            sync_dir(&self.root.join("ns"))?;
-            format!(
-                "its chunks moved from {} to {}",
-                self.ns_dir(from).display(),
-                self.ns_dir(to).display()
-            )
-        } else {
-            "with no chunks to move".to_string()
-        };
+        let dir = self.ns_dir(to)?;
         Ok(format!(
-            "renamed the folder {from:?} to {to:?}, {moved}. Who had access has it still, and {from:?} goes on reaching it, so every device and link made with it goes on working; no other folder can take that name"
+            "renamed the folder {from:?} to {to:?}; its chunks stay in {}. Who had access has it still, and {from:?} goes on reaching it, so every device and link made with it goes on working; no other folder can take that name",
+            dir.display()
         ))
     }
 
@@ -232,17 +179,24 @@ impl Repo {
     }
 
     pub fn chunks(&self, ns: &str) -> Result<std::sync::Arc<FsChunkStore>> {
+        let cached = self
+            .chunks
+            .lock()
+            .expect("a store panic aborts the process")
+            .get(ns)
+            .cloned();
+        if let Some(store) = cached {
+            return Ok(store);
+        }
+        // Asked of the database with no other lock held. A namespace's name now has a directory,
+        // never a former one: `ns_dir` knows only the first.
+        let dir = self.ns_dir(ns)?;
         let mut map = self
             .chunks
             .lock()
             .expect("a store panic aborts the process");
         if let Some(store) = map.get(ns) {
             return Ok(store.clone());
-        }
-        let dir = self.ns_dir(ns);
-        // Only a namespace's name now has a directory made for it, never a former one's.
-        if !dir.exists() && !self.meta().namespace_exists(ns)? {
-            anyhow::bail!("no namespace {ns:?}");
         }
         let store = std::sync::Arc::new(FsChunkStore::open(dir)?);
         sync_dir(&self.root.join("ns"))?;
@@ -479,49 +433,42 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A rename moves the folder's chunks to its new name's directory; one that ended after the
-    /// database and before the move is finished by the next open; a server's data directory is not
-    /// renamed under it.
+    /// A renamed folder keeps its chunks where they were, in the directory of the name it had first,
+    /// through any number of renames; no directory is made for a former name; and a server's data
+    /// directory is not renamed under it.
     #[test]
-    fn a_rename_moves_the_chunks_and_an_open_finishes_one_cut_short() {
+    fn a_renamed_folder_keeps_its_chunks_where_they_were() {
         use crate::sqlite::FIRST_FOLDER;
         let dir = tempdir();
         let dir_of = |ns: &str| dir.join("ns").join(hex::encode(ns));
         let h = Hash::of(b"kept");
-        {
-            let repo = Repo::open(&dir).unwrap();
-            repo.chunks(FIRST_FOLDER).unwrap().put(&h, b"kept").unwrap();
-            let said = repo.rename_namespace(FIRST_FOLDER, "files").unwrap();
-            assert!(said.contains("chunks moved"), "{said}");
-            assert!(!dir_of(FIRST_FOLDER).exists());
-            assert!(repo.missing("files", &[h]).unwrap().is_empty());
-            assert!(
-                repo.chunks(FIRST_FOLDER).is_err(),
-                "no directory made for a former name"
-            );
-            assert!(!dir_of(FIRST_FOLDER).exists());
-
-            let admin = Repo::open_for_admin(&dir).unwrap();
-            let err = admin.rename_namespace("files", "x").unwrap_err();
-            assert!(err.to_string().contains("stop it first"), "{err}");
-            drop(admin);
-
-            // Cut short: the database renamed, the chunks where they were.
-            repo.with_meta(|m| m.rename_namespace("files", "docs"))
-                .unwrap();
-            repo.with_meta(|m| m.create_namespace("taken")).unwrap();
-            std::fs::create_dir_all(dir_of("taken")).unwrap();
-            let err = repo.rename_namespace("taken", "files").unwrap_err();
-            assert!(err.to_string().contains("is there already"), "{err}");
-        }
-        assert!(dir_of("files").exists() && !dir_of("docs").exists());
         let repo = Repo::open(&dir).unwrap();
-        assert!(!dir_of("files").exists());
-        assert!(repo.missing("docs", &[h]).unwrap().is_empty());
+        repo.chunks(FIRST_FOLDER).unwrap().put(&h, b"kept").unwrap();
+        let said = repo.rename_namespace(FIRST_FOLDER, "files").unwrap();
+        assert!(said.contains("its chunks stay in"), "{said}");
+        assert!(dir_of(FIRST_FOLDER).exists() && !dir_of("files").exists());
+        assert!(repo.missing("files", &[h]).unwrap().is_empty());
+        assert!(
+            repo.chunks(FIRST_FOLDER).is_err(),
+            "a former name has no chunks of its own"
+        );
+        repo.rename_namespace("files", "docs").unwrap();
         assert_eq!(
             repo.chunks("docs").unwrap().get(&h).unwrap().as_deref(),
             Some(&b"kept"[..])
         );
+        assert!(!dir_of("files").exists() && !dir_of("docs").exists());
+
+        let admin = Repo::open_for_admin(&dir).unwrap();
+        let err = admin.rename_namespace("docs", "x").unwrap_err();
+        assert!(err.to_string().contains("stop it first"), "{err}");
+        drop(admin);
+        drop(repo);
+
+        // Opened again, the same; and back at its first name, its own name's directory again.
+        let repo = Repo::open(&dir).unwrap();
+        assert!(repo.missing("docs", &[h]).unwrap().is_empty());
+        repo.with_meta(|m| m.create_namespace("taken")).unwrap();
         let err = format!("{:#}", repo.rename_namespace("taken", "files").unwrap_err());
         assert!(
             err.contains("nothing renamed: ") && err.contains("which it still reaches"),
@@ -529,6 +476,12 @@ mod tests {
         );
         let err = format!("{:#}", repo.rename_namespace("docs", "taken").unwrap_err());
         assert!(err.contains("already"), "{err}");
+        repo.rename_namespace("docs", FIRST_FOLDER).unwrap();
+        assert!(repo.missing(FIRST_FOLDER, &[h]).unwrap().is_empty());
+        assert_eq!(
+            repo.with_meta(|m| m.chunk_dir(FIRST_FOLDER)).unwrap(),
+            hex::encode(FIRST_FOLDER)
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! A folder renamed on a server whose devices joined it by its old name: a kill at either point of the
-//! rename, or a full disk at its commit, renames all of it or none of it, and one cut short between
-//! the database and the chunks is finished by the server's next start. The devices go on by the old
-//! name, take the new one up at their next sync and lose nothing; a new device joins the user's only
-//! folder by its new name; and no other folder may take the old one.
+//! A folder renamed on a server whose devices joined it by its old name: a kill before its commit, or
+//! a full disk at it, renames nothing, and its chunks never move, so nothing is copied and a backup's
+//! next copy links them as before. The devices go on by the old name, take the new one up at their
+//! next sync and lose nothing; a new device joins the user's only folder by its new name; no other
+//! folder may take the old one; and the database goes back to schema 4 only once it is renamed back.
 
 mod common;
 use common::*;
@@ -35,7 +35,7 @@ fn a_folder_renamed_under_its_devices_loses_nothing_and_they_follow_it() {
     let listed = |server: &Server| server.admin(&["folder", "list"]).expect_ok().stdout;
     assert!(ns_dir("cloud").exists());
 
-    // Not under a server: its chunks are to move.
+    // Not under a server, which reads the former names when it starts.
     let run = server.admin(&["folder", "rename", "cloud", "photos"]);
     assert!(
         !run.ok() && run.stderr.contains("stop it first"),
@@ -72,13 +72,16 @@ fn a_folder_renamed_under_its_devices_loses_nothing_and_they_follow_it() {
     );
     unrenamed("a full disk at its commit");
 
-    // Killed between the database and the chunks: renamed, the chunks where they were.
-    let run = rename(&[("CAIRN_FP_CRASH", "server.rename.committed")]);
-    assert!(run.was_killed(), "never committed: {}", run.text());
+    // Renamed: the chunks stay where they were, under the name it had first.
+    let run = rename(&[]).expect_ok();
+    assert!(
+        run.stdout
+            .contains(&format!("its chunks stay in {}", ns_dir("cloud").display())),
+        "{}",
+        run.text()
+    );
     assert!(ns_dir("cloud").exists() && !ns_dir("photos").exists());
-    // The server's start moves them before anything asks, as any open of the data directory would.
     server.restart();
-    assert!(!ns_dir("cloud").exists() && ns_dir("photos").exists());
     assert!(
         listed(&server).contains("photos  at ") && listed(&server).contains("formerly cloud"),
         "{}",
@@ -119,5 +122,37 @@ fn a_folder_renamed_under_its_devices_loses_nothing_and_they_follow_it() {
         "{}",
         run.text()
     );
+    assert!(server.fsck().contains("clean"));
+    assert!(
+        !ns_dir("photos").exists(),
+        "nothing ever made under the new name"
+    );
+
+    // Back to schema 4 only once its chunks are under its own name again.
+    server.kill();
+    let run = run_server(&["downgrade", "--data", &data], &[]);
+    assert!(
+        !run.ok() && run.stderr.contains("stays at schema 5") && run.stderr.contains("rename"),
+        "{}",
+        run.text()
+    );
+    // Renamed back, the devices follow it back before the former names go with the downgrade.
+    run_server(
+        &["folder", "rename", "photos", "cloud", "--data", &data],
+        &[],
+    )
+    .expect_ok();
+    server.restart();
+    converge(&[&a, &b, &c]);
+    for d in [&a, &b, &c] {
+        assert_eq!(configured(d), "cloud");
+    }
+    server.kill();
+    let run = run_server(&["downgrade", "--data", &data], &[]).expect_ok();
+    assert!(run.stdout.contains("back to schema 4"), "{}", run.text());
+    server.restart();
+    a.write("d1/back", "at schema 5 again");
+    converge(&[&a, &b, &c]);
+    assert_eq!(c.read("d1/back"), b"at schema 5 again");
     assert!(server.fsck().contains("clean"));
 }

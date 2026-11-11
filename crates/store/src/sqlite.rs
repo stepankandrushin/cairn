@@ -73,9 +73,11 @@ CREATE INDEX shares_recipient ON shares (recipient);
 "#,
 ];
 
-/// Schema 5's, after 4: the names a renamed namespace had, which still reach it and no other may take,
-/// and each user's own name for a namespace.
+/// Schema 5's, after 4: the directory a renamed namespace keeps its chunks in, named after the name it
+/// had when first renamed (NULL: after its name now); the names a renamed namespace had, which still
+/// reach it and no other may take; and each user's own name for a namespace.
 pub(crate) const MIGRATION_5: &str = r#"
+ALTER TABLE namespaces ADD COLUMN dir TEXT;
 CREATE TABLE former_names (
     name TEXT PRIMARY KEY, ns INTEGER NOT NULL REFERENCES namespaces (id)
 ) WITHOUT ROWID;
@@ -636,9 +638,10 @@ impl MetaStore for SqliteStore {
             );
         }
         tx.execute("DELETE FROM former_names WHERE name = ?1", [to])?;
+        // Its chunks stay where they are: the directory named after the name it had when first renamed.
         tx.execute(
-            "UPDATE namespaces SET name = ?1 WHERE id = ?2",
-            params![to, id],
+            "UPDATE namespaces SET name = ?1, dir = COALESCE(dir, ?2) WHERE id = ?3",
+            params![to, hex::encode(from), id],
         )?;
         tx.execute(
             "INSERT INTO former_names (name, ns) VALUES (?1, ?2)",
@@ -648,6 +651,17 @@ impl MetaStore for SqliteStore {
         check("server.rename.write")?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn chunk_dir(&mut self, ns: &str) -> Result<String> {
+        let dir: Option<String> = self
+            .conn
+            .query_row("SELECT dir FROM namespaces WHERE name = ?1", [ns], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| anyhow!("no namespace {ns:?}"))?;
+        Ok(dir.unwrap_or_else(|| hex::encode(ns)))
     }
 
     fn former_names(&mut self, ns: &str) -> Result<Vec<String>> {

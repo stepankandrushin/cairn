@@ -5,7 +5,7 @@ versioned history, and clients that sync a real filesystem without losing anythi
 modes, owners, xattrs, hard links, sparse files, filename bytes). Files only: no groupware, no app
 platform.
 
-**Status: 0.1.16 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
+**Status: 0.1.17 released on GitHub, milestones 0 to 2 done, and the harness runs in CI.** Linux, a one-shot
 CLI and a daemon; the same on macOS and Windows with a tray, ahead of milestone 7 and not in CI; each
 installed copy updates itself from signed releases. Users, tokens and per-folder read, write and manage
 access, ahead of milestone 5, came in 0.1.12; the web interface, ahead of milestone 6 (browsing, uploads,

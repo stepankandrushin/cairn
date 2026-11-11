@@ -162,7 +162,9 @@ deleted brought back, who has access, and, for a folder's managers, shares of an
 another user of the server, to read or to write, or by a public link that needs no account, reads only and
 may expire. A change made there is a commit like any device's, refused rather than forced when something
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
-a user is seen in the web interface, not synced yet. The endpoints are in docs/protocol.md, "Web".
+a user is seen in the web interface, not synced yet. Times are on a 24-hour clock, as `11.11.2026 09:50`;
+its Settings choose a 12-hour clock or another order of the date, kept in that browser. The endpoints are in
+docs/protocol.md, "Web".
 
 A public link needs only `/s/`, `/web/` and `/v1/links/`. Where the server's address is open to some addresses
 alone, a second door in the proxy, open to anyone, can pass just those, and `cairn-server serve --link-url

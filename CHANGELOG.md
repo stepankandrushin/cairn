@@ -10,21 +10,21 @@
   A device offers the name of the directory it syncs the folder into, as `cairn init` joins and each time its
   daemon starts, which the server keeps only while the user has none: a folder synced into `~/Sync` shows as
   "Sync" until they choose another.
-- `cairn-server folder rename <from> <to>`, with the server stopped: the folder's chunks move to its new
-  name's directory, and its former name goes on reaching it, so every device, link and bookmark made with it
-  goes on working. Each device takes the new name up at its next sync, and no other folder may take the former
-  name; `folder list` shows it. A rename killed before its chunks moved is finished at the server's next start.
+- `cairn-server folder rename <from> <to>`, with the server stopped: one transaction, the folder's chunks left
+  where they are, so nothing is moved or copied; its former name goes on reaching it, so every device, link
+  and bookmark made with it goes on working. Each device takes the new name up at its next sync, and no other
+  folder may take the former name; `folder list` shows it.
 
 **Changed:**
 
 - A new server's first folder is `cloud`, where it was `default`; a server from before keeps its `default`
   and gets no second one. `cairn init` without `--folder` syncs the one folder the token reaches, whatever its
   name, and with several names them and asks which, where it took `default`.
-- The server's database is schema 5, two tables more: a renamed folder's former names, and each user's own
-  names for folders. A server moves a database of schema 4 to it when it starts, in one transaction, so a kill
-  or a full disk leaves 4 or 5 whole. A server of schema 4 refuses it; `cairn-server downgrade --data <dir>`,
-  with the server stopped, now moves it back one schema each time it runs: to 4, dropping both tables and what
-  they held, then to 3.
+- The server's database is schema 5: a renamed folder's former names, each user's own names for folders, and
+  where a renamed folder keeps its chunks. A server moves a database of schema 4 to it when it starts, in one
+  transaction, so a kill or a full disk leaves 4 or 5 whole. A server of schema 4 refuses it; `cairn-server
+  downgrade --data <dir>`, with the server stopped, now moves it back one schema each time it runs: to 4,
+  dropping what schema 5 added, once no folder is renamed away from its first name, then to 3.
 
 - The web interface writes times on a 24-hour clock and dates as year-month-day (`2026-11-11 09:50`), where it
   followed the browser's locale. Its new Settings page, at the top of every page, chooses a 12-hour clock or

@@ -129,6 +129,10 @@ p { margin: 0 0 10px; }
   .col-modified { display: none; }
   .who { display: none; }
 }
+@media (max-width: 420px) {
+  .topbar { gap: 4px; padding: 0 8px; }
+  .topbar .btn { padding: 0 8px; }
+}
 
 /* Icons */
 
@@ -273,19 +277,20 @@ table.list tr.current td { background: color-mix(in srgb, var(--accent) 7%, tran
    said is told on a line under the name instead. The widths are of .main, with or without the sidebar. */
 table.deleted .name-stack { flex: 1; min-width: 9em; }
 table.deleted .col-in { color: var(--muted); overflow-wrap: anywhere; }
-table.deleted .col-when { width: 1%; white-space: nowrap; }
-table.deleted .col-by { overflow-wrap: anywhere; }
-.row-meta { display: none; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+table.deleted .col-when, table.deleted .col-by { width: 1%; white-space: nowrap; }
+.row-meta { display: none; color: var(--muted); font-size: 12.5px; }
 .row-meta > span { display: none; }
-.row-meta > span + span::before { content: "·"; margin: 0 6px; }
-@container main (max-width: 760px) {
+.row-meta > .m-in { overflow-wrap: anywhere; }
+.m-size, .m-when { white-space: nowrap; }
+.m-size::after { content: "·"; margin: 0 6px; }
+@container main (max-width: 900px) {
   table.deleted .col-in, table.deleted .col-by { display: none; }
   .row-meta { display: block; }
-  .row-meta > .m-in, .row-meta > .m-by { display: inline; }
+  .row-meta > .m-in, .row-meta > .m-by { display: block; }
 }
-@container main (max-width: 520px) {
+@container main (max-width: 600px) {
   table.deleted .col-size, table.deleted .col-when { display: none; }
-  .row-meta > .m-size, .row-meta > .m-when { display: inline; }
+  .row-meta > .m-sizewhen { display: block; }
 }
 
 /* Menus */

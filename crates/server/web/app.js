@@ -238,6 +238,9 @@ function pathText(p) {
   return String(p);
 }
 
+/** Text that may break after each `/`, as a path's steps run together: text and `<wbr>`s. */
+const slashBreaks = (text) => text.split(/(?<=\/)/).flatMap((part, i) => (i ? [h('wbr'), part] : [part]));
+
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const byText = (user, device) => (user && device ? `${user} on ${device}` : user || device || '—');
 const atLeast = (have, want) => LEVELS.indexOf(have) >= LEVELS.indexOf(want);
@@ -1901,11 +1904,10 @@ async function renderDeleted(gen, ns) {
       h('td', { class: 'col-name' }, h('div', { class: 'name-cell' }, fileIcon(it), h('div', { class: 'name-stack' },
         h('span', { class: 'name-text', text: it.display }),
         h('div', { class: 'row-meta' },
-          h('span', { class: 'm-in', text: `in ${where}` }),
-          h('span', { class: 'm-size', text: size }),
-          h('span', { class: 'm-when', text: when }),
+          h('span', { class: 'm-in' }, 'in ', slashBreaks(where)),
+          h('span', { class: 'm-sizewhen' }, h('span', { class: 'm-size', text: size }), h('wbr'), h('span', { class: 'm-when', text: when })),
           by !== '—' && h('span', { class: 'm-by', text: `by ${by}` }))))),
-      h('td', { class: 'col-in', text: where }),
+      h('td', { class: 'col-in' }, slashBreaks(where)),
       h('td', { class: 'col-size', text: size }),
       h('td', { class: 'col-when', text: when }),
       h('td', { class: 'col-by', text: by }));

@@ -11,7 +11,8 @@
 **Fixed:**
 
 - The web's Recently deleted squeezed the Name column to a few letters wide on a narrow window or phone. As
-  the page narrows, the Was in and By columns, then Size and Deleted, move to a line under the name.
+  the page narrows, the Was in and By columns, then Size and Deleted, move to lines under the name, and a
+  path breaks after a `/` rather than inside a word.
 
 ## 0.1.16 (2026-11-11)
 

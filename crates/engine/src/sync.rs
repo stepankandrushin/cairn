@@ -158,6 +158,9 @@ pub struct SyncReport {
     pub compact_due: bool,
     /// What opening the state for this sync moved it from an older build's layout, for the log.
     pub migrated: Option<String>,
+    /// The folder was renamed on the server, and this root's configuration follows it now: what to
+    /// say so.
+    pub followed: Option<String>,
     /// This device's user may only read this folder: what changed here is listed in `skips` as
     /// `read_only`, and none of it went up.
     pub read_only: bool,
@@ -196,6 +199,7 @@ impl SyncReport {
             bytes_read: 0,
             compact_due: false,
             migrated: None,
+            followed: None,
             read_only: false,
         }
     }
@@ -1546,6 +1550,23 @@ pub fn compact(path: &Path) -> Result<crate::state::Compaction> {
     root.state.compact(&root.state_file())
 }
 
+/// The server answered by the folder's name now, which a rename gave it: the root's configuration
+/// takes it up, so that what this device asks and says names it so. The former name reaches it still,
+/// so a configuration that cannot be written now is only said, and tried again at the next sync.
+fn follow_rename(root: &mut Root, client: &Client) -> Option<String> {
+    let now = client.folder()?;
+    if now == root.config.namespace || !cairn_protocol::wire::valid_account_name(now) {
+        return None;
+    }
+    let was = root.config.namespace.clone();
+    Some(match root.take_up_folder_name(now) {
+        Ok(()) => format!("the folder {was:?} is called {now:?} now, and this root follows it"),
+        Err(e) => format!(
+            "the folder {was:?} is called {now:?} now, which this root's configuration could not take up ({e:#}); it goes on by the former name"
+        ),
+    })
+}
+
 fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let mut report = SyncReport::new();
     let mut root = match Root::open_to_sync(path) {
@@ -1557,6 +1578,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     };
     report.migrated = root.state.migrated().map(|m| m.to_string());
     let client = Client::new(&root.config, Retries::Sync)?;
+    report.followed = follow_rename(&mut root, &client);
     let retried = client.retried();
     let counted = |mut report: SyncReport| {
         report.retries = retried.load(std::sync::atomic::Ordering::SeqCst);
@@ -1584,6 +1606,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         hit("sync.fast");
         fast.report.compact_due = root.state.compaction_due();
         fast.report.migrated = report.migrated.clone();
+        fast.report.followed = report.followed.clone();
         fast.report.read_only = client.read_only();
         if !crate::steady::oracle() {
             return Ok(counted(fast.report));

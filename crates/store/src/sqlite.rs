@@ -73,13 +73,33 @@ CREATE INDEX shares_recipient ON shares (recipient);
 "#,
 ];
 
+/// Schema 5's, after 4: the names a renamed namespace had, which still reach it and no other may take,
+/// and each user's own name for a namespace.
+pub(crate) const MIGRATION_5: &str = r#"
+CREATE TABLE former_names (
+    name TEXT PRIMARY KEY, ns INTEGER NOT NULL REFERENCES namespaces (id)
+) WITHOUT ROWID;
+CREATE INDEX former_names_ns ON former_names (ns);
+CREATE TABLE folder_names (
+    ns INTEGER NOT NULL REFERENCES namespaces (id), user INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    PRIMARY KEY (ns, user)
+) WITHOUT ROWID;
+CREATE INDEX folder_names_user ON folder_names (user);
+"#;
+
 /// The schema this binary writes: `PRAGMA user_version` once every migration has run. Schema 4 keeps
 /// each revision's body once, in `revisions`, and bodies and operations as binary records
-/// (`crate::codec`), with what is sent made from them as the JSON it always was.
-pub const SCHEMA: usize = MIGRATIONS.len() + 1;
+/// (`crate::codec`), with what is sent made from them as the JSON it always was; schema 5 adds
+/// [`MIGRATION_5`]'s tables.
+pub const SCHEMA: usize = MIGRATIONS.len() + 2;
 
 /// The user a data directory's one token from before accounts becomes, managing every namespace.
 pub const FIRST_USER: &str = "admin";
+
+/// The namespace a data directory with none gets: what its first devices sync, `cloud` as people call
+/// the folder they keep there. Directories from before it keep their `default`.
+pub const FIRST_FOLDER: &str = "cloud";
 
 /// How to open a database.
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,7 +166,10 @@ fn adopt_first_token(tx: &Transaction<'_>, token: Option<&str>, time: i64) -> Re
     let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
         return Ok(());
     };
-    ensure_namespace(tx, "default", Bodies::Json)?;
+    // A store from before accounts has its `default` already, which every open of it made.
+    if no_namespace(tx)? {
+        ensure_namespace(tx, FIRST_FOLDER, Bodies::Json)?;
+    }
     tx.execute(
         "INSERT INTO users (name, created) VALUES (?1, ?2)",
         params![FIRST_USER, time],
@@ -161,6 +184,24 @@ fn adopt_first_token(tx: &Transaction<'_>, token: Option<&str>, time: i64) -> Re
         [user],
     )?;
     Ok(())
+}
+
+/// The name now of the namespace that `name` was the name of, if it was one's.
+fn former_of(conn: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT n.name FROM former_names f JOIN namespaces n ON n.id = f.ns WHERE f.name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn no_namespace(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM namespaces LIMIT 1", [], |_| Ok(()))
+        .optional()?
+        .is_none())
 }
 
 fn now() -> i64 {
@@ -310,11 +351,17 @@ impl SqliteStore {
         if version < 4 {
             crate::migrate::to_4(&mut conn, file, version == 0)?;
         }
+        // Before schema 5's step, so that a compaction killed leaves schema 4 as its move did.
         if let Some(file) = file {
             crate::migrate::compact_if_due(&conn, file)?;
         }
+        if version < 5 {
+            crate::migrate::to_5(&mut conn)?;
+        }
         let mut store = Self { conn };
-        store.create_namespace("default")?;
+        if no_namespace(&store.conn)? {
+            store.create_namespace(FIRST_FOLDER)?;
+        }
         Ok(store)
     }
 
@@ -544,9 +591,114 @@ impl MetaStore for SqliteStore {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
+        if let Some(now) = former_of(&tx, ns)? {
+            bail!(
+                "{ns:?} was the name of the folder {now:?}, which it still reaches: pick another"
+            );
+        }
         ensure_namespace(&tx, ns, Bodies::Binary)?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn resolve_namespace(&mut self, name: &str) -> Result<Option<String>> {
+        if self.ns_id(name).is_ok() {
+            return Ok(Some(name.to_string()));
+        }
+        former_of(&self.conn, name)
+    }
+
+    fn rename_namespace(&mut self, from: &str, to: &str) -> Result<()> {
+        if !cairn_protocol::wire::valid_account_name(to) {
+            bail!("{to:?} is no folder name: 1 to 64 of ASCII letters, digits, '.', '_' and '-', not starting with '.' or '-'");
+        }
+        let id = self.ns_id(from)?;
+        if from == to {
+            bail!("the folder {from:?} has that name already");
+        }
+        let tx = self.conn.transaction()?;
+        if tx
+            .query_row("SELECT 1 FROM namespaces WHERE name = ?1", [to], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            bail!("there is a folder {to:?} already");
+        }
+        let owner: Option<i64> = tx
+            .query_row("SELECT ns FROM former_names WHERE name = ?1", [to], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if owner.is_some_and(|o| o != id) {
+            let now = former_of(&tx, to)?.unwrap_or_default();
+            bail!(
+                "{to:?} was the name of the folder {now:?}, which it still reaches: pick another"
+            );
+        }
+        tx.execute("DELETE FROM former_names WHERE name = ?1", [to])?;
+        tx.execute(
+            "UPDATE namespaces SET name = ?1 WHERE id = ?2",
+            params![to, id],
+        )?;
+        tx.execute(
+            "INSERT INTO former_names (name, ns) VALUES (?1, ?2)",
+            params![from, id],
+        )?;
+        hit("server.rename.commit");
+        check("server.rename.write")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn former_names(&mut self, ns: &str) -> Result<Vec<String>> {
+        let id = self.ns_id(ns)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT name FROM former_names WHERE ns = ?1 ORDER BY name")?;
+        let names = stmt
+            .query_map([id], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    fn set_folder_name(
+        &mut self,
+        ns: &str,
+        user: &str,
+        name: Option<&str>,
+        if_none: bool,
+    ) -> Result<Option<String>> {
+        let ns_id = self.ns_id(ns)?;
+        let user_id = self.user_id(user)?;
+        match name {
+            None => {
+                self.conn.execute(
+                    "DELETE FROM folder_names WHERE ns = ?1 AND user = ?2",
+                    params![ns_id, user_id],
+                )?;
+            }
+            Some(name) => {
+                if !cairn_protocol::wire::valid_folder_name(name) {
+                    bail!("{name:?} is no name for a folder: 1 to 64 characters, no control character, and no space at either end");
+                }
+                let sql = if if_none {
+                    "INSERT INTO folder_names (ns, user, name) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (ns, user) DO NOTHING"
+                } else {
+                    "INSERT INTO folder_names (ns, user, name) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (ns, user) DO UPDATE SET name = excluded.name"
+                };
+                self.conn.execute(sql, params![ns_id, user_id, name])?;
+            }
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM folder_names WHERE ns = ?1 AND user = ?2",
+                params![ns_id, user_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     fn add_user(&mut self, name: &str, time: i64) -> Result<()> {
@@ -708,19 +860,25 @@ impl MetaStore for SqliteStore {
 
     fn folders_of(&mut self, user: &str) -> Result<Vec<FolderAccess>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT n.name, g.access FROM grants g
+            "SELECT n.name, g.access, f.name FROM grants g
              JOIN namespaces n ON n.id = g.ns JOIN users u ON u.id = g.user
+             LEFT JOIN folder_names f ON f.ns = g.ns AND f.user = g.user
              WHERE u.name = ?1 ORDER BY n.name",
         )?;
         let rows = stmt.query_map([user], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (folder, access) = row?;
+            let (folder, access, name) = row?;
             out.push(FolderAccess {
                 folder,
                 access: access_of(&access)?,
+                name,
             });
         }
         Ok(out)
@@ -1283,6 +1441,8 @@ mod tests {
         for ns in ["default", "team"] {
             assert_eq!(s.access(ns, FIRST_USER).unwrap(), Some(Access::Manage));
         }
+        // Its folders as they were, and no first folder of a new store beside them.
+        assert_eq!(s.namespaces().unwrap(), ["default", "team"]);
         drop(s);
         // Only the move to accounts does that: a token file seen again later changes nothing.
         let mut s = SqliteStore::open_with(
@@ -1300,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_with_a_token_gives_its_user_the_default_namespace() {
+    fn a_new_database_with_a_token_gives_its_user_the_first_folder() {
         let dir = scratch();
         let mut s = SqliteStore::open_with(
             &dir.join("db"),
@@ -1310,8 +1470,9 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(s.namespaces().unwrap(), [FIRST_FOLDER]);
         assert_eq!(
-            s.access("default", FIRST_USER).unwrap(),
+            s.access(FIRST_FOLDER, FIRST_USER).unwrap(),
             Some(Access::Manage)
         );
         let mut none = SqliteStore::open(&dir.join("other")).unwrap();

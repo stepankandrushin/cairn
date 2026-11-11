@@ -148,6 +148,31 @@ pub fn init_root(path: &Path, opts: InitOptions) -> Result<u64> {
     Ok(head)
 }
 
+/// The name of the directory a root is, as its user's own name for the folder: what a device offers
+/// the server. None for a name that is not text or would not do as one, or a drive's or the
+/// filesystem's top.
+pub fn root_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    cairn_protocol::wire::valid_folder_name(name).then(|| name.to_string())
+}
+
+/// Offers the server the name of the directory this root is, as its user's own name for the folder,
+/// which the server keeps only if they have none yet; what went wrong, if anything. Whatever
+/// happens, the sync goes on as before: the name is only what the web shows them.
+pub fn offer_root_name(path: &Path) -> Option<String> {
+    let name = root_name(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))?;
+    let offered = read_config(path).and_then(|config| {
+        crate::client::Client::new(&config, crate::client::Retries::Never)?.offer_name(&name)
+    });
+    // Taken, or theirs already, or a server before such names: nothing to say.
+    match offered {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "offering this root's name, {name:?}, as its user's name for the folder: {e:#}; offered again at the next start"
+        )),
+    }
+}
+
 /// This root's marker, without taking its lock.
 pub fn read_root_id(path: &Path) -> std::io::Result<String> {
     let state = path.join(name_path(STATE_DIR));
@@ -232,6 +257,20 @@ impl Root {
             state,
             _lock: lock,
         })
+    }
+
+    /// The namespace was renamed on the server, which calls it `now`: the configuration says so from
+    /// here on, written as a whole and durably, as init wrote it.
+    pub fn take_up_folder_name(&mut self, now: &str) -> Result<()> {
+        let mut config = self.config.clone();
+        config.namespace = now.to_string();
+        write_private(
+            &self.path.join(name_path(STATE_DIR)),
+            CONFIG,
+            &serde_json::to_vec_pretty(&config)?,
+        )?;
+        self.config = config;
+        Ok(())
     }
 
     /// Temporary names are this device's own, so a scan can tell its leftovers from a user's file.

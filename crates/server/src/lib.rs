@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use cairn_protocol::wire::{
-    self, Access, ChangesResponse, CommitRequest, Grant, HashList, Info, Me, Member,
+    self, Access, ChangesResponse, CommitRequest, FolderName, Grant, HashList, Info, Me, Member,
     MAX_CHUNK_BATCH_BYTES,
 };
 use cairn_store::{is_disk_full, token_hash, ChunkStore, Repo};
@@ -38,6 +38,56 @@ struct App {
     commits: tokio::sync::watch::Sender<u64>,
     /// Set when the server is stopping, so that no waiting request holds the shutdown up.
     closing: tokio::sync::watch::Sender<bool>,
+    /// Each renamed namespace's former names, and its name now: a rename is made with the server
+    /// stopped (`cairn-server folder rename`), so what it starts with holds while it serves.
+    former: std::collections::HashMap<String, String>,
+}
+
+/// The name a request asked for its namespace by, where that was a former one.
+#[derive(Clone)]
+struct AskedAs(String);
+
+/// A request to a namespace by a former name goes on as one by its name now, before any route is
+/// chosen, so that every handler, the chunks and the journal see the one name; what it was asked by
+/// is kept, for an answer that says so.
+async fn by_name_now(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
+    if app.former.is_empty() {
+        return next.run(req).await;
+    }
+    let Some(rest) = req.uri().path().strip_prefix("/v1/ns/").map(str::to_string) else {
+        return next.run(req).await;
+    };
+    let asked = rest.split('/').next().unwrap_or_default();
+    let Some(now) = app.former.get(asked) else {
+        return next.run(req).await;
+    };
+    let mut path = format!("/v1/ns/{now}{}", &rest[asked.len()..]);
+    if let Some(q) = req.uri().query() {
+        path = format!("{path}?{q}");
+    }
+    let mut parts = req.uri().clone().into_parts();
+    match path.parse() {
+        Ok(pq) => parts.path_and_query = Some(pq),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+    match axum::http::Uri::from_parts(parts) {
+        Ok(uri) => *req.uri_mut() = uri,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+    let asked = asked.to_string();
+    req.extensions_mut().insert(AskedAs(asked));
+    next.run(req).await
+}
+
+/// Every renamed namespace's former names, to their names now.
+fn former_names(repo: &Repo) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    for ns in repo.namespaces()? {
+        for was in repo.with_meta(|m| m.former_names(&ns))? {
+            out.insert(was, ns.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// About as much of the journal as one `GET /changes` answers: a new device asks for all of it, and
@@ -154,6 +204,7 @@ async fn check_namespace(
     State(app): State<Arc<App>>,
     Extension(caller): Extension<Caller>,
     Path(params): Path<Vec<(String, String)>>,
+    asked: Option<Extension<AskedAs>>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -162,6 +213,8 @@ async fn check_namespace(
         .find(|(k, _)| k == "ns")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    // Someone with no access learns nothing by asking, not even what a former name is called now.
+    let asked = asked.map_or_else(|| ns.clone(), |Extension(AskedAs(a))| a);
     let user = caller.user.clone();
     let name = ns.clone();
     match blocking(move || app.repo.with_meta(|m| m.access(&name, &user))).await {
@@ -174,7 +227,7 @@ async fn check_namespace(
         // The same answer whether it exists or not.
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            format!("no folder {ns:?} for user {:?}", caller.user),
+            format!("no folder {asked:?} for user {:?}", caller.user),
         )
             .into_response(),
         Err(e) => e.into_response(),
@@ -186,7 +239,8 @@ async fn info(
     Extension(allowed): Extension<Allowed>,
     Path(ns): Path<String>,
 ) -> ApiResult<Json<Info>> {
-    let head = blocking(move || app.repo.head(&ns)).await?;
+    let name = ns.clone();
+    let head = blocking(move || app.repo.head(&name)).await?;
     Ok(Json(Info {
         protocol: cairn_protocol::PROTOCOL_VERSION,
         server_version: env!("CARGO_PKG_VERSION").into(),
@@ -195,7 +249,51 @@ async fn info(
         access: Some(allowed.0),
         // A harness build can say what a server before them says.
         note_groups: !cairn_failpoint::unsupported("server.note_groups"),
+        folder: Some(ns),
     }))
+}
+
+/// The caller's own name for the namespace, which only they see, in place of its name: set, or with
+/// `if_none` set only if they have none, as a device offers the name of the directory it syncs into.
+async fn set_name(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Path(ns): Path<String>,
+    Json(body): Json<FolderName>,
+) -> ApiResult<Response> {
+    if !wire::valid_folder_name(&body.name) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "a name for a folder is 1 to 64 characters, no control character, and no space at either end",
+        )
+            .into_response());
+    }
+    let user = caller.user;
+    let name = blocking(move || {
+        app.repo
+            .with_meta(|m| m.set_folder_name(&ns, &user, Some(&body.name), body.if_none))
+    })
+    .await?;
+    Ok(Json(FolderName {
+        name: name.unwrap_or_default(),
+        if_none: false,
+    })
+    .into_response())
+}
+
+/// The caller's own name for the namespace taken away: they see its name again.
+async fn clear_name(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Path(ns): Path<String>,
+) -> ApiResult<StatusCode> {
+    let user = caller.user;
+    blocking(move || {
+        app.repo
+            .with_meta(|m| m.set_folder_name(&ns, &user, None, false))
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Who the token is, and every namespace it may reach: what a client offers to sync.
@@ -455,11 +553,12 @@ fn router(app: Arc<App>) -> Router {
         .route("/conflicts", get(conflicts))
         .route("/access", get(members))
         .route("/access/{user}", put(grant).delete(revoke))
+        .route("/name", put(set_name).delete(clear_name))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
         .merge(web::namespace_routes())
         .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .with_state(app.clone());
-    Router::new()
+    let routes = Router::new()
         .route("/v1/me", get(me))
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
@@ -468,7 +567,11 @@ fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), authorize))
         // After the layer, so outside it: what answers without a token.
         .merge(web::public_routes(&app))
-        .layer(middleware::map_response(web::no_referrer))
+        .layer(middleware::map_response(web::no_referrer));
+    // Around all of it, as one fallback that every request reaches before a route is chosen in it.
+    Router::new()
+        .fallback_service(routes)
+        .layer(middleware::from_fn_with_state(app.clone(), by_name_now))
 }
 
 #[derive(Parser)]
@@ -480,7 +583,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a data directory, with the user `admin`, who manages the folder `default`, and that
+    /// Create a data directory, with the user `admin`, who manages the folder `cloud`, and that
     /// user's token in the directory's `token` file.
     Init {
         #[arg(long)]
@@ -583,8 +686,9 @@ fn init(data: &FsPath) -> Result<()> {
     Repo::open(data)?;
     println!("initialized {}", data.display());
     println!(
-        "user {} manages folder default; its token file: {}",
+        "user {} manages folder {}; its token file: {}",
         cairn_store::FIRST_USER,
+        cairn_store::FIRST_FOLDER,
         token_path.display()
     );
     Ok(())
@@ -641,6 +745,7 @@ async fn serve(
         );
     }
     let repo = Repo::open(&data)?;
+    let former = former_names(&repo)?;
     if repo.with_meta(|m| m.users())?.is_empty() {
         eprintln!(
             "cairn-server: there are no users, so every request is refused: add one with `cairn-server user add`"
@@ -654,6 +759,7 @@ async fn serve(
         link_url,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
+        former,
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();
@@ -740,7 +846,7 @@ fn run_inner() -> Result<std::process::ExitCode> {
                 .block_on(serve(data, listen, behind_tls_proxy, link_url))?;
         }
         Command::Downgrade { data } => {
-            println!("{}", Repo::downgrade_to_3(&data)?);
+            println!("{}", Repo::downgrade(&data)?);
         }
         Command::Fsck { data } => {
             let repo = Repo::open(&data)?;

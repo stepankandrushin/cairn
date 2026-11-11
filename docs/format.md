@@ -8,6 +8,7 @@ data/
   lock                   flock held while a server has the directory
   meta.sqlite            metadata: WAL, synchronous=FULL
   ns/<hex of namespace name>/
+                         by its name now; renamed with it (below)
     chunks/ab/abcdef...  one file per chunk or manifest, named by its full hash
     incoming/            uploads in progress; emptied at startup
   web/uploads/<id>       a web upload's bytes as they arrive, until stored; emptied at startup
@@ -58,6 +59,8 @@ refused.
 | `tokens` | BLAKE3 of each token, never the token, with its user, label and when made |
 | `grants` | Namespace, user, and its level there: `read`, `write` or `manage` |
 | `shares` | An object of a namespace shared with a user at `read` or `write`, or by a public link's token, which reads only; who made it, when, and when it expires |
+| `former_names` | A name a renamed namespace had, and the namespace, which it still reaches |
+| `folder_names` | A user's own name for a namespace, which they see in its place |
 
 The `journal` also says, from schema 2 on, the user whose token made each commit. Schema 2 brought accounts:
 the migration to it, in its one transaction, makes the `token` file's token, if there is one, the user
@@ -103,6 +106,20 @@ next start. A binary before schema 4 refuses it ("newer than this binary"); `cai
 <dir>`, with the server stopped, moves it back to schema 3 in one transaction, each body written out again
 in its commit and in `revisions` as such a binary wrote them: moved to 4 and back, a real store's every row
 was the same, byte for byte.
+
+Schema 5 adds `former_names` and `folder_names`, empty, in one transaction after any compaction, so a kill
+or a full disk leaves schema 4 or 5 whole. `cairn-server downgrade` moves the database one schema back each
+time it runs: from 5 to 4 by dropping both tables, the former names and each user's own names with them, so
+a renamed namespace answers to its name now alone; from 4 to 3 as above.
+
+A data directory with no namespace, as `cairn-server init` makes it, gets its first, `cloud`, managed by the
+first user; one from before keeps its `default`. `cairn-server folder rename <from> <to>`, with the server
+stopped, renames a namespace in one transaction, keeping the name it had in `former_names`, then moves its
+chunks' directory to its new name's; it refuses a name that is another namespace's, now or before, and a
+directory already there. A rename killed between the two leaves the chunks under the former name, where
+no namespace's own directory is: every open of the data directory, before anything else, moves the
+directory of the one former name of a namespace whose own is not there, and refuses to guess between two.
+A directory is made only for a namespace's name now, never a former one's.
 
 `cairn-server fsck` reads every chunk, follows every manifest reference, checks `entries` and `objects`
 against a replay of `journal`, and that each revision is named by the commit that made it, but the first

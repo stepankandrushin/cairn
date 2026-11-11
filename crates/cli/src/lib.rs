@@ -89,9 +89,10 @@ enum Command {
         /// A file holding the access token. Or set CAIRN_TOKEN.
         #[arg(long)]
         token_file: Option<PathBuf>,
-        /// The folder on the server to sync here, from those `cairn folders` lists.
-        #[arg(long, visible_alias = "folder", default_value = "default")]
-        namespace: String,
+        /// The folder on the server to sync here, from those `cairn folders` lists. Default: the one
+        /// the token reaches, if it reaches one alone.
+        #[arg(long, visible_alias = "folder")]
+        namespace: Option<String>,
         /// This device's name in history and in conflict file names. Default: the hostname.
         #[arg(long)]
         device_name: Option<String>,
@@ -425,6 +426,9 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     for line in &report.planned {
         outln!("{line}");
     }
+    if let Some(f) = &report.followed {
+        outln!("{f}");
+    }
     for e in &report.events {
         outln!("event: {e}");
     }
@@ -688,6 +692,39 @@ fn date_time(epoch: i64) -> String {
     )
 }
 
+/// The folder a token reaches, when it reaches one alone: what `cairn init` syncs unless told which.
+/// A server before accounts had one token for every folder, and `default` first.
+fn only_folder(server: &str, token: &str, allow_http: bool) -> Result<String> {
+    let me = match cairn_engine::client::Client::of_server(server, token, allow_http)?.me() {
+        Ok(me) => me,
+        Err(e) if format!("{e:#}").contains("has no accounts") => return Ok("default".into()),
+        Err(e) => {
+            return Err(
+                e.context("asking the server which folder to sync, as --folder was not given")
+            )
+        }
+    };
+    match me.folders.as_slice() {
+        [one] => Ok(one.folder.clone()),
+        [] => bail!(
+            "user {:?} has access to no folder on this server: a manager of one gives it, or its administrator by `cairn-server grant`",
+            me.user
+        ),
+        many => bail!(
+            "user {:?} has access to {} folders, so say which with --folder: {}",
+            me.user,
+            many.len(),
+            many.iter()
+                .map(|f| match &f.name {
+                    Some(n) if *n != f.folder => format!("{} ({n})", f.folder),
+                    _ => f.folder.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn run_inner() -> Result<u8> {
     let cli = Cli::parse();
     match cli.command {
@@ -734,11 +771,20 @@ fn run_inner() -> Result<u8> {
                 mode: !no_mode,
                 ..ApplyPolicy::default()
             };
+            let namespace = match namespace {
+                Some(n) => n,
+                None => only_folder(&server, token.trim(), allow_http).with_context(|| {
+                    format!(
+                        "{} was not made a sync root, and nothing in it changed",
+                        dir.display()
+                    )
+                })?,
+            };
             let head = init_root(
                 &dir,
                 InitOptions {
                     server,
-                    namespace,
+                    namespace: namespace.clone(),
                     token: token.trim().to_string(),
                     device_name,
                     policy,
@@ -752,8 +798,12 @@ fn run_inner() -> Result<u8> {
             if let Err(e) = listed {
                 errln!("cairn: this root could not be added to the list of roots, so `cairn status --all` does not show it until its daemon starts: {e:#}");
             }
+            // Its user's own name for the folder, if they have none: the web shows it them.
+            if let Some(line) = cairn_engine::root::offer_root_name(&dir) {
+                errln!("cairn: {line}");
+            }
             outln!(
-                "{} is a sync root; the server is at sequence {head}",
+                "{} is a sync root of the folder {namespace}; the server is at sequence {head}",
                 dir.display()
             );
             Ok(EXIT_OK)
@@ -983,7 +1033,12 @@ fn run_inner() -> Result<u8> {
             } else {
                 outln!("user {} on {server}:", me.user);
                 for f in &me.folders {
-                    outln!("{:<24} {}", f.folder, f.access);
+                    match &f.name {
+                        Some(n) if *n != f.folder => {
+                            outln!("{:<24} {:<6}  your name for it: {n}", f.folder, f.access)
+                        }
+                        _ => outln!("{:<24} {}", f.folder, f.access),
+                    }
                 }
             }
             Ok(EXIT_OK)

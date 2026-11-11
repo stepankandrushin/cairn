@@ -66,8 +66,17 @@ pub enum FolderCommand {
         #[arg(long)]
         data: PathBuf,
     },
-    /// Every folder, its journal's head, and who has access at which level.
+    /// Every folder, its journal's head, its former names, and who has access at which level.
     List {
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Rename a folder, with the server stopped, as its chunks move. Its former name goes on reaching
+    /// it, so that every device, link and address made with it goes on working, and devices take the
+    /// new name up as they next sync; no other folder may take the former name.
+    Rename {
+        from: String,
+        to: String,
         #[arg(long)]
         data: PathBuf,
     },
@@ -266,8 +275,14 @@ pub fn folder(what: FolderCommand) -> Result<()> {
                     .iter()
                     .map(|x| format!("{} ({})", x.user, x.access))
                     .collect();
+                let former = repo.with_meta(|m| m.former_names(&ns))?;
                 println!(
-                    "{ns}  at {head}, access: {}",
+                    "{ns}  at {head}{}, access: {}",
+                    if former.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", formerly {}", former.join(", "))
+                    },
                     if members.is_empty() {
                         "nobody".to_string()
                     } else {
@@ -275,6 +290,11 @@ pub fn folder(what: FolderCommand) -> Result<()> {
                     }
                 );
             }
+        }
+        FolderCommand::Rename { from, to, data } => {
+            check_name("folder", &to)?;
+            let repo = open(&data)?;
+            println!("{}", repo.rename_namespace(&from, &to)?);
         }
     }
     Ok(())

@@ -45,7 +45,7 @@ fn each_user_reaches_only_the_folders_given_it() {
 
     // Bob's token opens neither alice's folder nor the first user's, and is answered as for a folder
     // that does not exist, so that nobody learns what is there by asking.
-    for folder in ["alice", "default", "nowhere"] {
+    for folder in ["alice", "cloud", "nowhere"] {
         let run = Device::try_as_user(&sb, &server, &format!("b-{folder}"), &bob, folder)
             .err()
             .unwrap_or_else(|| panic!("bob reached {folder}"));
@@ -73,13 +73,17 @@ fn each_user_reaches_only_the_folders_given_it() {
     )
     .expect_ok();
     assert!(listed.stdout.contains("user bob"), "{}", listed.text());
-    assert!(listed
-        .stdout
-        .lines()
-        .any(|l| l.starts_with("bob ") && l.ends_with("manage")));
+    // With his own name for it: that of the directory his device syncs it into, which it offered.
+    assert!(
+        listed.stdout.lines().any(|l| l.starts_with("bob ")
+            && l.contains(" manage ")
+            && l.ends_with("your name for it: b")),
+        "{}",
+        listed.text()
+    );
     assert!(!listed.stdout.contains("alice"), "{}", listed.text());
 
-    // The data directory's token from before accounts is the first user's, and still syncs default.
+    // The data directory's token from before accounts is the first user's, and syncs the first folder.
     let first = Device::new(&sb, &server, "first");
     first.write("x", "x");
     first.synced();
@@ -517,7 +521,7 @@ fn a_browser_at_the_servers_address_gets_the_page_and_no_data_without_a_token() 
     assert!(body.contains("This is a Cairn file sync server"), "{body}");
     assert!(body.contains("/web/app.js"), "{body}");
     // It names nothing a stranger could use: no version, user, folder, device or file.
-    for named in [env!("CARGO_PKG_VERSION"), "admin", "default", "secret"] {
+    for named in [env!("CARGO_PKG_VERSION"), "admin", "cloud", "secret"] {
         assert!(!body.contains(named), "the page names {named:?}: {body}");
     }
     let (code, ..) = http(&server, "HEAD", "/", None);
@@ -529,12 +533,7 @@ fn a_browser_at_the_servers_address_gets_the_page_and_no_data_without_a_token() 
     // Everything else still wants a token, and the right one.
     let token = std::fs::read_to_string(&server.token_file).unwrap();
     let token = token.trim();
-    for path in [
-        "/v1/me",
-        "/v1/ns/default/info",
-        "/favicon.ico",
-        "/index.html",
-    ] {
+    for path in ["/v1/me", "/v1/ns/cloud/info", "/favicon.ico", "/index.html"] {
         for wrong in [None, Some("not-the-token")] {
             let (code, head, body) = http(&server, "GET", path, wrong);
             assert_eq!(code, 401, "{path} with {wrong:?}: {head}\n{body}");
@@ -543,5 +542,5 @@ fn a_browser_at_the_servers_address_gets_the_page_and_no_data_without_a_token() 
     }
     let (code, _, body) = http(&server, "GET", "/v1/me", Some(token));
     assert_eq!(code, 200, "{body}");
-    assert!(body.contains("\"default\""), "{body}");
+    assert!(body.contains("\"cloud\""), "{body}");
 }

@@ -203,6 +203,7 @@ label { font-weight: 500; }
 label.check { display: inline-flex; align-items: center; gap: 8px; font-weight: 400; }
 .form-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
 .form-row > .grow { flex: 1; min-width: 160px; }
+.folder-id { min-width: 6em; color: var(--muted); overflow-wrap: anywhere; }
 .form-error { color: var(--danger); margin: 8px 0 0; }
 .hint { color: var(--muted); font-size: 13px; }
 

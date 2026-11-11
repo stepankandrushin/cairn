@@ -123,12 +123,19 @@ Beyond one machine, put a TLS-terminating reverse proxy in front, start the serv
 A server holds folders, each with its own tree, history and set of chunks, and users, each with tokens of its
 own, one per device at best. A user reaches only the folders given to it, at one of three levels: `read`,
 `write`, or `manage`, which is write and also saying who else has access. To anyone else a folder answers as
-one that does not exist. `cairn-server init` makes the user `admin`, who manages the folder `default`, with
+one that does not exist. `cairn-server init` makes the user `admin`, who manages the folder `cloud`, with
 its token in the data directory's `token` file; a server from before accounts gives that file's token the
-same, managing every folder it has.
+same, managing every folder it has, the first of them `default`. `cairn init` without `--folder` syncs the
+one folder its token reaches, and with several asks which.
+
+A folder's name is what devices, links and commands use. Each user may also call it something of their
+own, which only they see in the web, `cairn folders` and wherever else it is named for them: the name of the
+directory their first device syncs it into, until they choose another in the web's Settings. Renamed on the
+server, with the server stopped, a folder still answers to its former name, so no device, link or bookmark
+made with it breaks, and each device takes the new name up at its next sync.
 
 ```sh
-# On the server, while it runs or not
+# On the server, while it runs or not, but for a rename
 cairn-server user add alice --token-file alice.token --data ~/cairn-data
 cairn-server user add bob   --token-file bob.token   --data ~/cairn-data
 cairn-server folder add alice --manager alice --data ~/cairn-data      # her own
@@ -138,6 +145,8 @@ cairn-server token add bob --label laptop --token-file bob-laptop.token --data ~
 cairn-server user list --data ~/cairn-data
 cairn-server revoke team bob --data ~/cairn-data
 cairn-server token list --data ~/cairn-data; cairn-server token remove <ID> --data ~/cairn-data
+cairn-server folder list --data ~/cairn-data     # each folder, its head, former names and who has access
+cairn-server folder rename team crew --data ~/cairn-data   # with the server stopped
 
 # On a device: each folder is a root of its own
 cairn folders --server https://cairn.example --token-file bob.token
@@ -163,7 +172,8 @@ another user of the server, to read or to write, or by a public link that needs 
 may expire. A change made there is a commit like any device's, refused rather than forced when something
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
 a user is seen in the web interface, not synced yet. Times are on a 24-hour clock, as `2026-11-11 09:50`;
-its Settings choose a 12-hour clock or another order of the date, kept in that browser. The endpoints are in
+its Settings choose a 12-hour clock or another order of the date, kept in that browser, and the user's own
+name for each folder, kept on the server. The endpoints are in
 docs/protocol.md, "Web".
 
 A public link needs only `/s/`, `/web/` and `/v1/links/`. Where the server's address is open to some addresses

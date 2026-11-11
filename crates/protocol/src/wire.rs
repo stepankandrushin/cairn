@@ -21,6 +21,10 @@ pub struct Info {
     /// before them, which would keep only the first: a client sends such a server a note to each.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub note_groups: bool,
+    /// The namespace's name now. A namespace renamed answers to its former names too, so a client that
+    /// asked by one goes on working, and takes this one up. Absent from a server before renaming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 /// What a user may do in a namespace, which a person knows as a folder: each level holds the one
@@ -80,6 +84,26 @@ pub struct Me {
 pub struct FolderAccess {
     pub folder: String,
     pub access: Access,
+    /// The user's own name for it, which they see in place of `folder`: absent if they have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The body of `PUT /v1/ns/{ns}/name`, and its answer: the caller's own name for the namespace, which
+/// is theirs alone and changes nothing else. With `if_none`, it is set only if they have none yet, as
+/// a device sends the name of the directory it syncs the namespace into; the answer is the name then.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderName {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub if_none: bool,
+}
+
+/// A user's own name for a folder: 1 to 64 characters, none of them a control character, and no space
+/// at either end. Any script, as it is shown, never used as a path or in a URL.
+pub fn valid_folder_name(name: &str) -> bool {
+    let chars = name.chars().count();
+    (1..=64).contains(&chars) && name.trim() == name && !name.chars().any(char::is_control)
 }
 
 /// One user's access to a namespace, as `GET /v1/ns/{ns}/access` lists them.

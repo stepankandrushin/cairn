@@ -286,7 +286,8 @@ fn a_command_tries_again_for_a_few_seconds() {
     said_each_of(&run, 3, 3, &format!("(os error {ENOBUFS})"), "server info");
     assert!(run.stderr.contains("; tried 4 times"), "{}", run.text());
 
-    // A name that does not exist, as a mistyped one: looked up again, and refused as a root.
+    // A name that does not exist, as a mistyped one: looked up again, and refused as a root. Its first
+    // question, without --folder, is which folders the token reaches.
     let r = sb.path("r");
     std::fs::create_dir_all(&r).unwrap();
     let token = server.token_file.to_str().unwrap().to_string();
@@ -297,7 +298,7 @@ fn a_command_tries_again_for_a_few_seconds() {
         3,
         3,
         "cannot look up the server's name",
-        "server info",
+        "asking who this token is",
     );
     assert!(
         run.stderr.contains("not made a sync root"),

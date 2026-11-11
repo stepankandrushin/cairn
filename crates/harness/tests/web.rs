@@ -175,7 +175,7 @@ fn ticket_in(url: &str, server: &Server) -> String {
         .strip_prefix(&format!("{}/#/signin/", server.url))
         .unwrap_or_else(|| panic!("{url} is no sign-in address of {}", server.url));
     let (ticket, route) = rest.split_once('/').unwrap();
-    assert_eq!(route, "f/default/root", "{url}");
+    assert_eq!(route, "f/cloud/root", "{url}");
     ticket.to_string()
 }
 
@@ -276,7 +276,7 @@ fn what_the_web_uploads_arrives_byte_for_byte_and_cut_as_a_client_cuts_it() {
     let server = Server::start(sb.path("data"));
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
 
     let data = noise(5 * 1024 * 1024 + 123, 3);
     let made = post(
@@ -429,7 +429,7 @@ fn a_file_replaced_from_the_web_keeps_what_the_browser_never_saw() {
     let server = Server::start(sb.path("data"));
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
     let a = Device::new(&sb, &server, "a");
     a.write("run.sh", "echo one\n");
     chmod(&a.path("run.sh"), 0o750);
@@ -464,7 +464,7 @@ fn a_web_upload_never_replaces_what_it_did_not_see() {
     let server = Server::start(sb.path("data"));
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
     let a = Device::new(&sb, &server, "a");
     a.write("doc.txt", "first");
     a.synced();
@@ -556,7 +556,7 @@ fn a_web_upload_killed_before_its_commit_leaves_nothing() {
     );
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
     let data = noise(2 * 1024 * 1024, 9);
     let began = post(
         &server,
@@ -618,7 +618,7 @@ fn a_full_disk_during_a_web_upload_is_said_and_loses_nothing() {
     );
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
     let began = post(
         &server,
         &format!("{base}/uploads"),
@@ -690,7 +690,7 @@ fn deleted_from_the_web_comes_back_and_a_restore_is_a_new_revision() {
     let server = Server::start(sb.path("data"));
     let t = token(&server.token_file);
     let auth = Auth::Bearer(&t);
-    let base = "/v1/ns/default";
+    let base = "/v1/ns/cloud";
     let a = Device::new(&sb, &server, "a");
     a.write("d/one.txt", "1");
     a.write("d/sub/two.txt", "22");
@@ -1303,33 +1303,33 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     }
     let forged = post(
         &server,
-        "/v1/ns/default/mkdir",
+        "/v1/ns/cloud/mkdir",
         Auth::Cookie(&s, false),
         json!({"parent": ROOT, "name": b64("x")}),
     );
     assert_eq!(forged.code, 403, "{}", forged.text());
     let commit = post(
         &server,
-        "/v1/ns/default/commit",
+        "/v1/ns/cloud/commit",
         Auth::Cookie(&s, false),
         json!({}),
     );
     assert_eq!(commit.code, 403);
     assert_eq!(
-        get(&server, "/v1/ns/default/info", Auth::Cookie(&s, false))
+        get(&server, "/v1/ns/cloud/info", Auth::Cookie(&s, false))
             .ok()
             .json()["head"],
         0
     );
     post(
         &server,
-        "/v1/ns/default/mkdir",
+        "/v1/ns/cloud/mkdir",
         Auth::Cookie(&s, true),
         json!({"parent": ROOT, "name": b64("x")}),
     )
     .ok();
     assert_eq!(
-        get(&server, "/v1/ns/default/info", Auth::Cookie(&s, false))
+        get(&server, "/v1/ns/cloud/info", Auth::Cookie(&s, false))
             .ok()
             .json()["head"],
         1
@@ -1575,4 +1575,122 @@ fn a_ticket_signs_a_browser_in_once_and_its_session_ends_with_its_token() {
             .json()["user"],
         "admin"
     );
+}
+
+/// Each user's own name for a folder: theirs alone, offered by a device only while they have none, set
+/// or taken away in the web; `cairn init` without --folder joins the only folder there is and asks
+/// which of several; and a folder renamed answers by its former name, to someone without access as for
+/// a folder that does not exist.
+#[test]
+fn each_user_names_a_folder_for_themselves_and_init_asks_which_of_several() {
+    let sb = Sandbox::fast("web-names");
+    let mut server = Server::start(sb.path("data"));
+    let admin = token(&server.token_file);
+    let bob_file = server.user("bob");
+    let bob = token(&bob_file);
+    server.admin(&["grant", "cloud", "bob", "read"]).expect_ok();
+    let me = |t: &str| get(&server, "/v1/me", Auth::Bearer(t)).ok().json();
+    let name = |t: &str, body: Value| {
+        request(
+            &server,
+            "PUT",
+            "/v1/ns/cloud/name",
+            Auth::Bearer(t),
+            &[("Content-Type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+    };
+    assert_eq!(
+        me(&admin)["folders"],
+        json!([{"folder": "cloud", "access": "manage"}])
+    );
+
+    // A device's offer is taken while there is none, and only then; a choice always.
+    let a = Device::new(&sb, &server, "Мои файлы");
+    assert_eq!(me(&admin)["folders"][0]["name"], "Мои файлы");
+    let got = name(&admin, json!({"name": "other", "if_none": true}))
+        .ok()
+        .json();
+    assert_eq!(got["name"], "Мои файлы");
+    let got = name(&admin, json!({"name": "Family photos"})).ok().json();
+    assert_eq!(got["name"], "Family photos");
+    for bad in ["", " padded", "a\nb"] {
+        let r = name(&admin, json!({ "name": bad }));
+        assert_eq!(r.code, 400, "{bad:?}: {}", r.text());
+    }
+    // Theirs alone: bob, who may only read, has his own, and sees none of the admin's.
+    assert_eq!(
+        me(&bob)["folders"],
+        json!([{"folder": "cloud", "access": "read"}])
+    );
+    name(&bob, json!({"name": "Bob's"})).ok();
+    assert_eq!(me(&bob)["folders"][0]["name"], "Bob's");
+    assert_eq!(me(&admin)["folders"][0]["name"], "Family photos");
+    let r = request(
+        &server,
+        "DELETE",
+        "/v1/ns/cloud/name",
+        Auth::Bearer(&admin),
+        &[],
+        b"",
+    );
+    assert_eq!(r.code, 204, "{}", r.text());
+    assert_eq!(
+        me(&admin)["folders"],
+        json!([{"folder": "cloud", "access": "manage"}])
+    );
+    // No access, no name: as for a folder that does not exist.
+    let r = request(
+        &server,
+        "PUT",
+        "/v1/ns/nowhere/name",
+        Auth::Bearer(&admin),
+        &[("Content-Type", "application/json")],
+        br#"{"name":"x"}"#,
+    );
+    assert_eq!(r.code, 404, "{}", r.text());
+
+    // Several folders: init asks which, naming each with the user's own name for it.
+    server
+        .admin(&["folder", "add", "work", "--manager", "admin"])
+        .expect_ok();
+    let root = sb.path("several");
+    std::fs::create_dir_all(&root).unwrap();
+    let run = run(
+        &[
+            "init",
+            "--server",
+            &server.url,
+            "--token-file",
+            server.token_file.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr
+            .contains("access to 2 folders, so say which with --folder: cloud (Мои файлы), work")
+            || run
+                .stderr
+                .contains("access to 2 folders, so say which with --folder: cloud, work"),
+        "{}",
+        run.text()
+    );
+    assert!(!root.join(".cairn").exists(), "nothing made of it");
+
+    // Renamed: the former name reaches it for whoever has access, and for nobody else.
+    server.kill();
+    server
+        .admin(&["folder", "rename", "work", "office"])
+        .expect_ok();
+    server.restart();
+    let info = get(&server, "/v1/ns/work/info", Auth::Bearer(&admin))
+        .ok()
+        .json();
+    assert_eq!(info["folder"], "office");
+    let r = get(&server, "/v1/ns/work/info", Auth::Bearer(&bob));
+    assert_eq!(r.code, 404);
+    assert_eq!(r.text(), "no folder \"work\" for user \"bob\"");
+    drop(a);
 }

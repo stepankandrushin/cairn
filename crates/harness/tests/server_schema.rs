@@ -1,7 +1,8 @@
 //! A server's database of schema 3, every body as JSON in its commit and again in `revisions`, moved to
 //! schema 4 when a server opens it: every answer the same, byte for byte, a kill at any point of the
 //! move or of the compaction after it leaving one schema or the other whole, and the devices going on
-//! as before. A real full disk under it is in real_disk_full.rs.
+//! as before. A real full disk under it is in real_disk_full.rs. Then on to schema 5, whose two tables
+//! more a kill or a full disk leave out whole.
 
 mod common;
 use common::*;
@@ -60,7 +61,7 @@ fn get(server: &Server, path: &str) -> String {
 /// Every answer about the tree and its history: the journal whole and in pages, each folder's
 /// listing, each object's item and history, conflicts and what is deleted.
 fn answers(server: &Server) -> Vec<(String, String)> {
-    let ns = "/v1/ns/default";
+    let ns = "/v1/ns/cloud";
     let mut paths = vec![
         format!("{ns}/changes?after=0"),
         format!("{ns}/changes?after=0&limit=2"),
@@ -126,7 +127,10 @@ fn on_schema_3(label: &str) -> (Sandbox, Server, Device, Device, Vec<(String, St
     );
     assert!(want.len() > FILES, "{} answers", want.len());
     server.kill();
-    run_server(&["downgrade", "--data", server.data.to_str().unwrap()], &[]).expect_ok();
+    let data = server.data.to_str().unwrap();
+    run_server(&["downgrade", "--data", data], &[]).expect_ok();
+    assert_eq!(schema(&db_of(&server)), 4);
+    run_server(&["downgrade", "--data", data], &[]).expect_ok();
     assert_eq!(schema(&db_of(&server)), 3);
     (sb, server, a, b, want)
 }
@@ -218,7 +222,9 @@ fn a_kill_anywhere_in_the_move_to_schema_4_leaves_one_schema_or_the_other_whole(
         run.text()
     );
     assert!(run.stdout.contains("clean"), "{}", run.text());
-    same_state(&state_everything(&db), &four, "compacted");
+    // And moved on to schema 5, which only adds to it.
+    assert_eq!(schema(&db), 5);
+    same_state(&without_5(state_everything(&db)), &four, "compacted");
     assert_eq!(state_pages(&db).1, 0);
 
     server.restart();
@@ -240,10 +246,12 @@ fn a_server_moves_a_database_of_schema_3_when_it_starts_and_answers_the_same() {
     let data = server.data.to_str().unwrap().to_string();
     let three = state_everything(&db);
     server.restart();
-    assert_eq!(schema(&db), 4);
+    assert_eq!(schema(&db), 5);
     same_answers(&answers(&server), &want, "moved by the server");
     let four = state_everything(&db);
     server.kill();
+    let run = run_server(&["downgrade", "--data", &data], &[]).expect_ok();
+    assert!(run.stdout.contains("back to schema 4"), "{}", run.text());
     let run = run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     assert!(run.stdout.contains("back to schema 3"), "{}", run.text());
     assert!(!run.stdout.contains("not as long"), "{}", run.text());
@@ -256,9 +264,72 @@ fn a_server_moves_a_database_of_schema_3_when_it_starts_and_answers_the_same() {
         "{}",
         run.text()
     );
-    assert_eq!(schema(&db), 4);
+    assert_eq!(schema(&db), 5);
     same_state(&state_everything(&db), &four, "moved again by the server");
     a.write("d6/new", "new");
     converge(&[&a, &b]);
     assert_eq!(b.read("d6/new"), b"new");
+}
+
+/// A state with what schema 5 adds taken out: what is left must be schema 4's as it was.
+fn without_5(mut state: Vec<(String, Vec<String>)>) -> Vec<(String, Vec<String>)> {
+    let new = ["former_names", "folder_names"];
+    state.retain(|(t, _)| !new.contains(&t.as_str()));
+    for (t, rows) in &mut state {
+        if t == "sqlite_master" {
+            rows.retain(|r| !new.iter().any(|n| r.contains(n)));
+        }
+    }
+    state
+}
+
+/// The move from schema 4 to 5, two tables more: a kill at either point of it, or a full disk at its
+/// commit, leaves schema 4 as it was; then it is 5 with everything of 4 the same, the server answers
+/// as it did, and the devices go on.
+#[test]
+fn a_kill_or_a_full_disk_in_the_move_to_schema_5_leaves_schema_4_whole() {
+    let sb = Sandbox::on_disk("schema-5-move");
+    let mut server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..50 {
+        a.write(&format!("d{}/f{i}", i % 5), format!("file {i}"));
+    }
+    converge(&[&a, &b]);
+    let want = answers(&server);
+    server.kill();
+    let db = db_of(&server);
+    let data = server.data.to_str().unwrap().to_string();
+    let run = run_server(&["downgrade", "--data", &data], &[]).expect_ok();
+    assert!(run.stdout.contains("back to schema 4"), "{}", run.text());
+    assert_eq!(schema(&db), 4);
+    let four = state_everything(&db);
+    for point in ["server.migrate5.begun", "server.migrate5.commit"] {
+        let run = run_server(&["fsck", "--data", &data], &[("CAIRN_FP_CRASH", point)]);
+        assert!(run.was_killed(), "{point}: never reached: {}", run.text());
+        assert_eq!(schema(&db), 4, "{point}");
+        same_state(&state_everything(&db), &four, point);
+    }
+    let run = run_server(
+        &["fsck", "--data", &data],
+        &[("CAIRN_FP_ENOSPC", "server.migrate5.write")],
+    );
+    assert!(!run.ok(), "{}", run.text());
+    assert!(
+        run.stderr.contains("ran out of room") && run.stderr.contains("stays at schema 4"),
+        "{}",
+        run.text()
+    );
+    assert_eq!(schema(&db), 4);
+    same_state(&state_everything(&db), &four, "a full disk at the commit");
+
+    let run = run_server(&["fsck", "--data", &data], &[]).expect_ok();
+    assert!(run.stdout.contains("clean"), "{}", run.text());
+    assert_eq!(schema(&db), 5);
+    same_state(&without_5(state_everything(&db)), &four, "moved to 5");
+    server.restart();
+    same_answers(&answers(&server), &want, "after the move to 5");
+    a.write("after", "after the move");
+    converge(&[&a, &b]);
+    assert_eq!(b.read("after"), b"after the move");
 }

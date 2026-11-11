@@ -26,8 +26,8 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /v1/me` | | `{user, folders: [{folder, access}]}`: whose the token is, and every namespace it reaches |
-| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups`, absent before them, says that a note may name more objects than one |
+| `GET /v1/me` | | `{user, folders: [{folder, access, name?}]}`: whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)) |
+| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups, folder}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups`, absent before them, says that a note may name more objects than one. `folder`, absent before renaming, is the namespace's name now, which a client that asked by a former one takes up ([Names](#names)) |
 | `POST /chunks/missing` | `{hashes}` | `{hashes}`: those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
 | `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept. Needs `write` |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
@@ -37,6 +37,8 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `GET /access` | | `[{user, access}]`: who has access here, at which level |
 | `PUT /access/{user}` | `{access}` | 204: that user has this level here now, in place of any other. Needs `manage`. 404: no such user. 409: it would leave the namespace with no manager |
 | `DELETE /access/{user}` | | 204: that user has no access here now. Needs `manage`. 404: no such user, or it had none. 409: as for `PUT` |
+| `PUT /name` | `{name, if_none?}` | `{name}`: the caller's own name for the namespace now ([Names](#names)). With `if_none`, set only if they have none. 400: no such name |
+| `DELETE /name` | | 204: the caller has no name of their own for it now |
 
 401 means a missing or wrong token, 404 an unknown namespace or one the token has no access to, alike, 403
 a level too low for the request, and 507 a full disk on the server; in each case nothing changed.
@@ -56,6 +58,21 @@ No level is no access: the namespace answers 404, word for word as one that does
 do is looked up on every request, so a change holds from the next one, and a device whose access went keeps
 what it holds. A client that learns from `Info.access` that it may only read sends nothing up (PLAN.md,
 "Sharing and access"); one from before accounts tries, and is answered 403 with the reason.
+
+## Names
+
+A namespace's name is what every path, device and link uses: 1 to 64 of ASCII letters, digits, `.`, `_`
+and `-`, not starting with `.` or `-`. A server's first is `cloud`; one made before this release has
+`default`. Its administrator renames one with the server stopped, `cairn-server folder rename`, as its
+chunks' directory is named after it (format.md). The former name goes on reaching it, for paths of every
+kind, so every device, link and address made with it goes on working, and no other namespace may take it.
+`Info.folder` says the name now, and a client keeps the one it is told from then on.
+
+Each user may also have their own name for a namespace, which only they see, in place of its name: 1 to 64
+characters of any script, no control character, and no space at either end. A device offers the name of the
+directory it syncs the namespace into, `PUT /name` with `if_none`, as `cairn init` joins and once each time
+its daemon starts, so that it holds only until they choose one; the web sets it and takes it away. It
+changes nothing else: what a path, a device or another user says is the namespace's name.
 
 A **chunk batch** is any number of frames: 32 bytes of hash, a big-endian `u32` length, the bytes.
 Every frame is verified against its hash by whoever receives it.

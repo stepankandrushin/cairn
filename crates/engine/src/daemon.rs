@@ -988,6 +988,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
     let mut not_applied: Vec<NotApplied> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut walk_first = true;
+    // The root's name, offered once a run, once a sync got through.
+    let mut offered = false;
     // When the scan began that the last agreement in this process rests on: the watcher's marks since
     // then are where anything can have changed, if it can be trusted (scope.rs).
     let mut agreed_at: Option<Instant> = None;
@@ -1191,6 +1193,12 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         hit("daemon.synced");
         // Got through a sync, whatever it found: a version just installed works.
         updater.synced();
+        if !offered && result.is_ok() {
+            offered = true;
+            if let Some(line) = crate::root::offer_root_name(path) {
+                log(&line);
+            }
+        }
         // What a sync with nothing to do takes: loading the state, the scan, the merge. The rest of a
         // long one was moving data, which the next does not do again. Twice that keeps a tree that never
         // rests from keeping the daemon busy more than a third of the time, and a change after a big
@@ -1213,6 +1221,9 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 walk_first = false;
                 // In the log alone, as a compaction is: nothing a person sees changes.
                 if let Some(m) = &report.migrated {
+                    log(m);
+                }
+                if let Some(m) = &report.followed {
                     log(m);
                 }
                 if let Some(t) = report.agreed_since {

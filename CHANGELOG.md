@@ -2,7 +2,29 @@
 
 ## Unreleased
 
+**Added:**
+
+- Each user's own name for a folder, which only they see and which changes nothing else: the web interface
+  shows it wherever it names the folder (the sidebar, the top of the path, page titles, Members, Shares and
+  links, Recently deleted), its Settings set it or take it away (Folder names), and `cairn folders` lists it.
+  A device offers the name of the directory it syncs the folder into, as `cairn init` joins and each time its
+  daemon starts, which the server keeps only while the user has none: a folder synced into `~/Sync` shows as
+  "Sync" until they choose another.
+- `cairn-server folder rename <from> <to>`, with the server stopped: the folder's chunks move to its new
+  name's directory, and its former name goes on reaching it, so every device, link and bookmark made with it
+  goes on working. Each device takes the new name up at its next sync, and no other folder may take the former
+  name; `folder list` shows it. A rename killed before its chunks moved is finished at the server's next start.
+
 **Changed:**
+
+- A new server's first folder is `cloud`, where it was `default`; a server from before keeps its `default`
+  and gets no second one. `cairn init` without `--folder` syncs the one folder the token reaches, whatever its
+  name, and with several names them and asks which, where it took `default`.
+- The server's database is schema 5, two tables more: a renamed folder's former names, and each user's own
+  names for folders. A server moves a database of schema 4 to it when it starts, in one transaction, so a kill
+  or a full disk leaves 4 or 5 whole. A server of schema 4 refuses it; `cairn-server downgrade --data <dir>`,
+  with the server stopped, now moves it back one schema each time it runs: to 4, dropping both tables and what
+  they held, then to 3.
 
 - The web interface writes times on a 24-hour clock and dates as year-month-day (`2026-11-11 09:50`), where it
   followed the browser's locale. Its new Settings page, at the top of every page, chooses a 12-hour clock or

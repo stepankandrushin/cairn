@@ -91,7 +91,25 @@ pub struct ShareRow {
 pub trait MetaStore: Send {
     fn head(&mut self, ns: &str) -> Result<u64>;
     fn namespace_exists(&mut self, ns: &str) -> Result<bool>;
+    /// Makes the namespace if it is not there; refused for a name another one had, which reaches that.
     fn create_namespace(&mut self, ns: &str) -> Result<()>;
+    /// The namespace a name reaches, by its name now: the name itself, or what the namespace whose
+    /// former name it is is called now. `None` for none.
+    fn resolve_namespace(&mut self, name: &str) -> Result<Option<String>>;
+    /// Renames a namespace, all at once: its former name goes on reaching it, and so no other may
+    /// take that name. Its chunks' directory, named after it, is the caller's to move (`Repo`).
+    fn rename_namespace(&mut self, from: &str, to: &str) -> Result<()>;
+    /// The names a namespace had before, which still reach it.
+    fn former_names(&mut self, ns: &str) -> Result<Vec<String>>;
+    /// Sets a user's own name for a namespace, with `if_none` only if they have none, or with `None`
+    /// takes it away; the name they have then.
+    fn set_folder_name(
+        &mut self,
+        ns: &str,
+        user: &str,
+        name: Option<&str>,
+        if_none: bool,
+    ) -> Result<Option<String>>;
     /// All or nothing. Durable when this returns `Committed`. `user` is whose token sent it, kept in
     /// the journal with it.
     fn commit(
@@ -310,11 +328,12 @@ pub mod suite {
         s.create_namespace("m").unwrap();
         assert_eq!(s.head("m").unwrap(), 0);
         assert!(s.changes("m", 0, 100, usize::MAX).unwrap().is_empty());
-        assert_eq!(s.namespaces().unwrap(), ["default", "m", "n"]);
+        assert_eq!(s.namespaces().unwrap(), ["cloud", "m", "n"]);
 
         tree_reads(s, a, c);
         accounts(s);
         shares(s);
+        names(s);
     }
 
     /// What the web interface reads: a folder's entries, an object's head, links and history, and the
@@ -492,11 +511,13 @@ pub mod suite {
             [
                 FolderAccess {
                     folder: "m".into(),
-                    access: Access::Read
+                    access: Access::Read,
+                    name: None,
                 },
                 FolderAccess {
                     folder: "n".into(),
-                    access: Access::Read
+                    access: Access::Read,
+                    name: None,
                 }
             ]
         );
@@ -525,5 +546,79 @@ pub mod suite {
         s.add_user("bob", 30).unwrap();
         assert_eq!(s.access("n", "bob").unwrap(), None);
         assert_eq!(s.token_user(&tb).unwrap(), None);
+    }
+
+    fn names(s: &mut dyn MetaStore) {
+        s.create_namespace("old").unwrap();
+        s.create_namespace("taken").unwrap();
+        s.add_user("erin", 40).unwrap();
+        s.set_access("old", "erin", Some(Access::Write)).unwrap();
+        let mine = |s: &mut dyn MetaStore| {
+            let all = s.folders_of("erin").unwrap();
+            assert_eq!(all.len(), 1, "{all:?}");
+            (all[0].folder.clone(), all[0].name.clone())
+        };
+        assert_eq!(mine(s), ("old".into(), None));
+
+        // A user's own name: a device's offer is taken only while they have none, a choice always.
+        let set = |s: &mut dyn MetaStore, name: Option<&str>, if_none: bool| {
+            s.set_folder_name("old", "erin", name, if_none)
+        };
+        assert_eq!(
+            set(s, Some("cloud"), true).unwrap().as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            set(s, Some("other"), true).unwrap().as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            set(s, Some("Фото 2026"), false).unwrap().as_deref(),
+            Some("Фото 2026")
+        );
+        for bad in ["", " padded", "tab\there", &"x".repeat(65)] {
+            assert!(set(s, Some(bad), false).is_err(), "{bad:?}");
+        }
+        assert!(s
+            .set_folder_name("nowhere", "erin", Some("x"), false)
+            .is_err());
+        assert!(s
+            .set_folder_name("old", "nobody", Some("x"), false)
+            .is_err());
+        assert_eq!(mine(s), ("old".into(), Some("Фото 2026".into())));
+
+        // Renamed: the name now and the former one reach it; nothing else may take the former one.
+        assert!(s.rename_namespace("old", "taken").is_err());
+        assert!(s.rename_namespace("old", "bad name").is_err());
+        assert!(s.rename_namespace("old", "old").is_err());
+        assert!(s.rename_namespace("nowhere", "x").is_err());
+        assert_eq!(s.resolve_namespace("old").unwrap().as_deref(), Some("old"));
+        let head = s.head("old").unwrap();
+        s.rename_namespace("old", "new").unwrap();
+        assert!(!s.namespace_exists("old").unwrap());
+        assert!(s.namespace_exists("new").unwrap());
+        assert_eq!(s.resolve_namespace("old").unwrap().as_deref(), Some("new"));
+        assert_eq!(s.resolve_namespace("new").unwrap().as_deref(), Some("new"));
+        assert_eq!(s.resolve_namespace("none").unwrap(), None);
+        assert_eq!(s.former_names("new").unwrap(), ["old"]);
+        assert_eq!(s.head("new").unwrap(), head);
+        assert_eq!(s.access("new", "erin").unwrap(), Some(Access::Write));
+        assert_eq!(mine(s), ("new".into(), Some("Фото 2026".into())));
+        assert!(s.create_namespace("old").is_err());
+        assert!(s.rename_namespace("taken", "old").is_err());
+        assert!(s.resolve_namespace("taken").unwrap().is_some());
+        // And back: its name its own again, and the one it left a former name in turn.
+        s.rename_namespace("new", "old").unwrap();
+        assert_eq!(s.former_names("old").unwrap(), ["new"]);
+        assert_eq!(s.resolve_namespace("new").unwrap().as_deref(), Some("old"));
+
+        // Their own name taken away, they see the folder's; a user removed takes theirs with them.
+        assert_eq!(set(s, None, false).unwrap(), None);
+        assert_eq!(mine(s), ("old".into(), None));
+        set(s, Some("again"), false).unwrap();
+        s.remove_user("erin").unwrap();
+        s.add_user("erin", 41).unwrap();
+        s.set_access("old", "erin", Some(Access::Read)).unwrap();
+        assert_eq!(mine(s), ("old".into(), None));
     }
 }

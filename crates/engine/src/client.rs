@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cairn_protocol::wire::{
     self, ChangesResponse, CommitRequest, CommitResponse, ConflictEntry, HashList, Info,
 };
-use cairn_protocol::wire::{Access, Grant, Me, Member};
+use cairn_protocol::wire::{Access, FolderName, Grant, Me, Member};
 use cairn_protocol::{Hash, Op};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
@@ -272,6 +272,8 @@ pub struct Client {
     /// That the server takes a note naming more objects than one: a commit's notes of one text go
     /// as one.
     note_groups: bool,
+    /// The namespace's name now, as the server said when this client was made.
+    folder: Option<String>,
     /// How hard a request the network failed is tried again.
     retries: Retries,
     /// How many times a request was tried again, for the sync's report.
@@ -307,6 +309,7 @@ impl Client {
         }
         client.access = info.access;
         client.note_groups = info.note_groups;
+        client.folder = info.folder;
         Ok(client)
     }
 
@@ -326,6 +329,12 @@ impl Client {
             },
             Retries::Short,
         )
+    }
+
+    /// The namespace's name now, as the server said when this client was made: another than this
+    /// client asked by, where the namespace was renamed. `None` from a server before renaming.
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
     }
 
     /// What this token may do here, as the server said when this client was made.
@@ -378,6 +387,7 @@ impl Client {
             auth: format!("Bearer {}", config.token),
             access: None,
             note_groups: false,
+            folder: None,
             retries,
             retried: Arc::new(AtomicU64::new(0)),
         };
@@ -695,6 +705,35 @@ impl Client {
     /// Who has access to this folder, at which level.
     pub fn members(&self) -> Result<Vec<Member>> {
         self.get_json("reading who has access", "client.access", "/access")
+    }
+
+    /// Offers the server a name for this folder, its user's own, which it keeps only if they have none
+    /// yet: what a device sends, the name of the directory it syncs the folder into. The name they have
+    /// then, or `None` from a server before such names.
+    pub fn offer_name(&self, name: &str) -> Result<Option<String>> {
+        let url = format!("{}/name", self.base);
+        let body = serde_json::to_vec(&FolderName {
+            name: name.to_string(),
+            if_none: true,
+        })?;
+        let answer = self.exchange("offering the folder's name", "client.name", || {
+            self.agent
+                .put(&url)
+                .header("Authorization", &self.auth)
+                .header("Content-Type", "application/json")
+                .send(body.as_slice())
+        });
+        match answer {
+            Ok(b) => Ok(Some(serde_json::from_slice::<FolderName>(&b)?.name)),
+            Err(e) => {
+                let text = format!("{e:#}");
+                if text.contains("server answered 404") || text.contains("server answered 405") {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Give `user` this level here, or with `None` take all of it away. Only a manager may.

@@ -629,7 +629,7 @@ mod tests {
         store: &mut SqliteStore,
         unlinked: &HashMap<ObjectId, (Link, u64)>,
     ) {
-        let state = store.tree_state("default").unwrap();
+        let state = store.tree_state(cairn_store::FIRST_FOLDER).unwrap();
         let mut links: HashMap<ObjectId, Vec<Link>> = HashMap::new();
         for (parent, name, object) in &state.entries {
             links.entry(*object).or_default().push(Link {
@@ -640,7 +640,10 @@ mod tests {
         assert_eq!(index.objects.len(), state.heads.len());
         let mut dirs = 0;
         for (object, _) in &state.heads {
-            let head = store.object_head("default", *object).unwrap().unwrap();
+            let head = store
+                .object_head(cairn_store::FIRST_FOLDER, *object)
+                .unwrap()
+                .unwrap();
             let o = index.objects[object];
             let here = links.get(object).map_or(&[][..], |l| &l[..]);
             assert_eq!(o.kind, head.kind, "{object}");
@@ -672,12 +675,19 @@ mod tests {
             // What the journal came to hold: restores, hard links, folders moved, emptied and deleted.
             let (mut restored, mut hard, mut moved, mut dirs_gone) = (0, 0, 0, 0);
             for step in 0..700i64 {
-                let state = store.tree_state("default").unwrap();
+                let state = store.tree_state(cairn_store::FIRST_FOLDER).unwrap();
                 let entries = &state.entries;
                 let mut dirs = vec![ObjectId::ROOT];
                 let mut kind = HashMap::new();
                 for (o, _) in &state.heads {
-                    kind.insert(*o, store.object_head("default", *o).unwrap().unwrap().kind);
+                    kind.insert(
+                        *o,
+                        store
+                            .object_head(cairn_store::FIRST_FOLDER, *o)
+                            .unwrap()
+                            .unwrap()
+                            .kind,
+                    );
                 }
                 for (_, _, o) in entries {
                     if kind[o] == ObjectKind::Dir {
@@ -776,7 +786,7 @@ mod tests {
                 let user = ["admin", "u"][rng.below(2)];
                 let outcome = store
                     .commit(
-                        "default",
+                        cairn_store::FIRST_FOLDER,
                         &req,
                         1_000 + step,
                         (step % 3 != 0).then_some(user),
@@ -804,7 +814,11 @@ mod tests {
                             | Op::Update { object, .. }
                             | Op::Note { object, .. } => *object,
                         };
-                        if store.links_of("default", o).unwrap().is_empty() {
+                        if store
+                            .links_of(cairn_store::FIRST_FOLDER, o)
+                            .unwrap()
+                            .is_empty()
+                        {
                             if let Op::Unlink { link, .. } = op {
                                 unlinked.insert(o, (link.clone(), seq));
                                 if kind.get(&o) == Some(&ObjectKind::Dir) {
@@ -818,18 +832,22 @@ mod tests {
                 }
                 // Kept up now and then, as after commits, in pages smaller than a commit can be.
                 if rng.below(20) == 0 {
-                    kept.catch_up_by("default", |after| store.changes("default", after, 3, 64))
-                        .unwrap();
+                    kept.catch_up_by(cairn_store::FIRST_FOLDER, |after| {
+                        store.changes(cairn_store::FIRST_FOLDER, after, 3, 64)
+                    })
+                    .unwrap();
                     agrees(&kept, &mut store, &unlinked);
                 }
             }
-            kept.catch_up_by("default", |after| store.changes("default", after, 3, 64))
-                .unwrap();
+            kept.catch_up_by(cairn_store::FIRST_FOLDER, |after| {
+                store.changes(cairn_store::FIRST_FOLDER, after, 3, 64)
+            })
+            .unwrap();
             agrees(&kept, &mut store, &unlinked);
             let mut fresh = Replayed::new();
             fresh
-                .catch_up_by("default", |after| {
-                    store.changes("default", after, PAGE_CHANGES, PAGE_BYTES)
+                .catch_up_by(cairn_store::FIRST_FOLDER, |after| {
+                    store.changes(cairn_store::FIRST_FOLDER, after, PAGE_CHANGES, PAGE_BYTES)
                 })
                 .unwrap();
             agrees(&fresh, &mut store, &unlinked);
@@ -860,9 +878,11 @@ mod tests {
             user: None,
         };
         let mut pages = vec![vec![change]];
-        let first = index.catch_up_by("default", |_| Ok(pages.pop().unwrap_or_default()));
+        let first = index.catch_up_by(cairn_store::FIRST_FOLDER, |_| {
+            Ok(pages.pop().unwrap_or_default())
+        });
         assert!(format!("{:#}", first.unwrap_err()).contains("does not replay at seq 4"));
-        let again = index.catch_up_by("default", |_| Ok(Vec::new()));
+        let again = index.catch_up_by(cairn_store::FIRST_FOLDER, |_| Ok(Vec::new()));
         assert!(format!("{:#}", again.unwrap_err()).contains("read again when the server starts"));
         assert!(index.gone.is_empty() && index.seq == 0);
     }

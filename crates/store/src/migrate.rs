@@ -253,6 +253,87 @@ pub(crate) fn to_4(conn: &mut Connection, file: Option<&Path>, quiet: bool) -> R
     Ok(())
 }
 
+/// Moves a database of schema 4 to 5 in one transaction: two tables more, empty, so a kill or a full
+/// disk leaves it at 4 or 5 whole.
+pub(crate) fn to_5(conn: &mut Connection) -> Result<()> {
+    let moved = (|| -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        hit("server.migrate5.begun");
+        tx.execute_batch(crate::sqlite::MIGRATION_5)?;
+        tx.pragma_update(None, "user_version", 5)?;
+        hit("server.migrate5.commit");
+        check("server.migrate5.write")?;
+        tx.commit()?;
+        Ok(())
+    })();
+    match moved {
+        Ok(()) => Ok(()),
+        Err(e) if crate::is_disk_full(&e) => bail!(
+            "moving this database from schema 4 to 5 ran out of room on the disk that holds it ({e:#}). It stays at schema 4: make room, or go on with the binary from before"
+        ),
+        Err(e) => Err(e.context("move the database from schema 4 to 5; it stays at schema 4")),
+    }
+}
+
+/// Moves the database one schema back, with no server on it, which the caller sees to by holding
+/// the data directory's lock: from 5 to 4, which a binary of schema 4 reads, or from 4 to 3.
+pub fn back_one(file: &Path) -> Result<String> {
+    let version: usize = {
+        let conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
+        conn.pragma_query_value(None, "user_version", |r| r.get(0))?
+    };
+    match version {
+        5 => from_5(file),
+        4 => to_3(file),
+        v => bail!(
+            "this database has schema {v}: only one of schema 5 is moved back to 4, or of 4 to 3"
+        ),
+    }
+}
+
+/// Schema 5 back to 4, in one transaction: its two tables dropped, and with them the folders' former
+/// names, which reach them no more, and each user's own names for them.
+fn from_5(file: &Path) -> Result<String> {
+    let mut conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: usize = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version != 5 {
+        bail!("this database has schema {version}: only one of schema 5 is moved back to 4");
+    }
+    let mut former = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT f.name, n.name FROM former_names f JOIN namespaces n ON n.id = f.ns ORDER BY n.name, f.name",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (was, now) = row?;
+            former.push(format!("{was} for {now}"));
+        }
+    }
+    let own: i64 = tx.query_row("SELECT count(*) FROM folder_names", [], |r| r.get(0))?;
+    hit("server.downgrade5.begun");
+    tx.execute_batch("DROP TABLE folder_names; DROP TABLE former_names;")?;
+    tx.pragma_update(None, "user_version", 4)?;
+    hit("server.downgrade5.commit");
+    check("server.downgrade5.write")?;
+    tx.commit()
+        .context("move the database back to schema 4; it stays at schema 5")?;
+    checkpoint(&conn)?;
+    Ok(format!(
+        "moved {} back to schema 4, which a binary of schema 4 reads: {}, and {own} of users' own names for folders, gone with it. This binary moves it to 5 again when it opens it",
+        file.display(),
+        if former.is_empty() {
+            "no folder's former name".to_string()
+        } else {
+            format!("the former names {}, which reach those folders no more", former.join(", "))
+        }
+    ))
+}
+
 fn move_to_4(conn: &mut Connection) -> Result<Moved> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if tx.pragma_query_value(None, "user_version", |r| r.get::<_, usize>(0))? != 3 {
@@ -591,7 +672,7 @@ pub(crate) fn compact_if_due(conn: &Connection, file: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::meta::MetaStore;
-    use crate::sqlite::SqliteStore;
+    use crate::sqlite::{SqliteStore, FIRST_FOLDER};
     use cairn_protocol::wire::CommitRequest;
     use cairn_protocol::{
         Bytes, ConflictOf, Content, DeviceId, Hash, Link, Metadata, Name, ObjectId, OpId, Owner,
@@ -669,7 +750,7 @@ mod tests {
         let mut s = SqliteStore::open(db).unwrap();
         s.create_namespace("team").unwrap();
         let mut objects = Vec::new();
-        for ns in ["default", "team"] {
+        for ns in [FIRST_FOLDER, "team"] {
             let d = ObjectId::random();
             let (f, g) = (ObjectId::random(), ObjectId::random());
             let (rf, rg) = (RevisionId::random(), RevisionId::random());
@@ -787,7 +868,7 @@ mod tests {
     fn reads(db: &Path, objects: &[ObjectId]) -> String {
         let mut s = SqliteStore::open(db).unwrap();
         let mut out = String::new();
-        for ns in ["default", "team"] {
+        for ns in [FIRST_FOLDER, "team"] {
             let changes = s.changes(ns, 0, 1000, usize::MAX).unwrap();
             out += &serde_json::to_string(&changes).unwrap();
             let head = s.head(ns).unwrap();
@@ -851,6 +932,14 @@ mod tests {
         all
     }
 
+    /// From the schema this binary writes back to 3, as `cairn-server downgrade` run twice.
+    fn down_to_3(db: &Path) {
+        if version(db) == 5 {
+            from_5(db).unwrap();
+        }
+        to_3(db).unwrap();
+    }
+
     fn version(db: &Path) -> usize {
         Connection::open(db)
             .unwrap()
@@ -866,11 +955,11 @@ mod tests {
         let dir = scratch();
         let db = dir.join("meta.sqlite");
         let objects = rich(&db);
-        assert_eq!(version(&db), 4);
+        assert_eq!(version(&db), 5);
         let want = reads(&db, &objects);
         assert!(want.contains("from_the_future"), "{want}");
 
-        to_3(&db).unwrap();
+        down_to_3(&db);
         assert_eq!(version(&db), 3);
         let three = rows(&db);
         {
@@ -904,11 +993,11 @@ mod tests {
 
         // The binary of schema 4 moves it when it opens it, and reads it as before.
         assert_eq!(reads(&db, &objects), want);
-        assert_eq!(version(&db), 4);
+        assert_eq!(version(&db), 5);
         let four = rows(&db);
         let journal = four.iter().find(|(t, _)| t == "journal").unwrap();
         assert!(journal.1.iter().all(|r| r.contains("Blob(")), "{journal:?}");
-        to_3(&db).unwrap();
+        down_to_3(&db);
         assert!(rows(&db) == three, "not the same rows the second time");
         SqliteStore::open(&db).unwrap();
         assert!(rows(&db) == four, "not the same rows at schema 4 again");
@@ -922,7 +1011,7 @@ mod tests {
         let dir = scratch();
         let db = dir.join("meta.sqlite");
         let objects = rich(&db);
-        to_3(&db).unwrap();
+        down_to_3(&db);
         let (changed, gone): (Vec<u8>, Vec<u8>) = {
             let conn = Connection::open(&db).unwrap();
             let mut stmt = conn
@@ -953,21 +1042,21 @@ mod tests {
             .unwrap()
         };
         let mut s = SqliteStore::open(&db).unwrap();
-        let first = s.changes("default", 0, 1, usize::MAX).unwrap();
+        let first = s.changes(FIRST_FOLDER, 0, 1, usize::MAX).unwrap();
         assert_eq!(serde_json::to_string(&first[0].ops).unwrap(), journal_then);
         let held = s
-            .revision("default", RevisionId(changed.try_into().unwrap()))
+            .revision(FIRST_FOLDER, RevisionId(changed.try_into().unwrap()))
             .unwrap()
             .unwrap();
         assert_eq!(held.body, file(99, 0o600));
         assert!(s
-            .revision("default", RevisionId(gone.try_into().unwrap()))
+            .revision(FIRST_FOLDER, RevisionId(gone.try_into().unwrap()))
             .unwrap()
             .is_none());
         drop(s);
         let _ = reads(&db, &objects);
         // And back, the journal as it was.
-        to_3(&db).unwrap();
+        down_to_3(&db);
         let conn = Connection::open(&db).unwrap();
         let again: String = conn
             .query_row(
@@ -995,7 +1084,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let mut s = SqliteStore::open(&db).unwrap();
-        let err = s.changes("default", 0, 1000, usize::MAX).unwrap_err();
+        let err = s.changes(FIRST_FOLDER, 0, 1000, usize::MAX).unwrap_err();
         assert!(format!("{err:#}").contains("at commit 3"), "{err:#}");
         drop(s);
         let conn = Connection::open(&db).unwrap();
@@ -1003,7 +1092,7 @@ mod tests {
             .unwrap();
         drop(conn);
         let mut s = SqliteStore::open(&db).unwrap();
-        let err = s.changes("default", 0, 1000, usize::MAX).unwrap_err();
+        let err = s.changes(FIRST_FOLDER, 0, 1000, usize::MAX).unwrap_err();
         assert!(
             format!("{err:#}").contains("which the database does not hold"),
             "{err:#}"
@@ -1028,9 +1117,9 @@ mod tests {
                 conflict_of: None,
             });
         }
-        commit(&mut s, "default", ops);
+        commit(&mut s, FIRST_FOLDER, ops);
         drop(s);
-        to_3(&db).unwrap();
+        down_to_3(&db);
         let three = std::fs::metadata(&db).unwrap().len();
         SqliteStore::open(&db).unwrap();
         let four = std::fs::metadata(&db).unwrap().len();

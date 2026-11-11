@@ -319,7 +319,7 @@ async function request(method, path, { json, body, headers = {} } = {}) {
 }
 
 const api = {
-  get: (p) => request('GET', p),
+  get: async (p) => ownTopName(p, await request('GET', p)),
   post: (p, json) => request('POST', p, json === undefined ? {} : { json }),
   put: (p, json) => request('PUT', p, { json }),
   del: (p) => request('DELETE', p),
@@ -332,6 +332,26 @@ async function getUsers() {
 }
 
 const folderAccess = (ns) => state.me && state.me.folders.find((f) => f.folder === ns)?.access;
+/** What the user calls a folder: their own name for it, or else the folder's name. */
+const folderName = (ns) => (state.me && state.me.folders.find((f) => f.folder === ns)?.name) || ns;
+
+/**
+ * A folder's top, which the server's answers give by the folder's name, shown by the user's own name
+ * for it: the listing's or item's own, where it is the top, and the first step of its path.
+ */
+function ownTopName(path, data) {
+  const m = /^\/v1\/ns\/([^/?]+)\/(dir|item)\//.exec(path);
+  if (!m || !data || typeof data !== 'object') return data;
+  let ns;
+  try { ns = decodeURIComponent(m[1]); } catch { return data; }
+  const name = folderName(ns);
+  if (name === ns) return data;
+  const top = (x) => x && typeof x === 'object' && (x.name === undefined || x.name === null);
+  if (top(data.dir)) data.dir.display = name;
+  if (top(data.item)) data.item.display = name;
+  if (Array.isArray(data.path) && data.path[0]) data.path[0].display = name;
+  return data;
+}
 
 // ---------------------------------------------------------------- views
 
@@ -613,7 +633,7 @@ function renderSidebar(r) {
   for (const f of folders) {
     const here = r.ns === f.folder;
     items.push(navLink(`#/f/${enc(f.folder)}/root`, [
-      icon('folder', 't-folder'), h('span', { class: 'nav-label', text: f.folder }), h('span', { class: `badge ${f.access}`, text: f.access }),
+      icon('folder', 't-folder'), h('span', { class: 'nav-label', text: folderName(f.folder), title: f.name && f.name !== f.folder ? `Your name for the folder ${f.folder}` : undefined }), h('span', { class: `badge ${f.access}`, text: f.access }),
     ], here && r.name === 'files'));
     if (f.folder === open) {
       const sub = (page, glyph, text) => navLink(`#/${page}/${enc(f.folder)}`, [icon(glyph), h('span', { class: 'nav-label', text })], here && r.name === page, true);
@@ -706,6 +726,16 @@ async function route() {
     const first = state.me.folders[0];
     location.replace(first ? `#/f/${enc(first.folder)}/root` : '#/shared');
     return;
+  }
+  // An address by a folder's former name, as made before it was renamed: the same page by its name now.
+  if (r.ns && !folderAccess(r.ns)) {
+    const now = await api.get(`/v1/ns/${enc(r.ns)}/info`).then((i) => i && i.folder, () => null);
+    if (now && now !== r.ns && folderAccess(now) && parseRoute().ns === r.ns) {
+      const parts = location.hash.split('/');
+      parts[2] = enc(now);
+      location.replace(parts.join('/'));
+      return;
+    }
   }
   shell.layout.classList.remove('nav-open');
   renderSidebar(r);
@@ -1803,7 +1833,7 @@ async function renderMembers(gen, ns) {
       h('td', { class: 'row-actions' }, manager && h('button', {
         class: 'btn small danger',
         onclick: act(async () => {
-          const ok = await confirmDialog('Remove access', `${m.user} will no longer reach ${ns}. What their devices hold of it stays on them.`, { ok: 'Remove', danger: true });
+          const ok = await confirmDialog('Remove access', `${m.user} will no longer reach ${folderName(ns)}. What their devices hold of it stays on them.`, { ok: 'Remove', danger: true });
           if (!ok) return;
           await api.del(`${base}/access/${enc(m.user)}`);
           toast(`${m.user} no longer has access.`);
@@ -1833,12 +1863,12 @@ async function renderMembers(gen, ns) {
       h('p', { class: 'hint', text: 'A new user is made on the server, with cairn-server user add <name>.' }));
   }
   show(gen, h('section', {},
-    h('div', { class: 'screen-head' }, h('h1', { text: `Members of ${ns}` })),
+    h('div', { class: 'screen-head' }, h('h1', { text: `Members of ${folderName(ns)}` })),
     h('p', { class: 'muted', text: 'read: see the files and their history. write: also add, change and delete. manage: also say who has access, and share. A folder always keeps one manager.' }),
     h('table', { class: 'list' },
       h('thead', {}, h('tr', {}, h('th', { text: 'User' }), h('th', { text: 'Level' }), h('th', {}))),
       h('tbody', {}, rows)),
-    manager ? addForm : h('p', { class: 'hint', text: 'Only a manager of this folder changes who has access.' })), `Members of ${ns}`);
+    manager ? addForm : h('p', { class: 'hint', text: 'Only a manager of this folder changes who has access.' })), `Members of ${folderName(ns)}`);
 }
 
 async function renderShares(gen, ns) {
@@ -1852,7 +1882,7 @@ async function renderShares(gen, ns) {
     return h('tr', {},
       h('td', {}, h('div', { class: 'name-cell' },
         fileIcon({ kind: s.kind, display: where || '' }),
-        h('span', { text: s.path === undefined || s.path === null ? '(deleted)' : where || ns }))),
+        h('span', { text: s.path === undefined || s.path === null ? '(deleted)' : where || folderName(ns) }))),
       h('td', {}, s.user ? h('span', {}, icon('people'), ' ', s.user) : h('span', {}, icon('globe'), ' public link')),
       h('td', {}, h('span', { class: `badge ${s.access}`, text: LEVEL_TEXT[s.access] || s.access })),
       h('td', { class: 'share-meta', text: madeText(s) }),
@@ -1861,13 +1891,13 @@ async function renderShares(gen, ns) {
         h('button', { class: 'btn small danger', onclick: act(() => removeShare(base, s, reload)) }, s.user ? 'Remove' : 'Delete')));
   });
   show(gen, h('section', {},
-    h('div', { class: 'screen-head' }, h('h1', { text: `Shares and links in ${ns}` })),
+    h('div', { class: 'screen-head' }, h('h1', { text: `Shares and links in ${folderName(ns)}` })),
     h('p', { class: 'muted', text: 'Everything in this folder shared with a user, or by a public link. Share something from its menu in the folder.' }),
     shares.length
       ? h('table', { class: 'list' },
         h('thead', {}, h('tr', {}, ['What', 'With', 'Access', 'Made', ''].map((t) => h('th', { text: t })))),
         h('tbody', {}, rows))
-      : h('p', { class: 'empty', text: 'Nothing here is shared.' })), `Shares in ${ns}`);
+      : h('p', { class: 'empty', text: 'Nothing here is shared.' })), `Shares in ${folderName(ns)}`);
 }
 
 async function renderDeleted(gen, ns) {
@@ -1897,7 +1927,7 @@ async function renderDeleted(gen, ns) {
     const size = it.kind === 'dir'
       ? [it.files ? plural(it.files, 'file') : 'empty', it.size ? humanSize(it.size) : ''].filter(Boolean).join(', ')
       : humanSize(it.size);
-    const where = pathText(it.path) || ns;
+    const where = pathText(it.path) || folderName(ns);
     const when = fmtTime(it.time);
     const by = byText(it.user, it.device_name);
     // The columns a narrow page leaves out are told under the name instead (app.css, "Recently deleted").
@@ -1924,7 +1954,7 @@ async function renderDeleted(gen, ns) {
     return tr;
   });
   show(gen, h('section', {},
-    h('div', { class: 'screen-head' }, h('h1', { text: `Recently deleted in ${ns}` }), count, canWrite && restoreButton),
+    h('div', { class: 'screen-head' }, h('h1', { text: `Recently deleted in ${folderName(ns)}` }), count, canWrite && restoreButton),
     h('p', { class: 'muted', text: 'What was deleted in the last 30 days and is still deleted, from any device. Each comes back to where it was, as it was.' }),
     r && r.complete === false && h('p', { class: 'hint', text: 'Only the most recent deletes are listed here: older ones are further back in the history than this list reads.' }),
     items.length
@@ -1936,7 +1966,7 @@ async function renderDeleted(gen, ns) {
           h('th', { class: 'col-when', text: 'Deleted' }),
           h('th', { class: 'col-by', text: 'By' }))),
         h('tbody', {}, rows))
-      : h('p', { class: 'empty', text: 'Nothing was deleted in the last 30 days.' })), `Deleted in ${ns}`);
+      : h('p', { class: 'empty', text: 'Nothing was deleted in the last 30 days.' })), `Deleted in ${folderName(ns)}`);
 }
 
 async function renderSharedList(gen) {
@@ -1980,6 +2010,41 @@ const DATE_WORDS = {
   'mmm d, yyyy': 'month day, year',
 };
 
+/**
+ * The user's own name for each folder of theirs, kept on the server, so it holds wherever they sign
+ * in: emptied, or made the folder's name, they see the folder's name again.
+ */
+function folderNames() {
+  const rows = state.me.folders.map((f) => {
+    const input = h('input', {
+      type: 'text', class: 'grow', value: f.name || '', placeholder: f.folder, maxlength: 64,
+      'aria-label': `Your name for the folder ${f.folder}`,
+    });
+    const save = act(async (ev) => {
+      ev.preventDefault();
+      const name = input.value.trim();
+      if (name === (f.name || '')) return;
+      if (!name || name === f.folder) {
+        await api.del(`/v1/ns/${enc(f.folder)}/name`);
+        f.name = undefined;
+      } else {
+        f.name = (await api.put(`/v1/ns/${enc(f.folder)}/name`, { name })).name;
+      }
+      input.value = f.name || '';
+      renderSidebar(parseRoute());
+      toast(f.name ? `You see ${f.folder} as “${f.name}” now.` : `You see ${f.folder} by its own name now.`);
+    });
+    return h('form', { class: 'form-row', onsubmit: save },
+      h('span', { class: 'folder-id mono', title: 'The folder\'s name, which devices, links and other people use', text: f.folder }),
+      input,
+      h('button', { class: 'btn', type: 'submit' }, 'Save'));
+  });
+  return h('div', { class: 'panel' },
+    h('h2', { text: 'Folder names' }),
+    h('p', { class: 'muted', text: 'What you see each folder called, wherever you sign in. Yours alone: the folder keeps its name, which devices, links and other people use. Empty, you see that name.' }),
+    rows.length ? rows : h('p', { class: 'empty', text: 'No folder is yours yet.' }));
+}
+
 function renderSettings(gen) {
   // A day past the 12th, so that the order of each date shows.
   const sample = new Date(new Date().getFullYear(), 2, 25, 16, 52);
@@ -2002,6 +2067,7 @@ function renderSettings(gen) {
   showNow();
   show(gen, h('section', { class: 'settings' },
     h('div', { class: 'screen-head' }, h('h1', { text: 'Settings' })),
+    folderNames(),
     h('p', { class: 'muted', text: 'How times are shown. Kept in this browser, for whoever signs in on it.' }),
     group('Clock', 'clock', CLOCKS, (v) => (v === '12h' ? '12-hour' : '24-hour'), (v) => clockText(sample, v)),
     group('Dates', 'date', DATE_ORDERS, (v) => dayText(sample, v), (v) => DATE_WORDS[v]),

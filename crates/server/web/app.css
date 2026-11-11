@@ -88,7 +88,7 @@ p { margin: 0 0 10px; }
   padding: 10px 8px 24px;
   overflow: auto;
 }
-.main { padding: 16px 24px 96px; overflow: auto; min-width: 0; }
+.main { padding: 16px 24px 96px; overflow: auto; min-width: 0; container: main / inline-size; }
 .main.public { max-width: 1100px; width: 100%; margin: 0 auto; height: auto; overflow: visible; }
 
 .nav-title {
@@ -158,6 +158,7 @@ p { margin: 0 0 10px; }
   font: inherit; cursor: pointer; white-space: nowrap;
 }
 .btn:hover { background: var(--hover); }
+a.btn { text-decoration: none; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .btn.primary:hover { filter: brightness(1.07); }
@@ -189,7 +190,7 @@ input[type="text"], input[type="password"], input[type="date"], select, .text-in
   background: var(--bg); color: var(--text); font: inherit;
   min-width: 0;
 }
-input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); vertical-align: middle; }
+input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); vertical-align: middle; }
 .text-input { width: 100%; }
 label { font-weight: 500; }
 label.check { display: inline-flex; align-items: center; gap: 8px; font-weight: 400; }
@@ -258,7 +259,7 @@ table.list tr.current td { background: color-mix(in srgb, var(--accent) 7%, tran
 
 .col-check { width: 34px; }
 .col-size { width: 104px; text-align: right !important; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
-.col-modified { width: 190px; white-space: nowrap; color: var(--muted); }
+.col-modified { width: 1%; white-space: nowrap; color: var(--muted); }
 .col-menu { width: 40px; text-align: right; }
 .name-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .name-link, .name-text { color: var(--text); text-decoration: none; overflow-wrap: anywhere; min-width: 0; }
@@ -267,6 +268,25 @@ table.list tr.current td { background: color-mix(in srgb, var(--accent) 7%, tran
 .row-actions { text-align: right; white-space: nowrap; }
 .row-actions .btn + .btn { margin-left: 6px; }
 .nowrap { white-space: nowrap; }
+
+/* Recently deleted. The name keeps its room: on a narrow page the columns beside it go, and what they
+   said is told on a line under the name instead. The widths are of .main, with or without the sidebar. */
+table.deleted .name-stack { flex: 1; min-width: 9em; }
+table.deleted .col-in { color: var(--muted); overflow-wrap: anywhere; }
+table.deleted .col-when { width: 1%; white-space: nowrap; }
+table.deleted .col-by { overflow-wrap: anywhere; }
+.row-meta { display: none; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.row-meta > span { display: none; }
+.row-meta > span + span::before { content: "·"; margin: 0 6px; }
+@container main (max-width: 760px) {
+  table.deleted .col-in, table.deleted .col-by { display: none; }
+  .row-meta { display: block; }
+  .row-meta > .m-in, .row-meta > .m-by { display: inline; }
+}
+@container main (max-width: 520px) {
+  table.deleted .col-size, table.deleted .col-when { display: none; }
+  .row-meta > .m-size, .row-meta > .m-when { display: inline; }
+}
 
 /* Menus */
 
@@ -340,6 +360,10 @@ dialog.dlg::backdrop { background: rgba(10, 12, 14, 0.5); }
 .share-row .who-line { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
 .share-row .link-input { flex: 1; min-width: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
 .share-meta { color: var(--muted); font-size: 12.5px; }
+
+.settings { max-width: 620px; }
+.choice { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-weight: 400; cursor: pointer; }
+.choice-label { min-width: 8em; }
 
 .loading { display: flex; align-items: center; gap: 10px; color: var(--muted); padding: 28px 4px; }
 .spinner {

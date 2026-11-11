@@ -9,6 +9,22 @@ const LEVEL_TEXT = { read: 'Can view', write: 'Can edit', manage: 'Can manage' }
 const IS_PUBLIC = location.pathname.startsWith('/s/');
 const enc = encodeURIComponent;
 
+// How this browser shows times (Settings), kept in its localStorage: the clock, and the order of a date.
+const SETTINGS_KEY = 'cairn.settings';
+const CLOCKS = ['24h', '12h'];
+const DATE_ORDERS = ['dd.mm.yyyy', 'yyyy-mm-dd', 'dd/mm/yyyy', 'mm/dd/yyyy', 'd mmm yyyy', 'mmm d, yyyy'];
+
+/** What was chosen here, each setting the first of its list where nothing (or nothing known) was. */
+function loadSettings() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)); } catch { saved = null; }
+  const s = saved && typeof saved === 'object' ? saved : {};
+  return {
+    clock: CLOCKS.includes(s.clock) ? s.clock : CLOCKS[0],
+    date: DATE_ORDERS.includes(s.date) ? s.date : DATE_ORDERS[0],
+  };
+}
+
 const state = {
   me: null, // GET /v1/me
   shared: null, // GET /v1/shared, once asked
@@ -18,6 +34,7 @@ const state = {
   gen: 0, // the navigation a render belongs to: a stale one never paints
   routing: false,
   publicView: null,
+  settings: loadSettings(),
 };
 let shell = null;
 
@@ -159,16 +176,45 @@ function humanSize(n) {
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
 }
 
-/** A time: `{sec, nsec}` as the protocol sends one, or seconds. */
+// Times are written here, on the clock and in the date order chosen in Settings, rather than by the
+// browser's locale: a 24-hour clock and day.month.year unless changed, as the tray shows them.
+const pad2 = (n) => String(n).padStart(2, '0');
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** A day in one of DATE_ORDERS. */
+function dayText(d, order = state.settings.date) {
+  const dd = pad2(d.getDate());
+  const mm = pad2(d.getMonth() + 1);
+  const y = d.getFullYear();
+  switch (order) {
+    case 'yyyy-mm-dd': return `${y}-${mm}-${dd}`;
+    case 'dd/mm/yyyy': return `${dd}/${mm}/${y}`;
+    case 'mm/dd/yyyy': return `${mm}/${dd}/${y}`;
+    case 'd mmm yyyy': return `${d.getDate()} ${MONTHS[d.getMonth()]} ${y}`;
+    case 'mmm d, yyyy': return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${y}`;
+    default: return `${dd}.${mm}.${y}`;
+  }
+}
+
+/** `16:52`, or `4:52 PM` on a 12-hour clock. */
+function clockText(d, clock = state.settings.clock) {
+  const m = pad2(d.getMinutes());
+  if (clock === '12h') return `${d.getHours() % 12 || 12}:${m} ${d.getHours() < 12 ? 'AM' : 'PM'}`;
+  return `${pad2(d.getHours())}:${m}`;
+}
+
+/** A time: `{sec, nsec}` as the protocol sends one, or seconds. One no date can hold shows as its seconds. */
 function fmtTime(t) {
   const sec = typeof t === 'number' ? t : t && t.sec;
   if (sec === null || sec === undefined) return '';
-  return new Date(sec * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  const d = new Date(sec * 1000);
+  return Number.isNaN(d.getTime()) ? String(sec) : `${dayText(d)} ${clockText(d)}`;
 }
 
 function fmtDate(sec) {
   if (sec === null || sec === undefined) return '';
-  return new Date(sec * 1000).toLocaleDateString(undefined, { dateStyle: 'medium' });
+  const d = new Date(sec * 1000);
+  return Number.isNaN(d.getTime()) ? String(sec) : dayText(d);
 }
 
 function modeString(kind, mode) {
@@ -537,6 +583,7 @@ function buildShell() {
     brand(),
     h('span', { class: 'spacer' }),
     h('span', { class: 'who', text: state.me.user, title: 'Signed in as this user' }),
+    h('a', { class: 'btn subtle', href: '#/settings' }, 'Settings'),
     h('button', { class: 'btn subtle', onclick: act(signOut) }, 'Sign out'));
   $app().replaceChildren(top, layout);
   shell = { sidebar, main, layout };
@@ -624,6 +671,7 @@ function parseRoute() {
     case 'members':
     case 'shares': return a ? { name, ns: a } : { name: 'home' };
     case 'shared': return { name: 'shared' };
+    case 'settings': return { name: 'settings' };
     default: return { name: 'home' };
   }
 }
@@ -659,6 +707,7 @@ async function route() {
       case 'members': await renderMembers(gen, r.ns); break;
       case 'shares': await renderShares(gen, r.ns); break;
       case 'shared': await renderSharedList(gen); break;
+      case 'settings': renderSettings(gen); break;
       default: break;
     }
   } catch (e) {
@@ -1835,6 +1884,10 @@ async function renderDeleted(gen, ns) {
     const size = it.kind === 'dir'
       ? [it.files ? plural(it.files, 'file') : 'empty', it.size ? humanSize(it.size) : ''].filter(Boolean).join(', ')
       : humanSize(it.size);
+    const where = pathText(it.path) || ns;
+    const when = fmtTime(it.time);
+    const by = byText(it.user, it.device_name);
+    // The columns a narrow page leaves out are told under the name instead (app.css, "Recently deleted").
     const tr = h('tr', {},
       h('td', { class: 'col-check' }, canWrite && h('input', {
         type: 'checkbox',
@@ -1845,11 +1898,17 @@ async function renderDeleted(gen, ns) {
           update();
         },
       })),
-      h('td', {}, h('div', { class: 'name-cell' }, fileIcon(it), h('span', { class: 'name-text', text: it.display }))),
-      h('td', { class: 'muted', text: pathText(it.path) || ns }),
+      h('td', { class: 'col-name' }, h('div', { class: 'name-cell' }, fileIcon(it), h('div', { class: 'name-stack' },
+        h('span', { class: 'name-text', text: it.display }),
+        h('div', { class: 'row-meta' },
+          h('span', { class: 'm-in', text: `in ${where}` }),
+          h('span', { class: 'm-size', text: size }),
+          h('span', { class: 'm-when', text: when }),
+          by !== '—' && h('span', { class: 'm-by', text: `by ${by}` }))))),
+      h('td', { class: 'col-in', text: where }),
       h('td', { class: 'col-size', text: size }),
-      h('td', { class: 'nowrap', text: fmtTime(it.time) }),
-      h('td', { text: byText(it.user, it.device_name) }));
+      h('td', { class: 'col-when', text: when }),
+      h('td', { class: 'col-by', text: by }));
     return tr;
   });
   show(gen, h('section', {},
@@ -1857,8 +1916,13 @@ async function renderDeleted(gen, ns) {
     h('p', { class: 'muted', text: 'What was deleted in the last 30 days and is still deleted, from any device. Each comes back to where it was, as it was.' }),
     r && r.complete === false && h('p', { class: 'hint', text: 'Only the most recent deletes are listed here: older ones are further back in the history than this list reads.' }),
     items.length
-      ? h('table', { class: 'list' },
-        h('thead', {}, h('tr', {}, h('th', { class: 'col-check' }), ...['Name', 'Was in', 'Size', 'Deleted', 'By'].map((t) => h('th', { text: t, class: t === 'Size' ? 'col-size' : '' })))),
+      ? h('table', { class: 'list deleted' },
+        h('thead', {}, h('tr', {}, h('th', { class: 'col-check' }),
+          h('th', { class: 'col-name', text: 'Name' }),
+          h('th', { class: 'col-in', text: 'Was in' }),
+          h('th', { class: 'col-size', text: 'Size' }),
+          h('th', { class: 'col-when', text: 'Deleted' }),
+          h('th', { class: 'col-by', text: 'By' }))),
         h('tbody', {}, rows))
       : h('p', { class: 'empty', text: 'Nothing was deleted in the last 30 days.' })), `Deleted in ${ns}`);
 }
@@ -1882,6 +1946,62 @@ async function renderSharedList(gen) {
         h('tbody', {}, rows))
       : h('p', { class: 'empty', text: 'Nothing is shared with you.' })), 'Shared with me');
 }
+
+// ---------------------------------------------------------------- settings
+
+/** Chosen here, kept in this browser, it applies at once. A browser that will not keep it is said so. */
+function saveSetting(key, value) {
+  state.settings = { ...state.settings, [key]: value };
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  } catch {
+    throw new UserError('This browser would not keep the setting: it holds on this page until it is closed or reloaded.');
+  }
+}
+
+const DATE_WORDS = {
+  'dd.mm.yyyy': 'day.month.year',
+  'yyyy-mm-dd': 'year-month-day',
+  'dd/mm/yyyy': 'day/month/year',
+  'mm/dd/yyyy': 'month/day/year',
+  'd mmm yyyy': 'day month year',
+  'mmm d, yyyy': 'month day, year',
+};
+
+function renderSettings(gen) {
+  // A day past the 12th, so that the order of each date shows.
+  const sample = new Date(new Date().getFullYear(), 2, 25, 16, 52);
+  const now = h('strong');
+  const showNow = () => { now.textContent = fmtTime(Date.now() / 1000); };
+  const group = (title, key, values, label, about) => h('div', { class: 'panel', role: 'radiogroup', 'aria-label': title },
+    h('h2', { text: title }),
+    values.map((v) => h('label', { class: 'choice' },
+      h('input', {
+        type: 'radio',
+        name: key,
+        value: v,
+        checked: state.settings[key] === v,
+        onchange: act(() => {
+          try { saveSetting(key, v); } finally { showNow(); }
+        }),
+      }),
+      h('span', { class: 'choice-label', text: label(v) }),
+      h('span', { class: 'muted', text: about(v) }))));
+  showNow();
+  show(gen, h('section', { class: 'settings' },
+    h('div', { class: 'screen-head' }, h('h1', { text: 'Settings' })),
+    h('p', { class: 'muted', text: 'How times are shown. Kept in this browser, for whoever signs in on it.' }),
+    group('Clock', 'clock', CLOCKS, (v) => (v === '12h' ? '12-hour' : '24-hour'), (v) => clockText(sample, v)),
+    group('Dates', 'date', DATE_ORDERS, (v) => dayText(sample, v), (v) => DATE_WORDS[v]),
+    h('p', {}, 'A time now shows as ', now, '.')), 'Settings');
+}
+
+// Settings changed in another tab of this browser: the page on screen shows its times the new way.
+window.addEventListener('storage', (ev) => {
+  if (ev.key !== SETTINGS_KEY && ev.key !== null) return;
+  state.settings = loadSettings();
+  refresh();
+});
 
 // ---------------------------------------------------------------- public links
 

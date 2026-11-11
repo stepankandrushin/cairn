@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- The web interface writes times on a 24-hour clock and dates as day.month.year (`11.11.2026 09:50`), where it
+  followed the browser's locale. Its new Settings page, at the top of every page, chooses a 12-hour clock or
+  another date order; the choice is kept in that browser.
+
+**Fixed:**
+
+- The web's Recently deleted squeezed the Name column to a few letters wide on a narrow window or phone. As
+  the page narrows, the Was in and By columns, then Size and Deleted, move to a line under the name.
+
 ## 0.1.16 (2026-11-11)
 
 **Fixed:**

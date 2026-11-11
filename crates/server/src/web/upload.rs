@@ -105,6 +105,17 @@ impl Uploads {
         }
     }
 
+    /// A namespace renamed: its uploads go on in it, by its name now.
+    pub(crate) fn renamed(&self, from: &str, to: &str) {
+        let map = self.map.lock().expect("a panic aborts the process");
+        for up in map.values() {
+            let mut up = up.lock().expect("a panic aborts the process");
+            if up.ns == from {
+                up.ns = to.to_string();
+            }
+        }
+    }
+
     /// Give up what has lain idle, and forget what finished a while ago.
     pub(crate) fn sweep(&self) {
         let ids: Vec<String> = {

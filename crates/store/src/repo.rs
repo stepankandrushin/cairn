@@ -95,13 +95,13 @@ impl Repo {
         Ok(self.root.join("ns").join(dir))
     }
 
-    /// Renames a namespace, with no server on the data directory, which reads the former names as it
-    /// starts: one transaction, its former name reaching it still. Its chunks stay where they are, so
-    /// nothing is moved or copied, and a backup's next copy links them as before. What it did.
+    /// Renames a namespace, by the server that has the data directory or with none on it: one
+    /// transaction, its former name reaching it still. Its chunks stay where they are, so nothing is
+    /// moved or copied, and a backup's next copy links them as before. What it did.
     pub fn rename_namespace(&self, from: &str, to: &str) -> Result<String> {
         if self._lock.is_none() {
             anyhow::bail!(
-                "a server has {}: stop it first, as it reads the folders' former names when it starts",
+                "a server has {}: rename the folder through it, as a manager of the folder does in the web, or stop it first, as it keeps the folders' former names in memory",
                 self.root.display()
             );
         }
@@ -448,9 +448,15 @@ mod tests {
         assert!(said.contains("its chunks stay in"), "{said}");
         assert!(dir_of(FIRST_FOLDER).exists() && !dir_of("files").exists());
         assert!(repo.missing("files", &[h]).unwrap().is_empty());
-        assert!(
-            repo.chunks(FIRST_FOLDER).is_err(),
-            "a former name has no chunks of its own"
+        // What began by the former name, while a server serves, reaches the same chunks, and makes no
+        // directory of its own.
+        assert_eq!(
+            repo.chunks(FIRST_FOLDER)
+                .unwrap()
+                .get(&h)
+                .unwrap()
+                .as_deref(),
+            Some(&b"kept"[..])
         );
         repo.rename_namespace("files", "docs").unwrap();
         assert_eq!(

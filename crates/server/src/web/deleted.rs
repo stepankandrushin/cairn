@@ -81,6 +81,14 @@ impl Indexes {
             .or_insert_with(|| Arc::new(Mutex::new(Replayed::new())))
             .clone()
     }
+
+    /// A namespace renamed: its index is kept by its name now.
+    pub(crate) fn renamed(&self, from: &str, to: &str) {
+        let mut all = self.0.lock().expect("a panic aborts the process");
+        if let Some(index) = all.remove(from) {
+            all.insert(to.to_string(), index);
+        }
+    }
 }
 
 fn lock(index: &Mutex<Replayed>) -> MutexGuard<'_, Replayed> {
@@ -90,11 +98,19 @@ fn lock(index: &Mutex<Replayed>) -> MutexGuard<'_, Replayed> {
 /// Every index brought up to its namespace's head: at the start each namespace's, replayed from its
 /// first commit, and after a commit those already made.
 pub(crate) fn keep_up(app: &App, every_namespace: bool) -> Result<()> {
+    let names = app.repo.namespaces()?;
     if every_namespace {
-        for ns in app.repo.namespaces()? {
-            app.deleted.of(&ns);
+        for ns in &names {
+            app.deleted.of(ns);
         }
     }
+    // One made by a name that a rename had just made former, by a request begun before it: the index
+    // by the name now stands for the namespace.
+    app.deleted
+        .0
+        .lock()
+        .expect("a panic aborts the process")
+        .retain(|ns, _| names.contains(ns));
     let all: Vec<(String, Arc<Mutex<Replayed>>)> = app
         .deleted
         .0

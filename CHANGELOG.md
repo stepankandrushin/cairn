@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Added:**
+
+- Folders added and renamed in the web interface. The + beside Folders in the sidebar adds a folder of the
+  user's own, which they manage and nobody else reaches until given access: what they call it, and its name
+  on the server, made of that (`Family photos` as `family-photos`) until they change it. Each folder has a page
+  of its settings, opened from Folder settings under it in the sidebar or from its level beside its name, which
+  until now did nothing when clicked: its name on the server, which a manager renames there, the user's own
+  name for it, their access, and the command that syncs it on a computer.
+- A folder renamed while the server serves, by a manager of it, in one transaction, its chunks left where
+  they are: what was begun by the former name as it was renamed goes on in the same folder, a commit or a web
+  upload in flight lands in it, and the former name goes on reaching it as after `cairn-server folder rename`,
+  which stays for the server stopped. The API is `POST /v1/folders` and `POST /v1/ns/{ns}/rename`
+  (docs/protocol.md); a name that is or was another folder's is refused, saying nothing of that folder.
+
 **Changed:**
 
 - In the web's file list and on Shared with me, a click anywhere in the name's cell opens the item: its icon and

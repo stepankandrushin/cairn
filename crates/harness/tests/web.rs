@@ -1694,3 +1694,339 @@ fn each_user_names_a_folder_for_themselves_and_init_asks_which_of_several() {
     assert_eq!(r.text(), "no folder \"work\" for user \"bob\"");
     drop(a);
 }
+
+/// A request whose answer is not waited for, as one a server is killed in the middle of.
+fn fire_json(server: &Server, path: &str, token: &str, body: Value) {
+    let addr = server.url.strip_prefix("http://").unwrap();
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let body = body.to_string();
+    let _ = write!(
+        conn,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut sink = Vec::new();
+    let _ = conn.read_to_end(&mut sink);
+}
+
+/// Until the paused process says it reached its failpoint.
+#[track_caller]
+fn wait_reached(gate: &std::path::Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !gate.join("reached").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: never reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A user adds a folder of their own, which they manage, all at once or not at all, through a kill or
+/// a full disk, and learns of a name that is taken nothing but that it is; and a manager renames a
+/// folder while the server serves, with a commit and a web upload begun by its former name in flight
+/// across it: both land in it, devices follow it and lose nothing, what is deleted is listed by the
+/// name now, the chunks never move, and the server started again has the names it had in memory.
+#[test]
+fn a_user_adds_a_folder_and_a_manager_renames_one_while_it_serves_losing_nothing() {
+    let sb = Sandbox::fast("web-folders");
+    let mut server = Server::start(sb.path("data"));
+    let admin = token(&server.token_file);
+    let bob = token(&server.user("bob"));
+    let me = |server: &Server, t: &str| get(server, "/v1/me", Auth::Bearer(t)).ok().json();
+    let add =
+        |server: &Server, t: &str, body: Value| post(server, "/v1/folders", Auth::Bearer(t), body);
+
+    // Bob's own folder: his to manage, by his own name for it, and nobody else's to see.
+    let made = add(
+        &server,
+        &bob,
+        json!({"folder": "bobs", "name": "Bob's things"}),
+    );
+    assert_eq!(made.code, 201, "{}", made.text());
+    assert_eq!(
+        made.json(),
+        json!({"folder": "bobs", "access": "manage", "name": "Bob's things"})
+    );
+    assert_eq!(
+        me(&server, &bob)["folders"],
+        json!([{"folder": "bobs", "access": "manage", "name": "Bob's things"}])
+    );
+    assert_eq!(
+        me(&server, &admin)["folders"],
+        json!([{"folder": "cloud", "access": "manage"}])
+    );
+    assert_eq!(
+        get(&server, "/v1/ns/bobs/info", Auth::Bearer(&admin)).code,
+        404
+    );
+    assert_eq!(
+        add(&server, &bob, json!({"folder": "plain"})).code,
+        201,
+        "no name of his own"
+    );
+    // Taken: said, and nothing of whose it is or what it holds.
+    let taken = add(&server, &bob, json!({"folder": "cloud"}));
+    assert_eq!(taken.code, 409, "{}", taken.text());
+    assert_eq!(
+        taken.text(),
+        "the name \"cloud\" is taken by another folder, now or before: pick another"
+    );
+    for bad in [
+        json!({"folder": ""}),
+        json!({"folder": "two words"}),
+        json!({"folder": ".hidden"}),
+        json!({"folder": "-x"}),
+        json!({"folder": "x".repeat(65)}),
+        json!({"folder": "ok", "name": " padded"}),
+        json!({"folder": "ok", "name": ""}),
+    ] {
+        let r = add(&server, &bob, bad.clone());
+        assert_eq!(r.code, 400, "{bad}: {}", r.text());
+    }
+    let folders = |server: &Server| server.admin(&["folder", "list"]).expect_ok().stdout;
+    let listed = folders(&server);
+    assert_eq!(listed.lines().count(), 3, "{listed}");
+
+    // Killed before its commit, or a full disk at it: nothing made, and the name free.
+    server.set_env(vec![(
+        "CAIRN_FP_CRASH".into(),
+        "server.folder_add.commit".into(),
+    )]);
+    server.restart();
+    fire_json(&server, "/v1/folders", &bob, json!({"folder": "crashed"}));
+    assert!(
+        !server.alive_after_a_kill(),
+        "the failpoint did not kill the server"
+    );
+    server.set_env(vec![(
+        "CAIRN_FP_ENOSPC".into(),
+        "server.folder_add.write".into(),
+    )]);
+    server.restart();
+    let full = add(&server, &bob, json!({"folder": "full", "name": "Full"}));
+    assert_eq!(full.code, 507, "{}", full.text());
+    server.set_env(Vec::new());
+    server.restart();
+    assert_eq!(folders(&server), listed);
+    assert_eq!(me(&server, &bob)["folders"].as_array().unwrap().len(), 2);
+    for name in ["crashed", "full"] {
+        assert_eq!(
+            add(&server, &bob, json!({ "folder": name })).code,
+            201,
+            "{name}"
+        );
+    }
+
+    // The first folder on two devices, which bob may read.
+    server.admin(&["grant", "cloud", "bob", "read"]).expect_ok();
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    for i in 0..20 {
+        a.write(&format!("d{}/f{i}", i % 3), format!("file {i}"));
+    }
+    converge(&[&a, &b]);
+    let rename = |server: &Server, t: &str, ns: &str, to: &str| {
+        post(
+            server,
+            &format!("/v1/ns/{ns}/rename"),
+            Auth::Bearer(t),
+            json!({ "folder": to }),
+        )
+    };
+    let r = rename(&server, &bob, "cloud", "mine");
+    assert_eq!(r.code, 403, "{}", r.text());
+    let r = rename(&server, &admin, "cloud", "bobs");
+    assert_eq!(r.code, 409, "a folder the admin cannot reach: {}", r.text());
+    assert!(!r.text().contains("Bob"), "{}", r.text());
+    assert_eq!(rename(&server, &admin, "cloud", "no good").code, 400);
+    assert_eq!(rename(&server, &admin, "bobs", "x").code, 404);
+    // Beside a server that serves, the administrator's command is refused, as it would not know.
+    let run = server.admin(&["folder", "rename", "cloud", "photos"]);
+    assert!(
+        !run.ok() && run.stderr.contains("stop it first"),
+        "{}",
+        run.text()
+    );
+
+    // A commit whose name and access were found by "cloud", paused there while it becomes "photos".
+    let gate = sb.path("gate-commit");
+    std::fs::create_dir(&gate).unwrap();
+    server.set_env(vec![(
+        "CAIRN_FP_PAUSE".into(),
+        format!("server.commit.received#1:{}", gate.display()),
+    )]);
+    server.restart();
+    a.write("during/commit.txt", "committed across the rename");
+    std::fs::remove_file(a.path("d0/f0")).unwrap();
+    let syncing = {
+        let a = a.clone();
+        std::thread::spawn(move || a.sync())
+    };
+    wait_reached(&gate, "the commit");
+    let r = rename(&server, &admin, "cloud", "photos").ok();
+    assert_eq!(r.json(), json!({"folder": "photos"}));
+    std::fs::write(gate.join("go"), b"").unwrap();
+    syncing.join().unwrap().expect_ok();
+    assert_eq!(
+        get(&server, "/v1/ns/cloud/info", Auth::Bearer(&admin))
+            .ok()
+            .json()["folder"],
+        "photos"
+    );
+    assert_eq!(
+        get(&server, "/v1/ns/cloud/info", Auth::Bearer(&bob))
+            .ok()
+            .json()["folder"],
+        "photos",
+        "a reader learns the name now too"
+    );
+    let listed = folders(&server);
+    assert!(
+        listed.contains("photos  at ") && listed.contains("formerly cloud"),
+        "{listed}"
+    );
+    // What was deleted by the commit begun as "cloud" is listed by either name.
+    for ns in ["photos", "cloud"] {
+        let gone = get(
+            &server,
+            &format!("/v1/ns/{ns}/deleted"),
+            Auth::Bearer(&admin),
+        )
+        .ok()
+        .json();
+        let items = gone["items"].as_array().unwrap();
+        assert!(items.iter().any(|i| i["display"] == "f0"), "{ns}: {gone}");
+    }
+    let run = a.synced();
+    assert!(
+        run.stdout
+            .contains("is called \"photos\" now, and this root follows it"),
+        "{}",
+        run.text()
+    );
+    b.synced();
+    assert_eq!(b.read("during/commit.txt"), b"committed across the rename");
+    assert!(!b.exists("d0/f0"));
+
+    // A web upload begun as "photos", its chunks stored, paused before its commit while it becomes
+    // "pics": it lands, and its status is read by either name.
+    let gate = sb.path("gate-upload");
+    std::fs::create_dir(&gate).unwrap();
+    server.set_env(vec![(
+        "CAIRN_FP_PAUSE".into(),
+        format!("server.web.upload.stored#1:{}", gate.display()),
+    )]);
+    server.restart();
+    let auth = Auth::Bearer(&admin);
+    let data = noise(3 * 1024 * 1024, 17);
+    let began = post(
+        &server,
+        "/v1/ns/photos/uploads",
+        auth,
+        json!({"parent": ROOT, "name": b64("up.bin"), "size": data.len()}),
+    );
+    assert_eq!(began.code, 201, "{}", began.text());
+    let id = began.json()["id"].as_str().unwrap().to_string();
+    request(
+        &server,
+        "PUT",
+        &format!("/v1/ns/photos/uploads/{id}?offset=0"),
+        auth,
+        &[],
+        &data,
+    )
+    .ok();
+    let committed = request(
+        &server,
+        "POST",
+        &format!("/v1/ns/photos/uploads/{id}/commit"),
+        auth,
+        &[],
+        b"",
+    );
+    assert_eq!(committed.code, 202, "{}", committed.text());
+    wait_reached(&gate, "the upload");
+    rename(&server, &admin, "photos", "pics").ok();
+    let storing = get(&server, &format!("/v1/ns/pics/uploads/{id}"), auth)
+        .ok()
+        .json();
+    assert_eq!(storing["state"], "storing", "{storing}");
+    std::fs::write(gate.join("go"), b"").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let done = loop {
+        let status = get(&server, &format!("/v1/ns/photos/uploads/{id}"), auth)
+            .ok()
+            .json();
+        if status["state"] != "storing" {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "still storing");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(done["state"], "done", "{done}");
+    server.set_env(Vec::new());
+
+    // Back at its first name, its own former name its to take again; the names are no one else's.
+    assert_eq!(
+        rename(&server, &admin, "pics", "cloud").ok().json(),
+        json!({"folder": "cloud"})
+    );
+    for was in ["photos", "pics"] {
+        assert_eq!(
+            get(&server, &format!("/v1/ns/{was}/info"), Auth::Bearer(&admin))
+                .ok()
+                .json()["folder"],
+            "cloud",
+            "{was}"
+        );
+        assert_eq!(
+            add(&server, &bob, json!({ "folder": was })).code,
+            409,
+            "{was}"
+        );
+    }
+    let in_memory = folders(&server);
+    server.restart();
+    assert_eq!(folders(&server), in_memory, "as the database has them");
+    assert!(
+        in_memory.contains("cloud  at ") && in_memory.contains("formerly photos, pics"),
+        "{in_memory}"
+    );
+    assert_eq!(
+        get(&server, "/v1/ns/pics/info", Auth::Bearer(&admin))
+            .ok()
+            .json()["folder"],
+        "cloud"
+    );
+    let ns_dir = |name: &str| server.data.join("ns").join(hex::encode(name));
+    assert!(ns_dir("cloud").exists());
+    for never in ["photos", "pics"] {
+        assert!(!ns_dir(never).exists(), "{never}: a directory of its own");
+    }
+    let report = server.fsck();
+    assert!(report.contains("clean"), "{report}");
+
+    // Every device follows it and has all of it; a new one joins it by its name now.
+    let p = converge(&[&a, &b]);
+    for d in [&a, &b] {
+        assert_eq!(d.read("up.bin"), data);
+        assert_eq!(d.read("during/commit.txt"), b"committed across the rename");
+        for i in 1..20 {
+            assert_eq!(
+                d.read(&format!("d{}/f{i}", i % 3)),
+                format!("file {i}").as_bytes()
+            );
+        }
+    }
+    let c = Device::new(&sb, &server, "c");
+    c.synced();
+    let diff = Picture::of(&c.root).diff(
+        &p,
+        Ignore {
+            owner: true,
+            ..Ignore::default()
+        },
+    );
+    assert!(diff.is_empty(), "{diff:?}");
+}

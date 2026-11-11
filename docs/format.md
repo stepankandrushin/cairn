@@ -115,9 +115,13 @@ while a renamed namespace keeps its chunks under another name than its own, wher
 renamed back to its first name, and each device synced once so that it has taken that name up, it goes.
 
 A data directory with no namespace, as `cairn-server init` makes it, gets its first, `cloud`, managed by the
-first user; one from before keeps its `default`. `cairn-server folder rename <from> <to>`, with the server
-stopped, as it reads the former names when it starts, renames a namespace in one transaction, keeping the
-name it had in `former_names`; it refuses a name that is another namespace's, now or before. Its chunks
+first user; one from before keeps its `default`. A namespace a user adds (`POST /v1/folders`) is made in one
+transaction with that user's `manage` grant and their own name for it, if they gave one. A rename, by the
+server (`POST /rename`) or with it stopped (`cairn-server folder rename <from> <to>`, refused while it
+serves, as it keeps the former names in memory), is one transaction, keeping the name it had in
+`former_names`; it refuses a name that is another namespace's, now or before. A former name reaches the
+namespace wherever a name is looked up, but in making or renaming one, so that what the server began by a
+name just made former goes on in the same namespace. Its chunks
 stay where they are: `namespaces.dir`, empty until then, takes the hex of the name it had at its first
 rename, and its chunks are under that from then on, so a rename moves and copies nothing, and a backup that
 links each chunk to the last copy's by its path links them all again. A former name has no directory of

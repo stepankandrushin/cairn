@@ -374,7 +374,21 @@ impl SqliteStore {
             .ok_or_else(|| anyhow!("no user {name:?}"))
     }
 
+    /// The namespace by its name now or a former one, which reaches it as long as it lasts: a request
+    /// begun by a name that a rename then made former, while the server serves, goes on in the same
+    /// namespace, as no other may ever take that name.
     fn ns_id(&self, ns: &str) -> Result<i64> {
+        self.conn
+            .prepare_cached(
+                "SELECT COALESCE((SELECT id FROM namespaces WHERE name = ?1),
+                                 (SELECT ns FROM former_names WHERE name = ?1))",
+            )?
+            .query_row([ns], |r| r.get::<_, Option<i64>>(0))?
+            .ok_or_else(|| anyhow!("no namespace {ns:?}"))
+    }
+
+    /// The namespace by its name now alone.
+    fn ns_id_now(&self, ns: &str) -> Result<i64> {
         self.conn
             .query_row("SELECT id FROM namespaces WHERE name = ?1", [ns], |r| {
                 r.get(0)
@@ -576,20 +590,21 @@ pub(crate) fn ops_of(conn: &Connection, ns: i64, seq: i64, stored: &[u8]) -> Res
 
 impl MetaStore for SqliteStore {
     fn head(&mut self, ns: &str) -> Result<u64> {
+        let id = self.ns_id(ns)?;
         let head: i64 =
             self.conn
-                .query_row("SELECT head FROM namespaces WHERE name = ?1", [ns], |r| {
+                .query_row("SELECT head FROM namespaces WHERE id = ?1", [id], |r| {
                     r.get(0)
                 })?;
         Ok(head as u64)
     }
 
     fn namespace_exists(&mut self, ns: &str) -> Result<bool> {
-        Ok(self.ns_id(ns).is_ok())
+        Ok(self.ns_id_now(ns).is_ok())
     }
 
     fn create_namespace(&mut self, ns: &str) -> Result<()> {
-        if self.ns_id(ns).is_ok() {
+        if self.ns_id_now(ns).is_ok() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
@@ -603,8 +618,48 @@ impl MetaStore for SqliteStore {
         Ok(())
     }
 
+    fn add_namespace(&mut self, ns: &str, manager: &str, own_name: Option<&str>) -> Result<()> {
+        if !cairn_protocol::wire::valid_account_name(ns) {
+            bail!("{ns:?} is no folder name: 1 to 64 of ASCII letters, digits, '.', '_' and '-', not starting with '.' or '-'");
+        }
+        if let Some(name) = own_name {
+            if !cairn_protocol::wire::valid_folder_name(name) {
+                bail!("{name:?} is no name for a folder: 1 to 64 characters, no control character, and no space at either end");
+            }
+        }
+        let user = self.user_id(manager)?;
+        let tx = self.conn.transaction()?;
+        if tx
+            .query_row("SELECT 1 FROM namespaces WHERE name = ?1", [ns], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            bail!("there is a folder {ns:?} already");
+        }
+        if let Some(now) = former_of(&tx, ns)? {
+            bail!(
+                "{ns:?} was the name of the folder {now:?}, which it still reaches: pick another"
+            );
+        }
+        let id = ensure_namespace(&tx, ns, Bodies::Binary)?;
+        tx.execute(
+            "INSERT INTO grants (ns, user, access) VALUES (?1, ?2, 'manage')",
+            params![id, user],
+        )?;
+        if let Some(name) = own_name {
+            tx.execute(
+                "INSERT INTO folder_names (ns, user, name) VALUES (?1, ?2, ?3)",
+                params![id, user, name],
+            )?;
+        }
+        hit("server.folder_add.commit");
+        check("server.folder_add.write")?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn resolve_namespace(&mut self, name: &str) -> Result<Option<String>> {
-        if self.ns_id(name).is_ok() {
+        if self.ns_id_now(name).is_ok() {
             return Ok(Some(name.to_string()));
         }
         former_of(&self.conn, name)
@@ -614,7 +669,7 @@ impl MetaStore for SqliteStore {
         if !cairn_protocol::wire::valid_account_name(to) {
             bail!("{to:?} is no folder name: 1 to 64 of ASCII letters, digits, '.', '_' and '-', not starting with '.' or '-'");
         }
-        let id = self.ns_id(from)?;
+        let id = self.ns_id_now(from)?;
         if from == to {
             bail!("the folder {from:?} has that name already");
         }
@@ -654,14 +709,13 @@ impl MetaStore for SqliteStore {
     }
 
     fn chunk_dir(&mut self, ns: &str) -> Result<String> {
-        let dir: Option<String> = self
-            .conn
-            .query_row("SELECT dir FROM namespaces WHERE name = ?1", [ns], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .ok_or_else(|| anyhow!("no namespace {ns:?}"))?;
-        Ok(dir.unwrap_or_else(|| hex::encode(ns)))
+        let id = self.ns_id(ns)?;
+        let (dir, name): (Option<String>, String) = self.conn.query_row(
+            "SELECT dir, name FROM namespaces WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(dir.unwrap_or_else(|| hex::encode(name)))
     }
 
     fn former_names(&mut self, ns: &str) -> Result<Vec<String>> {
@@ -826,9 +880,9 @@ impl MetaStore for SqliteStore {
         let level: Option<String> = self
             .conn
             .prepare_cached(
-                "SELECT g.access FROM grants g
-                 JOIN namespaces n ON n.id = g.ns JOIN users u ON u.id = g.user
-                 WHERE n.name = ?1 AND u.name = ?2",
+                "SELECT g.access FROM grants g JOIN users u ON u.id = g.user
+                 WHERE u.name = ?2 AND g.ns = COALESCE((SELECT id FROM namespaces WHERE name = ?1),
+                                                       (SELECT ns FROM former_names WHERE name = ?1))",
             )?
             .query_row([ns, user], |r| r.get(0))
             .optional()?;

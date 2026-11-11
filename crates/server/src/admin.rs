@@ -57,7 +57,8 @@ pub enum TokenCommand {
 
 #[derive(Subcommand)]
 pub enum FolderCommand {
-    /// Add a folder, which nobody can reach until given access, here by --manager or by `grant`.
+    /// Add a folder, which nobody can reach until given access, here by --manager or by `grant`. A
+    /// user adds one of their own in the web, which they manage.
     Add {
         name: String,
         /// A user to manage it; may be given more than once.
@@ -71,7 +72,8 @@ pub enum FolderCommand {
         #[arg(long)]
         data: PathBuf,
     },
-    /// Rename a folder, with the server stopped, which reads the former names as it starts. Its
+    /// Rename a folder, with the server stopped, which reads the former names as it starts; while it
+    /// serves, a manager of the folder renames it through it, as in the web's folder settings. Its
     /// chunks stay where they are, and its former name goes on reaching it, so that every device, link
     /// and address made with it goes on working, and devices take the new name up as they next sync;
     /// no other folder may take the former name.

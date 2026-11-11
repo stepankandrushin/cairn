@@ -101,6 +101,7 @@ const ICONS = {
   file: ['M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z', 'M14 3v5h5'],
   link: ['M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1', 'M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1'],
   menu: ['M4 7h16M4 12h16M4 17h16'],
+  plus: ['M12 5v14M5 12h14'],
   more: ['M5.5 12h.01M12 12h.01M18.5 12h.01'],
   upload: ['M12 16V4M7 9l5-5 5 5M5 20h14'],
   download: ['M12 4v12M7 11l5 5 5-5M5 20h14'],
@@ -628,18 +629,29 @@ function renderSidebar(r) {
   if (r.ns) state.openFolder = r.ns;
   const folders = state.me.folders;
   const open = folders.some((f) => f.folder === state.openFolder) ? state.openFolder : folders[0]?.folder;
-  const items = [h('div', { class: 'nav-title', text: 'Folders' })];
+  const items = [h('div', { class: 'nav-title nav-title-row' },
+    h('span', { text: 'Folders' }),
+    h('button', { class: 'icon-btn nav-add', type: 'button', title: 'Add a folder', 'aria-label': 'Add a folder', onclick: act(addFolder) }, icon('plus')))];
   if (!folders.length) items.push(h('div', { class: 'nav-empty', text: 'No folder is yours yet' }));
   for (const f of folders) {
     const here = r.ns === f.folder;
+    const settings = `#/folder/${enc(f.folder)}`;
+    // The level opens the folder's settings, where what it allows is done; the rest of the row, its files.
+    const badge = h('span', {
+      class: `badge ${f.access} badge-link`,
+      text: f.access,
+      title: `${LEVEL_TEXT[f.access] || f.access}: this folder's settings`,
+      onclick: (ev) => { ev.preventDefault(); ev.stopPropagation(); location.hash = settings; },
+    });
     items.push(navLink(`#/f/${enc(f.folder)}/root`, [
-      icon('folder', 't-folder'), h('span', { class: 'nav-label', text: folderName(f.folder), title: f.name && f.name !== f.folder ? `Your name for the folder ${f.folder}` : undefined }), h('span', { class: `badge ${f.access}`, text: f.access }),
+      icon('folder', 't-folder'), h('span', { class: 'nav-label', text: folderName(f.folder), title: f.name && f.name !== f.folder ? `Your name for the folder ${f.folder}` : undefined }), badge,
     ], here && r.name === 'files'));
     if (f.folder === open) {
       const sub = (page, glyph, text) => navLink(`#/${page}/${enc(f.folder)}`, [icon(glyph), h('span', { class: 'nav-label', text })], here && r.name === page, true);
       items.push(sub('deleted', 'trash', 'Recently deleted'));
       items.push(sub('members', 'people', 'Members'));
       if (f.access === 'manage') items.push(sub('shares', 'link', 'Shares and links'));
+      items.push(sub('folder', 'settings', 'Folder settings'));
     }
   }
   items.push(h('div', { class: 'nav-title', text: 'Shared' }));
@@ -702,7 +714,8 @@ function parseRoute() {
     case 's': return a ? { name: 'sharedview', id: a, obj } : { name: 'shared' };
     case 'deleted':
     case 'members':
-    case 'shares': return a ? { name, ns: a } : { name: 'home' };
+    case 'shares':
+    case 'folder': return a ? { name, ns: a } : { name: 'home' };
     case 'shared': return { name: 'shared' };
     case 'settings': return { name: 'settings' };
     default: return { name: 'home' };
@@ -749,6 +762,7 @@ async function route() {
       case 'deleted': await renderDeleted(gen, r.ns); break;
       case 'members': await renderMembers(gen, r.ns); break;
       case 'shares': await renderShares(gen, r.ns); break;
+      case 'folder': renderFolder(gen, r.ns); break;
       case 'shared': await renderSharedList(gen); break;
       case 'settings': renderSettings(gen); break;
       default: break;
@@ -1871,6 +1885,171 @@ async function renderMembers(gen, ns) {
     manager ? addForm : h('p', { class: 'hint', text: 'Only a manager of this folder changes who has access.' })), `Members of ${folderName(ns)}`);
 }
 
+// ---------------------------------------------------------------- folders: added, renamed, their settings
+
+/** A folder's name on the server, as devices, links and paths use it (docs/protocol.md, "Names"). */
+const FOLDER_ID = /^(?![.-])[A-Za-z0-9._-]{1,64}$/;
+
+function folderIdProblem(id) {
+  if (!id) return 'The name on the server cannot be empty.';
+  if (!FOLDER_ID.test(id)) return 'The name on the server is 1 to 64 of the letters a to z, digits, “.”, “_” and “-”, and starts with neither “.” nor “-”.';
+  return null;
+}
+
+/** A user's own name for a folder: 1 to 64 characters, none a control character (docs/protocol.md, "Names"). */
+function ownNameProblem(name) {
+  if ([...name].length > 64) return 'Your name for it is longer than 64 characters.';
+  if (/\p{Cc}/u.test(name)) return 'Your name for it cannot hold a control character.';
+  return null;
+}
+
+const CYRILLIC = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l',
+  м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh',
+  щ: 'shch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya', і: 'i', ї: 'yi', є: 'ye', ґ: 'g', ў: 'u',
+};
+
+/** A name on the server made of what a person calls a folder: “Family photos” as family-photos. */
+function folderIdFor(name) {
+  let out = '';
+  for (const ch of name.normalize('NFC').toLowerCase()) {
+    if (/[a-z0-9._-]/.test(ch)) out += ch;
+    else if (Object.hasOwn(CYRILLIC, ch)) out += CYRILLIC[ch];
+    else out += ch.normalize('NFKD').replace(/[^a-z0-9]/g, '') || '-';
+  }
+  return out.replace(/-{2,}/g, '-').replace(/^[.-]+/, '').slice(0, 64).replace(/-+$/, '');
+}
+
+/** What the server said, as a sentence. */
+function said(e) {
+  const m = (e && e.message) || String(e);
+  return m.charAt(0).toUpperCase() + m.slice(1) + (/[.!?]$/.test(m) ? '' : '.');
+}
+
+/**
+ * A folder of its own on the server, which the user manages from then on: what they call it, and its
+ * name on the server, made of that until they change it.
+ */
+function addFolder() {
+  return new Promise((resolve) => {
+    let made = null;
+    let idTouched = false;
+    const nameInput = h('input', { type: 'text', class: 'text-input', maxlength: 64, autocomplete: 'off', placeholder: 'Family photos', 'aria-label': 'Name' });
+    const idInput = h('input', { type: 'text', class: 'text-input mono', maxlength: 64, spellcheck: 'false', autocomplete: 'off', placeholder: 'family-photos', 'aria-label': 'Name on the server' });
+    nameInput.addEventListener('input', () => { if (!idTouched) idInput.value = folderIdFor(nameInput.value); });
+    idInput.addEventListener('input', () => { idTouched = idInput.value !== ''; });
+    const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
+    const create = h('button', { class: 'btn primary', type: 'submit', form: 'add-folder' }, 'Add');
+    const fail = (text) => { err.textContent = text; err.hidden = false; };
+    const submit = async (ev) => {
+      ev.preventDefault();
+      err.hidden = true;
+      const name = nameInput.value.trim();
+      const folder = idInput.value.trim();
+      const problem = folderIdProblem(folder) || ownNameProblem(name);
+      if (problem) { fail(problem); return; }
+      create.disabled = true;
+      try {
+        await api.post('/v1/folders', name && name !== folder ? { folder, name } : { folder });
+        made = folder;
+        d.close();
+      } catch (e) {
+        if (e.status !== 401) fail(said(e));
+      } finally {
+        create.disabled = false;
+      }
+    };
+    const d = dialog({
+      title: 'Add a folder',
+      body: h('form', { id: 'add-folder', class: 'stack', onsubmit: submit },
+        h('p', { class: 'muted', text: 'A folder of its own on the server, which you manage: you sync it on your computers apart from your other folders, and say who else has it. A folder inside one is made with New folder above its files.' }),
+        h('label', { class: 'field' }, h('span', { text: 'Name' }), nameInput,
+          h('span', { class: 'hint', text: 'What you see it called. Yours alone: others see its name on the server, or a name of their own.' })),
+        h('label', { class: 'field' }, h('span', { text: 'Name on the server' }), idInput,
+          h('span', { class: 'hint', text: 'What devices, links and other people use: letters a to z, digits, “.”, “_” and “-”. It can be renamed later.' })),
+        err),
+      actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Cancel'), create],
+      onClose: () => resolve(made),
+    });
+    nameInput.focus();
+  }).then(async (folder) => {
+    if (!folder) return;
+    state.me = await api.get('/v1/me');
+    state.openFolder = folder;
+    toast(`Added the folder ${folder}, which you manage.`);
+    location.hash = `#/f/${enc(folder)}/root`;
+  });
+}
+
+/** A folder's own page: its name on the server, which a manager changes, the user's own name for it, and how to sync it. */
+function renderFolder(gen, ns) {
+  const f = state.me.folders.find((x) => x.folder === ns);
+  if (!f) throw new ApiError(404, `no folder "${ns}" for user "${state.me.user}"`);
+  const manager = f.access === 'manage';
+  let rename;
+  if (manager) {
+    const input = h('input', { type: 'text', class: 'grow mono', value: ns, maxlength: 64, spellcheck: 'false', autocomplete: 'off', 'aria-label': 'The folder\'s name on the server' });
+    const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
+    const button = h('button', { class: 'btn', type: 'submit' }, 'Rename');
+    const fail = (text) => { err.textContent = text; err.hidden = false; };
+    const submit = act(async (ev) => {
+      ev.preventDefault();
+      err.hidden = true;
+      const to = input.value.trim();
+      if (to === ns) return;
+      const problem = folderIdProblem(to);
+      if (problem) { fail(problem); return; }
+      const ok = await confirmDialog(`Rename ${ns} to ${to}`,
+        `For everyone who has it: their devices take ${to} up at their next sync. ${ns} goes on reaching it, so every device, link and address made with it goes on working, and no other folder can take that name. Whoever gave it a name of their own goes on seeing theirs.`,
+        { ok: 'Rename' });
+      if (!ok) return;
+      button.disabled = true;
+      try {
+        const r = await api.post(`/v1/ns/${enc(ns)}/rename`, { folder: to });
+        state.me = await api.get('/v1/me');
+        state.openFolder = r.folder;
+        toast(`The folder ${ns} is called ${r.folder} now.`);
+        location.hash = `#/folder/${enc(r.folder)}`;
+      } catch (e) {
+        if (e.status !== 401) fail(said(e));
+      } finally {
+        button.disabled = false;
+      }
+    });
+    rename = [
+      h('form', { class: 'form-row', onsubmit: submit }, input, button),
+      err,
+      h('p', { class: 'hint', text: 'Letters a to z, digits, “.”, “_” and “-”. Renamed, it answers to this name still, so nothing made with it breaks.' }),
+    ];
+  } else {
+    rename = h('p', { class: 'hint', text: 'Only a manager of this folder renames it.' });
+  }
+  const page = (p, text) => h('a', { class: 'btn subtle', href: `#/${p}/${enc(ns)}` }, text);
+  const command = `cairn init --server ${location.origin} --folder ${ns} <directory>`;
+  show(gen, h('section', { class: 'settings' },
+    h('div', { class: 'screen-head' }, h('h1', { text: folderName(ns) })),
+    h('div', { class: 'panel' },
+      h('h2', { text: 'Name on the server' }),
+      h('p', { class: 'muted' }, 'What devices, links and other people use: ', h('code', { text: ns }), '.'),
+      rename),
+    h('div', { class: 'panel' },
+      h('h2', { text: 'Your name for it' }),
+      h('p', { class: 'muted', text: 'What you see it called, wherever you sign in. Yours alone. Empty, you see its name on the server.' }),
+      ownNameForm(f, { label: false, onSaved: () => refresh() })),
+    h('div', { class: 'panel' },
+      h('h2', { text: 'Your access' }),
+      h('p', { class: 'access-line' }, h('span', { class: `badge ${f.access}`, text: f.access }), ' ', LEVEL_TEXT[f.access] || f.access, manager ? ': you say who else has it, and share what is in it.' : '.'),
+      h('div', { class: 'form-row' },
+        page('members', 'Members'),
+        manager && page('shares', 'Shares and links'),
+        page('deleted', 'Recently deleted'))),
+    h('div', { class: 'panel' },
+      h('h2', { text: 'Sync it on a computer' }),
+      h('p', { class: 'muted', text: 'Each folder is a root of its own on a computer. In a terminal there, with a token of yours in CAIRN_TOKEN or given by --token-file:' }),
+      h('pre', { class: 'command' }, h('code', { text: command })),
+      h('p', { class: 'hint' }, 'Then ', h('code', { text: 'cairn daemon --root <directory>' }), ' keeps it in sync.'))), folderName(ns));
+}
+
 async function renderShares(gen, ns) {
   const base = `/v1/ns/${enc(ns)}`;
   const r = await api.get(`${base}/shares`);
@@ -2014,31 +2193,34 @@ const DATE_WORDS = {
  * The user's own name for each folder of theirs, kept on the server, so it holds wherever they sign
  * in: emptied, or made the folder's name, they see the folder's name again.
  */
-function folderNames() {
-  const rows = state.me.folders.map((f) => {
-    const input = h('input', {
-      type: 'text', class: 'grow', value: f.name || '', placeholder: f.folder, maxlength: 64,
-      'aria-label': `Your name for the folder ${f.folder}`,
-    });
-    const save = act(async (ev) => {
-      ev.preventDefault();
-      const name = input.value.trim();
-      if (name === (f.name || '')) return;
-      if (!name || name === f.folder) {
-        await api.del(`/v1/ns/${enc(f.folder)}/name`);
-        f.name = undefined;
-      } else {
-        f.name = (await api.put(`/v1/ns/${enc(f.folder)}/name`, { name })).name;
-      }
-      input.value = f.name || '';
-      renderSidebar(parseRoute());
-      toast(f.name ? `You see ${f.folder} as “${f.name}” now.` : `You see ${f.folder} by its own name now.`);
-    });
-    return h('form', { class: 'form-row', onsubmit: save },
-      h('span', { class: 'folder-id mono', title: 'The folder\'s name, which devices, links and other people use', text: f.folder }),
-      input,
-      h('button', { class: 'btn', type: 'submit' }, 'Save'));
+function ownNameForm(f, { label = true, onSaved = null } = {}) {
+  const input = h('input', {
+    type: 'text', class: 'grow', value: f.name || '', placeholder: f.folder, maxlength: 64,
+    'aria-label': `Your name for the folder ${f.folder}`,
   });
+  const save = act(async (ev) => {
+    ev.preventDefault();
+    const name = input.value.trim();
+    if (name === (f.name || '')) return;
+    if (!name || name === f.folder) {
+      await api.del(`/v1/ns/${enc(f.folder)}/name`);
+      f.name = undefined;
+    } else {
+      f.name = (await api.put(`/v1/ns/${enc(f.folder)}/name`, { name })).name;
+    }
+    input.value = f.name || '';
+    renderSidebar(parseRoute());
+    if (onSaved) onSaved();
+    toast(f.name ? `You see ${f.folder} as “${f.name}” now.` : `You see ${f.folder} by its own name now.`);
+  });
+  return h('form', { class: 'form-row', onsubmit: save },
+    label && h('span', { class: 'folder-id mono', title: 'The folder\'s name, which devices, links and other people use', text: f.folder }),
+    input,
+    h('button', { class: 'btn', type: 'submit' }, 'Save'));
+}
+
+function folderNames() {
+  const rows = state.me.folders.map((f) => ownNameForm(f));
   return h('div', { class: 'panel' },
     h('h2', { text: 'Folder names' }),
     h('p', { class: 'muted', text: 'What you see each folder called, wherever you sign in. Yours alone: the folder keeps its name, which devices, links and other people use. Empty, you see that name.' }),

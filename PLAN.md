@@ -393,14 +393,18 @@ than answered.
 Each folder is its own namespace, so permissions are checked once per namespace and moving a share
 rewrites nothing: a user's own folder and a shared one differ only in who has access. A user has tokens,
 one per device, kept as their hashes, and a level in each folder given it: `read`, `write`, or `manage`,
-which is write and also saying who else has access, and never leaves a folder without a manager. No level is
+which is write and also saying who else has access and renaming the folder, and never leaves a folder without
+a manager. No level is
 no access, and the folder answers 404 as one that does not exist, so that nobody learns what is there by
 asking; too low a level answers 403. The server's administrator adds users, tokens and folders with
-`cairn-server` on the data directory, while it serves too, and a folder's managers change who has access
-through the API. A folder's name is what paths, devices, links and commands use, and a server's first is
-`cloud`, which `cairn init` joins as the only one its token reaches. The administrator renames one with the
-server stopped, its chunks left where they are, so a rename moves and copies nothing; the former name goes
-on reaching it and no other folder may take it, so nothing made with it breaks, and devices take the new
+`cairn-server` on the data directory, while it serves too; any user adds a folder of their own through the
+API, which they manage, and a folder's managers change who has access
+through it. A folder's name is what paths, devices, links and commands use, and a server's first is
+`cloud`, which `cairn init` joins as the only one its token reaches. Names are one space for the server, so a
+user asking for one that is taken learns that it is, and nothing more. A folder's managers rename it through
+the API while the server serves, and the administrator with it stopped; its chunks stay where they are, so a
+rename moves and copies nothing; the former name goes on reaching it and no other folder may take it, so
+nothing made with it breaks, what a request began by it goes on in the same folder, and devices take the new
 name up as they sync.
 Each user may also have their own name for a folder, which only they see and which changes nothing else:
 the name of the directory their first device syncs it into, until they choose another. The journal says whose token made each commit. A data directory's one token from before
@@ -458,7 +462,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck`, which the harness uses as an oracle | The harness runs in CI and finds no violation |
 | 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
 | 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal until this API holds it | GC under load never removes a reachable chunk |
-| 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite. Accounts came early, at the owner's asking: users, their tokens, folders as namespaces with read, write and manage access, sharing by a folder's managers, and read-only folders on the client, with their failure tests; OIDC, PostgreSQL and mounting a share into another root wait here |
+| 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite. Accounts came early, at the owner's asking: users, their tokens, folders as namespaces with read, write and manage access, sharing by a folder's managers, folders added by any user and renamed by their managers while the server serves, and read-only folders on the client, with their failure tests; OIDC, PostgreSQL and mounting a share into another root wait here |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API. Most of it came early, at the owner's asking: browsing, uploads, downloads and folders as zips, previews, history and restore, recently deleted, a folder's members, and shares with users and public links, each through endpoints any client may use, with failure tests for uploads killed or starved of disk; activity and the conflict inbox wait here |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3's run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open (`:`, `CON`, a trailing dot), refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5's accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3's devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. Installers wait here |
 | 8 | On-demand files (FUSE, File Provider, Cloud Files API), mobile | |

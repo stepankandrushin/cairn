@@ -130,9 +130,11 @@ one folder its token reaches, and with several asks which.
 
 A folder's name is what devices, links and commands use. Each user may also call it something of their
 own, which only they see in the web, `cairn folders` and wherever else it is named for them: the name of the
-directory their first device syncs it into, until they choose another in the web's Settings. Renamed on the
-server, with the server stopped, a folder still answers to its former name, so no device, link or bookmark
-made with it breaks, and each device takes the new name up at its next sync.
+directory their first device syncs it into, until they choose another in the web's Settings. Any user adds a
+folder of their own in the web, which they manage; a folder's managers rename it there, in its settings, while
+the server serves, and the administrator on the server with it stopped. Renamed, a folder still answers to its
+former name, so no device, link or bookmark made with it breaks, and each device takes the new name up at its
+next sync.
 
 ```sh
 # On the server, while it runs or not, but for a rename
@@ -146,7 +148,7 @@ cairn-server user list --data ~/cairn-data
 cairn-server revoke team bob --data ~/cairn-data
 cairn-server token list --data ~/cairn-data; cairn-server token remove <ID> --data ~/cairn-data
 cairn-server folder list --data ~/cairn-data     # each folder, its head, former names and who has access
-cairn-server folder rename team crew --data ~/cairn-data   # with the server stopped
+cairn-server folder rename team crew --data ~/cairn-data   # with the server stopped; or in the web
 
 # On a device: each folder is a root of its own
 cairn folders --server https://cairn.example --token-file bob.token
@@ -167,11 +169,12 @@ The server's address opens it in a browser. From a computer that syncs, the tray
 web` in a synced folder, opens it signed in as that device, with nothing to type; elsewhere, sign in with a
 token, which `cairn-server token add alice --label browser --data ~/cairn-data` makes. Each folder is there to browse, with uploads of files and folders,
 downloads of a file or of a folder as a zip, previews, a file's history with any revision restored, what was
-deleted brought back, who has access, and, for a folder's managers, shares of any file or folder in it: with
+deleted brought back, who has access, a page of its settings, and, for a folder's managers, its rename and
+shares of any file or folder in it: with
 another user of the server, to read or to write, or by a public link that needs no account, reads only and
 may expire. A change made there is a commit like any device's, refused rather than forced when something
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
-a user is seen in the web interface, not synced yet. Times are on a 24-hour clock, as `2026-11-11 09:50`;
+a user is seen in the web interface, not synced yet. The + beside Folders adds a folder of one's own. Times are on a 24-hour clock, as `2026-11-11 09:50`;
 its Settings choose a 12-hour clock or another order of the date, kept in that browser, and the user's own
 name for each folder, kept on the server. The endpoints are in
 docs/protocol.md, "Web".

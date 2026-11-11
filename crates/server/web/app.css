@@ -95,6 +95,9 @@ p { margin: 0 0 10px; }
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
   color: var(--muted); padding: 14px 10px 4px;
 }
+.nav-title-row { display: flex; align-items: center; justify-content: space-between; padding-right: 4px; }
+.nav-add { margin: -8px 0 -6px; }
+.nav-add .icon { width: 16px; height: 16px; }
 .nav-empty { color: var(--muted); padding: 4px 10px; font-size: 13px; }
 .nav-link {
   display: flex; align-items: center; gap: 8px;
@@ -117,6 +120,9 @@ p { margin: 0 0 10px; }
 }
 .badge.manage { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
 .badge.write { border-color: color-mix(in srgb, var(--folder) 55%, var(--line)); }
+.badge-link { cursor: pointer; }
+.access-line .badge { margin-left: 0; }
+.badge-link:hover { background: var(--hover); color: var(--text); }
 
 @media (max-width: 820px) {
   .menu-btn { display: inline-flex !important; }
@@ -205,6 +211,15 @@ label.check { display: inline-flex; align-items: center; gap: 8px; font-weight: 
 .form-row > .grow { flex: 1; min-width: 160px; }
 .folder-id { min-width: 6em; color: var(--muted); overflow-wrap: anywhere; }
 .form-error { color: var(--danger); margin: 8px 0 0; }
+.stack { display: flex; flex-direction: column; gap: 14px; }
+.stack > p { margin: 0; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field .hint { font-weight: 400; }
+pre.command {
+  margin: 8px 0; padding: 10px 12px; overflow-x: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
 .hint { color: var(--muted); font-size: 13px; }
 
 /* Sign-in */

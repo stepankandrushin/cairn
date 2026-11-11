@@ -88,11 +88,19 @@ pub struct ShareRow {
     pub expires: Option<i64>,
 }
 
+/// Each method that takes a namespace takes it by its name now or by a former one, which reaches it for
+/// good, so that what a server began by a name a rename then made former goes on where it began; but
+/// `namespace_exists`, `create_namespace`, `add_namespace`, `resolve_namespace` and `rename_namespace`
+/// mean the name now alone.
 pub trait MetaStore: Send {
     fn head(&mut self, ns: &str) -> Result<u64>;
+    /// Whether a namespace has this name now.
     fn namespace_exists(&mut self, ns: &str) -> Result<bool>;
     /// Makes the namespace if it is not there; refused for a name another one had, which reaches that.
     fn create_namespace(&mut self, ns: &str) -> Result<()>;
+    /// Makes a namespace with a user to manage it, and that user's own name for it if one is given,
+    /// all at once; refused for a name that is or was one's.
+    fn add_namespace(&mut self, ns: &str, manager: &str, own_name: Option<&str>) -> Result<()>;
     /// The namespace a name reaches, by its name now: the name itself, or what the namespace whose
     /// former name it is is called now. `None` for none.
     fn resolve_namespace(&mut self, name: &str) -> Result<Option<String>>;
@@ -607,12 +615,14 @@ pub mod suite {
         // Its chunks where they were, under the name it had.
         assert_eq!(s.chunk_dir("new").unwrap(), hex::encode("old"));
         assert_eq!(s.chunk_dir("taken").unwrap(), hex::encode("taken"));
-        assert!(
-            s.chunk_dir("old").is_err(),
-            "a former name has no chunks of its own"
-        );
         assert_eq!(s.head("new").unwrap(), head);
         assert_eq!(s.access("new", "erin").unwrap(), Some(Access::Write));
+        // What a server began by the former name goes on in the same namespace: its chunks, its head,
+        // who may do what there.
+        assert_eq!(s.chunk_dir("old").unwrap(), hex::encode("old"));
+        assert_eq!(s.head("old").unwrap(), head);
+        assert_eq!(s.access("old", "erin").unwrap(), Some(Access::Write));
+        assert_eq!(s.members("old").unwrap(), s.members("new").unwrap());
         assert_eq!(mine(s), ("new".into(), Some("Фото 2026".into())));
         assert!(s.create_namespace("old").is_err());
         assert!(s.rename_namespace("taken", "old").is_err());
@@ -631,5 +641,33 @@ pub mod suite {
         s.add_user("erin", 41).unwrap();
         s.set_access("old", "erin", Some(Access::Read)).unwrap();
         assert_eq!(mine(s), ("old".into(), None));
+
+        // A folder a user adds: theirs to manage, with their own name for it, all at once; no name
+        // that is or was a folder's, and nothing made of a refusal.
+        s.add_user("finn", 50).unwrap();
+        s.add_namespace("finns", "finn", Some("Finn's things"))
+            .unwrap();
+        assert_eq!(s.access("finns", "finn").unwrap(), Some(Access::Manage));
+        assert_eq!(s.head("finns").unwrap(), 0);
+        let finns = s.folders_of("finn").unwrap();
+        assert_eq!(finns.len(), 1, "{finns:?}");
+        assert_eq!(finns[0].name.as_deref(), Some("Finn's things"));
+        s.add_namespace("plain", "finn", None).unwrap();
+        assert_eq!(s.folders_of("finn").unwrap()[1].name, None);
+        let before = s.namespaces().unwrap();
+        for (ns, user, name) in [
+            ("finns", "finn", None),
+            ("new", "finn", None),
+            ("bad name", "finn", None),
+            ("ok", "nobody", None),
+            ("ok", "finn", Some(" padded")),
+        ] {
+            assert!(
+                s.add_namespace(ns, user, name).is_err(),
+                "{ns:?} {user:?} {name:?}"
+            );
+        }
+        assert_eq!(s.namespaces().unwrap(), before);
+        assert_eq!(s.access("new", "finn").unwrap(), None);
     }
 }

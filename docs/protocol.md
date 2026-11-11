@@ -27,6 +27,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | Method and path | Body | Answer |
 |---|---|---|
 | `GET /v1/me` | | `{user, folders: [{folder, access, name?}]}`: whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)) |
+| `POST /v1/folders` | `{folder, name?}` | 201 `{folder, access, name?}`: a new namespace, which the caller manages, with `name` as their own name for it, all at once ([Names](#names)). 400: no such name. 409: the name is or was another namespace's, of which the answer says nothing more |
 | `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups, folder}`: `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups`, absent before them, says that a note may name more objects than one. `folder`, absent before renaming, is the namespace's name now, which a client that asked by a former one takes up ([Names](#names)) |
 | `POST /chunks/missing` | `{hashes}` | `{hashes}`: those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
 | `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept. Needs `write` |
@@ -39,6 +40,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `DELETE /access/{user}` | | 204: that user has no access here now. Needs `manage`. 404: no such user, or it had none. 409: as for `PUT` |
 | `PUT /name` | `{name, if_none?}` | `{name}`: the caller's own name for the namespace now ([Names](#names)). With `if_none`, set only if they have none. 400: no such name |
 | `DELETE /name` | | 204: the caller has no name of their own for it now |
+| `POST /rename` | `{folder}` | `{folder}`: the namespace's name now, for everyone who has it ([Names](#names)). Needs `manage`. 400: no such name. 409: as for `POST /v1/folders`; its own former name it may take back |
 
 401 means a missing or wrong token, 404 an unknown namespace or one the token has no access to, alike, 403
 a level too low for the request, and 507 a full disk on the server; in each case nothing changed.
@@ -52,7 +54,7 @@ each namespace given it, each level holding the one before:
 |---|---|
 | `read` | Read the tree, its chunks, the journal and the conflict inbox, and who has access |
 | `write` | Also upload chunks and commit |
-| `manage` | Also give other users a level here, or take it away |
+| `manage` | Also give other users a level here, or take it away, and rename the namespace |
 
 No level is no access: the namespace answers 404, word for word as one that does not exist. What a user may
 do is looked up on every request, so a change holds from the next one, and a device whose access went keeps
@@ -63,11 +65,13 @@ what it holds. A client that learns from `Info.access` that it may only read sen
 
 A namespace's name is what every path, device and link uses: 1 to 64 of ASCII letters, digits, `.`, `_`
 and `-`, not starting with `.` or `-`. A server's first is `cloud`; one made before this release has
-`default`. Its administrator renames one with the server stopped, `cairn-server folder rename`, as the
-server reads the former names when it starts; nothing of its tree or chunks moves (format.md). The former
-name goes on reaching it, for paths of every
-kind, so every device, link and address made with it goes on working, and no other namespace may take it.
-`Info.folder` says the name now, and a client keeps the one it is told from then on.
+`default`. Any user adds one, `POST /v1/folders`, which they manage and nobody else reaches until given
+access; its name is no other's, and the answer to one that is says only that. Its managers rename it while the
+server serves, `POST /rename`, and its administrator with the server stopped, `cairn-server folder rename`;
+nothing of its tree or chunks moves (format.md). The former name goes on reaching it, for paths of every
+kind, so every device, link and address made with it goes on working, and no other namespace may take it;
+a request begun by it as the rename is made goes on in the same namespace. `Info.folder` says the name now,
+and a client keeps the one it is told from then on.
 
 Each user may also have their own name for a namespace, which only they see, in place of its name: 1 to 64
 characters of any script, no control character, and no space at either end. A device offers the name of the

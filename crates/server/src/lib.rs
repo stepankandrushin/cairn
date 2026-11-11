@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use cairn_protocol::wire::{
-    self, Access, ChangesResponse, CommitRequest, FolderName, Grant, HashList, Info, Me, Member,
-    MAX_CHUNK_BATCH_BYTES,
+    self, Access, ChangesResponse, CommitRequest, FolderAccess, FolderName, FolderRename, Grant,
+    HashList, Info, Me, Member, NewFolder, MAX_CHUNK_BATCH_BYTES,
 };
 use cairn_store::{is_disk_full, token_hash, ChunkStore, Repo};
 use clap::{Parser, Subcommand};
@@ -38,9 +38,12 @@ struct App {
     commits: tokio::sync::watch::Sender<u64>,
     /// Set when the server is stopping, so that no waiting request holds the shutdown up.
     closing: tokio::sync::watch::Sender<bool>,
-    /// Each renamed namespace's former names, and its name now: a rename is made with the server
-    /// stopped (`cairn-server folder rename`), so what it starts with holds while it serves.
-    former: std::collections::HashMap<String, String>,
+    /// Each renamed namespace's former names, and its name now: read as the server starts, and kept so
+    /// by each rename it makes. `cairn-server folder rename` is refused while it serves.
+    former: std::sync::RwLock<std::collections::HashMap<String, String>>,
+    /// Held by each rename and each namespace added, one at a time, so that a name found free is still
+    /// free when it is taken, and the names in memory follow the database's in its order.
+    naming: std::sync::Mutex<()>,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -51,14 +54,17 @@ struct AskedAs(String);
 /// chosen, so that every handler, the chunks and the journal see the one name; what it was asked by
 /// is kept, for an answer that says so.
 async fn by_name_now(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
-    if app.former.is_empty() {
-        return next.run(req).await;
-    }
     let Some(rest) = req.uri().path().strip_prefix("/v1/ns/").map(str::to_string) else {
         return next.run(req).await;
     };
     let asked = rest.split('/').next().unwrap_or_default();
-    let Some(now) = app.former.get(asked) else {
+    let now = app
+        .former
+        .read()
+        .expect("a panic aborts the process")
+        .get(asked)
+        .cloned();
+    let Some(now) = now else {
         return next.run(req).await;
     };
     let mut path = format!("/v1/ns/{now}{}", &rest[asked.len()..]);
@@ -296,6 +302,129 @@ async fn clear_name(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// What a name that is taken is answered with: not whose, nor what that folder is called now, which
+/// someone with no access to it learns nothing of.
+fn name_taken(name: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        format!("the name {name:?} is taken by another folder, now or before: pick another"),
+    )
+        .into_response()
+}
+
+fn bad_folder_name(name: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("{name:?} is no folder name: 1 to 64 of ASCII letters, digits, '.', '_' and '-', not starting with '.' or '-'"),
+    )
+        .into_response()
+}
+
+/// A folder the caller adds, which they manage, and their own name for it if they give one, all at
+/// once: a name that is or was any folder's is refused.
+async fn add_folder(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<NewFolder>,
+) -> ApiResult<Response> {
+    if !wire::valid_account_name(&body.folder) {
+        return Ok(bad_folder_name(&body.folder));
+    }
+    if body
+        .name
+        .as_deref()
+        .is_some_and(|n| !wire::valid_folder_name(n))
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "a name for a folder is 1 to 64 characters, no control character, and no space at either end",
+        )
+            .into_response());
+    }
+    let user = caller.user;
+    blocking(move || {
+        let _one = app.naming.lock().expect("a panic aborts the process");
+        if app
+            .repo
+            .with_meta(|m| m.resolve_namespace(&body.folder))?
+            .is_some()
+        {
+            return Ok(name_taken(&body.folder));
+        }
+        app.repo
+            .with_meta(|m| m.add_namespace(&body.folder, &user, body.name.as_deref()))?;
+        Ok((
+            StatusCode::CREATED,
+            Json(FolderAccess {
+                folder: body.folder,
+                access: Access::Manage,
+                name: body.name,
+            }),
+        )
+            .into_response())
+    })
+    .await
+}
+
+/// A manager renames the namespace for everyone who has it, while the server serves. As
+/// `cairn-server folder rename` does: one transaction, its chunks left where they are, its former name
+/// reaching it from then on, and no other folder ever taking that name. What was begun by the former
+/// name goes on in the same namespace (`MetaStore`'s names), and what the server keeps by name, the
+/// index of what is deleted and the web's uploads, follows it.
+async fn rename_folder(
+    State(app): State<Arc<App>>,
+    Extension(caller): Extension<Caller>,
+    Extension(allowed): Extension<Allowed>,
+    Path(ns): Path<String>,
+    Json(body): Json<FolderRename>,
+) -> ApiResult<Response> {
+    if allowed.0 < Access::Manage {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            format!(
+                "only a manager of folder {ns:?} renames it, and user {:?} is not one",
+                caller.user
+            ),
+        )
+            .into_response());
+    }
+    let to = body.folder;
+    if !wire::valid_account_name(&to) {
+        return Ok(bad_folder_name(&to));
+    }
+    if to == ns {
+        return Ok(Json(FolderRename { folder: to }).into_response());
+    }
+    blocking(move || {
+        let _one = app.naming.lock().expect("a panic aborts the process");
+        // Its own former name is its to take back.
+        if app
+            .repo
+            .with_meta(|m| m.resolve_namespace(&to))?
+            .is_some_and(|now| now != ns)
+        {
+            return Ok(name_taken(&to));
+        }
+        app.repo.rename_namespace(&ns, &to)?;
+        // As the database has it now: what reached `ns` reaches `to`, and `ns` does too, while `to` is
+        // a name now, no former one.
+        {
+            let mut former = app.former.write().expect("a panic aborts the process");
+            for now in former.values_mut() {
+                if *now == ns {
+                    now.clone_from(&to);
+                }
+            }
+            former.remove(&to);
+            former.insert(ns.clone(), to.clone());
+        }
+        app.deleted.renamed(&ns, &to);
+        app.uploads.renamed(&ns, &to);
+        Ok(Json(FolderRename { folder: to }).into_response())
+    })
+    .await
+}
+
 /// Who the token is, and every namespace it may reach: what a client offers to sync.
 async fn me(
     State(app): State<Arc<App>>,
@@ -391,7 +520,12 @@ async fn commit(
         return Ok(r);
     }
     let repo = app.clone();
-    let result = blocking(move || repo.repo.commit(&ns, &req, now(), Some(&caller.user))).await?;
+    let result = blocking(move || {
+        // Its namespace's name found and its access checked, its commit not begun.
+        cairn_failpoint::hit("server.commit.received");
+        repo.repo.commit(&ns, &req, now(), Some(&caller.user))
+    })
+    .await?;
     // Durable by now, so a device that wakes reads it. A retried commit wakes them for nothing.
     app.commits.send_modify(|n| *n = n.wrapping_add(1));
     // The acknowledgement goes out only now that the commit is durable.
@@ -554,12 +688,14 @@ fn router(app: Arc<App>) -> Router {
         .route("/access", get(members))
         .route("/access/{user}", put(grant).delete(revoke))
         .route("/name", put(set_name).delete(clear_name))
+        .route("/rename", post(rename_folder))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
         .merge(web::namespace_routes())
         .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .with_state(app.clone());
     let routes = Router::new()
         .route("/v1/me", get(me))
+        .route("/v1/folders", post(add_folder))
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .merge(web::user_routes(&app))
@@ -759,7 +895,8 @@ async fn serve(
         link_url,
         commits: tokio::sync::watch::channel(0).0,
         closing: tokio::sync::watch::channel(false).0,
-        former,
+        former: std::sync::RwLock::new(former),
+        naming: std::sync::Mutex::new(()),
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();

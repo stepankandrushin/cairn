@@ -99,6 +99,21 @@ pub struct FolderName {
     pub if_none: bool,
 }
 
+/// The body of `POST /v1/folders`: a namespace to make, which the caller manages from then on, and
+/// their own name for it, if they give one. The answer is the namespace as `GET /v1/me` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewFolder {
+    pub folder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The body of `POST /v1/ns/{ns}/rename`, the namespace's name to be, and its answer, the name now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderRename {
+    pub folder: String,
+}
+
 /// A user's own name for a folder: 1 to 64 characters, none of them a control character, and no space
 /// at either end. Any script, as it is shown, never used as a path or in a URL.
 pub fn valid_folder_name(name: &str) -> bool {

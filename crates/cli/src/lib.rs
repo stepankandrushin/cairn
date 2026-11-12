@@ -346,6 +346,7 @@ enum UpdateCommand {
 #[derive(clap::Args)]
 struct FeedArgs {
     /// Another feed, for this run only: the URL or path of an update.json, to try a release first.
+    /// Several, comma-separated, are asked in order until one answers.
     #[arg(long)]
     feed: Option<String>,
     /// A key that feed is signed with, base64, in place of the build's; may be given more than once.
@@ -1389,19 +1390,32 @@ fn update_command(what: UpdateCommand) -> Result<u8> {
                 outln!("{} {v}: {}", p.name, p.path.display());
             }
             let settings = update::settings()?;
-            match update::feed(&settings) {
-                Some(f) => outln!("updates: {}, from {f}", status.policy.name()),
-                None => outln!(
+            let feeds = update::feeds(&settings);
+            if feeds.is_empty() {
+                outln!(
                     "updates: {}, but this build names no feed and the settings none, so nothing updates it",
                     status.policy.name()
-                ),
+                );
+            } else {
+                outln!(
+                    "updates: {}, from {}",
+                    status.policy.name(),
+                    feeds.join(", or if it does not answer ")
+                );
             }
             if status.checked > 0 {
                 outln!(
-                    "last asked: {}, latest {}",
+                    "last asked: {}, latest {}{}",
                     date_time(status.checked),
-                    status.latest.as_deref().unwrap_or("?")
+                    status.latest.as_deref().unwrap_or("?"),
+                    match &status.answered {
+                        Some(f) if feeds.len() > 1 => format!(", from {f}"),
+                        _ => String::new(),
+                    }
                 );
+                if let Some(why) = &status.unanswered {
+                    outln!("not answered then: {why}");
+                }
             } else {
                 outln!("last asked: never");
             }
@@ -1520,6 +1534,11 @@ fn report_update(
     status: &cairn_protocol::update::Status,
 ) -> Result<u8> {
     use cairn_engine::update::Outcome;
+    if let (Some(why), Some(by)) = (&status.unanswered, &status.answered) {
+        if !matches!(outcome, Outcome::NoFeed | Outcome::Busy) {
+            outln!("{why}; {by} answered instead");
+        }
+    }
     match outcome {
         Outcome::NoFeed => bail!(
             "this build names no feed to update from, and the settings none: --feed names one"

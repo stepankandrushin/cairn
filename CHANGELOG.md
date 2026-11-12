@@ -21,6 +21,13 @@
 
 **Changed:**
 
+- Updates come from cairn.storage, where each release's files are, with its downloads page
+  (https://cairn.storage/download/), and from GitHub's latest release only when that does not answer. `cairn
+  update` says which feed answered, and what the one before it said when it did not, so a fallback never hides
+  a feed that is down. Several feeds, comma-separated, are asked in order wherever one is named: a build's
+  `CAIRN_UPDATE_FEED`, `update-settings.json`'s `feed`, `--feed`. A release's `update.json` names its files
+  beside it, so the one signed file serves from either; copies of 0.1.17 and before, which ask GitHub alone,
+  take this release there.
 - In the web's file list and on Shared with me, a click anywhere in the name's cell opens the item: its icon and
   the space around and beside the name too, where only the name itself did.
 

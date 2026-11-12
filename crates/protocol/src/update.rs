@@ -175,7 +175,7 @@ pub struct Settings {
     #[serde(default)]
     pub policy: Policy,
     /// Another feed, the URL of an `update.json`: for a build of one's own, or to try a release before
-    /// it is published.
+    /// it is published. Several, comma-separated, are asked in order, as the build's are.
     #[serde(default)]
     pub feed: Option<String>,
     /// The keys that feed is signed with, base64. With a feed, they replace the build's own.
@@ -194,6 +194,13 @@ pub struct Status {
     pub checked: Secs,
     #[serde(default)]
     pub latest: Option<String>,
+    /// The feed that answered then, the first of those named that gave a release a trusted key signed,
+    /// and what each one asked before it said instead: a later feed is a fallback, so this says the first
+    /// is down rather than leaving it unseen.
+    #[serde(default)]
+    pub answered: Option<String>,
+    #[serde(default)]
+    pub unanswered: Option<String>,
     /// A release newer than what is installed here, which is not installed: why is in `waits`.
     #[serde(default)]
     pub available: Option<String>,

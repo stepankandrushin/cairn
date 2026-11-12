@@ -327,8 +327,9 @@ this user's updater on this device knows, the same in every daemon's status, and
 
 ## Updates
 
-In `cairn_protocol::update`. A release is published with `update.json`, which a feed URL names, for a GitHub
-release `https://github.com/<owner>/<repo>/releases/latest/download/update.json`:
+In `cairn_protocol::update`. A release is published with `update.json`, which a feed URL names: a site's folder,
+for this project's `https://cairn.storage/download/update.json`, or a GitHub release's latest download,
+`https://github.com/<owner>/<repo>/releases/latest/download/update.json`, where this project mirrors it:
 
 ```json
 { "release": "<the release, as JSON text>",
@@ -340,12 +341,16 @@ can change what is checked, and a signature made with the key for anything else 
 release, `{ version, protocol, published, notes, files: [{ program, platform, form, url, size, sha256 }] }`, names
 each program (`cairn`, `cairn-tray`) for each platform (`linux-x86_64`, `windows-x86_64`, `macos-aarch64`,
 `macos-x86_64` or `macos-universal`, which serves either Mac) as `binary`, the executable itself, or `app`, a
-gzipped tar holding one macOS bundle; a `url` that is not absolute is beside `update.json`. A version is numbers
-with dots and perhaps a `-` tag, which comes before the same numbers without one.
+gzipped tar holding one macOS bundle; a `url` that is not absolute is beside `update.json`, wherever that was
+fetched from, so one signed file serves from every feed that has the files beside it, as this project's releases
+do. A version is numbers with dots and perhaps a `-` tag, which comes before the same numbers without one.
 
-A build trusts the keys it was built with (`CAIRN_UPDATE_KEYS`) and asks the feed it was built with
-(`CAIRN_UPDATE_FEED`); `update-settings.json` in the user dir can name another feed and its keys, and holds the
-`policy`: `auto` (the default), `notify` or `off`. A file that does not parse is an error, never written over. One
+A build trusts the keys it was built with (`CAIRN_UPDATE_KEYS`) and asks the feeds it was built with
+(`CAIRN_UPDATE_FEED`, comma-separated), in order: the first that answers with a release a trusted key signed is
+the one used, its files downloaded beside it, and what each one before it said instead is kept and logged, so a
+fallback never hides a feed that is down; when none answers, the error says what each did. This project's builds
+ask cairn.storage, then GitHub. `update-settings.json` in the user dir can name other feeds and their keys, and
+holds the `policy`: `auto` (the default), `notify` or `off`. A file that does not parse is an error, never written over. One
 updater runs at a time, under `update.lock` in the user dir: a daemon's, about once an hour, give or take a
 tenth, and a person's `cairn update now`, which waits for another. It installs a release only if one of the trusted
 keys signed it, its version is above what is installed, it was not taken back on this device (unless a person
@@ -363,7 +368,8 @@ folder, or `Cairn.app` beside the bundle `cairn` is in on macOS):
    renamed but not replaced: a kill between the two leaves no program at the path and the old one whole as the
    previous, which whatever runs the daemon can put back.
 
-`update-state.json` in the user dir holds what it found (`checked`, `latest`, `available` and why it `waits`,
+`update-state.json` in the user dir holds what it found (`checked`, `latest`, the feed that `answered` and what
+those before it said, `unanswered`, `available` and why it `waits`,
 `installed` and when, the last `error` and since when, the versions `rejected` here), which is the status's
 `update`, and the version on probation. A daemon whose program has been replaced, by an update or a person,
 restarts into the new one between syncs: on Unix in the same process, by exec, and on Windows by exiting with 75

@@ -94,6 +94,10 @@ These outrank features and speed, and each has failure tests in `crates/harness`
 
 ## Try it
 
+Each release's files are at [cairn.storage/download](https://cairn.storage/download/), each with its SHA-256,
+and the same in [GitHub's releases](https://github.com/stepankandrushin/cairn/releases). Or build it (Build and
+test, below).
+
 ```sh
 # The server
 cairn-server init --data ~/cairn-data
@@ -285,8 +289,9 @@ router, not on the Mac's own network, needs no permission.
 
 ## Updates
 
-A release build keeps itself up to date. Each daemon asks its release's feed about once an hour, and when there
-is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
+A release build keeps itself up to date. Each daemon asks about once an hour for the latest release, at
+cairn.storage, or at GitHub's latest release when that does not answer (`cairn update` says which did), and when
+there is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
 it between syncs; the tray installed beside `cairn` is updated with it and restarts too. No permission is asked
 again: macOS keeps them for a signature by the same team, which every release has, and Windows by the path, which
 does not change.
@@ -309,7 +314,8 @@ not yours to write, as for a `/usr/local/bin` owned by root, `cairn update` says
 installs it; the daemons restart into it.
 
 A build of your own names no feed and is never updated by anyone's releases. To update it from releases of your
-own, build with `CAIRN_UPDATE_FEED` (the URL of your `update.json`) and `CAIRN_UPDATE_KEYS` (your public keys), or
+own, build with `CAIRN_UPDATE_FEED` (the URL of your `update.json`, or several comma-separated, asked in order) and
+`CAIRN_UPDATE_KEYS` (your public keys), or
 name them in `update-settings.json` beside the registry of roots (`feed`, `keys`); `cairn-release` (crates/release)
 makes the key and signs the file, and docs/protocol.md has its format.
 

@@ -39,9 +39,9 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The feed a release build asks, and the public keys its releases are signed with, comma-separated:
-/// given by whoever builds it. scripts/release.sh insists on both, or on `CAIRN_UPDATE=off`. A build
-/// without them updates only from a feed its settings name.
+/// The feeds a release build asks, in order, and the public keys its releases are signed with, each
+/// list comma-separated: given by whoever builds it. scripts/release.sh insists on both, or on
+/// `CAIRN_UPDATE=off`. A build without them updates only from a feed its settings name.
 const BUILT_FEED: Option<&str> = option_env!("CAIRN_UPDATE_FEED");
 const BUILT_KEYS: Option<&str> = option_env!("CAIRN_UPDATE_KEYS");
 
@@ -437,17 +437,33 @@ pub fn status() -> Result<Status> {
 // --- The feed ---
 
 struct Source {
-    feed: String,
+    /// In the order they are asked: the first that answers with a release a trusted key signed is the
+    /// one its files are downloaded beside, and the rest are a fallback for when it does not.
+    feeds: Vec<String>,
     keys: Vec<String>,
 }
 
+/// The feeds a setting names: one URL or path, or several comma-separated, asked in that order.
+fn feeds_of(setting: &str) -> Vec<String> {
+    setting
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 fn source(settings: &Settings, opts: &Options) -> Result<Option<Source>> {
-    let feed = opts
+    let feeds = opts
         .feed
         .clone()
         .or_else(|| settings.feed.clone())
-        .or_else(|| BUILT_FEED.filter(|f| !f.is_empty()).map(String::from));
-    let Some(feed) = feed else { return Ok(None) };
+        .or_else(|| BUILT_FEED.map(String::from))
+        .map(|f| feeds_of(&f))
+        .unwrap_or_default();
+    if feeds.is_empty() {
+        return Ok(None);
+    }
     let built = || -> Vec<String> {
         BUILT_KEYS
             .unwrap_or("")
@@ -465,17 +481,44 @@ fn source(settings: &Settings, opts: &Options) -> Result<Option<Source>> {
         built()
     };
     if keys.is_empty() {
-        bail!("no key to check {feed}'s signature with: this build trusts none, and the settings name none");
+        bail!(
+            "no key to check {}'s signature with: this build trusts none, and the settings name none",
+            feeds.join(", ")
+        );
     }
-    Ok(Some(Source { feed, keys }))
+    Ok(Some(Source { feeds, keys }))
 }
 
-/// The feed this user's programs here are updated from: the settings', or else the build's.
-pub fn feed(settings: &Settings) -> Option<String> {
+/// The feeds this user's programs here are updated from, in the order they are asked: the settings', or
+/// else the build's.
+pub fn feeds(settings: &Settings) -> Vec<String> {
     settings
         .feed
         .clone()
-        .or_else(|| BUILT_FEED.filter(|f| !f.is_empty()).map(String::from))
+        .or_else(|| BUILT_FEED.map(String::from))
+        .map(|f| feeds_of(&f))
+        .unwrap_or_default()
+}
+
+/// The release of the first of the feeds that answers with one a trusted key signed, and that feed. What
+/// each one before it said is kept in the status, which `cairn update` shows and a daemon says once, so a
+/// fallback is never what hides a feed that is down; when none answers, the error says what each did.
+fn ask(source: &Source, status: &mut Status) -> Result<(String, Release)> {
+    let mut failed = Vec::new();
+    for feed in &source.feeds {
+        let mut bytes = Vec::new();
+        let got = fetch(feed, MAX_FEED, &mut bytes)
+            .and_then(|_| verify(&bytes, &source.keys).with_context(|| format!("{feed} answered")));
+        match got {
+            Ok(release) => {
+                status.answered = Some(feed.clone());
+                status.unanswered = (!failed.is_empty()).then(|| failed.join("; "));
+                return Ok((feed.clone(), release));
+            }
+            Err(e) => failed.push(format!("{e:#}")),
+        }
+    }
+    bail!("{}", failed.join("; "))
 }
 
 /// Where `url` is, relative to the feed's own URL or path when it is not absolute.
@@ -670,9 +713,7 @@ fn attempt(
     probation: &mut Option<Probation>,
     log: &mut dyn FnMut(&str),
 ) -> Result<Outcome> {
-    let mut bytes = Vec::new();
-    fetch(&source.feed, MAX_FEED, &mut bytes)?;
-    let release = verify(&bytes, &source.keys)?;
+    let (feed, release) = ask(source, status)?;
     status.checked = now_secs();
     status.latest = Some(release.version.clone());
     let new = Version::parse(&release.version).expect("verify parsed it");
@@ -762,7 +803,7 @@ fn attempt(
             t.from,
             t.program.path.display()
         ));
-        let url = resolve(&source.feed, &t.file.url);
+        let url = resolve(&feed, &t.file.url);
         install(&t.program, &t.file, &url, &version)
             .with_context(|| format!("{} is still {}", t.program.name, t.from))?;
     }
@@ -1295,6 +1336,7 @@ impl Worker {
             };
             let mut next = Instant::now() + jittered(tuned("update.first_secs", FIRST_SECS));
             let mut said_error: Option<String> = None;
+            let mut said_unanswered: Option<String> = None;
             let mut said_found: Option<String> = None;
             let note = |line: String| {
                 s.notes.lock().unwrap_or_else(|e| e.into_inner()).push(line);
@@ -1348,6 +1390,18 @@ impl Worker {
                         match result {
                             Ok((outcome, st)) => {
                                 said_error = None;
+                                // A feed passed over for the next is said when it starts and when it
+                                // ends, not at every check.
+                                if st.unanswered != said_unanswered {
+                                    let by = st.answered.as_deref().unwrap_or("another");
+                                    note(match &st.unanswered {
+                                        Some(why) => {
+                                            format!("update: {why}; {by} answered instead")
+                                        }
+                                        None => format!("update: {by} answers again"),
+                                    });
+                                    said_unanswered = st.unanswered.clone();
+                                }
                                 match &outcome {
                                     Outcome::Installed(v) => note(format!(
                                         "update: installed {v}; restarting into it between syncs"

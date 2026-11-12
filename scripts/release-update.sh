@@ -5,15 +5,16 @@
 #   Cairn-Sync-<v>-macos-<arch>.app.tar.gz and Cairn-<v>-macos-<arch>.app.tar.gz, arch universal, aarch64
 #   or x86_64.
 # Needs CAIRN_UPDATE_SIGNING_KEY, the secret of a key the release was built to trust, which is checked
-# against CAIRN_UPDATE_KEYS here, and CAIRN_RELEASE_URL, where the release's files are downloaded from,
-# each by its name: for a GitHub release https://github.com/<owner>/<repo>/releases/download/v<version>.
+# against CAIRN_UPDATE_KEYS here. Each file is named beside update.json, wherever that is fetched from, so
+# the one signed update.json serves from every feed a build asks: a site's folder, or a GitHub release's
+# latest download, https://github.com/<owner>/<repo>/releases/latest/download/update.json. CAIRN_RELEASE_URL,
+# if given, names one place the files are downloaded from instead, each by its name under it.
 # CAIRN_RELEASE_NOTES, a URL, is shown to people.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 : "${CAIRN_UPDATE_SIGNING_KEY:?the signing key, base64 PKCS#8}"
 : "${CAIRN_UPDATE_KEYS:?the public keys the release trusts}"
-: "${CAIRN_RELEASE_URL:?where the files of the release are downloaded from}"
 files=()
 add() {
     if [[ -f dist/$2 ]]; then
@@ -32,7 +33,11 @@ if [[ ${#files[@]} -eq 0 ]]; then
     exit 1
 fi
 cargo build --release --locked -p cairn-release
-target/release/cairn-release sign --version "$version" --base-url "$CAIRN_RELEASE_URL" \
+base=()
+if [[ -n ${CAIRN_RELEASE_URL-} ]]; then
+    base=(--base-url "$CAIRN_RELEASE_URL")
+fi
+target/release/cairn-release sign --version "$version" "${base[@]}" \
     --notes "${CAIRN_RELEASE_NOTES-}" --out dist/update.json "${files[@]}"
 keys=()
 IFS=, read -ra trusted <<<"$CAIRN_UPDATE_KEYS"

@@ -951,3 +951,143 @@ fn a_release_comes_over_http_through_a_redirect() {
     );
     assert!(!r.ok() && r.stderr.contains("answered 404"), "{}", r.text());
 }
+
+/// An address nothing listens on, as a site that is down.
+fn closed_feed() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}/update.json", listener.local_addr().unwrap())
+}
+
+#[test]
+fn a_feed_that_does_not_answer_is_passed_over_for_the_next_and_said() {
+    // The first is down: the release comes from the second, and what the first did is kept and shown.
+    let lab = Lab::new("update-fallback");
+    lab.publish_new();
+    let closed = closed_feed();
+    let feeds = format!("{closed},{}", lab.feed());
+    let r = lab
+        .cairn(
+            &["update", "now", "--feed", &feeds, "--key", &lab.key.public],
+            &[],
+        )
+        .expect_ok();
+    assert!(
+        r.stdout.contains(&format!("installed {VERSION}"))
+            && r.stdout.contains(&format!("{closed}: cannot be reached")),
+        "{}",
+        r.text()
+    );
+    assert_eq!(lab.installed(), program_bytes(true));
+    let state = lab.state();
+    assert_eq!(state["answered"], lab.feed(), "{state}");
+    assert!(
+        state["unanswered"]
+            .as_str()
+            .is_some_and(|u| u.contains(&closed)),
+        "{state}"
+    );
+    let status = lab.cairn(&["update"], &[]).expect_ok();
+    assert!(
+        status.stdout.contains("not answered then:") && status.stdout.contains(&closed),
+        "{}",
+        status.text()
+    );
+
+    // The first answers with a release no trusted key signed, a file of its own beside it: the
+    // second's release is installed, with the second's file, never the first's.
+    let lab = Lab::new("update-fallback-forged");
+    lab.publish_new();
+    let mirror = lab.sandbox.path("mirror");
+    std::fs::create_dir_all(&mirror).unwrap();
+    let good: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(lab.feed()).unwrap()).unwrap();
+    let forged = Key::new().sign(good["release"].as_str().unwrap());
+    let forged_feed = mirror.join("update.json");
+    std::fs::write(&forged_feed, forged.to_string()).unwrap();
+    std::fs::write(mirror.join("cairn-new"), b"not the release's program").unwrap();
+    let forged_feed = forged_feed.to_str().unwrap().to_string();
+    let feeds = format!("{forged_feed},{}", lab.feed());
+    let r = lab
+        .cairn(
+            &["update", "now", "--feed", &feeds, "--key", &lab.key.public],
+            &[],
+        )
+        .expect_ok();
+    assert!(
+        r.stdout.contains(&format!("installed {VERSION}")),
+        "{}",
+        r.text()
+    );
+    assert_eq!(lab.installed(), program_bytes(true));
+    assert!(
+        lab.state()["unanswered"]
+            .as_str()
+            .is_some_and(|u| u.contains(&forged_feed) && u.contains("not signed by a key")),
+        "{}",
+        lab.state()
+    );
+
+    // Neither answers: nothing is installed, and the error says what each did.
+    let lab = Lab::new("update-fallback-none");
+    let closed = closed_feed();
+    let feeds = format!("{closed},{forged_feed}");
+    let r = lab.cairn(
+        &["update", "now", "--feed", &feeds, "--key", &lab.key.public],
+        &[],
+    );
+    assert!(!r.ok(), "{}", r.text());
+    assert!(
+        r.stderr.contains(&closed) && r.stderr.contains("not signed by a key"),
+        "{}",
+        r.text()
+    );
+    assert_eq!(lab.installed(), program_bytes(false));
+    assert!(lab.previous().is_none());
+    let error = lab.state()["error"].as_str().unwrap_or("").to_string();
+    assert!(
+        error.contains(&closed) && error.contains(&forged_feed),
+        "{error}"
+    );
+    lab.runs();
+}
+
+#[test]
+fn a_daemon_says_a_feed_passed_over_once_and_again_when_it_answers() {
+    let lab = Lab::new("update-daemon-fallback");
+    let server = Server::start(lab.sandbox.path("server"));
+    let root = lab_root(&lab, &server);
+    lab.publish_new();
+    let mirror = lab.sandbox.path("mirror");
+    std::fs::create_dir_all(&mirror).unwrap();
+    let first = mirror.join("update.json");
+    let feeds = format!("{},{}", first.to_str().unwrap(), lab.feed());
+    // Notify, so the release waits and every check asks the feeds again.
+    let settings =
+        serde_json::json!({ "policy": "notify", "feed": feeds, "keys": [lab.key.public] });
+    std::fs::write(lab.user.join("update-settings.json"), settings.to_string()).unwrap();
+    let tune = [(
+        "CAIRN_FP_TUNE",
+        "update.tick_ms=100,update.first_secs=0,update.every_secs=1,client.retry_ms=1",
+    )];
+    let d = Daemon::start(&lab, &root, &tune);
+    let checked = || lab.state()["checked"].as_i64().unwrap_or(0);
+    let said = |what: &str| d.log().matches(what).count();
+    wait_until("the second feed's release shown", &d, || {
+        d.status()["update"]["available"] == VERSION
+    });
+    let since = checked();
+    wait_until("three more checks", &d, || checked() >= since + 3);
+    assert_eq!(said("answered instead"), 1, "{}", d.log());
+    assert_eq!(lab.state()["answered"], lab.feed(), "{}", lab.state());
+    // The first answers again: said once, and the status no longer holds what it said.
+    std::fs::copy(lab.feed(), &first).unwrap();
+    wait_until("the first feed answering", &d, || {
+        lab.state()["answered"] == first.to_str().unwrap()
+    });
+    let since = checked();
+    wait_until("three more checks", &d, || checked() >= since + 3);
+    assert_eq!(said("answers again"), 1, "{}", d.log());
+    assert_eq!(said("answered instead"), 1, "{}", d.log());
+    assert!(lab.state()["unanswered"].is_null(), "{}", lab.state());
+    assert_eq!(lab.installed(), program_bytes(false));
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # What must hold before a change goes in. Run by .github/workflows/ci.yml, and by hand:
-#   bash scripts/ci.sh           the full suite, about 20 minutes: GitHub runs it on every push, and a release
-#                                waits for it there
+#   bash scripts/ci.sh           the full suite: every release passes it first, with CAIRN_SEEDS=200 and
+#                                CAIRN_NO_SKIP=1, in its own tree on the machine that builds it; GitHub runs it
+#                                too on every push, in about 33 minutes, as a second check that nothing waits for
 #   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 71 tests over 20 s, most
 #                                of them sweeping every step of a sync (.config/nextest.toml, "quick")
 # CAIRN_NO_SKIP=1, which the workflow sets, turns a test that cannot run here into a failure.

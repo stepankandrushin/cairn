@@ -11,8 +11,8 @@ fail-fast = false
 final-status-level = "fail"
 
 # `scripts/ci.sh --quick`, before a commit: everything but the tests that sweep every step of a sync, or
-# a sync at every size, which take a minute or more each. The full suite runs on GitHub on every push,
-# and a release waits for it there.
+# a sync at every size, which take a minute or more each. The full suite is what a release passes first, in
+# its own tree on the machine that builds it, and GitHub runs it on every push.
 [profile.quick]
 fail-fast = true
 # Those over 20 s in a full run on a 16-core machine, 2026-11-09. A test renamed or added runs here too, until

@@ -174,9 +174,10 @@ shares of any file or folder in it: with
 another user of the server, to read or to write, or by a public link that needs no account, reads only and
 may expire. A change made there is a commit like any device's, refused rather than forced when something
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
-a user is seen in the web interface, not synced yet. The + beside Folders adds a folder of one's own. Times are on a 24-hour clock, as `2026-11-11 09:50`;
-its Settings choose a 12-hour clock or another order of the date, kept in that browser, and the user's own
-name for each folder, kept on the server. The endpoints are in
+a user is seen in the web interface, not synced yet. The + beside Folders adds a folder of one's own. It is
+light or dark as the device is, and the sun or moon at the right end of its top bar switches it. Times are on
+a 24-hour clock, as `2026-11-11 09:50`; its Settings choose the theme, a 12-hour clock or another order of the
+date, kept in that browser, and the user's own name for each folder, kept on the server. The endpoints are in
 docs/protocol.md, "Web".
 
 A public link needs only `/s/`, `/web/` and `/v1/links/`. Where the server's address is open to some addresses

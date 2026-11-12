@@ -1,7 +1,7 @@
 /* Cairn's web interface. No external fonts or images: system-ui and the icons app.js draws. */
 
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --bg: #f6f6f4;
   --panel: #ffffff;
   --text: #1f2328;
@@ -16,8 +16,11 @@
   --radius: 8px;
 }
 
+/* Dark where the device is, unless this browser chose light, and wherever it chose dark: the data-theme
+   app.js sets from Settings' Theme or the top bar's button. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --bg: #151617;
     --panel: #1d1e20;
     --text: #e5e5e2;
@@ -30,6 +33,20 @@
     --folder: #d3a54b;
     --shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
   }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #151617;
+  --panel: #1d1e20;
+  --text: #e5e5e2;
+  --muted: #9a9fa6;
+  --line: #2d2f32;
+  --hover: #26282b;
+  --accent: #62b59c;
+  --accent-text: #0c1512;
+  --danger: #f57166;
+  --folder: #d3a54b;
+  --shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
 }
 
 * { box-sizing: border-box; }
@@ -74,6 +91,7 @@ p { margin: 0 0 10px; }
 .spacer { flex: 1; }
 .who { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-btn { display: none !important; }
+.signin-theme { position: fixed; top: 11px; right: 16px; }
 
 /* Layout */
 

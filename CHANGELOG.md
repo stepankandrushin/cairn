@@ -15,6 +15,9 @@
   upload in flight lands in it, and the former name goes on reaching it as after `cairn-server folder rename`,
   which stays for the server stopped. The API is `POST /v1/folders` and `POST /v1/ns/{ns}/rename`
   (docs/protocol.md); a name that is or was another folder's is refused, saying nothing of that folder.
+- A light and a dark theme in the web interface, switched by a button at the right end of the top bar (on the
+  sign-in page and a public link's page too) and chosen in Settings, Theme, which also goes back to following
+  the device. Kept in that browser; until something is chosen it is light or dark as the device is, as before.
 
 **Changed:**
 

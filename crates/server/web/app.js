@@ -9,8 +9,10 @@ const LEVEL_TEXT = { read: 'Can view', write: 'Can edit', manage: 'Can manage' }
 const IS_PUBLIC = location.pathname.startsWith('/s/');
 const enc = encodeURIComponent;
 
-// How this browser shows times (Settings), kept in its localStorage: the clock, and the order of a date.
+// How this browser shows the pages (Settings), kept in its localStorage: the theme, the clock, and the
+// order of a date.
 const SETTINGS_KEY = 'cairn.settings';
+const THEMES = ['system', 'light', 'dark'];
 const CLOCKS = ['24h', '12h'];
 const DATE_ORDERS = ['yyyy-mm-dd', 'dd.mm.yyyy', 'dd/mm/yyyy', 'mm/dd/yyyy', 'd mmm yyyy', 'mmm d, yyyy'];
 
@@ -20,6 +22,7 @@ function loadSettings() {
   try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)); } catch { saved = null; }
   const s = saved && typeof saved === 'object' ? saved : {};
   return {
+    theme: THEMES.includes(s.theme) ? s.theme : THEMES[0],
     clock: CLOCKS.includes(s.clock) ? s.clock : CLOCKS[0],
     date: DATE_ORDERS.includes(s.date) ? s.date : DATE_ORDERS[0],
   };
@@ -38,6 +41,49 @@ const state = {
   settings: loadSettings(),
 };
 let shell = null;
+
+// ---------------------------------------------------------------- theme
+
+// Light or dark as the device is (app.css's media query), unless this browser chose one: then
+// <html data-theme>. Set before anything is drawn, and again as the choice or the device's own changes.
+const deviceDark = window.matchMedia('(prefers-color-scheme: dark)');
+const shownTheme = () => (state.settings.theme === 'system' ? (deviceDark.matches ? 'dark' : 'light') : state.settings.theme);
+
+function applyTheme() {
+  const root = document.documentElement;
+  if (state.settings.theme === 'system') delete root.dataset.theme;
+  else root.dataset.theme = state.settings.theme;
+  for (const b of document.querySelectorAll('.theme-btn')) paintThemeButton(b);
+  for (const r of document.querySelectorAll('input[name="theme"]')) r.checked = r.value === state.settings.theme;
+}
+
+/** The button shows the theme it switches to. */
+function paintThemeButton(b) {
+  const next = shownTheme() === 'dark' ? 'light' : 'dark';
+  const text = `Switch to the ${next} theme`;
+  b.title = text;
+  b.setAttribute('aria-label', text);
+  b.replaceChildren(icon(next === 'dark' ? 'moon' : 'sun'));
+}
+
+/** The other theme of the two; the device's own is followed again once it is the one chosen. */
+function toggleTheme() {
+  const next = shownTheme() === 'dark' ? 'light' : 'dark';
+  try {
+    saveSetting('theme', next === (deviceDark.matches ? 'dark' : 'light') ? 'system' : next);
+  } finally {
+    applyTheme();
+  }
+}
+
+function themeButton(cls = '') {
+  const b = h('button', { class: `icon-btn theme-btn ${cls}`.trim(), type: 'button', onclick: act(toggleTheme) });
+  paintThemeButton(b);
+  return b;
+}
+
+applyTheme();
+deviceDark.addEventListener?.('change', () => applyTheme());
 
 // ---------------------------------------------------------------- errors
 
@@ -113,6 +159,8 @@ const ICONS = {
   people: ['M9 11a3.2 3.2 0 1 0 0-6.4A3.2 3.2 0 0 0 9 11z', 'M3 20a6 6 0 0 1 12 0', 'M16 4.8a3.2 3.2 0 0 1 0 6.2', 'M21 20a6 6 0 0 0-3.6-5.5'],
   settings: ['M10.29 5.62L10.4 2.94L13.6 2.94L13.71 5.62A6.6 6.6 0 0 1 15.3 6.28L17.28 4.46L19.54 6.72L17.72 8.7A6.6 6.6 0 0 1 18.38 10.29L21.06 10.4L21.06 13.6L18.38 13.71A6.6 6.6 0 0 1 17.72 15.3L19.54 17.28L17.28 19.54L15.3 17.72A6.6 6.6 0 0 1 13.71 18.38L13.6 21.06L10.4 21.06L10.29 18.38A6.6 6.6 0 0 1 8.7 17.72L6.72 19.54L4.46 17.28L6.28 15.3A6.6 6.6 0 0 1 5.62 13.71L2.94 13.6L2.94 10.4L5.62 10.29A6.6 6.6 0 0 1 6.28 8.7L4.46 6.72L6.72 4.46L8.7 6.28A6.6 6.6 0 0 1 10.29 5.62z', 'M12 14.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2z'],
   shared: ['M18 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M18 22a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M8.6 10.5l6.8-4M8.6 13.5l6.8 4'],
+  sun: ['M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', 'M12 2.8v1.9M12 19.3v1.9M2.8 12h1.9M19.3 12h1.9M5.5 5.5l1.35 1.35M17.15 17.15l1.35 1.35M5.5 18.5l1.35-1.35M17.15 6.85l1.35-1.35'],
+  moon: ['M20.2 14.1A8.3 8.3 0 1 1 9.9 3.8a6.6 6.6 0 0 0 10.3 10.3z'],
   'sign-out': ['M10 4H6.5A2.5 2.5 0 0 0 4 6.5v11A2.5 2.5 0 0 0 6.5 20H10', 'M15 8l4 4-4 4M19 12H9'],
   globe: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M3 12h18', 'M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3z'],
 };
@@ -581,7 +629,7 @@ function showSignIn(message) {
       }
     },
   }, h('label', { for: 'token', text: 'Token' }), input, err, button);
-  $app().replaceChildren(h('div', { class: 'signin' }, h('div', { class: 'signin-card' },
+  $app().replaceChildren(h('div', { class: 'signin' }, themeButton('signin-theme'), h('div', { class: 'signin-card' },
     brand(false),
     h('h1', { text: 'Sign in' }),
     form,
@@ -614,7 +662,8 @@ function buildShell() {
     h('span', { class: 'spacer' }),
     h('span', { class: 'who', text: state.me.user, title: 'Signed in as this user' }),
     h('a', { class: 'btn subtle settings-link', href: '#/settings', 'aria-label': 'Settings' }, icon('settings'), h('span', { class: 'btn-text', text: 'Settings' })),
-    h('button', { class: 'btn subtle', onclick: act(signOut) }, icon('sign-out'), 'Sign out'));
+    h('button', { class: 'btn subtle', onclick: act(signOut) }, icon('sign-out'), 'Sign out'),
+    themeButton());
   $app().replaceChildren(top, layout);
   shell = { sidebar, main, layout };
 }
@@ -2180,6 +2229,12 @@ function saveSetting(key, value) {
   }
 }
 
+const THEME_WORDS = {
+  system: ['As this device', 'Light or dark as the device is set, and switching when it does'],
+  light: ['Light', ''],
+  dark: ['Dark', ''],
+};
+
 const DATE_WORDS = {
   'yyyy-mm-dd': 'year-month-day',
   'dd.mm.yyyy': 'day.month.year',
@@ -2241,7 +2296,7 @@ function renderSettings(gen) {
         value: v,
         checked: state.settings[key] === v,
         onchange: act(() => {
-          try { saveSetting(key, v); } finally { showNow(); }
+          try { saveSetting(key, v); } finally { showNow(); applyTheme(); }
         }),
       }),
       h('span', { class: 'choice-label', text: label(v) }),
@@ -2250,7 +2305,8 @@ function renderSettings(gen) {
   show(gen, h('section', { class: 'settings' },
     h('div', { class: 'screen-head' }, h('h1', { text: 'Settings' })),
     folderNames(),
-    h('p', { class: 'muted', text: 'How times are shown. Kept in this browser, for whoever signs in on it.' }),
+    h('p', { class: 'muted', text: 'How this page looks and shows times. Kept in this browser, for whoever signs in on it.' }),
+    group('Theme', 'theme', THEMES, (v) => THEME_WORDS[v][0], (v) => THEME_WORDS[v][1]),
     group('Clock', 'clock', CLOCKS, (v) => (v === '12h' ? '12-hour' : '24-hour'), (v) => clockText(sample, v)),
     group('Dates', 'date', DATE_ORDERS, (v) => dayText(sample, v), (v) => DATE_WORDS[v]),
     h('p', {}, 'A time now shows as ', now, '.')), 'Settings');
@@ -2260,6 +2316,7 @@ function renderSettings(gen) {
 window.addEventListener('storage', (ev) => {
   if (ev.key !== SETTINGS_KEY && ev.key !== null) return;
   state.settings = loadSettings();
+  applyTheme();
   refresh();
 });
 
@@ -2271,7 +2328,7 @@ async function startPublic() {
   state.publicView = view;
   const main = h('main', { class: 'main public', id: 'main' });
   $app().replaceChildren(
-    h('header', { class: 'topbar' }, brand(false), h('span', { class: 'spacer' }), h('span', { class: 'muted', text: 'Shared with you' })),
+    h('header', { class: 'topbar' }, brand(false), h('span', { class: 'spacer' }), h('span', { class: 'muted', text: 'Shared with you' }), themeButton()),
     main);
   shell = { main, layout: null, sidebar: null };
   try {

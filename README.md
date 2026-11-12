@@ -22,7 +22,7 @@ filesystem and privileges.
 | Feature | **Cairn**[^cairn] | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
 |---|---|---|---|---|
 | Installed application size (macOS)[^macos-size] | **17.1 MB** — tray + sync daemon, Apple Silicon | **414.4 MB** — desktop client, universal Intel + Apple Silicon | Not measured | Not measured |
-| Application download size (Linux x86-64)[^downloads] | **6.3 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
+| Application download size (Linux x86-64)[^downloads] | **7.1 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
 | RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
 | Implementation languages | **Rust** — CLI, daemon and server; HTML/JavaScript web UI | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
 | Run without a separate database server or language runtime | ✅ Native binaries with embedded SQLite | ❌ PHP and a web server; usually a separate database | ❌ Server stack includes a database, cache and web services | ✅ Native binary; no central server required |
@@ -39,10 +39,11 @@ filesystem and privileges.
     These are installed application files, not download sizes or allocated disk space; user data and
     server components are excluded. Nextcloud's executable is universal (Intel + Apple Silicon), while
     these Cairn builds are Apple Silicon only. Seafile and Syncthing were not installed for measurement.
-[^downloads]: Download sizes: [Cairn 0.1.5](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.5),
+[^downloads]: Download sizes: [Cairn 0.1.19](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.19),
     [Nextcloud Desktop 35.0.3](https://download.nextcloud.com/desktop/releases/Linux/),
     [Seafile Client 9.0.22](https://github.com/haiwen/seafile-client/releases/tag/v9.0.22),
     [Syncthing 2.1.7](https://github.com/syncthing/syncthing/releases/tag/v2.1.7).
+    Cairn's archive is 7,483,009 bytes; 1 MiB = 1,048,576 bytes.
     Archives are `.tar.gz`; AppImages bundle desktop or CLI dependencies. These packages contain different
     components, and their download sizes are not installed sizes. Cairn's archive does not include its tray.
 [^performance]: RAM entries describe implementation behavior or upstream requirements, not measured

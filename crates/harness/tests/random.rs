@@ -519,52 +519,50 @@ fn settles_fast(d: &Device) -> bool {
     false
 }
 
-#[test]
-fn random_operations_on_three_devices_lose_nothing() {
-    many_seeds(false);
+fn random_operations_on_three_devices_lose_nothing(shard: Shard) {
+    many_seeds(shard, false);
 }
 
-#[test]
-fn random_operations_with_rules_coming_and_going_on_one_device_lose_nothing() {
-    many_seeds(true);
+shards!(random_operations_on_three_devices_lose_nothing: s001 s002 s003 s004 s005 s006 s007 s008
+    s009 s010 s011 s012 s013 s014 s015 s016 s017 s018 s019 s020 s021 s022 s023 s024 s025 s026
+    s027 s028 s029 s030 s031 s032 s033 s034 s035 s036 s037 s038 s039 s040 s041 s042 s043 s044
+    s045 s046 s047 s048 s049 s050 s051 s052 s053 s054 s055 s056 s057 s058 s059 s060 s061 s062
+    s063 s064 s065 s066 s067 s068 s069 s070 s071 s072 s073 s074 s075 s076 s077 s078 s079 s080
+    s081 s082 s083 s084 s085 s086 s087 s088 s089 s090 s091 s092 s093 s094 s095 s096 s097 s098
+    s099 s100);
+
+fn random_operations_with_rules_coming_and_going_on_one_device_lose_nothing(shard: Shard) {
+    many_seeds(shard, true);
 }
 
-fn many_seeds(with_rules: bool) {
+shards!(random_operations_with_rules_coming_and_going_on_one_device_lose_nothing: s001 s002 s003
+    s004 s005 s006 s007 s008 s009 s010 s011 s012 s013 s014 s015 s016 s017 s018 s019 s020 s021
+    s022 s023 s024 s025 s026 s027 s028 s029 s030 s031 s032 s033 s034 s035 s036 s037 s038 s039
+    s040 s041 s042 s043 s044 s045 s046 s047 s048 s049 s050 s051 s052 s053 s054 s055 s056 s057
+    s058 s059 s060 s061 s062 s063 s064 s065 s066 s067 s068 s069 s070 s071 s072 s073 s074 s075
+    s076 s077 s078 s079 s080 s081 s082 s083 s084 s085 s086 s087 s088 s089 s090 s091 s092 s093
+    s094 s095 s096 s097 s098 s099 s100);
+
+/// This part's seeds of `CAIRN_SEEDS`, one after another; or `CAIRN_SEED` alone, in the part it falls
+/// to.
+fn many_seeds(shard: Shard, with_rules: bool) {
     if let Ok(seed) = std::env::var("CAIRN_SEED") {
-        run_seed(seed.parse().expect("CAIRN_SEED is a number"), with_rules);
+        let seed: u64 = seed.parse().expect("CAIRN_SEED is a number");
+        if shard.has(seed as usize) {
+            run_seed(seed, with_rules);
+        }
         return;
     }
     let seeds: u64 = std::env::var("CAIRN_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
-    let next = AtomicU64::new(0);
-    let failed = std::sync::Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(12);
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                let seed = next.fetch_add(1, Ordering::SeqCst);
-                if seed >= seeds {
-                    return;
-                }
-                if let Err(e) = std::panic::catch_unwind(|| run_seed(seed, with_rules)) {
-                    let msg = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_default();
-                    failed.lock().unwrap().push((seed, msg));
-                }
-            });
-        }
+    let failed = each_item(shard, seeds as usize, |seed| {
+        run_seed(seed as u64, with_rules)
     });
-    let failed = failed.into_inner().unwrap();
     assert!(
         failed.is_empty(),
-        "{} of {seeds} seeds failed; first: {:?}",
+        "{} of this part's seeds of {seeds} failed; first: {:?}",
         failed.len(),
         failed.first()
     );

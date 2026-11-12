@@ -7,8 +7,6 @@
 mod common;
 use common::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 fn steps(log: &Path) -> Vec<String> {
@@ -34,38 +32,15 @@ fn nth_step(steps: &[String], name: &str, nth: usize) -> usize {
         .unwrap_or_else(|| panic!("no hit {nth} of {name} in {steps:?}"))
 }
 
-/// Run `f` for 1..=count on a worker pool, failing on the first panic with its step.
-fn for_each_step(count: usize, f: impl Fn(usize) + Sync) {
-    let next = AtomicUsize::new(1);
-    let failures: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(16);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let n = next.fetch_add(1, Ordering::SeqCst);
-                if n > count {
-                    return;
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(n)));
-                if let Err(e) = result {
-                    let message = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_default();
-                    failures.lock().unwrap().push((n, message));
-                }
-            });
-        }
-    });
-    let failures = failures.into_inner().unwrap();
+/// Run `f` for this part's steps of 1..=count, one after another, failing at the end with the first that
+/// panicked.
+fn for_each_step(shard: Shard, count: usize, f: impl Fn(usize)) {
+    let failures = each_item(shard, count, |i| f(i + 1));
     assert!(
         failures.is_empty(),
-        "{} of {count} steps failed; first: {:?}",
+        "{} of this part's steps of {count} failed; first: {:?}",
         failures.len(),
-        failures.first()
+        failures.first().map(|(i, m)| (i + 1, m))
     );
 }
 
@@ -183,8 +158,7 @@ fn an_upload_request_is_answered_only_once_all_of_it_is_durable() {
     assert!(durable.len() <= renamed.len(), "{steps:?}");
 }
 
-#[test]
-fn a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks() {
+fn a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks(shard: Shard) {
     let probe = Sandbox::fast("killed-request-probe");
     let log = probe.path("steps");
     std::fs::write(&log, "").unwrap();
@@ -198,7 +172,7 @@ fn a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks() 
     drop(server);
     let steps = steps(&log);
     assert!(count(&steps, "server.chunk.renamed") >= 26, "{steps:?}");
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let sb = Sandbox::fast("killed-request");
         let mut server = Server::start_with(
             sb.path("server"),
@@ -228,6 +202,9 @@ fn a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks() 
         assert_eq!(incoming, 0, "{context}: uploads left in incoming/");
     });
 }
+
+shards!(a_server_killed_at_every_step_of_an_upload_request_keeps_only_whole_chunks: s01 s02 s03
+    s04 s05 s06 s07 s08 s09 s10 s11 s12 s13 s14 s15 s16);
 
 #[test]
 fn a_full_disk_in_the_middle_of_an_upload_request_leaves_nothing_behind() {
@@ -437,8 +414,7 @@ fn manifests_come_down_many_to_a_request() {
 
 /// Killed before the rows of what arrived are stored, a device must still tell what it received
 /// from an edit of its own: a later change from elsewhere stands, and nothing comes back as a copy.
-#[test]
-fn a_download_killed_before_its_rows_are_stored_is_not_this_devices_change() {
+fn a_download_killed_before_its_rows_are_stored_is_not_this_devices_change(shard: Shard) {
     let probe = Sandbox::fast("rows-probe");
     let server = Server::start(probe.path("server"));
     let a = Device::new(&probe, &server, "a");
@@ -467,7 +443,7 @@ fn a_download_killed_before_its_rows_are_stored_is_not_this_devices_change() {
         let steps = steps(&log);
         let stores = count(&steps, "apply.rows.store");
         assert!(n == "all" || stores >= 9, "rows a few at a time: {steps:?}");
-        for_each_step(stores, |k| {
+        for_each_step(shard, stores, |k| {
             let sb = Sandbox::fast("rows-killed");
             let server = Server::start(sb.path("server"));
             let a = Device::new(&sb, &server, "a");
@@ -500,10 +476,12 @@ fn a_download_killed_before_its_rows_are_stored_is_not_this_devices_change() {
     }
 }
 
+shards!(a_download_killed_before_its_rows_are_stored_is_not_this_devices_change: s01 s02 s03
+    s04);
+
 // --- The download: in slices of the cache ---
 
-#[test]
-fn a_download_in_slices_killed_at_every_step_loses_nothing() {
+fn a_download_in_slices_killed_at_every_step_loses_nothing(shard: Shard) {
     let make = |a: &Device| {
         for i in 0..8u64 {
             a.write(&format!("s{}/f{i}", i % 2), token::make(500 + i, 300_000));
@@ -525,7 +503,7 @@ fn a_download_in_slices_killed_at_every_step_loses_nothing() {
         count(&steps, "apply.slice.fetched") >= 5,
         "in slices: {steps:?}"
     );
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let sb = Sandbox::fast("slices-killed");
         let server = Server::start(sb.path("server"));
         let a = Device::new(&sb, &server, "a");
@@ -545,6 +523,9 @@ fn a_download_in_slices_killed_at_every_step_loses_nothing() {
         assert_eq!(cached, 0, "{context}: chunks left in the cache");
     });
 }
+
+shards!(a_download_in_slices_killed_at_every_step_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08
+    s09 s10 s11 s12 s13 s14 s15 s16);
 
 #[test]
 fn a_download_bigger_than_its_cache_needs_about_its_own_size_free() {
@@ -793,20 +774,23 @@ fn metadata_set_in_place_is_not_read_again() {
 /// sync's own change then moves the ctime as the edit did: it is not taken for that content, and goes
 /// up. A plain edit moves the mtime, which, unless the sync set it, must not be taken for the pair of
 /// the server's: it goes up too.
-#[test]
-fn an_edit_while_a_files_metadata_is_set_is_sent() {
-    for (mode, keep_time, point) in metadata_kinds().into_iter().flat_map(|mode| {
-        [true, false].into_iter().flat_map(move |keep_time| {
-            [
-                "sync.identified",
-                "apply.meta",
-                "apply.meta.done",
-                "apply.dirs.synced",
-            ]
-            .into_iter()
-            .map(move |point| (mode, keep_time, point))
+fn an_edit_while_a_files_metadata_is_set_is_sent(shard: Shard) {
+    let cases: Vec<(bool, bool, &str)> = metadata_kinds()
+        .into_iter()
+        .flat_map(|mode| {
+            [true, false].into_iter().flat_map(move |keep_time| {
+                [
+                    "sync.identified",
+                    "apply.meta",
+                    "apply.meta.done",
+                    "apply.dirs.synced",
+                ]
+                .into_iter()
+                .map(move |point| (mode, keep_time, point))
+            })
         })
-    }) {
+        .collect();
+    for &(mode, keep_time, point) in shard.share(&cases) {
         let context = format!("mode {mode}, keeping the mtime {keep_time}, edited at {point}");
         let sb = Sandbox::on_disk("edit-while-meta");
         let server = Server::start(sb.path("server"));
@@ -853,6 +837,8 @@ fn an_edit_while_a_files_metadata_is_set_is_sent() {
         }
     }
 }
+
+shards!(an_edit_while_a_files_metadata_is_set_is_sent: s01 s02 s03 s04 s05 s06 s07 s08);
 
 /// A shared writable mapping of a file, in this process, from before the sync.
 #[cfg(target_os = "linux")]

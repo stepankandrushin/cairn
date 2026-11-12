@@ -18,7 +18,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -141,8 +141,7 @@ fn a_sync_with_nothing_to_do_reads_no_file_and_agrees_with_the_full_one() {
 /// The report's failure test: every kind of change, one at a time, after a sync that had nothing to
 /// do. The fast path must leave each to the full sync, and each must reach the other device. Run as a
 /// release build runs, with nothing checking the fast path but the outcome.
-#[test]
-fn every_kind_of_change_is_seen_past_the_fast_path() {
+fn every_kind_of_change_is_seen_past_the_fast_path(shard: Shard) {
     type Make = fn(&Device, &Device);
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut changes: Vec<(&str, Make, bool)> = vec![
@@ -254,7 +253,7 @@ fn every_kind_of_change_is_seen_past_the_fast_path() {
             true,
         ),
     ]);
-    for (what, make, travels) in &changes {
+    for (what, make, travels) in shard.share(&changes) {
         let (_sb, _s, a, b) = pair("steady-changes");
         everything(&a);
         a.synced();
@@ -279,6 +278,9 @@ fn every_kind_of_change_is_seen_past_the_fast_path() {
         }
     }
 }
+
+shards!(every_kind_of_change_is_seen_past_the_fast_path: s01 s02 s03 s04 s05 s06 s07 s08 s09 s10
+    s11 s12 s13 s14 s15 s16);
 
 /// What changes once the probe has passed it is the next sync's, as with any scan.
 #[test]
@@ -309,8 +311,7 @@ fn an_edit_while_the_fast_path_looks_goes_up_with_the_next_sync() {
 /// The kill sweep, for the syncs this adds: the one that records what it agreed on, the fast one, and
 /// one that the fast path leaves to the full sync. A kill at any of their steps changes nothing about
 /// where things end up, and the syncs after it agree with the oracle.
-#[test]
-fn a_kill_at_any_step_of_a_sync_with_nothing_to_do_changes_nothing() {
+fn a_kill_at_any_step_of_a_sync_with_nothing_to_do_changes_nothing(shard: Shard) {
     #[derive(Clone, Copy, Debug)]
     enum Phase {
         Records,
@@ -352,82 +353,55 @@ fn a_kill_at_any_step_of_a_sync_with_nothing_to_do_changes_nothing() {
         }
         (Picture::of(&a.root), Picture::of(&b.root))
     }
-    let mut jobs = Vec::new();
-    let mut references = Vec::new();
-    for (i, phase) in [Phase::Records, Phase::Fast, Phase::Declines]
-        .into_iter()
-        .enumerate()
-    {
-        let probe = Sandbox::fast("steady-sweep-probe");
-        let log = probe.path("steps");
-        references.push(story(phase, None, Some(&log)));
-        let steps = std::fs::read_to_string(&log).unwrap();
-        match phase {
-            Phase::Records => assert!(steps.contains("sync.steady.recorded"), "{steps}"),
-            Phase::Fast => assert!(steps.contains("sync.fast.confirmed"), "{steps}"),
-            Phase::Declines => assert!(!steps.contains("sync.fast\n"), "{steps}"),
-        }
-        for (n, step) in steps.lines().enumerate() {
-            if !["scan.dir", "scan.file"].contains(&step) {
-                jobs.push((
-                    i,
-                    phase,
-                    n + 1,
-                    format!("{phase:?}: step {} ({step})", n + 1),
-                ));
-            }
-        }
+    // Each phase a sweep of its own, in as many parts as each of the others.
+    let phases = [Phase::Records, Phase::Fast, Phase::Declines];
+    let (i, part) = shard.within(phases.len());
+    let phase = phases[i];
+    let probe = Sandbox::fast("steady-sweep-probe");
+    let log = probe.path("steps");
+    let reference = story(phase, None, Some(&log));
+    let steps = std::fs::read_to_string(&log).unwrap();
+    match phase {
+        Phase::Records => assert!(steps.contains("sync.steady.recorded"), "{steps}"),
+        Phase::Fast => assert!(steps.contains("sync.fast.confirmed"), "{steps}"),
+        Phase::Declines => assert!(!steps.contains("sync.fast\n"), "{steps}"),
     }
-    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(12);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, Ordering::SeqCst);
-                let Some((i, phase, n, context)) = jobs.get(at) else {
-                    return;
-                };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (a, b) = story(*phase, Some(*n), None);
-                    let ignore = Ignore {
-                        owner: true,
-                        all_mtime: true,
-                        ..Ignore::default()
-                    };
-                    assert_eq!(
-                        references[*i].0.diff(&a, ignore),
-                        Vec::<String>::new(),
-                        "{context}"
-                    );
-                    assert_eq!(
-                        references[*i].1.diff(&b, ignore),
-                        Vec::<String>::new(),
-                        "{context}"
-                    );
-                }));
-                if let Err(e) = result {
-                    let message = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|m| (*m).to_string()))
-                        .unwrap_or_default();
-                    failures.lock().unwrap().push(message);
-                }
-            });
-        }
+    let jobs: Vec<(usize, String)> = steps
+        .lines()
+        .enumerate()
+        .filter(|(_, step)| !["scan.dir", "scan.file"].contains(step))
+        .map(|(n, step)| (n + 1, format!("{phase:?}: step {} ({step})", n + 1)))
+        .collect();
+    let failures = each_item(part, jobs.len(), |at| {
+        let (n, context) = &jobs[at];
+        let (a, b) = story(phase, Some(*n), None);
+        let ignore = Ignore {
+            owner: true,
+            all_mtime: true,
+            ..Ignore::default()
+        };
+        assert_eq!(
+            reference.0.diff(&a, ignore),
+            Vec::<String>::new(),
+            "{context}"
+        );
+        assert_eq!(
+            reference.1.diff(&b, ignore),
+            Vec::<String>::new(),
+            "{context}"
+        );
     });
-    let failures = failures.into_inner().unwrap();
     assert!(
         failures.is_empty(),
-        "{} of {} kills changed the outcome; first: {}",
+        "{} of this part's kills of {} changed the outcome; first: {}",
         failures.len(),
         jobs.len(),
-        failures[0]
+        failures[0].1
     );
 }
+
+shards!(a_kill_at_any_step_of_a_sync_with_nothing_to_do_changes_nothing: s01 s02 s03 s04 s05 s06
+    s07 s08 s09 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24);
 
 // --- The daemon ---
 

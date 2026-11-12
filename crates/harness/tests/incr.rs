@@ -8,8 +8,6 @@ use common::*;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 /// As a release build runs: the incremental round's answer is the answer.
 const RELEASE: (&str, &str) = ("CAIRN_FP_INCR_ORACLE", "0");
@@ -177,8 +175,7 @@ fn a_change_goes_the_incremental_way_on_both_devices() {
     assert_eq!(b.read("d/e/f3"), b"edited too");
 }
 
-#[test]
-fn every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device() {
+fn every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device(shard: Shard) {
     type Make = fn(&Device, &Device);
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut changes: Vec<(&str, Make)> = vec![
@@ -288,7 +285,7 @@ fn every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device() 
             symlink("d/f2", a.path("l")).unwrap();
         }),
     ]);
-    for (what, make) in &changes {
+    for (what, make) in shard.share(&changes) {
         let (_sb, _s, a, b) = started("incr-changes");
         make(&a, &b);
         incremental(&a);
@@ -298,11 +295,13 @@ fn every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device() 
     }
 }
 
+shards!(every_kind_of_change_goes_the_incremental_way_and_reaches_the_other_device: s01 s02 s03
+    s04 s05 s06 s07 s08 s09 s10 s11 s12 s13 s14 s15 s16);
+
 /// What both devices change at once meets in the merge, among neighbours: each side's syncs take what
 /// changed alone, and the trees come out as the full sync's would, which the oracle checks round by
 /// round.
-#[test]
-fn changes_that_meet_go_the_incremental_way() {
+fn changes_that_meet_go_the_incremental_way(shard: Shard) {
     type Both = fn(&Device, &Device);
     let cases: Vec<(&str, Both)> = vec![
         ("the same file edited on both", |a, b| {
@@ -385,7 +384,7 @@ fn changes_that_meet_go_the_incremental_way() {
             chmod(&b.path("f1"), 0o400);
         }),
     ];
-    for (what, both) in &cases {
+    for (what, both) in shard.share(&cases) {
         let (_sb, _s, a, b) = started("incr-meet");
         both(&a, &b);
         for d in [&a, &b, &a, &b, &a] {
@@ -394,6 +393,8 @@ fn changes_that_meet_go_the_incremental_way() {
         same_trees(&a, &b, what);
     }
 }
+
+shards!(changes_that_meet_go_the_incremental_way: s01 s02 s03 s04 s05 s06 s07);
 
 /// Today's date as a conflict copy's name has it.
 fn today() -> String {
@@ -1809,8 +1810,7 @@ fn an_entry_moved_back_past_the_walk_is_no_delete() {
 
 /// A kill at any step of a sync that takes what changed alone, then syncs until both devices agree:
 /// both trees as with no kill, and every later sync the oracle checks.
-#[test]
-fn a_kill_at_any_step_of_an_incremental_sync_loses_nothing() {
+fn a_kill_at_any_step_of_an_incremental_sync_loses_nothing(shard: Shard) {
     #[derive(Clone, Copy, Debug)]
     enum Phase {
         Here,
@@ -1865,71 +1865,48 @@ fn a_kill_at_any_step_of_an_incremental_sync_loses_nothing() {
         }
         (Picture::of(&a.root), Picture::of(&b.root))
     }
-    let mut jobs = Vec::new();
-    let mut references = Vec::new();
-    for (i, phase) in [Phase::Here, Phase::There, Phase::Both]
-        .into_iter()
+    // Each phase a sweep of its own, in as many parts as each of the others.
+    let phases = [Phase::Here, Phase::There, Phase::Both];
+    let (i, part) = shard.within(phases.len());
+    let phase = phases[i];
+    let probe = Sandbox::fast("incr-sweep-probe");
+    let log = probe.path("steps");
+    let reference = story(phase, None, Some(&log));
+    let steps = std::fs::read_to_string(&log).unwrap();
+    assert!(steps.contains("sync.incr.confirmed"), "{phase:?}: {steps}");
+    assert!(!steps.contains("sync.incr.declined"), "{phase:?}: {steps}");
+    let jobs: Vec<(usize, String)> = steps
+        .lines()
         .enumerate()
-    {
-        let probe = Sandbox::fast("incr-sweep-probe");
-        let log = probe.path("steps");
-        references.push(story(phase, None, Some(&log)));
-        let steps = std::fs::read_to_string(&log).unwrap();
-        assert!(steps.contains("sync.incr.confirmed"), "{phase:?}: {steps}");
-        assert!(!steps.contains("sync.incr.declined"), "{phase:?}: {steps}");
-        for (n, step) in steps.lines().enumerate() {
-            if !["scan.dir", "scan.file"].contains(&step) {
-                jobs.push((
-                    i,
-                    phase,
-                    n + 1,
-                    format!("{phase:?}: step {} ({step})", n + 1),
-                ));
-            }
-        }
-    }
-    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(12);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, Ordering::SeqCst);
-                let Some((i, phase, n, context)) = jobs.get(at) else {
-                    return;
-                };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (a, b) = story(*phase, Some(*n), None);
-                    let ignore = Ignore {
-                        owner: true,
-                        all_mtime: true,
-                        ..Ignore::default()
-                    };
-                    // Conflict copies are named by the day, the same in both stories.
-                    assert_eq!(
-                        references[*i].0.diff(&a, ignore),
-                        Vec::<String>::new(),
-                        "{context}"
-                    );
-                    assert_eq!(
-                        references[*i].1.diff(&b, ignore),
-                        Vec::<String>::new(),
-                        "{context}"
-                    );
-                }));
-                if let Err(e) = result {
-                    let text = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_default();
-                    failures.lock().unwrap().push(format!("{context}: {text}"));
-                }
-            });
-        }
+        .filter(|(_, step)| !["scan.dir", "scan.file"].contains(step))
+        .map(|(n, step)| (n + 1, format!("{phase:?}: step {} ({step})", n + 1)))
+        .collect();
+    let failures = each_item(part, jobs.len(), |at| {
+        let (n, context) = &jobs[at];
+        let (a, b) = story(phase, Some(*n), None);
+        let ignore = Ignore {
+            owner: true,
+            all_mtime: true,
+            ..Ignore::default()
+        };
+        // Conflict copies are named by the day, the same in both stories.
+        assert_eq!(
+            reference.0.diff(&a, ignore),
+            Vec::<String>::new(),
+            "{context}"
+        );
+        assert_eq!(
+            reference.1.diff(&b, ignore),
+            Vec::<String>::new(),
+            "{context}"
+        );
     });
-    let failures = failures.into_inner().unwrap();
+    let failures: Vec<String> = failures
+        .into_iter()
+        .map(|(at, text)| format!("{}: {text}", jobs[at].1))
+        .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
+
+shards!(a_kill_at_any_step_of_an_incremental_sync_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08
+    s09 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30);

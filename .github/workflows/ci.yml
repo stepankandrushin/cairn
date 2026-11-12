@@ -12,6 +12,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # The tests run under cargo-nextest (scripts/ci.sh).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       # Ubuntu's AppArmor forbids the unprivileged namespaces that the real full-disk test needs.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # A test that cannot run here fails instead of skipping: libtest hides a skip's line, so a change

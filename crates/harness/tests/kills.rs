@@ -5,8 +5,7 @@
 mod common;
 use common::*;
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
     let sb = Sandbox::on_disk(label);
@@ -1830,69 +1829,43 @@ const SAME_AS_A_NEIGHBOUR: &[&str] = &[
 ];
 
 /// Comparing where things end up finds what the per-step matrix cannot: nothing lost, yet the wrong
-/// version current, a name gone everywhere, or something back that was deleted.
-#[test]
-fn a_kill_at_any_step_does_not_change_where_things_end_up() {
-    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let mut jobs: Vec<(usize, usize, String)> = Vec::new();
-    let mut references = Vec::new();
-    for (i, s) in SCENARIOS.iter().enumerate() {
-        let probe = Sandbox::fast("sweep-probe");
-        let log = probe.path("steps");
-        references.push(story(s, None, Some(&log)));
-        let steps = fs::read_to_string(&log).unwrap();
-        for (n, step) in steps.lines().enumerate() {
-            if !SAME_AS_A_NEIGHBOUR.contains(&step) {
-                jobs.push((i, n + 1, format!("{}: step {} ({step})", s.name, n + 1)));
-            }
-        }
-    }
-    eprintln!("{} kills across {} scenarios", jobs.len(), SCENARIOS.len());
-    let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(12);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, Ordering::SeqCst);
-                let Some((i, n, context)) = jobs.get(at) else {
-                    return;
-                };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let got = story(&SCENARIOS[*i], Some(*n), None);
-                    same_tree(
-                        &references[*i].a,
-                        &got.a,
-                        &format!("{context}, first device"),
-                    );
-                    same_tree(
-                        &references[*i].b,
-                        &got.b,
-                        &format!("{context}, second device"),
-                    );
-                }));
-                if let Err(e) = result {
-                    let message = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|m| (*m).to_string()))
-                        .unwrap_or_default();
-                    failures.lock().unwrap().push(message);
-                }
-            });
-        }
+/// version current, a name gone everywhere, or something back that was deleted. Each scenario a sweep of
+/// its own, in as many parts as each of the others.
+fn a_kill_at_any_step_does_not_change_where_things_end_up(shard: Shard) {
+    let (i, part) = shard.within(SCENARIOS.len());
+    let s = &SCENARIOS[i];
+    let probe = Sandbox::fast("sweep-probe");
+    let log = probe.path("steps");
+    let reference = story(s, None, Some(&log));
+    let steps = fs::read_to_string(&log).unwrap();
+    let jobs: Vec<(usize, String)> = steps
+        .lines()
+        .enumerate()
+        .filter(|(_, step)| !SAME_AS_A_NEIGHBOUR.contains(step))
+        .map(|(n, step)| (n + 1, format!("{}: step {} ({step})", s.name, n + 1)))
+        .collect();
+    eprintln!("{} kills in {}", jobs.len(), s.name);
+    let failures = each_item(part, jobs.len(), |at| {
+        let (n, context) = &jobs[at];
+        let got = story(s, Some(*n), None);
+        same_tree(&reference.a, &got.a, &format!("{context}, first device"));
+        same_tree(&reference.b, &got.b, &format!("{context}, second device"));
     });
-    let failures = failures.into_inner().unwrap();
     assert!(
         failures.is_empty(),
-        "{} of {} kills changed the outcome; first: {}\nall: {:#?}",
+        "{} of this part's kills of {} changed the outcome; first: {}\nall: {:#?}",
         failures.len(),
         jobs.len(),
-        failures[0],
+        failures[0].1,
         failures
             .iter()
-            .map(|f| f.lines().next().unwrap_or(""))
+            .map(|(_, f)| f.lines().next().unwrap_or(""))
             .collect::<Vec<_>>()
     );
 }
+
+shards!(a_kill_at_any_step_does_not_change_where_things_end_up: s01 s02 s03 s04 s05 s06 s07 s08
+    s09 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31
+    s32 s33 s34 s35 s36 s37 s38 s39 s40 s41 s42 s43 s44 s45 s46 s47 s48 s49 s50 s51 s52 s53 s54
+    s55 s56 s57 s58 s59 s60 s61 s62 s63 s64 s65 s66 s67 s68 s69 s70 s71 s72 s73 s74 s75 s76 s77
+    s78);

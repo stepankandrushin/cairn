@@ -18,11 +18,34 @@ pub const SERVER: &str = env!("CARGO_BIN_EXE_h-cairn-server");
 /// A directory on a real disk under the build directory, removed unless the test failed.
 pub struct Sandbox {
     pub dir: PathBuf,
+    /// What goes with it, where that is a folder around it.
+    outer: Option<PathBuf>,
 }
 
 impl Sandbox {
     pub fn on_disk(label: &str) -> Self {
         Self::under(Path::new(env!("CARGO_TARGET_TMPDIR")), label)
+    }
+
+    /// As `on_disk`, for a test that needs an inode number it freed to come back. ext4 hands out the
+    /// lowest number free in the first group with room of those its folder is in, and under nextest the
+    /// tests running beside this one make and remove files in the same groups, so one of them took the
+    /// number first, or freed a lower one, often enough to fail the test. A folder marked as the top of
+    /// a tree (`FS_TOPDIR_FL`, `chattr +T`) has each folder made in it put in groups of its own, where
+    /// no other test's files are. Elsewhere it is a folder as any other.
+    pub fn apart(label: &str) -> Self {
+        let outer = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cairn-{label}-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&outer).unwrap();
+        #[cfg(target_os = "linux")]
+        if let Ok(f) = std::fs::File::open(&outer) {
+            if let Ok(flags) = rustix::fs::ioctl_getflags(&f) {
+                let _ = rustix::fs::ioctl_setflags(&f, flags | rustix::fs::IFlags::TOPDIR);
+            }
+        }
+        let mut sb = Self::under(&outer, label);
+        sb.outer = Some(outer);
+        sb
     }
 
     /// In the system temp directory, for the matrices that spawn thousands of runs.
@@ -33,7 +56,7 @@ impl Sandbox {
     pub fn under(parent: &Path, label: &str) -> Self {
         let dir = parent.join(format!("cairn-{label}-{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
-        Self { dir }
+        Self { dir, outer: None }
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
@@ -43,32 +66,153 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        let dir = self.outer.as_ref().unwrap_or(&self.dir);
         if std::thread::panicking() {
             eprintln!("kept for inspection: {}", self.dir.display());
         } else {
-            // Trees under test may hold read-only directories.
+            // Trees under test may hold folders this user cannot list or write to.
             #[cfg(unix)]
-            let _ = Command::new("chmod")
-                .args(["-R", "u+rwx"])
-                .arg(&self.dir)
-                .output();
+            open_up_folders(dir);
             // And on Windows read-only files, and what `chmod` made unreadable.
             #[cfg(windows)]
-            if std::fs::remove_dir_all(&self.dir).is_err() {
+            if std::fs::remove_dir_all(dir).is_err() {
                 let _ = Command::new("icacls")
-                    .arg(&self.dir)
+                    .arg(dir)
                     .args(["/reset", "/T", "/C", "/Q"])
                     .output();
                 let _ = Command::new("attrib")
                     .arg("-R")
-                    .arg(self.dir.join("*"))
+                    .arg(dir.join("*"))
                     .args(["/S", "/D"])
                     .output();
             }
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(dir);
+            // And the harness's list of the roots made in it.
+            let _ = std::fs::remove_dir_all(cairn_harness::user_dir_of(&self.dir));
         }
     }
 }
+
+/// Gives this user back the folders under `dir` that removing them needs, and only those: a file goes
+/// whatever its own mode. `chmod -R` would rewrite every inode's ctime, one more write through the
+/// filesystem's journal for each file of a tree of 50,000, which the other tests' fsyncs then wait
+/// behind.
+#[cfg(unix)]
+fn open_up_folders(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(m) = std::fs::symlink_metadata(&d) else {
+            continue;
+        };
+        let mode = m.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        let Ok(list) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in list.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+            }
+        }
+    }
+}
+
+/// One part of a sweep too long for one test: a test of its own, so that the parts run at once as any
+/// other tests do, each on one thread, and the run is as long as its longest part rather than the
+/// sweep. `shards!` makes them, as `<sweep>::s01` and on. The sweep deals its items out in turn (the
+/// steps of a sync to kill it at, the seeds, the cases), so that each part has its share of the costly
+/// late ones; between them the parts run every item once, as the sweep did in one test.
+#[derive(Clone, Copy, Debug)]
+pub struct Shard {
+    pub index: usize,
+    pub of: usize,
+}
+
+impl Shard {
+    /// The part named `name` of those `shards!` made, `names` in their order.
+    pub fn named(name: &str, names: &[&str]) -> Self {
+        let index = names.iter().position(|n| *n == name).unwrap();
+        Self {
+            index,
+            of: names.len(),
+        }
+    }
+
+    /// Whether item `i` of the sweep, counted from 0, is this part's.
+    pub fn has(&self, i: usize) -> bool {
+        i % self.of == self.index
+    }
+
+    /// This part's share of `items`.
+    pub fn share<T>(self, items: &[T]) -> impl Iterator<Item = &T> {
+        items
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| self.has(*i))
+            .map(|(_, item)| item)
+    }
+
+    /// For a sweep of `groups` sweeps of their own, as many parts to each: the one this part is in, and
+    /// this part's share of it. `of` is a multiple of `groups`.
+    pub fn within(&self, groups: usize) -> (usize, Shard) {
+        assert_eq!(self.of % groups, 0, "{} parts for {groups} sweeps", self.of);
+        let each = self.of / groups;
+        (
+            self.index / each,
+            Shard {
+                index: self.index % each,
+                of: each,
+            },
+        )
+    }
+}
+
+/// Runs `f` on each of `shard`'s items of `0..count`, one after another, and returns the panics, each
+/// with its item, so that a failing item does not stop the others.
+pub fn each_item(shard: Shard, count: usize, f: impl Fn(usize)) -> Vec<(usize, String)> {
+    let mut failures = Vec::new();
+    for i in (0..count).filter(|i| shard.has(*i)) {
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(i))) {
+            let message = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            failures.push((i, message));
+        }
+    }
+    failures
+}
+
+/// This part's steps of a sweep that has no count of them first, from 1 on: the caller stops at the
+/// first that a kill no longer reaches, which each part then runs as the whole sweep did one.
+pub fn each_step_to_the_end(shard: Shard) -> impl Iterator<Item = u64> {
+    (shard.index as u64 + 1..).step_by(shard.of)
+}
+
+/// The tests of a sweep `fn <sweep>(shard: Shard)`, one for each name given: `shards!(sweep: s01 s02)`
+/// makes `sweep::s01` and `sweep::s02`, each running its part. Attributes before the sweep's name go on
+/// the module, a `#[cfg]` among them.
+#[allow(unused_macros)]
+macro_rules! shards {
+    ($(#[$attr:meta])* $sweep:ident: $($shard:ident)+) => {
+        $(#[$attr])*
+        mod $sweep {
+            const SHARDS: &[&str] = &[$(stringify!($shard)),+];
+            $(
+                #[test]
+                fn $shard() {
+                    super::$sweep(super::Shard::named(stringify!($shard), SHARDS));
+                }
+            )+
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use shards;
 
 pub struct Run {
     pub code: Option<i32>,
@@ -130,9 +274,9 @@ pub struct Server {
 fn next_port() -> u16 {
     const FIRST: u32 = 20_000;
     const COUNT: u32 = 12_000;
-    // 187 ports for each of 64 tests at once: no test has that many servers up together, and its
+    // 93 ports for each of 128 tests at once: no test has that many servers up together, and its
     // ports come round again only long after the servers that had them were stopped.
-    const SLOTS: u32 = 64;
+    const SLOTS: u32 = 128;
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let spread = std::process::id().wrapping_mul(31).wrapping_add(n);

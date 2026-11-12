@@ -4,7 +4,6 @@
 mod common;
 use common::*;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
     let sb = Sandbox::on_disk(label);
@@ -1303,7 +1302,11 @@ fn excluding_a_path_something_else_was_moved_to_is_refused() {
 #[cfg(unix)]
 #[test]
 fn a_regenerated_copy_on_a_reused_inode_stays_out() {
-    let (sb, server, a, b) = pair("sel-reuse");
+    // Its inode numbers apart from the other tests', or one of theirs takes the number it frees.
+    let sb = Sandbox::apart("sel-reuse");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
     b.write("conf.local", "shared");
     b.write("old.txt", "old");
     for i in 0..12 {
@@ -1846,48 +1849,44 @@ fn a_copy_moved_aside_and_regenerated_at_once_both_stay_out() {
 }
 
 /// Killed anywhere in `exclude --remove-local`, then changed its mind.
-#[test]
-fn remove_local_killed_at_any_step_then_included_deletes_nothing() {
-    let next = AtomicU64::new(1);
-    let done = AtomicBool::new(false);
-    std::thread::scope(|s| {
-        for _ in 0..8 {
-            s.spawn(|| {
-                while !done.load(Ordering::SeqCst) {
-                    let step = next.fetch_add(1, Ordering::SeqCst);
-                    let sb = Sandbox::fast("sel-rm-kill");
-                    let server = Server::start(sb.path("server"));
-                    let a = Device::new(&sb, &server, "a");
-                    let b = Device::new(&sb, &server, "b");
-                    b.write("d/one", "1");
-                    b.write("d/sub/two", "2");
-                    b.write("d/three", "3");
-                    for i in 0..12 {
-                        b.write(&format!("plain{i}"), "p");
-                    }
-                    b.synced();
-                    a.synced();
-                    let run = a.cairn_env(
-                        &["exclude", "d", "--remove-local"],
-                        &[("CAIRN_FP_CRASH", &step.to_string())],
-                    );
-                    if !run.was_killed() {
-                        assert!(step > 20, "never killed");
-                        done.store(true, Ordering::SeqCst);
-                    }
-                    // However far it got: excluded or not, it comes back.
-                    let _ = a.cairn(&["include", "d", "--merge"]);
-                    a.synced();
-                    b.synced();
-                    for (path, want) in [("d/one", "1"), ("d/sub/two", "2"), ("d/three", "3")] {
-                        assert_eq!(b.read(path), want.as_bytes(), "step {step}");
-                        assert_eq!(a.read(path), want.as_bytes(), "step {step}");
-                    }
-                }
-            });
+fn remove_local_killed_at_any_step_then_included_deletes_nothing(shard: Shard) {
+    for step in each_step_to_the_end(shard) {
+        let sb = Sandbox::fast("sel-rm-kill");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        b.write("d/one", "1");
+        b.write("d/sub/two", "2");
+        b.write("d/three", "3");
+        for i in 0..12 {
+            b.write(&format!("plain{i}"), "p");
         }
-    });
+        b.synced();
+        a.synced();
+        let run = a.cairn_env(
+            &["exclude", "d", "--remove-local"],
+            &[("CAIRN_FP_CRASH", &step.to_string())],
+        );
+        let killed = run.was_killed();
+        if !killed {
+            assert!(step > 20, "never killed");
+        }
+        // However far it got: excluded or not, it comes back.
+        let _ = a.cairn(&["include", "d", "--merge"]);
+        a.synced();
+        b.synced();
+        for (path, want) in [("d/one", "1"), ("d/sub/two", "2"), ("d/three", "3")] {
+            assert_eq!(b.read(path), want.as_bytes(), "step {step}");
+            assert_eq!(a.read(path), want.as_bytes(), "step {step}");
+        }
+        if !killed {
+            return;
+        }
+    }
 }
+
+shards!(remove_local_killed_at_any_step_then_included_deletes_nothing: s01 s02 s03 s04 s05 s06
+    s07 s08 s09 s10 s11 s12);
 
 // --- Hard links across an exclusion ---
 
@@ -2128,27 +2127,17 @@ fn kill_around_a_rule(step: u64) -> bool {
     killed
 }
 
-#[test]
-fn a_kill_at_any_step_around_a_rule_loses_nothing() {
-    let next = AtomicU64::new(1);
-    let done = AtomicBool::new(false);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(12);
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| {
-                while !done.load(Ordering::SeqCst) {
-                    let step = next.fetch_add(1, Ordering::SeqCst);
-                    if !kill_around_a_rule(step) {
-                        assert!(step > 20, "the sync was never killed");
-                        done.store(true, Ordering::SeqCst);
-                    }
-                }
-            });
+fn a_kill_at_any_step_around_a_rule_loses_nothing(shard: Shard) {
+    for step in each_step_to_the_end(shard) {
+        if !kill_around_a_rule(step) {
+            assert!(step > 20, "the sync was never killed");
+            return;
         }
-    });
+    }
 }
+
+shards!(a_kill_at_any_step_around_a_rule_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08 s09 s10
+    s11 s12);
 
 /// A copy moved onto a held name became that file, and the record of the copy it once was must not
 /// turn a later rename into a delete for everyone, the file's own or its folder's.

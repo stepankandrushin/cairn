@@ -9,8 +9,6 @@ use common::*;
 use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 struct World {
     sb: Sandbox,
@@ -210,38 +208,15 @@ fn check_settled(w: &mut World, context: &str) {
     );
 }
 
-/// Run `f` for 1..=count on a worker pool, failing on the first panic with its step.
-fn for_each_step(count: usize, f: impl Fn(usize) + Sync) {
-    let next = AtomicUsize::new(1);
-    let failures: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(16);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let n = next.fetch_add(1, Ordering::SeqCst);
-                if n > count {
-                    return;
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(n)));
-                if let Err(e) = result {
-                    let message = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_default();
-                    failures.lock().unwrap().push((n, message));
-                }
-            });
-        }
-    });
-    let failures = failures.into_inner().unwrap();
+/// Run `f` for this part's steps of 1..=count, one after another, failing at the end with the first that
+/// panicked.
+fn for_each_step(shard: Shard, count: usize, f: impl Fn(usize)) {
+    let failures = each_item(shard, count, |i| f(i + 1));
     assert!(
         failures.is_empty(),
-        "{} of {count} steps failed; first: {:?}",
+        "{} of this part's steps of {count} failed; first: {:?}",
         failures.len(),
-        failures.first()
+        failures.first().map(|(i, m)| (i + 1, m))
     );
 }
 
@@ -289,8 +264,7 @@ const REQUIRED_CLIENT_STEPS: &[&str] = &[
     "sync.finalize.base",
 ];
 
-#[test]
-fn killed_at_every_client_step_nothing_is_lost() {
+fn killed_at_every_client_step_nothing_is_lost(shard: Shard) {
     let steps = client_steps();
     eprintln!("client steps: {}", steps.len());
     let seen: BTreeSet<&str> = steps.iter().map(String::as_str).collect();
@@ -300,7 +274,7 @@ fn killed_at_every_client_step_nothing_is_lost() {
             "the scenario no longer reaches {required}: {seen:?}"
         );
     }
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let mut w = world(Vec::new());
         let n_s = n.to_string();
         let run = w.a.sync_env(&[("CAIRN_FP_CRASH", &n_s)]);
@@ -320,8 +294,10 @@ fn killed_at_every_client_step_nothing_is_lost() {
     });
 }
 
-#[test]
-fn killed_at_every_server_step_acknowledged_commits_stay() {
+shards!(killed_at_every_client_step_nothing_is_lost: s01 s02 s03 s04 s05 s06 s07 s08 s09 s10 s11
+    s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32);
+
+fn killed_at_every_server_step_acknowledged_commits_stay(shard: Shard) {
     // The server's steps during a's sync, counted from its own log.
     let probe = Sandbox::fast("matrix-probe");
     let log = probe.path("steps");
@@ -345,7 +321,7 @@ fn killed_at_every_server_step_acknowledged_commits_stay() {
         );
     }
 
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let mut w = world(Vec::new());
         let name = steps[n - 1].clone();
         // Counted per server run, so the server is restarted fresh for this sync.
@@ -366,8 +342,10 @@ fn killed_at_every_server_step_acknowledged_commits_stay() {
     });
 }
 
-#[test]
-fn a_full_disk_at_every_client_write_loses_nothing() {
+shards!(killed_at_every_server_step_acknowledged_commits_stay: s01 s02 s03 s04 s05 s06 s07 s08
+    s09 s10 s11 s12 s13 s14 s15 s16);
+
+fn a_full_disk_at_every_client_write_loses_nothing(shard: Shard) {
     let w = world(Vec::new());
     let log = w.sb.path("steps");
     w.a.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())])
@@ -375,7 +353,7 @@ fn a_full_disk_at_every_client_write_loses_nothing() {
     let steps = logged_steps(&log);
     drop(w);
     // Only steps that can report a full disk matter; counting all keeps the numbering shared.
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let mut w = world(Vec::new());
         let n_s = n.to_string();
         let run = w.a.sync_env(&[("CAIRN_FP_ENOSPC", &n_s)]);
@@ -400,8 +378,10 @@ fn a_full_disk_at_every_client_write_loses_nothing() {
     });
 }
 
-#[test]
-fn a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing() {
+shards!(a_full_disk_at_every_client_write_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08 s09 s10
+    s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32);
+
+fn a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing(shard: Shard) {
     let probe = Sandbox::fast("matrix-probe");
     let log = probe.path("steps");
     let w = world(vec![("CAIRN_FP_LOG".into(), log.to_str().unwrap().into())]);
@@ -410,7 +390,7 @@ fn a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing() {
     let steps = logged_steps(&log);
     drop(w);
 
-    for_each_step(steps.len(), |n| {
+    for_each_step(shard, steps.len(), |n| {
         let mut w = world(Vec::new());
         w.server
             .set_env(vec![("CAIRN_FP_ENOSPC".into(), n.to_string())]);
@@ -431,3 +411,6 @@ fn a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing() {
         check_settled(&mut w, &context);
     });
 }
+
+shards!(a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing: s01 s02 s03 s04
+    s05 s06 s07 s08 s09 s10 s11 s12 s13 s14 s15 s16);

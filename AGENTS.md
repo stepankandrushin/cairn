@@ -43,13 +43,14 @@ on the owner's own trees and machines.
 
 - PLAN.md — the design and build order; before any design or code work.
 - docs/protocol.md, docs/format.md — the wire and on-disk formats; before changing either.
-- scripts/ci.sh — the checks and every test, on the real disk in /var/tmp, since tmpfs hid a bug. `--quick`
-  must pass before a commit: all but the 71 tests over 20 s (.config/nextest.toml), about a minute, under
-  cargo-nextest (`cargo install cargo-nextest --locked`). The full run, with `CAIRN_SEEDS=200` and
-  `CAIRN_NO_SKIP=1`, which makes a test that cannot run fail instead of skipping (`skip` in the harness's
-  common/), is what a release passes first, in its own tree on the machine that builds it (about half an hour
-  there, beside the other platforms' builds), and waits for no hosted CI; GitHub runs it too on every push, a
-  second check that nothing waits for, whose failure is work for the next release. scripts/release.sh — a release,
+- scripts/ci.sh — the checks and every test, on the real disk in /var/tmp, since tmpfs hid a bug, under
+  cargo-nextest (`cargo install cargo-nextest --locked`), the long sweeps split into parts by `shards!`
+  (crates/harness/tests/common). `--quick` must pass before a commit: all but the 56 tests and sweeps over
+  20 s (.config/nextest.toml), about a minute. The full run, with `CAIRN_SEEDS=200` and `CAIRN_NO_SKIP=1`,
+  which makes a test that cannot run fail instead of skipping (`skip` in the harness's common/), is what a
+  release passes first, in its own tree on the machine that builds it (about 16 minutes there, as long as its
+  disk takes over the suite's fsyncs), and waits for no hosted CI; GitHub runs it too on every push, a second
+  check that nothing waits for, whose failure is work for the next release. scripts/release.sh — a release,
   with release-macos.sh and release-windows.ps1 for those platforms, and release-update.sh for the signed
   update.json every installed copy checks before it updates itself (docs/protocol.md, "Updates").
   Run them with `bash`: git does not keep them executable. Rust comes from rustup.

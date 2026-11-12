@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # What must hold before a change goes in. Run by .github/workflows/ci.yml, and by hand:
 #   bash scripts/ci.sh           the full suite: every release passes it first, with CAIRN_SEEDS=200 and
-#                                CAIRN_NO_SKIP=1, in its own tree on the machine that builds it; GitHub runs it
-#                                too on every push, in about 33 minutes, as a second check that nothing waits for
-#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 71 tests over 20 s, most
-#                                of them sweeping every step of a sync (.config/nextest.toml, "quick")
+#                                CAIRN_NO_SKIP=1, in its own tree on the machine that builds it, where its tests
+#                                take about 16 minutes; GitHub runs it too on every push, as a second check that
+#                                nothing waits for
+#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 56 tests and sweeps
+#                                over 20 s (.config/nextest.toml, "quick")
 # CAIRN_NO_SKIP=1, which the workflow sets, turns a test that cannot run here into a failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,13 +19,19 @@ case "${1:-}" in
         ;;
 esac
 
-# The quick run is cargo-nextest's: each test a process of its own and the tests of every file in one pool,
-# so it takes about as long as its share of the machine, where cargo test takes the sum of its files. The
-# full run stays cargo test's: under nextest all the sweeps ran at once, each with its own pool of workers,
-# took three times as long each, and two tests with a deadline failed.
-if [ "$profile" = quick ] && ! cargo nextest --version >/dev/null 2>&1; then
-    echo "the quick run is cargo-nextest's, which is not installed: cargo install cargo-nextest --locked" >&2
+# Both runs are cargo-nextest's (.config/nextest.toml): each test a process of its own, the tests of every
+# file in one pool, the longest first, where cargo test runs one file after another. The full run's tests
+# wait on the disk's fsyncs far more than on the CPU, and the more of them wait at once the more fsyncs each
+# journal commit takes together: half as many again as there are CPUs, and no fewer than 16, as on a runner
+# of 4.
+if ! cargo nextest --version >/dev/null 2>&1; then
+    echo "the tests run under cargo-nextest, which is not installed: cargo install cargo-nextest --locked" >&2
     exit 1
+fi
+threads=()
+if [ "$profile" = default ]; then
+    n=$(( $(nproc) * 3 / 2 ))
+    threads=(--test-threads "$(( n > 16 ? n : 16 ))")
 fi
 
 # On a real disk: /tmp is often tmpfs, which never reuses an inode number, and ext4 reuses them at once.
@@ -35,11 +42,7 @@ export TMPDIR
 cargo fmt --all --check
 python3 scripts/tray-version.py --test
 cargo clippy --workspace --all-targets -- -D warnings
-if [ "$profile" = quick ]; then
-    cargo nextest run --workspace --profile quick
-else
-    cargo test --workspace
-fi
+cargo nextest run --workspace --profile "$profile" ${threads[@]+"${threads[@]}"}
 
 # As root the round trip also covers owners, setuid, capabilities and trusted.* xattrs.
 if sudo -n true 2>/dev/null; then

@@ -890,8 +890,14 @@ fn a_daemon_says_a_request_tried_again_in_two_lines() {
     let spec = format!("client.commit:{enobufs}:8");
     let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &[("CAIRN_FP_NET", &spec)]);
     let path = da.log.clone();
+    // A sync after the error, said in the log: until this daemon's first sync ends, .cairn/daemon.json is
+    // still the last daemon's, which said synced, and under load the error's line came out long enough
+    // before this daemon's own state that the stale one was read with it.
     wait_for("the next sync to deliver", &path, || {
-        da.log().contains("error: ") && da.state() == "synced"
+        let log = da.log();
+        log.find("error: ")
+            .is_some_and(|at| log[at..].contains("synced to sequence"))
+            && da.state() == "synced"
     });
     let log = da.log();
     drop(da);
@@ -2586,9 +2592,9 @@ fn the_harness_leaves_nothing_in_the_users_own_directory() {
     let da = Daemon::start_env(&d, &["--reconcile-secs", DAY], &env);
     da.wait_state("synced");
     d.cairn_env(&["status"], &env).expect_ok();
-    // Listed, in the harness's own directory.
+    // Listed, in the harness's own directory for this test's roots.
     let id = std::fs::read_to_string(d.path(".cairn/root-id")).unwrap();
-    let listed = cairn_harness::user_dir().join("roots.json");
+    let listed = cairn_harness::user_dir_of(&sb.dir).join("roots.json");
     let reg = std::fs::read_to_string(&listed).unwrap_or_default();
     assert!(reg.contains(id.trim()), "{}: {reg}", listed.display());
     let left: Vec<_> = std::fs::read_dir(&home)

@@ -950,7 +950,11 @@ fn many_small_files_go_up_in_several_requests() {
 #[cfg(unix)]
 #[test]
 fn a_conflict_copys_inode_number_reused_by_a_symlink_is_a_new_entry() {
-    let (_sb, _s, a, b) = pair("copy-ino");
+    // Its inode numbers apart from the other tests', or one of theirs takes the number it frees.
+    let sb = Sandbox::apart("copy-ino");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
     a.write("f", "base");
     a.synced();
     b.synced();

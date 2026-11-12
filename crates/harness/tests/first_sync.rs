@@ -481,13 +481,16 @@ shards!(a_download_killed_before_its_rows_are_stored_is_not_this_devices_change:
 
 // --- The download: in slices of the cache ---
 
+/// Eight files in two folders, which arrive in batches, and one of two chunks beside the folders.
+fn sliced_tree(a: &Device) {
+    for i in 0..8u64 {
+        a.write(&format!("s{}/f{i}", i % 2), token::make(500 + i, 300_000));
+    }
+    a.write("two-chunks", token::make(600, 1_500_000));
+}
+
 fn a_download_in_slices_killed_at_every_step_loses_nothing(shard: Shard) {
-    let make = |a: &Device| {
-        for i in 0..8u64 {
-            a.write(&format!("s{}/f{i}", i % 2), token::make(500 + i, 300_000));
-        }
-        a.write("two-chunks", token::make(600, 1_500_000));
-    };
+    let make = sliced_tree;
     let tune = ("CAIRN_FP_TUNE", "apply.slice_bytes=400000");
     let probe = Sandbox::fast("slices-probe");
     let server = Server::start(probe.path("server"));
@@ -503,6 +506,9 @@ fn a_download_in_slices_killed_at_every_step_loses_nothing(shard: Shard) {
         count(&steps, "apply.slice.fetched") >= 5,
         "in slices: {steps:?}"
     );
+    // The files written ahead of their turns and flushed together: one batch, or two where the file
+    // beside the folders is made between the two folders and takes some of the first one's files along.
+    assert!(count(&steps, "apply.batch.synced") >= 1, "{steps:?}");
     for_each_step(shard, steps.len(), |n| {
         let sb = Sandbox::fast("slices-killed");
         let server = Server::start(sb.path("server"));
@@ -526,6 +532,230 @@ fn a_download_in_slices_killed_at_every_step_loses_nothing(shard: Shard) {
 
 shards!(a_download_in_slices_killed_at_every_step_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08
     s09 s10 s11 s12 s13 s14 s15 s16);
+
+/// A full disk from any step of the same download on: the run says so and leaves no temporary, a whole
+/// file or none at every name, and what arrived before it is not this device's change, so a later edit
+/// and delete elsewhere stand; the next sync with room brings the rest.
+fn a_full_disk_at_every_step_of_a_download_loses_nothing(shard: Shard) {
+    let tune = ("CAIRN_FP_TUNE", "apply.slice_bytes=400000");
+    let probe = Sandbox::fast("full-download-probe");
+    let server = Server::start(probe.path("server"));
+    let a = Device::new(&probe, &server, "a");
+    let b = Device::new(&probe, &server, "b");
+    sliced_tree(&a);
+    a.synced();
+    let log = probe.path("steps");
+    b.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap()), tune])
+        .expect_ok();
+    let steps = steps(&log);
+    assert!(count(&steps, "apply.batch.synced") >= 1, "{steps:?}");
+    for_each_step(shard, steps.len(), |n| {
+        let sb = Sandbox::fast("full-download");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        sliced_tree(&a);
+        a.synced();
+        let n_s = n.to_string();
+        let run = b.sync_env(&[("CAIRN_FP_ENOSPC", &n_s), tune]);
+        let context = format!("disk full from step {n} ({})", steps[n - 1]);
+        assert!(!run.was_killed(), "{context}: {}", run.text());
+        if !run.ok() {
+            assert!(
+                run.stderr.contains("full") || run.stdout.contains("full"),
+                "{context}: a full disk must be named as such: {}",
+                run.text()
+            );
+        }
+        let _ = token::all_in(&Picture::of(&b.root));
+        assert!(
+            leftover_temps(&b.root).is_empty(),
+            "{context}: temporary files left: {:?}",
+            leftover_temps(&b.root)
+        );
+        a.write("s0/f0", token::make(700, 1000));
+        std::fs::remove_file(a.path("s1/f1")).unwrap();
+        a.synced();
+        b.sync_env(&[tune]).expect_ok();
+        let p = converge(&[&a, &b]);
+        assert_eq!(b.read("s0/f0"), token::make(700, 1000), "{context}");
+        assert!(!b.exists("s1/f1"), "{context}: the delete was undone");
+        let names = p.names();
+        assert!(
+            !names.iter().any(|n| n.contains("(conflict ")),
+            "{context}: {names:?}"
+        );
+        assert_eq!(token::all_in(&p).len(), 8, "{context}: {names:?}");
+        assert!(leftover_temps(&b.root).is_empty(), "{context}");
+    });
+}
+
+shards!(a_full_disk_at_every_step_of_a_download_loses_nothing: s01 s02 s03 s04 s05 s06 s07 s08
+    s09 s10 s11 s12 s13 s14 s15 s16);
+
+// --- The download: new files a batch at a time ---
+
+/// Ten new files in one folder: one batch.
+fn batch_tree(a: &Device) {
+    for i in 0..10u64 {
+        a.write(&format!("x/f{i}"), token::make(800 + i, 2000));
+    }
+}
+
+fn placed_of_batch(d: &Device) -> usize {
+    (0..10).filter(|i| d.exists(&format!("x/f{i}"))).count()
+}
+
+/// A full disk at the flush of one file of a batch, or at its write: the files before it in the batch
+/// are placed in their turns, and nothing from it on, none of it left behind as a temporary, and the run
+/// says the disk is full. With room again, the rest arrive and nothing is a conflict.
+#[test]
+fn a_full_disk_partway_through_a_batch_places_what_came_before_and_nothing_after() {
+    let probe = Sandbox::fast("batch-full-probe");
+    let server = Server::start(probe.path("server"));
+    let a = Device::new(&probe, &server, "a");
+    let b = Device::new(&probe, &server, "b");
+    batch_tree(&a);
+    a.synced();
+    let log = probe.path("steps");
+    b.sync_env(&[("CAIRN_FP_LOG", log.to_str().unwrap())])
+        .expect_ok();
+    let steps = steps(&log);
+    assert_eq!(count(&steps, "apply.batch.synced"), 1, "{steps:?}");
+    assert_eq!(count(&steps, "apply.temp.sync"), 10, "{steps:?}");
+    // The writes, a chunk each, all come before the first flush, and the flushes, all returned, before
+    // the first rename.
+    assert!(
+        nth_step(&steps, "apply.temp.write", 10) < nth_step(&steps, "apply.temp.sync", 1)
+            && nth_step(&steps, "apply.temp.sync", 10) < nth_step(&steps, "apply.batch.synced", 1)
+            && nth_step(&steps, "apply.batch.synced", 1)
+                < nth_step(&steps, "apply.create.before_rename", 1),
+        "{steps:?}"
+    );
+    for (point, k) in [
+        ("apply.temp.sync", 1),
+        ("apply.temp.sync", 2),
+        ("apply.temp.sync", 6),
+        ("apply.temp.sync", 10),
+        ("apply.temp.write", 1),
+        ("apply.temp.write", 7),
+    ] {
+        let sb = Sandbox::fast("batch-full");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        batch_tree(&a);
+        a.synced();
+        let at = nth_step(&steps, point, k).to_string();
+        let run = b.sync_env(&[("CAIRN_FP_ENOSPC", &at)]);
+        let context = format!("a full disk from the {point} of file {k}");
+        assert!(!run.ok() && !run.was_killed(), "{context}: {}", run.text());
+        assert!(run.stderr.contains("full"), "{context}: {}", run.text());
+        let placed = placed_of_batch(&b);
+        if point == "apply.temp.sync" {
+            // Every flush before it went through, and each of those files was renamed in its turn.
+            assert_eq!(placed, k - 1, "{context}: {}", run.text());
+        } else {
+            // Here every flush after the write is refused too, as the disk stays full.
+            assert!(placed < k, "{context}: {placed} placed: {}", run.text());
+        }
+        let _ = token::all_in(&Picture::of(&b.root));
+        assert!(
+            leftover_temps(&b.root).is_empty(),
+            "{context}: temporary files left: {:?}",
+            leftover_temps(&b.root)
+        );
+        b.synced();
+        assert_eq!(placed_of_batch(&b), 10, "{context}");
+        let p = converge(&[&a, &b]);
+        assert_eq!(token::all_in(&p).len(), 10, "{context}");
+        assert!(
+            !p.names().iter().any(|n| n.contains("(conflict ")),
+            "{context}: {:?}",
+            p.names()
+        );
+    }
+}
+
+/// Between a batch's writes and the renames, and between one rename and the next: a new file made at
+/// the name of one still to come is not overwritten, as the check against its name is made in its own
+/// turn, and an edit to one just placed is kept. Both versions of each name stay, on both devices.
+#[test]
+fn a_file_made_at_a_batchs_name_before_its_turn_is_kept() {
+    for point in ["apply.batch.synced", "apply.create.renamed"] {
+        let sb = Sandbox::on_disk("batch-name-taken");
+        let server = Server::start(sb.path("server"));
+        let a = Device::new(&sb, &server, "a");
+        let b = Device::new(&sb, &server, "b");
+        batch_tree(&a);
+        a.synced();
+        let mut made = Vec::new();
+        let mut edited = None;
+        let run = sync_with_gap(&sb, &b, point, &[], || {
+            for i in 0..10u64 {
+                let name = format!("x/f{i}");
+                if b.exists(&name) {
+                    if edited.is_none() {
+                        b.write(&name, token::make(950 + i, 100));
+                        edited = Some(i);
+                    }
+                } else if made.len() < 2 {
+                    b.write(&name, token::make(900 + i, 100));
+                    made.push(i);
+                }
+            }
+        });
+        assert!(!run.was_killed(), "{point}: {}", run.text());
+        assert_eq!(made.len(), 2, "{point}");
+        assert_eq!(edited.is_some(), point == "apply.create.renamed", "{point}");
+        let p = converge(&[&a, &b]);
+        let mut want: std::collections::BTreeSet<u64> = (800..810).collect();
+        want.extend(made.iter().map(|i| 900 + i));
+        want.extend(edited.iter().map(|i| 950 + i));
+        assert_eq!(token::all_in(&p), want, "{point}: {:?}", p.names());
+        assert!(leftover_temps(&b.root).is_empty(), "{point}");
+    }
+}
+
+/// A write to a temporary of a batch while it waits for its flush, by whatever found it there: the file
+/// is placed with it, and as nothing vouches for that write, the next look reads the file and sends it
+/// as this device's edit, rather than taking it for what the server sent.
+#[test]
+fn a_write_to_a_batchs_temporary_before_its_flush_is_read_and_sent() {
+    let sb = Sandbox::on_disk("batch-temp-written");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    let b = Device::new(&sb, &server, "b");
+    batch_tree(&a);
+    a.synced();
+    let mut edited = Vec::new();
+    // No window to wait out once a watch has seen nothing: only the watch could tell of the write.
+    let tune = [("CAIRN_FP_TUNE", "apply.watch_window_ns=0")];
+    let run = sync_with_gap(&sb, &b, "apply.batch.synced", &tune, || {
+        let temps: Vec<PathBuf> = std::fs::read_dir(b.path("x"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".cairn-tmp-")
+            })
+            .collect();
+        assert_eq!(temps.len(), 10, "{temps:?}");
+        // Past the tick of the temporary's last change, so a later write moves its timestamps.
+        std::thread::sleep(Duration::from_millis(50));
+        edit_keeping_size_and_time(&temps[3]);
+        edited = std::fs::read(&temps[3]).unwrap();
+    });
+    assert!(run.ok(), "{}", run.text());
+    let name = (0..10)
+        .map(|i| format!("x/f{i}"))
+        .find(|n| b.read(n) == edited)
+        .expect("the written temporary was placed");
+    converge(&[&a, &b]);
+    assert_eq!(a.read(&name), edited, "the write on b went up");
+}
 
 #[test]
 fn a_download_bigger_than_its_cache_needs_about_its_own_size_free() {

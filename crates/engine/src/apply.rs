@@ -1,7 +1,8 @@
 //! Making the local tree match a plan. Every file arrives the same way: temporary in the same
 //! directory → verified → metadata → fsync → check the destination has not changed → atomic rename.
-//! No step overwrites anything it has not checked, and a kill at any point leaves whole files at
-//! synced paths (invariant 4).
+//! New files take the first steps a batch at a time, their fsyncs at once, and each the last two in its
+//! own turn. No step overwrites anything it has not checked, and a kill at any point leaves whole files
+//! at synced paths (invariant 4).
 
 use crate::client::Client;
 use crate::fsops::{self, is_exists, is_not_found, is_permission, AsFd, Dir, OwnedFd};
@@ -21,6 +22,8 @@ use cairn_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The losing side of a same-field metadata conflict, for the activity log: noted before the first
 /// step, since once the winner is applied nothing on disk says there was a conflict, and gone once the
@@ -110,6 +113,21 @@ const COARSEST_MTIME_NS: i128 = 2_000_000_000;
 /// a daemon's own watch on its folders draws on too.
 const META_WATCHED_AT_ONCE: usize = 4_096;
 
+/// New files written ahead of their turn, with their metadata, and then flushed at once: at most this
+/// many, each holding a descriptor until its turn, and its folder another. On a journaling filesystem
+/// each fsync is a commit that flushes the disk's cache, and fsyncs that wait together share commits:
+/// a first sync of 50,000 small files on an ext4 of two NVMe drives in RAID1 took 5.2 ms a file one
+/// after another, 0.8 in batches of 32 and 0.7 of 64.
+const FILES_A_BATCH: usize = 64;
+
+/// The bytes a batch is closed at: a file this big takes about as long to write as its flush, and what
+/// waits in the page cache for a flush stays about this.
+const BATCH_BYTES: u64 = 16 << 20;
+
+/// Threads that flush one batch, each one file at a time: a flush of its own for every file of a full
+/// batch, as it is the fsyncs waiting at once that a commit takes together.
+const FLUSHERS: usize = FILES_A_BATCH;
+
 /// A file whose metadata this run set, its content left as the scan found it: watched for anything
 /// that could write to it from before it was checked against the scan, and for any change of its
 /// metadata from just after this run's own.
@@ -129,6 +147,75 @@ struct Watched {
     wd: i32,
     /// What it was once written and synced.
     wrote: Fingerprint,
+}
+
+/// A watch on a temporary just written and flushed: its file opened read-only, the watch, and what the
+/// file was then.
+type TempWatch = (OwnedFd, i32, Fingerprint);
+
+/// A temporary this run wrote and has not renamed yet: dropped, it is removed.
+struct Temp {
+    dir: Arc<Dir>,
+    name: Vec<u8>,
+    /// A file's, open to be flushed; `None` for a symlink, and once the file is flushed and closed.
+    fd: Option<OwnedFd>,
+    /// What the file was once its last write and its metadata were done.
+    wrote: Option<Fingerprint>,
+    /// Its flush, where its batch did it: with the rest, or failed before it began.
+    flushed: Option<std::io::Result<()>>,
+}
+
+impl Temp {
+    /// Its name, for a rename: from here it is the caller's to remove.
+    fn keep(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.name)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        // Closed first, as Windows removes no file held open without sharing its deletion.
+        self.fd = None;
+        if !self.name.is_empty() {
+            let _ = self.dir.unlink(&self.name);
+        }
+    }
+}
+
+/// Flush every one of `fds` at once, on up to `FLUSHERS` threads: each its own answer, in order.
+fn flush_together(fds: &[fsops::BorrowedFd<'_>]) -> Vec<std::io::Result<()>> {
+    let answers: Vec<Mutex<Option<std::io::Result<()>>>> =
+        fds.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let work = || loop {
+        let at = next.fetch_add(1, Ordering::SeqCst);
+        let Some(fd) = fds.get(at) else {
+            return;
+        };
+        let flushed = fsops::sync_fd(*fd);
+        *answers[at].lock().unwrap_or_else(|e| e.into_inner()) = Some(flushed);
+    };
+    std::thread::scope(|scope| {
+        let spawned = (0..fds.len().min(FLUSHERS))
+            .filter(|_| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, work)
+                    .is_ok()
+            })
+            .count();
+        // No thread to be had: the flushes are done here, one after another.
+        if spawned == 0 {
+            work();
+        }
+    });
+    answers
+        .into_iter()
+        .map(|a| {
+            a.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| Err(std::io::Error::other("not flushed")))
+        })
+        .collect()
 }
 
 /// The chunks a download still has to bring into the cache, and the files they are for.
@@ -315,8 +402,9 @@ pub struct Applier<'a> {
     unstored: BTreeSet<ObjectId>,
     /// What notes writes to the files this run places, where the filesystem lets it see them all.
     writes: Option<fsops::WriteWatch>,
-    /// The file `write_temp` has just written, watched, and what it was then.
-    temp_watch: Option<(OwnedFd, i32, Fingerprint)>,
+    /// New files whose temporaries a batch wrote ahead of their turn, in the order of their steps, each
+    /// flushed or why it could not be.
+    ahead: VecDeque<(ObjectId, Result<Temp, StepError>)>,
     /// Files placed by this run, still watched, oldest first.
     watched: VecDeque<Watched>,
     /// Files whose metadata this run set, still watched, oldest first.
@@ -371,7 +459,7 @@ impl<'a> Applier<'a> {
             fetch: Fetch::default(),
             unstored: BTreeSet::new(),
             writes: fsops::WriteWatch::new(),
-            temp_watch: None,
+            ahead: VecDeque::new(),
             watched: VecDeque::new(),
             meta_watched: VecDeque::new(),
             vouched: HashMap::new(),
@@ -855,14 +943,9 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// A watch on what `write_temp` has just written and synced: `None` where nothing can watch it, or
-    /// the file changed in between.
-    fn watch(
-        &mut self,
-        dir: &Dir,
-        name: &[u8],
-        wrote: Fingerprint,
-    ) -> Option<(OwnedFd, i32, Fingerprint)> {
+    /// A watch on a temporary this run has just written and flushed: `None` where nothing can watch it,
+    /// or the file changed in between.
+    fn watch(&mut self, dir: &Dir, name: &[u8], wrote: Fingerprint) -> Option<TempWatch> {
         let writes = self.writes.as_mut()?;
         let fd = dir.open_read(name).ok()?;
         let wd = writes.watch(fd.as_fd())?;
@@ -875,14 +958,8 @@ impl<'a> Applier<'a> {
         }
     }
 
-    fn drop_temp_watch(&mut self) {
-        if let (Some((_, wd, _)), Some(writes)) = (self.temp_watch.take(), self.writes.as_mut()) {
-            writes.forget(wd);
-        }
-    }
-
     /// After the rename that placed `id`: watched until it settles.
-    fn keep_watching(&mut self, id: ObjectId, watch: Option<(OwnedFd, i32, Fingerprint)>) {
+    fn keep_watching(&mut self, id: ObjectId, watch: Option<TempWatch>) {
         if let Some((fd, wd, wrote)) = watch {
             self.watched.push_back(Watched { id, fd, wd, wrote });
         }
@@ -1037,46 +1114,51 @@ impl<'a> Applier<'a> {
         Ok(data)
     }
 
-    /// Write `t`'s content under a temporary name in `dir`, with its metadata, durably.
+    /// Write `t`'s content under a temporary name in `dir`, with its metadata, not yet flushed: `seal`
+    /// makes it durable.
     fn write_temp(
         &mut self,
-        dir: &Dir,
+        dir: &Arc<Dir>,
         id: ObjectId,
         t: &TNode,
         display: &[Name],
-    ) -> Result<Vec<u8>, StepError> {
-        let tmp = self.root.temp_name();
-        self.drop_temp_watch();
-        let done = self.write_temp_inner(dir, &tmp, id, t, display);
+    ) -> Result<Temp, StepError> {
+        let mut temp = Temp {
+            dir: dir.clone(),
+            name: self.root.temp_name(),
+            fd: None,
+            wrote: None,
+            flushed: None,
+        };
+        let done = self.write_temp_inner(&mut temp, id, t, display);
         self.done_with(id);
-        if let Err(e) = done {
-            let _ = dir.unlink(&tmp);
-            return Err(e);
-        }
-        Ok(tmp)
+        // Failed, it goes, as `temp` does.
+        done.map(|()| temp)
     }
 
     fn write_temp_inner(
         &mut self,
-        dir: &Dir,
-        tmp: &[u8],
+        temp: &mut Temp,
         id: ObjectId,
         t: &TNode,
         display: &[Name],
     ) -> Result<(), StepError> {
         let kind = t.body.content.kind();
+        let dir = temp.dir.clone();
+        let tmp = temp.name.clone();
         match &t.body.content {
             Content::Dir => return Err(StepError::Failed("a directory has no temporary".into())),
             Content::Symlink { target } => {
                 check("apply.temp.create")?;
-                dir.symlink(&target.0, tmp)?;
+                dir.symlink(&target.0, &tmp)?;
             }
             Content::File { manifest, size } => {
                 check("apply.temp.create")?;
-                let fd = dir.create_new(tmp, 0o600)?;
+                let fd: &OwnedFd = temp.fd.insert(dir.create_new(&tmp, 0o600)?);
+                let fd = fd.as_fd();
                 hit("apply.temp.created");
                 let m = self.manifest(manifest).map_err(StepError::Other)?;
-                fsops::set_len(fd.as_fd(), *size, crate::chunker::has_holes(&m))?;
+                fsops::set_len(fd, *size, crate::chunker::has_holes(&m))?;
                 // Where the old version of this object is, to reuse its chunks.
                 let old = self.old_chunks(id)?;
                 for (offset, chunk) in m.placed_chunks() {
@@ -1091,27 +1173,48 @@ impl<'a> Applier<'a> {
                     }
                     let data = self.read_chunk(chunk, source)?;
                     check("apply.temp.write")?;
-                    fsops::write_all_at(fd.as_fd(), &data, offset)?;
+                    fsops::write_all_at(fd, &data, offset)?;
                     self.used(id, &chunk.hash);
                 }
-                crate::chunker::restore_holes(fd.as_fd(), &m);
+                crate::chunker::restore_holes(fd, &m);
                 hit("apply.temp.written");
                 // Short of room for a field, the temporary is no whole arrival: it goes, and so does the run.
-                self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display)?;
-                // Data and metadata in one flush, as nothing is at a path a sync reads before the rename. Each
-                // flush empties the disk's cache: on an HDD under NTFS a second cost a placed file 7 to 11 ms.
-                fsops::sync_fd(fd.as_fd())?;
-                hit("apply.temp.meta");
-                // From here until a later write would show, whatever is done to it is seen.
-                let wrote = fingerprint(&fsops::fstat(fd.as_fd())?);
-                drop(fd);
-                self.temp_watch = self.watch(dir, tmp, wrote);
+                self.apply_meta(&dir, &tmp, kind, &t.body.metadata, None, display)?;
+                temp.wrote = Some(fingerprint(&fsops::fstat(fd)?));
                 return Ok(());
             }
         }
-        self.apply_meta(dir, tmp, kind, &t.body.metadata, None, display)?;
+        self.apply_meta(&dir, &tmp, kind, &t.body.metadata, None, display)?;
         hit("apply.temp.meta");
         Ok(())
+    }
+
+    /// Make `temp` durable, where its batch did not already, and watch it from here where that can be
+    /// had. Data and metadata in one flush, as nothing is at a path a sync reads before the rename. Each
+    /// flush empties the disk's cache: on an HDD under NTFS a second cost a placed file 7 to 11 ms.
+    fn seal(&mut self, mut temp: Temp) -> Result<(Temp, Option<TempWatch>), StepError> {
+        // A symlink's is the folder's, made durable with it.
+        let Some(fd) = temp.fd.take() else {
+            return Ok((temp, None));
+        };
+        let flushed = match temp.flushed.take() {
+            Some(flushed) => flushed,
+            None => check("apply.temp.sync").and_then(|()| fsops::sync_fd(fd.as_fd())),
+        };
+        flushed?;
+        hit("apply.temp.meta");
+        // From here until a later write would show, whatever is done to it is seen. Anything done to it
+        // since its last write here, while it waited for its flush, means it is read again.
+        let now = fingerprint(&fsops::fstat(fd.as_fd())?);
+        drop(fd);
+        let watch = match &temp.wrote {
+            Some(wrote) if *wrote == now => {
+                let (dir, name) = (temp.dir.clone(), temp.name.clone());
+                self.watch(&dir, &name, now)
+            }
+            _ => None,
+        };
+        Ok((temp, watch))
     }
 
     fn old_chunks(&mut self, id: ObjectId) -> Result<Option<OldVersion>, StepError> {
@@ -1166,11 +1269,19 @@ impl<'a> Applier<'a> {
 
     /// Make a new object appear at its first link.
     fn create(&mut self, id: ObjectId, link: &Link, t: &TNode) -> Result<(), StepError> {
+        // A new file of a batch: written, and flushed or failed, with the rest, its folder held open
+        // since, and every check against its name still to come.
+        if let Some(at) = self.ahead.iter().position(|(o, _)| *o == id) {
+            let (_, written) = self.ahead.remove(at).expect("found at that place");
+            let temp = written?;
+            let dir = temp.dir.clone();
+            return self.place_new(id, link, t, &dir, link.name.as_bytes(), temp);
+        }
         let (dir, name) = self.locate(link)?;
+        let dir = Arc::new(dir);
         self.writable(link.parent, &dir)?;
         self.touched_dirs.insert(link.parent);
         let display = step_path(&self.cur, link);
-        let mut written = None;
         if matches!(t.body.content, Content::Symlink { .. }) && !fsops::HOLDS_SYMLINKS {
             return Err(StepError::Unholdable {
                 why: "a symlink, which this device does not make yet".into(),
@@ -1185,23 +1296,66 @@ impl<'a> Applier<'a> {
             }
             hit("apply.mkdir.done");
             self.touched_dirs.insert(id);
-        } else {
-            let tmp = self.write_temp(&dir, id, t, &display)?;
-            let watch = self.temp_watch.take();
-            // Taken before the rename: any later difference but ctime is someone's edit.
-            written = Some(fingerprint(&dir.stat(&tmp)?));
-            hit("apply.create.before_rename");
-            let placed = refuse_name(&name)
-                .and_then(|()| cairn_failpoint::refuse("apply.place", &name))
-                .and_then(|()| dir.rename_new(&tmp, &dir, &name));
-            if let Err(e) = placed {
-                let _ = dir.unlink(&tmp);
-                return Err(unholdable(&dir, &name, e));
-            }
-            hit("apply.create.renamed");
-            self.keep_watching(id, watch);
+            let st = dir.stat(&name)?;
+            self.created(id, link, t, &dir, &name, fingerprint(&st));
+            return Ok(());
         }
-        let st = dir.stat(&name)?;
+        let temp = self.write_temp(&dir, id, t, &display)?;
+        self.place_new(id, link, t, &dir, &name, temp)
+    }
+
+    /// Rename a new file's or symlink's temporary to its name, once it is durable, if nothing has taken
+    /// the name.
+    fn place_new(
+        &mut self,
+        id: ObjectId,
+        link: &Link,
+        t: &TNode,
+        dir: &Dir,
+        name: &[u8],
+        temp: Temp,
+    ) -> Result<(), StepError> {
+        let (temp, watch) = self.seal(temp)?;
+        // Taken before the rename: any later difference but ctime is someone's edit.
+        let written = match dir.stat(&temp.name) {
+            Ok(st) => fingerprint(&st),
+            Err(e) => {
+                if let Some((_, wd, _)) = watch {
+                    self.forget_watch(wd);
+                }
+                return Err(e.into());
+            }
+        };
+        hit("apply.create.before_rename");
+        let placed = refuse_name(name)
+            .and_then(|()| cairn_failpoint::refuse("apply.place", name))
+            .and_then(|()| dir.rename_new(&temp.name, dir, name));
+        if let Err(e) = placed {
+            if let Some((_, wd, _)) = watch {
+                self.forget_watch(wd);
+            }
+            // The temporary goes.
+            drop(temp);
+            return Err(unholdable(dir, name, e));
+        }
+        temp.keep();
+        hit("apply.create.renamed");
+        self.keep_watching(id, watch);
+        dir.stat(name)?;
+        self.created(id, link, t, dir, name, written);
+        Ok(())
+    }
+
+    /// What a new entry is now that it is at its name: `written` is what this run made it.
+    fn created(
+        &mut self,
+        id: ObjectId,
+        link: &Link,
+        t: &TNode,
+        dir: &Dir,
+        name: &[u8],
+        written: Fingerprint,
+    ) {
         self.cur.insert(
             id,
             CurNode {
@@ -1209,13 +1363,118 @@ impl<'a> Applier<'a> {
                 links: [link.clone()].into(),
                 content: t.body.content.clone(),
                 apply_from: t.body.metadata.clone(),
-                fp: Some(written.unwrap_or_else(|| fingerprint(&st))),
+                fp: Some(written),
                 holds_excluded: false,
             },
         );
-        self.refresh_fp(id, &dir, &name);
+        self.refresh_fp(id, dir, name);
         self.placed.insert(id);
-        Ok(())
+    }
+
+    /// Write the new files among the creations that begin `steps`, the first of them a new file, ahead of
+    /// their turn, a batch of them, and flush them at once: what each one's turn then finds in `ahead`.
+    /// The batch ends at a new file in a folder it does not find here, which a step before it is to make,
+    /// so each is written where it would have been. Every step but the writes and the flushes stays in its
+    /// turn: each check against a name, and each rename, after its own flush, in the order they had. How
+    /// many steps the batch spans.
+    fn write_ahead(
+        &mut self,
+        steps: &[TopoOp],
+        plan: &Plan,
+        unheld_dirs: &BTreeSet<ObjectId>,
+    ) -> usize {
+        // Whatever an earlier batch left is no longer anyone's: removed.
+        self.ahead.clear();
+        let most = cairn_failpoint::tuned("apply.files_a_batch", FILES_A_BATCH as u64) as usize;
+        let mut files: Vec<(ObjectId, &Link)> = Vec::new();
+        let mut bytes = 0;
+        let mut span = 0;
+        // Past folders and symlinks, which are made in their turns, but not far.
+        for step in steps.iter().take(most.max(1) * 4) {
+            let TopoOp::Create { object, link } = step else {
+                break;
+            };
+            if let Content::File { size, .. } = &plan.target[object].body.content {
+                if link.parent != ObjectId::ROOT && !self.cur.contains_key(&link.parent) {
+                    break;
+                }
+                if !is_stage(link) && !unheld_dirs.contains(&link.parent) {
+                    files.push((*object, link));
+                    bytes += size;
+                }
+            }
+            span += 1;
+            if files.len() >= most || bytes >= BATCH_BYTES {
+                break;
+            }
+        }
+        // Alone, a file is written in its turn, as it would gain nothing.
+        if files.len() < 2 {
+            return span;
+        }
+        let mut dirs: HashMap<ObjectId, Arc<Dir>> = HashMap::new();
+        for (object, link) in files {
+            let written = self.write_one_ahead(object, link, &plan.target[&object], &mut dirs);
+            // What stops the run stops the batch: those before it are still placed in their turns.
+            let stop = matches!(written, Err(StepError::DiskFull(_) | StepError::Other(_)));
+            self.ahead.push_back((object, written));
+            if stop {
+                break;
+            }
+        }
+        // Each flush a step of its own, in order, before any begins: a kill or a full disk numbered by
+        // step falls where it would in every run.
+        let mut flushing = Vec::new();
+        for (at, (_, written)) in self.ahead.iter_mut().enumerate() {
+            let Ok(temp) = written else {
+                continue;
+            };
+            if temp.fd.is_none() {
+                continue;
+            }
+            match check("apply.temp.sync") {
+                Ok(()) => flushing.push(at),
+                Err(e) => temp.flushed = Some(Err(e)),
+            }
+        }
+        let fds: Vec<fsops::BorrowedFd<'_>> = flushing
+            .iter()
+            .filter_map(|at| match &self.ahead[*at].1 {
+                Ok(temp) => temp.fd.as_ref().map(|fd| fd.as_fd()),
+                Err(_) => None,
+            })
+            .collect();
+        let answers = flush_together(&fds);
+        drop(fds);
+        for (at, flushed) in flushing.into_iter().zip(answers) {
+            if let Ok(temp) = &mut self.ahead[at].1 {
+                temp.flushed = Some(flushed);
+            }
+        }
+        hit("apply.batch.synced");
+        span
+    }
+
+    /// What `create` does up to the flush, for a new file of a batch, its folder opened once for all of
+    /// the batch's files in it.
+    fn write_one_ahead(
+        &mut self,
+        id: ObjectId,
+        link: &Link,
+        t: &TNode,
+        dirs: &mut HashMap<ObjectId, Arc<Dir>>,
+    ) -> Result<Temp, StepError> {
+        let dir = match dirs.get(&link.parent) {
+            Some(dir) => dir.clone(),
+            None => {
+                let (dir, _) = self.locate(link)?;
+                dirs.entry(link.parent).or_insert(Arc::new(dir)).clone()
+            }
+        };
+        self.writable(link.parent, &dir)?;
+        self.touched_dirs.insert(link.parent);
+        let display = step_path(&self.cur, link);
+        self.write_temp(&dir, id, t, &display)
     }
 
     fn add_link(&mut self, id: ObjectId, link: &Link) -> Result<(), StepError> {
@@ -1359,11 +1618,14 @@ impl<'a> Applier<'a> {
             .ok_or_else(|| StepError::Changed("no entry".into()))?
             .clone();
         let (dir, name) = self.locate(&first)?;
+        let dir = Arc::new(dir);
         self.writable(first.parent, &dir)?;
         self.check_fp(id, &dir, &name)?;
         let display = step_path(&self.cur, &first);
-        let tmp = self.write_temp(&dir, id, t, &display)?;
-        let watch = self.temp_watch.take();
+        let temp = self.write_temp(&dir, id, t, &display)?;
+        let (temp, watch) = self.seal(temp)?;
+        // What follows removes it where it gives up, and the next scan what an error left.
+        let tmp = temp.keep();
         let relink_key = format!("{INTENT_RELINK}{id}");
         if links.len() > 1 {
             // No single rename can move every name to the new inode: note the work, so a crash in
@@ -2208,7 +2470,15 @@ impl<'a> Applier<'a> {
         self.give_up_what_goes(&steps)?;
         // Folders this filesystem cannot hold: what goes in them waits with them.
         let mut unheld_dirs: BTreeSet<ObjectId> = BTreeSet::new();
-        for step in &steps {
+        // Up to where the last batch of new files spans.
+        let mut batched = 0;
+        for (at, step) in steps.iter().enumerate() {
+            let new_file = |object: &ObjectId| {
+                matches!(plan.target[object].body.content, Content::File { .. })
+            };
+            if at >= batched && matches!(step, TopoOp::Create { object, .. } if new_file(object)) {
+                batched = at + self.write_ahead(&steps[at..], plan, &unheld_dirs);
+            }
             if let TopoOp::Create { link, .. } | TopoOp::Link { link, .. } = step {
                 if unheld_dirs.contains(&link.parent) {
                     if let TopoOp::Create { object, .. } = step {
@@ -2264,6 +2534,8 @@ impl<'a> Applier<'a> {
                 (Err(e), _) => self.record(object, display, e)?,
             }
         }
+        // Nothing is left of the last batch: removed if something was.
+        self.ahead.clear();
         hit("apply.created");
         self.apply_updates(plan)?;
         // Durable before any row says so, or a power cut would leave a row claiming a file that the

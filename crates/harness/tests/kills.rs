@@ -1826,6 +1826,8 @@ const SAME_AS_A_NEIGHBOUR: &[&str] = &[
     "apply.temp.written",
     "apply.temp.meta",
     "apply.temp.write",
+    "apply.temp.sync",
+    "apply.batch.synced",
 ];
 
 /// Comparing where things end up finds what the per-step matrix cannot: nothing lost, yet the wrong

@@ -252,6 +252,7 @@ const REQUIRED_CLIENT_STEPS: &[&str] = &[
     "apply.replace.before_rename",
     "apply.replace.renamed",
     "apply.temp.written",
+    "apply.temp.sync",
     "apply.stage.intent",
     "apply.relink.intent",
     "apply.replace.relink",

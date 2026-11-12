@@ -7,8 +7,9 @@
 #
 # A full run is as long as the disk takes over all of it: every fsync is a journal commit, and on an ext4 of
 # two consumer NVMe drives in RAID1 a commit is two cache flushes of 3 to 6 ms each, which the tests take
-# turns at, some 120,000 of them for the suite's 90 GB of writes. Its longest test, the join of 50,000
-# files, places them one fsync after another and takes 6 minutes on such a disk by itself.
+# turns at, some 60,000 of them for the suite's 90 GB of writes. Its longest test, the join of 50,000
+# files, places them 64 at a time with their fsyncs at once, and takes 2 minutes on such a disk by itself
+# and 5 to 7 beside the rest.
 
 [profile.default]
 # Slow is not failing: each test's own deadlines say when something hangs. Every failure is reported,
@@ -17,24 +18,24 @@ slow-timeout = { period = "60s" }
 fail-fast = false
 final-status-level = "fail"
 
-# The longest first, as the run lasts until the last test ends: syncs of thousands of files, each placed with
-# an fsync of its own, one after another, which no split of a test shortens.
+# The longest first, as the run lasts until the last test ends: syncs of thousands of files, and a storm of
+# renames during one, which no split of a test shortens.
 [[profile.default.overrides]]
 filter = "test(=a_join_of_50_000_files_leaves_the_other_devices_incremental)"
 priority = 100
 
 [[profile.default.overrides]]
 filter = """
-    test(=a_change_too_big_for_one_commit_goes_in_several) |
-    test(=the_periodic_check_holds_little_more_than_the_round)
+    test(=hard_links_across_commits_of_a_big_change_all_stay) |
+    test(=a_rename_storm_during_sync_loses_nothing)
 """
 priority = 90
 
 [[profile.default.overrides]]
 filter = """
-    test(=hard_links_across_commits_of_a_big_change_all_stay) |
+    test(=a_change_too_big_for_one_commit_goes_in_several) |
+    test(=the_periodic_check_holds_little_more_than_the_round) |
     test(=one_edit_in_a_big_tree_lists_a_few_folders_not_the_tree) |
-    test(=a_rename_storm_during_sync_loses_nothing) |
     test(=a_move_of_the_servers_database_on_a_full_disk_leaves_schema_3_as_it_was) |
     test(=a_folder_of_thousands_renamed_looks_at_what_is_in_it_and_no_more) |
     test(=every_kind_of_change_reaches_the_other_device_through_scoped_syncs) |
@@ -50,8 +51,9 @@ filter = """
 """
 priority = 50
 
-# A daemon's first sync of 2,000 files within its 30 s: beside the full run's other tests each file's fsync took
-# some 30 ms, and it failed in every such run, so it runs last and alone, in some 20 s.
+# A daemon's first sync of 2,000 files within its 30 s: when they were fsynced one after another, each file's
+# took some 30 ms beside the full run's other tests, and it failed in every such run, so it runs last and
+# alone, in some 8 s.
 [[profile.default.overrides]]
 filter = "test(=the_daemon_compacts_a_state_its_join_left_mostly_free)"
 priority = -100
@@ -73,6 +75,7 @@ default-filter = """not (
     test(=a_folder_of_thousands_of_subfolders_is_watched_whole_under_a_low_limit) |
     test(=a_folder_of_thousands_renamed_looks_at_what_is_in_it_and_no_more) |
     test(/^a_full_disk_at_every_client_write_loses_nothing::/) |
+    test(/^a_full_disk_at_every_step_of_a_download_loses_nothing::/) |
     test(/^a_full_disk_at_every_server_write_refuses_the_commit_and_loses_nothing::/) |
     test(=a_join_of_50_000_files_leaves_the_other_devices_incremental) |
     test(=a_join_s_notes_of_every_file_leave_the_other_devices_incremental) |

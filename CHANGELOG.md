@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- A sync that brings many new files, as a device's first sync of a big tree does, waits far less on the disk:
+  new files are written up to 64 at a time and flushed together, so a journaling filesystem commits them in a
+  few flushes rather than one each. Each is still whole and durable before it appears at its name, checked
+  against what is there in its own turn, and placed in the same order as before. A first sync of 50,000 small
+  files on two NVMe drives in RAID1 took 34 s, where it took 261.
+
 ## 0.1.18 (2026-11-12)
 
 **Added:**

@@ -364,7 +364,7 @@ bash scripts/release.sh         # static binaries and checksums in dist/, after 
 
 Both run the tests under cargo-nextest (`cargo install cargo-nextest --locked`), each test a process of its own
 and every long sweep split into parts that run at once; the full run is as long as the disk takes over its
-fsyncs, about 16 minutes on two NVMe drives in RAID1, whose every journal commit waits on two cache flushes.
+fsyncs, about 11 minutes on two NVMe drives in RAID1, whose every journal commit waits on two cache flushes.
 `CAIRN_SEEDS=500 cargo nextest run -p cairn-harness --test random` runs more random seeds, and `CAIRN_SEED=n`
 reproduces one.
 

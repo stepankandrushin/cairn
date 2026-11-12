@@ -1,8 +1,8 @@
 //! Making the local tree match a plan. Every file arrives the same way: temporary in the same
 //! directory → verified → metadata → fsync → check the destination has not changed → atomic rename.
-//! New files take the first steps a batch at a time, their fsyncs at once, and each the last two in its
-//! own turn. No step overwrites anything it has not checked, and a kill at any point leaves whole files
-//! at synced paths (invariant 4).
+//! New files take the first steps a batch at a time, their fsyncs at once where they wait on the disk,
+//! and each the last two in its own turn. No step overwrites anything it has not checked, and a kill at
+//! any point leaves whole files at synced paths (invariant 4).
 
 use crate::client::Client;
 use crate::fsops::{self, is_exists, is_not_found, is_permission, AsFd, Dir, OwnedFd};
@@ -22,8 +22,7 @@ use cairn_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// The losing side of a same-field metadata conflict, for the activity log: noted before the first
 /// step, since once the winner is applied nothing on disk says there was a conflict, and gone once the
@@ -117,15 +116,15 @@ const META_WATCHED_AT_ONCE: usize = 4_096;
 /// many, each holding a descriptor until its turn, and its folder another. On a journaling filesystem
 /// each fsync is a commit that flushes the disk's cache, and fsyncs that wait together share commits:
 /// a first sync of 50,000 small files on an ext4 of two NVMe drives in RAID1 took 5.2 ms a file one
-/// after another, 0.8 in batches of 32 and 0.7 of 64.
+/// after another, 0.8 in batches of 32 and 0.6 of 64.
 const FILES_A_BATCH: usize = 64;
 
 /// The bytes a batch is closed at: a file this big takes about as long to write as its flush, and what
 /// waits in the page cache for a flush stays about this.
 const BATCH_BYTES: u64 = 16 << 20;
 
-/// Threads that flush one batch, each one file at a time: a flush of its own for every file of a full
-/// batch, as it is the fsyncs waiting at once that a commit takes together.
+/// Threads that flush a batch once a flush has been slow, the run's own among them: one for every file of
+/// a full batch, as it is the fsyncs waiting at once that a commit takes together.
 const FLUSHERS: usize = FILES_A_BATCH;
 
 /// A file whose metadata this run set, its content left as the scan found it: watched for anything
@@ -182,40 +181,156 @@ impl Drop for Temp {
     }
 }
 
-/// Flush every one of `fds` at once, on up to `FLUSHERS` threads: each its own answer, in order.
-fn flush_together(fds: &[fsops::BorrowedFd<'_>]) -> Vec<std::io::Result<()>> {
-    let answers: Vec<Mutex<Option<std::io::Result<()>>>> =
-        fds.iter().map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    let work = || loop {
-        let at = next.fetch_add(1, Ordering::SeqCst);
-        let Some(fd) = fds.get(at) else {
-            return;
+/// The stack of a thread that flushes: it calls the system, and nothing else.
+const FLUSHER_STACK: usize = 256 << 10;
+
+/// A flush that took this long waited on the disk: from then on the run's flushes are made at once. One
+/// that did not, as where the disk has nothing to flush, would gain nothing from company and on a busy
+/// machine lose the moments other threads wait to run.
+const SLOW_FLUSH: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// Threads that flush a batch's files, kept for the run. The run's own thread takes the flushes one after
+/// another until one is slow; from then on, and for the rest of the run, the others are started as needed
+/// and each wakes the next while a flush waits to be taken, so the flushes wait on the disk together.
+#[derive(Default)]
+struct Flushers {
+    queue: Arc<FlushQueue>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// A flush of this run has waited on the disk.
+    slow: bool,
+}
+
+#[derive(Default)]
+struct FlushQueue {
+    state: Mutex<FlushState>,
+    /// A flush waits to be taken, or the threads are to go.
+    work: Condvar,
+    /// A flush is done.
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct FlushState {
+    waiting: VecDeque<(usize, OwnedFd)>,
+    /// Whoever takes a flush wakes another thread for the next.
+    together: bool,
+    done: Vec<(usize, OwnedFd, std::io::Result<()>)>,
+    closing: bool,
+}
+
+impl FlushQueue {
+    fn lock(&self) -> MutexGuard<'_, FlushState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take the next flush that waits and do it: `false` if none waits.
+    fn take_one<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, FlushState>,
+    ) -> (MutexGuard<'a, FlushState>, bool) {
+        let Some((at, fd)) = state.waiting.pop_front() else {
+            return (state, false);
         };
-        let flushed = fsops::sync_fd(*fd);
-        *answers[at].lock().unwrap_or_else(|e| e.into_inner()) = Some(flushed);
-    };
-    std::thread::scope(|scope| {
-        let spawned = (0..fds.len().min(FLUSHERS))
-            .filter(|_| {
-                std::thread::Builder::new()
-                    .spawn_scoped(scope, work)
-                    .is_ok()
-            })
-            .count();
-        // No thread to be had: the flushes are done here, one after another.
-        if spawned == 0 {
-            work();
+        if state.together && !state.waiting.is_empty() {
+            self.work.notify_one();
         }
-    });
-    answers
-        .into_iter()
-        .map(|a| {
-            a.into_inner()
-                .unwrap_or_else(|e| e.into_inner())
-                .unwrap_or_else(|| Err(std::io::Error::other("not flushed")))
-        })
-        .collect()
+        drop(state);
+        let flushed = fsops::sync_fd(fd.as_fd());
+        let mut state = self.lock();
+        state.done.push((at, fd, flushed));
+        self.done.notify_all();
+        (state, true)
+    }
+}
+
+fn flusher(queue: Arc<FlushQueue>) {
+    let mut state = queue.lock();
+    loop {
+        if state.together {
+            let (now, took) = queue.take_one(state);
+            state = now;
+            if took {
+                continue;
+            }
+        }
+        if state.closing {
+            return;
+        }
+        state = queue.work.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+impl Flushers {
+    /// Flush every one of `fds`, at once once a flush has been slow, on up to `FLUSHERS` threads with
+    /// this one: each back with its answer, in the order given.
+    fn flush(&mut self, fds: Vec<OwnedFd>) -> Vec<(OwnedFd, std::io::Result<()>)> {
+        let count = fds.len();
+        let queue = self.queue.clone();
+        if self.slow {
+            self.start(count);
+        }
+        let mut state = queue.lock();
+        state.waiting.extend(fds.into_iter().enumerate());
+        state.together = self.slow;
+        if state.together {
+            queue.work.notify_one();
+        }
+        loop {
+            let alone = !state.together;
+            let began = std::time::Instant::now();
+            let (now, took) = queue.take_one(state);
+            state = now;
+            if !took {
+                break;
+            }
+            if alone && began.elapsed() >= SLOW_FLUSH {
+                self.slow = true;
+            }
+            if alone && self.slow && !state.waiting.is_empty() {
+                drop(state);
+                self.start(count);
+                state = queue.lock();
+                state.together = true;
+                queue.work.notify_one();
+            }
+        }
+        while state.done.len() < count {
+            state = queue.done.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.together = false;
+        let mut done = std::mem::take(&mut state.done);
+        drop(state);
+        done.sort_by_key(|(at, ..)| *at);
+        done.into_iter()
+            .map(|(_, fd, flushed)| (fd, flushed))
+            .collect()
+    }
+
+    /// Threads enough for `count` flushes at once, this one among them, as far as they can be had: those
+    /// there are, or this one alone, do the rest.
+    fn start(&mut self, count: usize) {
+        while self.threads.len() + 1 < count.min(FLUSHERS) {
+            let queue = self.queue.clone();
+            let started = std::thread::Builder::new()
+                .name("cairn-flush".into())
+                .stack_size(FLUSHER_STACK)
+                .spawn(move || flusher(queue));
+            match started {
+                Ok(thread) => self.threads.push(thread),
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+impl Drop for Flushers {
+    fn drop(&mut self) {
+        self.queue.lock().closing = true;
+        self.queue.work.notify_all();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// The chunks a download still has to bring into the cache, and the files they are for.
@@ -405,6 +520,8 @@ pub struct Applier<'a> {
     /// New files whose temporaries a batch wrote ahead of their turn, in the order of their steps, each
     /// flushed or why it could not be.
     ahead: VecDeque<(ObjectId, Result<Temp, StepError>)>,
+    /// What flushes a batch's files at once.
+    flushers: Flushers,
     /// Files placed by this run, still watched, oldest first.
     watched: VecDeque<Watched>,
     /// Files whose metadata this run set, still watched, oldest first.
@@ -460,6 +577,7 @@ impl<'a> Applier<'a> {
             unstored: BTreeSet::new(),
             writes: fsops::WriteWatch::new(),
             ahead: VecDeque::new(),
+            flushers: Flushers::default(),
             watched: VecDeque::new(),
             meta_watched: VecDeque::new(),
             vouched: HashMap::new(),
@@ -1372,7 +1490,7 @@ impl<'a> Applier<'a> {
     }
 
     /// Write the new files among the creations that begin `steps`, the first of them a new file, ahead of
-    /// their turn, a batch of them, and flush them at once: what each one's turn then finds in `ahead`.
+    /// their turn, a batch of them, and flush them (`Flushers`): what each one's turn then finds in `ahead`.
     /// The batch ends at a new file in a folder it does not find here, which a step before it is to make,
     /// so each is written where it would have been. Every step but the writes and the flushes stays in its
     /// turn: each check against a name, and each rename, after its own flush, in the order they had. How
@@ -1437,17 +1555,18 @@ impl<'a> Applier<'a> {
                 Err(e) => temp.flushed = Some(Err(e)),
             }
         }
-        let fds: Vec<fsops::BorrowedFd<'_>> = flushing
+        // Each file's descriptor lent to the flush and given back with its answer.
+        let fds: Vec<OwnedFd> = flushing
             .iter()
-            .filter_map(|at| match &self.ahead[*at].1 {
-                Ok(temp) => temp.fd.as_ref().map(|fd| fd.as_fd()),
+            .filter_map(|at| match &mut self.ahead[*at].1 {
+                Ok(temp) => temp.fd.take(),
                 Err(_) => None,
             })
             .collect();
-        let answers = flush_together(&fds);
-        drop(fds);
-        for (at, flushed) in flushing.into_iter().zip(answers) {
+        let answers = self.flushers.flush(fds);
+        for (at, (fd, flushed)) in flushing.into_iter().zip(answers) {
             if let Ok(temp) = &mut self.ahead[at].1 {
+                temp.fd = Some(fd);
                 temp.flushed = Some(flushed);
             }
         }
@@ -3067,6 +3186,43 @@ mod tests {
             unholdable(&d, b"\xff", ilseq),
             StepError::Unholdable { twin: false, .. }
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Alone, as before a flush is slow, and together, as after: each file is flushed once and comes back
+    /// with its answer in the order given, batch after batch, and the threads go with the run.
+    #[test]
+    fn the_flushers_give_back_every_file_in_order_alone_or_together() {
+        let dir = std::env::temp_dir().join(format!("cairn-flush-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let open = |n: usize| -> Vec<OwnedFd> {
+            (0..n)
+                .map(|i| {
+                    let path = dir.join(format!("f{i}"));
+                    std::fs::write(&path, format!("{i}")).unwrap();
+                    OwnedFd::from(std::fs::File::options().write(true).open(&path).unwrap())
+                })
+                .collect()
+        };
+        let mut flushers = Flushers::default();
+        for (slow, count) in [(false, 5), (true, 70), (true, 3), (false, 1)] {
+            flushers.slow = slow;
+            let fds = open(count);
+            let inodes: Vec<_> = fds
+                .iter()
+                .map(|fd| fsops::fstat(fd.as_fd()).unwrap().ino)
+                .collect();
+            let back = flushers.flush(fds);
+            assert_eq!(back.len(), count);
+            for ((fd, flushed), ino) in back.iter().zip(&inodes) {
+                assert!(flushed.is_ok(), "{flushed:?}");
+                assert_eq!(fsops::fstat(fd.as_fd()).unwrap().ino, *ino);
+            }
+            if slow {
+                assert!(!flushers.threads.is_empty() && flushers.threads.len() < FLUSHERS);
+            }
+        }
+        drop(flushers);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

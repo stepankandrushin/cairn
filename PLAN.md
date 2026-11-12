@@ -135,10 +135,12 @@ from one scan, the server checking each against what the ones before it left.
 **Applying a change.** Download to a temp file in the same directory → verify hashes → set metadata →
 fsync, once for both, as a flush empties the disk's cache → check the destination has not changed locally →
 atomic `rename()`. New files take the first four steps a batch at a time, up to 64 or 16 MiB from a run of
-creations whose folders are there: all written, then all fsynced at once, a thread each, since a journal
-commits fsyncs that wait together in one flush where one after another each waits for its own (a first sync
-of 50,000 small files on an NVMe mirror took 261 s at 5 ms a file, and 34 s so); then each, in its own turn
-and the order it had, is checked and renamed once its own fsync has returned. One that fails is reported in
+creations whose folders are there: all written, then fsynced, one after another until one has waited on the
+disk and from then on all at once, a thread each, since a journal commits fsyncs that wait together in one
+flush where one after another each waits for its own (a first sync of 50,000 small files on an NVMe mirror
+took 261 s at 5 ms a file, and 32 s so), and where no fsync waits, threads would only wait to run on a busy
+machine; then each, in its own turn and the order it had, is checked and renamed once its own fsync has
+returned. One that fails is reported in
 its turn, those before it placed; a full disk stops the run, and what it had not renamed it removes, or after
 a kill the next scan does. Anything done to one while it waits for its fsync means the next scan reads it. A
 replacement goes one at a time. Chunks come through a cache a

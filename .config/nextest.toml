@@ -9,7 +9,7 @@
 # two consumer NVMe drives in RAID1 a commit is two cache flushes of 3 to 6 ms each, which the tests take
 # turns at, some 60,000 of them for the suite's 90 GB of writes. Its longest test, the join of 50,000
 # files, places them 64 at a time with their fsyncs at once, and takes 2 minutes on such a disk by itself
-# and 5 to 7 beside the rest.
+# and 5 to 8 beside the rest.
 
 [profile.default]
 # Slow is not failing: each test's own deadlines say when something hangs. Every failure is reported,

@@ -27,7 +27,8 @@ priority = 100
 [[profile.default.overrides]]
 filter = """
     test(=hard_links_across_commits_of_a_big_change_all_stay) |
-    test(=a_rename_storm_during_sync_loses_nothing)
+    test(=a_rename_storm_during_sync_loses_nothing) |
+    test(=a_sync_holds_a_few_hundred_bytes_for_each_entry_of_the_tree)
 """
 priority = 90
 
@@ -101,6 +102,7 @@ default-filter = """not (
     test(=a_small_state_is_left_with_its_free_pages) |
     test(=a_state_of_version_1_is_moved_by_the_next_sync_and_holds_the_same) |
     test(=a_subscriber_that_never_reads_does_not_stall_syncs) |
+    test(=a_sync_holds_a_few_hundred_bytes_for_each_entry_of_the_tree) |
     test(=a_sync_that_leaves_the_state_mostly_free_compacts_it_and_keeps_all_of_it) |
     test(=an_edit_kept_while_the_tree_keeps_moving_is_one_copy) |
     test(/^an_edit_while_a_files_metadata_is_set_is_sent::/) |

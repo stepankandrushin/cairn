@@ -346,7 +346,8 @@ type WholeRows<'a> = (&'a BTreeMap<ObjectId, Row>, (&'a Tree, &'a Tree));
 #[allow(clippy::too_many_arguments)]
 fn scan_stable(
     root: &mut Root,
-    by_inode: &HashMap<(u64, u64), Known>,
+    by_inode: &dyn crate::scan::KnownRows,
+    (sieve, keep_all, digest): (Option<&dyn crate::scan::Sieve>, bool, bool),
     whole: Option<WholeRows<'_>>,
     accounts: &Accounts,
     remove_temps: bool,
@@ -376,6 +377,10 @@ fn scan_stable(
         probe: false,
         scope: scope.map(|(s, _)| s),
         started: scope.map(|(_, t)| t),
+        sieve,
+        keep_all,
+        digest,
+        discard: false,
     };
     let scan = |dir: &crate::fsops::Dir, opts: &ScanOptions<'_>| match opts.scope {
         Some(_) => crate::scan::scan_scoped(dir, opts),
@@ -630,11 +635,27 @@ fn layout(m: &Manifest) -> Vec<(u64, u64)> {
 /// read again.
 fn keep_what_only_moved_holes(
     root: &Root,
-    by_inode: &HashMap<(u64, u64), Known>,
+    by_inode: &dyn crate::scan::KnownRows,
     result: &mut ScanResult,
 ) {
+    let mut nodes = std::mem::take(&mut result.nodes);
+    holes_only_moved(root, by_inode, &mut nodes, &result.new_manifests);
+    result.nodes = nodes;
+    // The whole scan a harness build keeps beside it, likewise.
+    if let Some(mut all) = result.all.take() {
+        holes_only_moved(root, by_inode, &mut all, &result.new_manifests);
+        result.all = Some(all);
+    }
+}
+
+fn holes_only_moved(
+    root: &Root,
+    by_inode: &dyn crate::scan::KnownRows,
+    nodes: &mut [crate::scan::Scanned],
+    new_manifests: &[(Hash, Vec<u8>)],
+) {
     let mut new: Option<HashMap<Hash, &[u8]>> = None;
-    for node in &mut result.nodes {
+    for node in nodes {
         let Content::File {
             manifest: now,
             size,
@@ -646,17 +667,16 @@ fn keep_what_only_moved_holes(
             manifest: was,
             size: was_size,
         }) = by_inode
-            .get(&(node.fp.dev, node.fp.ino))
-            .map(|r| &r.content)
+            .known(&(node.fp.dev, node.fp.ino))
+            .map(|r| r.content)
         else {
             continue;
         };
-        if now == *was || size != *was_size {
+        if now == was || size != was_size {
             continue;
         }
         let new = new.get_or_insert_with(|| {
-            result
-                .new_manifests
+            new_manifests
                 .iter()
                 .map(|(h, b)| (*h, b.as_slice()))
                 .collect()
@@ -667,7 +687,7 @@ fn keep_what_only_moved_holes(
         };
         let Some(recorded) = root
             .state
-            .manifest(was)
+            .manifest(&was)
             .ok()
             .flatten()
             .and_then(|b| decode(&b))
@@ -676,7 +696,7 @@ fn keep_what_only_moved_holes(
         };
         if layout(&read) != layout(&recorded) && still_holds(root, node, &recorded) {
             node.content = Content::File {
-                manifest: *was,
+                manifest: was,
                 size,
             };
         }
@@ -1792,6 +1812,7 @@ fn sync_full(
                     again = true;
                     continue;
                 }
+                Err(Declined::Rebuilt) => continue,
                 Err(Declined::Widen(more)) => {
                     if scope_widenings < SCOPE_WIDENINGS {
                         scope_widenings += 1;
@@ -1901,6 +1922,10 @@ fn sync_full(
 
             let moved = RefCell::new(Vec::new());
             let scan_started = std::time::Instant::now();
+            // What a later sync with nothing to do would compare itself with, if this one turns out to be.
+            let digest = report.rounds == 1
+                && !opts.dry_run
+                && (crate::steady::oracle() || root.state.generation()? == generation);
             scanned = {
                 let by_inode: HashMap<(u64, u64), Known> = rows
                     .values()
@@ -1909,6 +1934,7 @@ fn sync_full(
                 scan_stable(
                     &mut root,
                     &by_inode,
+                    (None, false, digest),
                     Some((&*rows, (base, remote))),
                     &accounts,
                     !opts.dry_run,
@@ -1924,15 +1950,8 @@ fn sync_full(
             };
             report.scan_time += scan_started.elapsed();
             round_work += scan_started.elapsed();
-            // What a later sync with nothing to do would compare itself with, if this one turns out to be:
-            // worked out beside the identification, which reads the same scan and rows, unless what this
-            // scan rescued is about to change a row.
-            let digest = report.rounds == 1
-                && !opts.dry_run
-                && (crate::steady::oracle() || root.state.generation()? == generation);
-            let digest_beside = digest && scanned.rescued.is_empty();
-            if digest && !digest_beside {
-                trace.first = Some((crate::steady::digest_of(&scanned, rows), seq));
+            if digest {
+                trace.first = Some((crate::steady::digest(&scanned)?, seq));
             }
             for id in &scanned.rescued {
                 if let Some(row) = rows.get_mut(id) {
@@ -1971,25 +1990,16 @@ fn sync_full(
                 .map(|(_, a)| (a.object, a))
                 .collect();
             let ids = crate::incr::Ids::for_round();
-            identified = std::thread::scope(|s| {
-                let digest =
-                    digest_beside.then(|| s.spawn(|| crate::steady::digest_of(&scanned, rows)));
-                let identified = identify(
-                    &scanned,
-                    &view.base,
-                    &view.remote,
-                    rows,
-                    &intents,
-                    &arriving,
-                    &seen.commits,
-                    &|n| ids.of_scanned(n),
-                );
-                if let Some(d) = digest {
-                    let d = d.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-                    trace.first = Some((d, seq));
-                }
-                identified
-            });
+            identified = identify(
+                &scanned,
+                &view.base,
+                &view.remote,
+                rows,
+                &intents,
+                &arriving,
+                &seen.commits,
+                &|n| ids.of_scanned(n),
+            );
             // In a tree still moving, what was seen was seen, and only what was not is asked again.
             if !arriving.is_empty() {
                 let holds =
@@ -2574,18 +2584,6 @@ type Settled = (Vec<(ObjectId, Row)>, Vec<String>);
 /// Rounds of widening before a round gives up on what changed alone.
 const WIDENINGS: usize = 4;
 
-/// Every row's view for the scan, from a glance at each, but those the selection's view takes: on two
-/// rows at one inode, the later object's.
-fn glanced<'g>(
-    g: &'g [(ObjectId, crate::state::Glance)],
-    purged: &BTreeSet<ObjectId>,
-) -> HashMap<(u64, u64), Known<'g>> {
-    g.iter()
-        .filter(|(id, _)| !purged.contains(id))
-        .map(|(_, g)| ((g.fp.dev, g.fp.ino), g.known()))
-        .collect()
-}
-
 /// Why a round on what changed alone cannot go on.
 enum Declined {
     /// The whole tree is the round's to take, and why.
@@ -2598,6 +2596,8 @@ enum Declined {
     Again,
     /// The round's decisions reach folders its scope did not list: the round again, listing these too.
     Widen(crate::scope::Folders),
+    /// The ledger was rebuilt from the state and a scan: the round, on it, with a scan of its own.
+    Rebuilt,
 }
 
 /// A round on what changed alone, up to the merge: the scan, then the part of the tree the ledger cannot
@@ -2633,11 +2633,15 @@ fn incremental_head(
     };
     let rebuilding = session.to_rebuild;
     // What the ledger does not speak for: what was written since it was, and what a rebuild of it found
-    // unsettled. A rebuild starts from the state itself, and finds both again.
-    let (mut dirty, mut dirty_nodes, mut dirty_rows) = match rebuilding {
+    // unsettled. A rebuild starts from the state itself, and finds both again; the round just after it,
+    // on what it found, takes what it found unsettled alone, as the state's own word.
+    let (dirty, dirty_nodes, dirty_rows) = match rebuilding {
         true => (BTreeSet::new(), BTreeMap::new(), BTreeMap::new()),
         false => {
-            let mut dirty = root.state.dirty()?;
+            let mut dirty = match session.just_rebuilt {
+                true => BTreeSet::new(),
+                false => root.state.dirty()?,
+            };
             dirty.extend(session.unsettled.iter().copied());
             let dirty_list: Vec<ObjectId> = dirty.iter().copied().collect();
             let nodes = root.state.nodes_of(&dirty_list)?;
@@ -2659,8 +2663,9 @@ fn incremental_head(
         false => None,
     };
     // For a rebuild, the base as a skeleton, what of it is in view here, and the rows the selection's
-    // view takes, which the scan is not given, as the full sync's is not.
-    let mut purged: BTreeSet<ObjectId> = BTreeSet::new();
+    // view takes, which the scan is not given, as the full sync's is not; for the round just after it,
+    // the same rows, which it is not given either.
+    let mut purged: BTreeSet<ObjectId> = session.unscanned.clone();
     let mut skeleton = None;
     if let Some(g) = &glance {
         let sk = crate::rebuild::skeleton(root)?;
@@ -2712,9 +2717,24 @@ fn incremental_head(
             glanced: rebuilding,
             unscanned: &purged,
         };
-        let known = match &glance {
-            Some(g) => glanced(g, &purged),
-            None => before.scan_rows(),
+        let sorting = incr::Sorting::new(&before, &marked_inodes);
+        // The check keeps of each quiet node a witness of what was read, which a harness build's
+        // oracle has whole.
+        let sorting = match checking {
+            true => sorting.witnessing(),
+            false => sorting,
+        };
+        // A rebuild's scan is given the rows, and keeps what they account for as the object it is.
+        let glanced_rows = glance
+            .as_deref()
+            .map(|g| crate::rebuild::Glanced::new(g, &purged));
+        let row_sieve = match (&glanced_rows, &skeleton) {
+            (Some(rows), Some((sk, _))) => Some(crate::rebuild::RowSieve { rows, sk }),
+            _ => None,
+        };
+        let known: &dyn crate::scan::KnownRows = match &glanced_rows {
+            Some(rows) => rows,
+            None => &sorting,
         };
         // Where the watcher saw something, and what this round must see besides; the rest of the tree
         // as the ledger has it. Not for a rebuild, which reads every row, nor for the check, which is
@@ -2760,9 +2780,18 @@ fn incremental_head(
         if scoped.is_some() {
             hit("sync.scoped");
         }
+        // What the ledger accounts for is kept as the object it is, not whole; in a rebuild, where the
+        // ledger is not the state's word, what the rows account for. The check judges the state
+        // against the ledger the walk was sorted by.
+        let sieve: Option<&dyn crate::scan::Sieve> = match &row_sieve {
+            Some(r) => Some(r),
+            None => Some(&sorting),
+        };
+        let keep_all = sieve.is_some() && incr::oracle();
         let scanned = scan_stable(
             root,
-            &known,
+            known,
+            (sieve, keep_all, first && scoped.is_none()),
             None,
             accounts,
             true,
@@ -2781,7 +2810,7 @@ fn incremental_head(
         *round_work += scan_started.elapsed();
         // A scan that took part of the tree from the ledger is no record of the tree.
         if first && scanned.listed.is_none() {
-            trace.first = Some((crate::steady::digest(&scanned, &known), seq));
+            trace.first = Some((crate::steady::digest(&scanned)?, seq));
         }
         scanned
     };
@@ -2793,39 +2822,68 @@ fn incremental_head(
     }
     if rebuilding {
         let rebuild_started = std::time::Instant::now();
-        let provisional = crate::rebuild::provisional(
-            glance.as_deref().unwrap_or_default(),
-            &purged,
-            &scanned.nodes,
-        );
-        // The oracle compares the scan's rows with the state's; nothing else needs them now.
-        if !incr::oracle() {
-            glance = None;
-        }
-        let Some(skeleton) = skeleton.take() else {
-            bail!("a rebuild with no skeleton of the base");
+        let (Some(g), Some((sk, vis))) = (glance.as_deref(), skeleton.take()) else {
+            bail!("a rebuild with no glance at the rows, or no skeleton of the base");
         };
-        match crate::rebuild::rebuild(
-            root,
-            skeleton,
-            &scanned.nodes,
-            &provisional,
-            session.limit(),
-        )? {
+        // Where the walk found each object, as the rows say by inode; then the rows are let go, the
+        // judging reading each from the state.
+        let (placed, every_provisional) = {
+            let rows = crate::rebuild::Glanced::new(g, &purged);
+            let placed = incr::placed(&scanned, &|n| rows.provisional(n));
+            let every = scanned
+                .all
+                .as_deref()
+                .map(|every| incr::par_map(every.len(), |i| rows.provisional(&every[i])));
+            (placed, every)
+        };
+        drop(glance.take());
+        let found = crate::rebuild::RowFound {
+            c: &placed,
+            sk: &sk,
+        };
+        let limit = session.limit();
+        let r = crate::rebuild::rebuild(root, (&sk, vis), &found, limit)?;
+        // A harness build rebuilds again from every node whole, which must come to the same.
+        if let (Some(every), Some(provisional), Ok(r)) =
+            (scanned.all.as_deref(), every_provisional, &r)
+        {
+            let dir_at = crate::rebuild::dir_at(every);
+            let node_of = crate::rebuild::node_of(&provisional);
+            let places = crate::rebuild::Places {
+                nodes: every,
+                dir_at: &dir_at,
+                provisional: &provisional,
+                node_of: &node_of,
+            };
+            let sk = crate::rebuild::skeleton(root)?;
+            let vis = crate::rebuild::visible(&sk, selection);
+            match crate::rebuild::rebuild(root, (&sk, vis), &places, limit)? {
+                Ok(whole) if whole.same(r) => {}
+                Ok(whole) => bail!(
+                    "the ledger rebuilt from what the walk kept and from every node whole differ: {}",
+                    whole.difference(r)
+                ),
+                Err(why) => bail!(
+                    "the ledger rebuilt from every node whole went the whole way ({why}), and from what the walk kept did not"
+                ),
+            }
+        }
+        match r {
             Err(why) => return Ok(Err(Declined::Whole(why))),
             Ok(r) => {
                 hit("sync.incr.rebuilt");
                 session.ledger = r.ledger;
                 session.anchor.reserved = r.reserved;
                 session.size = session.ledger.len() + r.unsettled.len();
-                session.unsettled = r.unsettled.clone();
+                session.unsettled = r.unsettled;
                 session.to_rebuild = false;
-                dirty = r.unsettled;
-                dirty_nodes = r.nodes;
-                dirty_rows = r.rows;
+                session.just_rebuilt = true;
+                session.unscanned = purged;
             }
         }
         *round_work += rebuild_started.elapsed();
+        // The round on what the rebuild found, with a scan of its own, sorted by the ledger rebuilt.
+        return Ok(Err(Declined::Rebuilt));
     }
     hold(&dirty_rows, &mut released);
     let before = Before {
@@ -2834,7 +2892,7 @@ fn incremental_head(
         dirty_nodes: &dirty_nodes,
         dirty_rows: &dirty_rows,
         journal: &session.journal,
-        glanced: rebuilding,
+        glanced: false,
         unscanned: &purged,
     };
     let thinking = std::time::Instant::now();
@@ -2847,12 +2905,8 @@ fn incremental_head(
     released.extend(scanned.new_manifests.iter().map(|(h, _)| *h));
     let unstable = scanned.unstable;
 
-    let mut c = incr::classify(&before, &scanned);
-    for (i, n) in scanned.nodes.iter().enumerate() {
-        if c.quiet[i] && marked_inodes.contains(&(n.fp.dev, n.fp.ino)) {
-            c.unquiet(i);
-        }
-    }
+    let sorting = incr::Sorting::new(&before, &marked_inodes);
+    let c = incr::classify(&sorting, &scanned);
     let rules = !selection.rules.is_empty();
     let limit = session.limit();
     let unheld: BTreeSet<ObjectId> = selection
@@ -2893,15 +2947,39 @@ fn incremental_head(
             *id == ObjectId::ROOT
                 || c.seeds.contains(id)
                 || unheld.contains(id)
-                || c.node_of.get(id).is_some_and(|&i| scanned.vouched(i))
+                || c.slot_of(id).is_some_and(|s| scanned.vouched(c.seq(s)))
         };
-        let places = crate::rebuild::Places {
-            nodes: &scanned.nodes,
-            dir_at: &c.dir_at,
-            provisional: &c.provisional,
-            node_of: &c.node_of,
+        let sifted = incr::Sifted {
+            c: &c,
+            ledger: &session.ledger,
         };
-        let defects = crate::rebuild::check(root, &session.ledger, selection, &places, &skip)?;
+        let defects = crate::rebuild::check(root, &session.ledger, selection, &sifted, &skip)?;
+        // A harness build checks again with every node whole, which must find the same.
+        if let Some(every) = scanned.all.as_deref() {
+            let provisional: Vec<Option<ObjectId>> =
+                incr::par_map(every.len(), |i| sorting.provisional(&every[i]));
+            let dir_at = crate::rebuild::dir_at(every);
+            let node_of = crate::rebuild::node_of(&provisional);
+            let places = crate::rebuild::Places {
+                nodes: every,
+                dir_at: &dir_at,
+                provisional: &provisional,
+                node_of: &node_of,
+            };
+            let whole = crate::rebuild::check(root, &session.ledger, selection, &places, &skip)?;
+            // Where the walk took for quiet what it read otherwise, as only a planted miss does, the two
+            // say it in other words.
+            let said = |d: &[crate::rebuild::Defect]| -> Vec<ObjectId> {
+                d.iter().map(|d| d.object).collect()
+            };
+            if said(&defects) != said(&whole) {
+                bail!(
+                    "the check of what the walk kept and of every node whole differ: {:?} against {:?}",
+                    said(&defects),
+                    said(&whole)
+                );
+            }
+        }
         if defects.is_empty() {
             if checking {
                 report.checked.get_or_insert(true);
@@ -2956,22 +3034,17 @@ fn incremental_head(
         // looks at must have been listed: otherwise the round again, listing those too.
         if let Some(listed) = &scanned.listed {
             let mut demand = crate::scope::Folders::new();
-            for &i in &reach.nodes {
+            for (&i, &s) in &reach.nodes {
                 if scanned.vouched(i) {
-                    for p in &scanned.nodes[i].paths {
-                        if let Some((_, folder)) = p.split_last() {
-                            demand.insert(folder.to_vec(), false);
-                        }
+                    for folder in c.folder_paths(s) {
+                        demand.insert(folder, false);
                     }
                 }
             }
             for o in &reach.opened {
                 let path = match *o == ObjectId::ROOT {
                     true => Some(Vec::new()),
-                    false => c
-                        .node_of
-                        .get(o)
-                        .and_then(|&i| scanned.nodes[i].paths.first().cloned()),
+                    false => c.slot_of(o).and_then(|s| c.path_of_folder_node(s)),
                 };
                 if let Some(path) = path.filter(|p| !listed.contains(p)) {
                     demand.insert(path, false);
@@ -3039,7 +3112,7 @@ fn incremental_head(
                 &|n| ids.of_scanned(n),
             );
         }
-        if let Some(why) = c.misidentified(&reach, &identified) {
+        if let Some(why) = c.misidentified(&before, &reach, &identified) {
             return Ok(Err(Declined::Rebuild(why)));
         }
         let mut changed = rows_after_scan(&mut rows, &identified, &view.base);
@@ -3119,16 +3192,42 @@ fn incremental_head(
                     moving: moving_with_excluded(&plan, &identified, &scanned.excluded),
                     reserved: view.hidden.reserved.clone(),
                 };
-                // The rows the scan was given, again, as the scan had them.
-                let known = match &glance {
-                    Some(g) => glanced(g, &purged),
-                    None => before.scan_rows(),
-                };
+                // The rows the scan was given, again, as a map of them all would have them: what the
+                // walk asked of the ledger one inode at a time must be what that map says.
+                let known = before.scan_rows();
+                let whole = scanned.whole();
+                let every = whole.as_ref().unwrap_or(&scanned);
+                {
+                    for n in &every.nodes {
+                        let key = (n.fp.dev, n.fp.ino);
+                        let (a, b) = (
+                            crate::scan::KnownRows::known(&sorting, &key),
+                            known.get(&key),
+                        );
+                        let same = match (&a, b) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => {
+                                *a.fp == *b.fp
+                                    && a.racy == b.racy
+                                    && a.incomplete == b.incomplete
+                                    && a.content == b.content
+                                    && a.scan == b.scan
+                            }
+                            _ => false,
+                        };
+                        if !same {
+                            bail!(
+                                "the walk was given another row for {} than a map of every row gives: {a:?} against {b:?}",
+                                n.paths.first().map(|p| crate::scan::display_path(p)).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
                 let full = oracle_full(
                     root,
                     (sbase, srows, ssel),
                     &session.journal.ops,
-                    (&scanned, &session.ledger),
+                    (every, &session.ledger),
                     &known,
                     (&intents, &arriving_marks, accounts),
                     landed,
@@ -3231,6 +3330,9 @@ fn incremental_head(
         hit("sync.incr.round");
         let (all, scanned_part) = (reach.all, scan);
         session.released.extend(released);
+        // What a rebuild found speaks for this round alone; the next reads the state as it is then.
+        session.just_rebuilt = false;
+        session.unscanned.clear();
         return Ok(Ok(Ready {
             base,
             remote,
@@ -3272,7 +3374,7 @@ fn oracle_full(
     (base, rows0, sel0): (&Tree, &BTreeMap<ObjectId, Row>, &Selection),
     journal: &[Op],
     (scanned, ledger): (&ScanResult, &crate::incr::Ledger),
-    known: &HashMap<(u64, u64), Known>,
+    known: &HashMap<(u64, u64), crate::state::Looked>,
     (intents, arriving0, accounts): (&[CopyIntent], &BTreeMap<ObjectId, Arriving>, &Accounts),
     landed: &BTreeSet<OpId>,
     ids: crate::incr::Ids,
@@ -3292,10 +3394,10 @@ fn oracle_full(
         .values()
         .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
         .collect();
-    let same = |a: Option<&Known>, b: Option<&Known>| match (a, b) {
+    let same = |a: Option<&crate::state::Looked>, b: Option<&Known>| match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => {
-            a.fp == b.fp
+            *a.fp == *b.fp
                 && a.racy == b.racy
                 && a.incomplete == b.incomplete
                 && a.content == b.content

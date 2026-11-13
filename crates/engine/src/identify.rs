@@ -734,27 +734,7 @@ mod tests {
     }
 
     fn scan_of(nodes: Vec<Scanned>) -> ScanResult {
-        ScanResult {
-            root: scanned(Vec::new(), fp(1, 1, None), Content::Dir),
-            nodes,
-            skips: Vec::new(),
-            unobserved: Vec::new(),
-            refused: Vec::new(),
-            unobserved_inodes: Vec::new(),
-            unidentified: false,
-            unlisted: Vec::new(),
-            unstable: false,
-            new_manifests: Vec::new(),
-            stale_temps: Vec::new(),
-            rescued_temps: Vec::new(),
-            rescued: Vec::new(),
-            excluded: Vec::new(),
-            excluded_ids: Vec::new(),
-            stopped: false,
-            started: std::time::Instant::now(),
-            vouched_from: usize::MAX,
-            listed: None,
-        }
+        ScanResult::of(scanned(Vec::new(), fp(1, 1, None), Content::Dir), nodes)
     }
 
     fn run(scan: &ScanResult, rows: &BTreeMap<ObjectId, Row>) -> Vec<ObjectId> {

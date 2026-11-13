@@ -248,12 +248,20 @@ rebuild finds unsettled comes to more than a quarter of the tree, the set counti
 ID a join's adoption leaves behind for each file it took in; when the journal does not replay on the part
 loaded; when a round on a
 rebuilt ledger cannot go on either, or a rebuild finds records going out of view while the journal moves things;
-or after four widenings. A round holds the scan and the ledger, a few
-hundred bytes an entry, and decodes the base and rows of the set alone; a rebuild holds every row's glance
-for the scan besides, and reads the base and rows once without holding them. A harness build decides every
-incremental round the full way as well, on the same scan, journal and state, and fails the sync unless every
-decision is the same: the rows the scan was given, identification, the rows, the mass-delete check, twins,
-the plan, the operations, the local steps, what is out of view, and nothing at all outside the set; after a
+or after four widenings. A round's walk sorts each folder's entries against the ledger as it leaves the
+folder, on several threads, and keeps whole only what the ledger does not account for; of the rest it keeps
+the object each is and its folder, some 30 bytes an entry, and what a scope takes from the ledger under a
+folder it does not list the same way. The ledger is held as the state stores it, about 150 bytes an entry, and
+the round decodes the base and rows of the set alone, making again what it takes in of the rest from its
+ledger entry and row. A rebuild walks the tree against every row's glance and the base the same way, keeping
+of what they account for a witness of what was read, which the judging of each row checks; then the round
+walks again, sorted by the ledger rebuilt. The daemon's check keeps such a witness of what its walk takes as
+the ledger has it. So a sync after a device's first holds a few hundred bytes an entry, about 300 MB at
+842,000 entries. A harness build decides every incremental round the full way as well, on the same scan,
+journal and state, and fails the sync unless every decision is the same: the rows the scan was given,
+identification, the rows, the mass-delete check, twins, the plan, the operations, the local steps, what is out
+of view, and nothing at all outside the set; the walk keeps every node whole beside what it sorted, and the
+rows it was given, the check and a rebuild must be the same from either; after a
 finalize, the base, rows and ledger must be what a full one leaves; and on a ledger kept, the ledger rebuilt
 from the state must be it for everything the round leaves alone. A release build has no such oracle, so the
 daemon checks the bookkeeping instead, a day (`--full-sync-secs`) after the last sync whose every decision was

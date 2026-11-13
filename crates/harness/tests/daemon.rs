@@ -588,6 +588,94 @@ fn the_periodic_check_finds_a_write_whose_mark_was_lost() {
     assert_eq!(b.read("far/unmarked"), b"first");
 }
 
+/// What a sync holds grows with the tree by a few hundred bytes an entry, whichever way it goes: a walk
+/// keeps of what the ledger accounts for only the object it is, the ledger is held as it is stored, and a
+/// rebuild of it walks the tree against the rows the same way. A daemon's syncs of one edit each, on a
+/// tree of 1,000 files and on the same tree grown by 30,000 in 600 folders: its first, which walks the
+/// whole tree; one its watcher scopes; and one that rebuilds the ledger. For each entry added the peak
+/// of each grew by 732, 583 and 971 bytes when this was written, SQLite's cache of the state filling as
+/// the state grows among them (it stops at 32 MiB, some 40 bytes an entry at 842,000 entries), where
+/// 0.1.19's grew by 1,824, 1,654 and 1,444: a node held for every entry the walk found or took from the
+/// ledger, the ledger with what was seen of each entry in 168 bytes, every row by inode beside it, and
+/// in a rebuild every node whole. Below 1,100, 1,000 and 1,250 bytes, which 0.1.19 fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sync_holds_a_few_hundred_bytes_for_each_entry_of_the_tree() {
+    const SMALL: usize = 1_000;
+    const ADDED: usize = 30_000;
+    let (_sb, _s, a, _b) = pair("d-memory-per-entry");
+    for i in 0..SMALL {
+        a.write(&format!("small/{}/{i}", i % 20), format!("{i}"));
+    }
+    a.synced();
+    a.synced();
+    let release = [("CAIRN_FP_INCR_ORACLE", "0"), ("CAIRN_FP_FAST_ORACLE", "0")];
+    let rebuild = [release[0], release[1], ("CAIRN_FP_LEDGER_REBUILD", "1")];
+    let peak = |d: &Daemon| -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", d.child.id())).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    };
+    let mut edits = 0;
+    let mut peaks = |a: &Device| -> [u64; 3] {
+        let mut edit = || {
+            edits += 1;
+            a.write("small/3/3", format!("edited {edits}"));
+        };
+        edit();
+        let d = Daemon::start_env(a, &["--reconcile-secs", DAY], &release);
+        let synced = |n: usize| d.log().matches("synced to sequence").count() >= n;
+        wait_for("the first sync", &d.log, || synced(1));
+        let walked = peak(&d);
+        // From here on the peak of what comes next.
+        std::fs::write(format!("/proc/{}/clear_refs", d.child.id()), "5").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        edit();
+        wait_for("the scoped sync", &d.log, || synced(2));
+        let scoped = peak(&d);
+        let log = d.log();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("synced to sequence") && l.contains("listed")),
+            "{log}"
+        );
+        drop(d);
+        edit();
+        let d = Daemon::start_env(a, &["--reconcile-secs", DAY], &rebuild);
+        wait_for("the rebuild", &d.log, || {
+            d.log().matches("synced to sequence").count() >= 1
+        });
+        let rebuilt = peak(&d);
+        assert!(!d.log().contains("looked at the whole tree"), "{}", d.log());
+        [walked, scoped, rebuilt]
+    };
+    let small = peaks(&a);
+    for i in 0..ADDED {
+        a.write(&format!("big/{}/{i}", i % 600), format!("{i}"));
+    }
+    a.synced();
+    a.synced();
+    let big = peaks(&a);
+    let mut said = Vec::new();
+    for (k, kind) in ["walked", "scoped", "rebuilt"].iter().enumerate() {
+        let each = big[k].saturating_sub(small[k]) * 1024 / ADDED as u64;
+        said.push(format!(
+            "{kind}: {} kB on {SMALL} files, {} kB on {}, {each} bytes for each added",
+            small[k],
+            big[k],
+            SMALL + ADDED
+        ));
+    }
+    eprintln!("{}", said.join("\n"));
+    for (k, most) in [1_100, 1_000, 1_250].into_iter().enumerate() {
+        let each = big[k].saturating_sub(small[k]) * 1024 / ADDED as u64;
+        assert!(each < most, "{}", said.join("\n"));
+    }
+}
+
 /// The check holds little besides the round it checks: the ledger against the state object by object,
 /// no second decision, no second copy of the tree. Peak memory of a daemon whose sync is the check, on a
 /// tree of thousands, against one whose sync is not, each with one edit to take: within a fifth more,

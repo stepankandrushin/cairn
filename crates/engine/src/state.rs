@@ -336,6 +336,39 @@ impl Known<'_> {
     }
 }
 
+/// What a scan is given of a row when it asks by inode (scan.rs `KnownRows`): a `Known` as a map holds
+/// it, or one made from a ledger entry, which holds its own fingerprint.
+#[derive(Clone, Debug)]
+pub struct Looked<'a> {
+    pub fp: std::borrow::Cow<'a, Fingerprint>,
+    pub racy: bool,
+    pub incomplete: bool,
+    pub content: Content,
+    pub scan: Option<&'a Metadata>,
+}
+
+impl<'a> From<&Known<'a>> for Looked<'a> {
+    fn from(k: &Known<'a>) -> Self {
+        Looked {
+            fp: std::borrow::Cow::Borrowed(k.fp),
+            racy: k.racy,
+            incomplete: k.incomplete,
+            content: k.content.clone(),
+            scan: k.scan,
+        }
+    }
+}
+
+impl Looked<'_> {
+    /// As `Known::vouches_for`.
+    pub fn vouches_for(&self, fp: &Fingerprint) -> bool {
+        self.fp.current() == *fp
+            && !self.racy
+            && !self.incomplete
+            && matches!(self.content, Content::File { .. })
+    }
+}
+
 /// A row as a sync with nothing to do reads it: what the scan needs, without the rest.
 #[derive(Debug)]
 pub struct Glance {
@@ -1256,7 +1289,12 @@ impl State {
             Ok(all)
         })?;
         parsed.sort_by_key(|(i, _)| *i);
-        Ok(parsed.into_iter().flat_map(|(_, batch)| batch).collect())
+        // Into one list of the size it ends at, each batch let go as it is taken in.
+        let mut out = Vec::with_capacity(parsed.iter().map(|(_, b)| b.len()).sum());
+        for (_, batch) in parsed {
+            out.extend(batch);
+        }
+        Ok(out)
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>> {

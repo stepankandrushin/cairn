@@ -20,7 +20,8 @@ use crate::scan::Scanned;
 use crate::selection::Selection;
 use crate::state::{Glance, Row, StateTable, Stored};
 use anyhow::Result;
-use cairn_protocol::{Content, Link, Name, Node, ObjectId, ObjectKind};
+use cairn_protocol::{Content, Link, Metadata, Name, Node, ObjectId, ObjectKind};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// What the state says of one object.
@@ -108,7 +109,7 @@ fn in_parallel<B: Send, R: Send>(
 /// Every live object of the base besides the root, with its kind and entries, in object order.
 pub fn skeleton(root: &Root) -> Result<Ledger> {
     type Parsed = Vec<(ObjectId, Option<(ObjectKind, Node)>)>;
-    let mut sk = Ledger::default();
+    let mut sk = Ledger::with_room(root.state.base_len()?);
     let work = |batch: Vec<(ObjectId, Stored)>| -> Result<Parsed> {
         batch
             .into_iter()
@@ -229,8 +230,23 @@ pub struct Places<'a, 's> {
     pub node_of: &'a FxMap<ObjectId, usize>,
 }
 
-impl Places<'_, '_> {
+/// Where the scan found each object, for the rows judged against it: every node whole (`Places`), or
+/// what a sieve kept, with what it kept quiet made again from the ledger and the row (incr.rs `Sifted`).
+pub trait Found: Sync {
+    /// The node the scan found this object at, by its inode, given the row it is judged against; `Err`
+    /// with why, where what the scan read cannot have been what the row says.
+    fn found(&self, id: &ObjectId, row: &Row) -> Option<Result<Cow<'_, Scanned>, &'static str>>;
     /// The entries a node has, by what its folders' inodes say they are.
+    fn links_of(&self, n: &Scanned) -> Option<Vec<Link>>;
+}
+
+impl Found for Places<'_, '_> {
+    fn found(&self, id: &ObjectId, _: &Row) -> Option<Result<Cow<'_, Scanned>, &'static str>> {
+        self.node_of
+            .get(id)
+            .map(|&i| Ok(Cow::Borrowed(&self.nodes[i])))
+    }
+
     fn links_of(&self, n: &Scanned) -> Option<Vec<Link>> {
         let mut out = Vec::with_capacity(n.paths.len());
         for p in &n.paths {
@@ -247,6 +263,190 @@ impl Places<'_, '_> {
         out.sort();
         out.dedup();
         Some(out)
+    }
+}
+
+/// Every row a rebuild's scan is given, but those the selection's view takes, found by inode: a glance at
+/// each, as the scan and identification need it.
+pub struct Glanced<'g> {
+    glance: &'g [(ObjectId, Glance)],
+    purged: &'g BTreeSet<ObjectId>,
+    /// The rows by inode number, then device and object: each one's inode number, and the row.
+    inos: Vec<u64>,
+    at: Vec<u32>,
+}
+
+impl<'g> Glanced<'g> {
+    pub fn new(glance: &'g [(ObjectId, Glance)], purged: &'g BTreeSet<ObjectId>) -> Self {
+        let mut order: Vec<(u64, u64, u32)> = glance
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, _))| !purged.contains(id))
+            .map(|(i, (_, g))| (g.fp.ino, g.fp.dev, i as u32))
+            .collect();
+        order.sort_unstable();
+        Glanced {
+            glance,
+            purged,
+            inos: order.iter().map(|(ino, _, _)| *ino).collect(),
+            at: order.iter().map(|(_, _, i)| *i).collect(),
+        }
+    }
+
+    /// The rows at an inode, in object order.
+    fn at_inode(&self, key: (u64, u64)) -> impl Iterator<Item = &'g (ObjectId, Glance)> + '_ {
+        let (dev, ino) = key;
+        let start = self.inos.partition_point(|i| *i < ino);
+        self.inos[start..]
+            .iter()
+            .zip(&self.at[start..])
+            .take_while(move |(i, _)| **i == ino)
+            .map(|(_, at)| &self.glance[*at as usize])
+            .filter(move |(_, g)| g.fp.dev == dev)
+    }
+
+    /// The row of an object.
+    fn of(&self, id: &ObjectId) -> Option<&'g Glance> {
+        let i = self.glance.binary_search_by_key(id, |(x, _)| *x).ok()?;
+        (!self.purged.contains(id)).then(|| &self.glance[i].1)
+    }
+
+    /// The object a node's inode says it is, as identification goes first (and `provisional`).
+    pub fn provisional(&self, n: &Scanned) -> Option<ObjectId> {
+        let mut best: Option<(bool, ObjectId)> = None;
+        for (id, g) in self.at_inode((n.fp.dev, n.fp.ino)) {
+            if g.content.kind() == n.content.kind()
+                && birth_mark(g.fp.btime) == birth_mark(n.fp.btime)
+            {
+                let here = (g.fp.current() == n.fp.current(), *id);
+                if best.is_none_or(|b| here > b) {
+                    best = Some(here);
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+}
+
+impl crate::scan::KnownRows for Glanced<'_> {
+    /// On two rows at one inode, the later object's, as a map of them all gives it.
+    fn known(&self, key: &(u64, u64)) -> Option<crate::state::Looked<'_>> {
+        self.at_inode(*key)
+            .last()
+            .map(|(_, g)| crate::state::Looked::from(&g.known()))
+    }
+
+    fn count(&self) -> usize {
+        self.glance.len()
+    }
+}
+
+/// What a rebuild's scan keeps of what it reads: of what its row and the base's entries account for,
+/// the object it is and a witness of what was read, which `of_row` judges made again from the row.
+pub struct RowSieve<'a> {
+    pub rows: &'a Glanced<'a>,
+    pub sk: &'a Ledger,
+}
+
+impl crate::scan::Sieve for RowSieve<'_> {
+    fn folder(&self, node: &Scanned) -> Option<ObjectId> {
+        self.rows.provisional(node)
+    }
+
+    fn quiet(&self, parent: Option<ObjectId>, n: &Scanned) -> Option<ObjectId> {
+        let parent = parent?;
+        let [path] = n.paths.as_slice() else {
+            return None;
+        };
+        let name = path.last()?;
+        let x = self.rows.provisional(n)?;
+        let g = self.rows.of(&x)?;
+        let si = self.sk.find(&x)?;
+        let link = Link {
+            parent,
+            name: name.clone(),
+        };
+        if self.sk.kind_at(si) != n.content.kind()
+            || !self.sk.links_at_are(si, std::slice::from_ref(&link))
+            || (g.fp.dev, g.fp.ino) != (n.fp.dev, n.fp.ino)
+            || g.content != n.content
+        {
+            return None;
+        }
+        let as_its_row = match n.content {
+            Content::File { .. } => g.known().vouches_for(&n.fp),
+            // Its metadata, which a glance does not hold, is the witness's to tell.
+            _ => n.fp == g.fp && !n.racy && !n.metadata_incomplete,
+        };
+        as_its_row.then_some(x)
+    }
+
+    fn quiet_vouched(&self, _: Option<ObjectId>, _: &crate::scan::Child<'_>) -> bool {
+        false
+    }
+
+    fn witness(&self, node: &Scanned) -> Option<[u8; 16]> {
+        Some(crate::incr::witness(node))
+    }
+
+    fn witnessing(&self) -> bool {
+        true
+    }
+}
+
+/// Where a rebuild's scan found each object: what it kept whole, and what it kept quiet made again from
+/// the row it is judged against and the base's one entry of it, checked against what was read.
+pub struct RowFound<'a, 's> {
+    pub c: &'a crate::incr::Classified<'s>,
+    pub sk: &'a Ledger,
+}
+
+impl Found for RowFound<'_, '_> {
+    fn found(&self, id: &ObjectId, row: &Row) -> Option<Result<Cow<'_, Scanned>, &'static str>> {
+        let scan = self.c.scan();
+        let q = match self.c.slot_of(id)? {
+            crate::scan::Slot::Kept(k) => return Some(Ok(Cow::Borrowed(&scan.nodes[k as usize]))),
+            crate::scan::Slot::Quiet(q) => q as usize,
+        };
+        let read = scan.witnesses.get(q)?;
+        let link = self.sk.links_at(self.sk.find(id)?).into_iter().next()?;
+        let mut path = scan.folder_path(scan.quiet[q].folder);
+        path.push(link.name);
+        let file = matches!(row.content, Content::File { .. });
+        let mut n = Scanned {
+            paths: vec![path],
+            fp: match file {
+                true => row.fp.current(),
+                false => row.fp.clone(),
+            },
+            racy: false,
+            content: row.content.clone(),
+            metadata: match file {
+                true => Metadata::default(),
+                false => row.scan.clone(),
+            },
+            metadata_incomplete: false,
+            holds_excluded: false,
+            only_excluded: false,
+        };
+        if file {
+            return Some(match crate::incr::witness(&n) == *read {
+                true => Ok(Cow::Owned(n)),
+                false => Err("the scan found another file than its record"),
+            });
+        }
+        for (holds, only) in [(false, false), (true, false), (true, true)] {
+            n.holds_excluded = holds;
+            n.only_excluded = only;
+            if crate::incr::witness(&n) == *read {
+                return Some(Ok(Cow::Owned(n)));
+            }
+        }
+        Some(Err("the scan read otherwise of it than its record"))
+    }
+
+    fn links_of(&self, n: &Scanned) -> Option<Vec<Link>> {
+        self.c.links_of(n)
     }
 }
 
@@ -275,47 +475,12 @@ pub fn dir_at(nodes: &[Scanned]) -> FxMap<&[Name], usize> {
     out
 }
 
-/// The object each node's inode says it is, from every row, as identification goes first (and
-/// `incr::classify`): of the rows at its inode of the same kind and birth, the one whose whole
-/// fingerprint holds, the later object on a tie.
-pub fn provisional(
-    glance: &[(ObjectId, Glance)],
-    purged: &BTreeSet<ObjectId>,
-    nodes: &[Scanned],
-) -> Vec<Option<ObjectId>> {
-    let mut by_inode: Vec<((u64, u64), u32)> = glance
-        .iter()
-        .enumerate()
-        .filter(|(_, (id, _))| !purged.contains(id))
-        .map(|(i, (_, g))| ((g.fp.dev, g.fp.ino), i as u32))
-        .collect();
-    by_inode.sort_unstable();
-    crate::incr::par_map(nodes.len(), |i| {
-        let n = &nodes[i];
-        let key = (n.fp.dev, n.fp.ino);
-        let start = by_inode.partition_point(|(k, _)| *k < key);
-        let mut best: Option<(bool, ObjectId)> = None;
-        for (_, gi) in by_inode[start..].iter().take_while(|(k, _)| *k == key) {
-            let (id, g) = &glance[*gi as usize];
-            if g.content.kind() == n.content.kind()
-                && birth_mark(g.fp.btime) == birth_mark(n.fp.btime)
-            {
-                let here = (g.fp.current() == n.fp.current(), *id);
-                if best.is_none_or(|b| here > b) {
-                    best = Some(here);
-                }
-            }
-        }
-        best.map(|(_, id)| id)
-    })
-}
-
 /// What the state says of an object with a row: `si` is its place in the skeleton, if the base has it
 /// live.
 fn of_row(
     sk: &Ledger,
     vis: Option<&Visible>,
-    p: &Places<'_, '_>,
+    p: &dyn Found,
     id: ObjectId,
     si: Option<usize>,
     row: &Row,
@@ -348,17 +513,18 @@ fn of_row(
             return Rebuilt::Unsettled("the names it is held at here are not the base's");
         }
     }
-    let Some(&i) = p.node_of.get(&id) else {
-        return Rebuilt::Unsettled("the scan did not find it at its inode");
+    let n = match p.found(&id, row) {
+        None => return Rebuilt::Unsettled("the scan did not find it at its inode"),
+        Some(Err(why)) => return Rebuilt::Unsettled(why),
+        Some(Ok(n)) => n,
     };
-    let n = &p.nodes[i];
     if (n.fp.dev, n.fp.ino) != (row.fp.dev, row.fp.ino) {
         return Rebuilt::Unsettled("the scan found it at another inode than its record's");
     }
     if n.content.kind() != kind {
         return Rebuilt::Unsettled("the scan found something else at its inode");
     }
-    if !p.links_of(n).is_some_and(|l| sk.links_at_are(si, &l)) {
+    if !p.links_of(&n).is_some_and(|l| sk.links_at_are(si, &l)) {
         return Rebuilt::Unsettled("the scan found it at other names than the base's");
     }
     let changed = match n.content {
@@ -376,7 +542,7 @@ fn of_row(
             {
                 return Rebuilt::Unsettled("the scan read otherwise of it than its record");
             }
-            Some(crate::incr::digest(n))
+            Some(crate::incr::digest(&n))
         }
     };
     let entry = Entry {
@@ -417,7 +583,7 @@ fn judge_rows(
     root: &Root,
     sk: &Ledger,
     vis: Option<&Visible>,
-    p: &Places<'_, '_>,
+    p: &dyn Found,
     skip: &(dyn Fn(&ObjectId) -> bool + Sync),
     sink: &mut dyn FnMut(Judged) -> Result<()>,
 ) -> Result<()> {
@@ -449,43 +615,77 @@ fn judge_rows(
 /// A ledger rebuilt from the state, and what it leaves for a round to take up.
 pub struct Rebuild {
     pub ledger: Ledger,
-    /// What is not settled, each with its base node and row where it has them.
+    /// What is not settled, which a round takes as written since.
     pub unsettled: BTreeSet<ObjectId>,
-    pub nodes: BTreeMap<ObjectId, Node>,
-    pub rows: BTreeMap<ObjectId, Row>,
     /// The topmost entries on the server out of view here.
     pub reserved: BTreeSet<Link>,
+}
+
+impl Rebuild {
+    /// Whether another rebuild came to this one.
+    pub fn same(&self, other: &Rebuild) -> bool {
+        self.difference(other).is_empty()
+    }
+
+    /// Where another rebuild differs from this one, for the oracle's report.
+    pub fn difference(&self, other: &Rebuild) -> String {
+        let mut out = Vec::new();
+        if self.unsettled != other.unsettled {
+            out.push(format!(
+                "unsettled {:?} against {:?}",
+                self.unsettled
+                    .difference(&other.unsettled)
+                    .collect::<Vec<_>>(),
+                other
+                    .unsettled
+                    .difference(&self.unsettled)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if self.reserved != other.reserved {
+            out.push(format!(
+                "reserved {:?} against {:?}",
+                self.reserved, other.reserved
+            ));
+        }
+        let ids: BTreeSet<ObjectId> = self
+            .ledger
+            .ids()
+            .iter()
+            .chain(other.ledger.ids())
+            .copied()
+            .collect();
+        for id in ids {
+            let (a, b) = (self.ledger.entry(&id), other.ledger.entry(&id));
+            if a != b {
+                out.push(format!("{id}: {a:?} against {b:?}"));
+                if out.len() > 8 {
+                    break;
+                }
+            }
+        }
+        out.join("; ")
+    }
 }
 
 /// The ledger from the state and this scan, whose nodes `provisional` says the objects of; `Err` with
 /// why, when more is unsettled than `limit`, which the whole tree costs less than.
 pub fn rebuild(
     root: &Root,
-    (sk, vis): (Ledger, Option<Visible>),
-    nodes: &[Scanned],
-    provisional: &[Option<ObjectId>],
+    (sk, vis): (&Ledger, Option<Visible>),
+    p: &dyn Found,
     limit: usize,
 ) -> Result<std::result::Result<Rebuild, String>> {
-    let dirs = dir_at(nodes);
-    let found = node_of(provisional);
-    let p = Places {
-        nodes,
-        dir_at: &dirs,
-        provisional,
-        node_of: &found,
-    };
-    let mut seen: Vec<Option<Seen>> = Vec::new();
-    seen.resize_with(sk.len(), || None);
+    let mut seen = crate::incr::SeenParts::with_room(sk.len());
     let mut keep = vec![false; sk.len()];
     let mut has_row = vec![false; sk.len()];
-    let mut rows: BTreeMap<ObjectId, Row> = BTreeMap::new();
     let mut unsettled: BTreeSet<ObjectId> = BTreeSet::new();
     let too_many = |n: usize| {
         format!("{n} objects are not as the state says the last agreement left them, more than taking the whole tree costs")
     };
     let mut over = false;
-    judge_rows(root, &sk, vis.as_ref(), &p, &|_| false, &mut |judged| {
-        for (id, si, r, row) in judged {
+    judge_rows(root, sk, vis.as_ref(), p, &|_| false, &mut |judged| {
+        for (id, si, r, _) in judged {
             if let Some(si) = si {
                 has_row[si] = true;
             }
@@ -495,21 +695,15 @@ pub fn rebuild(
             }
             match (r, si) {
                 (Rebuilt::Put(e) | Rebuilt::Changed(e, _), Some(si)) => {
-                    seen[si] = e.seen;
+                    if let Some(s) = &e.seen {
+                        seen.put(si, s);
+                    }
                     keep[si] = true;
                 }
                 (_, _) => {
                     unsettled.insert(id);
-                    if let Some(row) = row {
-                        if !over {
-                            rows.insert(id, row);
-                        }
-                    }
-                    if unsettled.len() > limit {
-                        // Read on to the end, holding nothing more: the count is for the log.
-                        over = true;
-                        rows.clear();
-                    }
+                    // Read on to the end: the count is for the log.
+                    over |= unsettled.len() > limit;
                 }
             }
         }
@@ -519,9 +713,11 @@ pub fn rebuild(
         if has_row[si] {
             continue;
         }
-        match of_rowless(&sk, vis.as_ref(), si) {
+        match of_rowless(sk, vis.as_ref(), si) {
             Rebuilt::Put(e) => {
-                seen[si] = e.seen;
+                if let Some(s) = &e.seen {
+                    seen.put(si, s);
+                }
                 keep[si] = true;
             }
             _ => {
@@ -532,14 +728,10 @@ pub fn rebuild(
     if over || unsettled.len() > limit {
         return Ok(Err(too_many(unsettled.len())));
     }
-    let want: Vec<ObjectId> = unsettled.iter().copied().collect();
-    let nodes = root.state.nodes_of(&want)?;
     let reserved = vis.map(|v| v.left_out).unwrap_or_default();
     Ok(Ok(Rebuild {
         ledger: sk.rebuilt(seen, &keep),
         unsettled,
-        nodes,
-        rows,
         reserved,
     }))
 }
@@ -557,7 +749,7 @@ pub fn check(
     root: &Root,
     stored: &Ledger,
     selection: &Selection,
-    p: &Places<'_, '_>,
+    p: &dyn Found,
     skip: &(dyn Fn(&ObjectId) -> bool + Sync),
 ) -> Result<Vec<Defect>> {
     let sk = skeleton(root)?;

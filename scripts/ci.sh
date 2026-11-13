@@ -4,7 +4,7 @@
 #                                CAIRN_NO_SKIP=1, in its own tree on the machine that builds it, where its tests
 #                                take about 11 minutes; GitHub runs it too on every push, as a second check that
 #                                nothing waits for
-#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 57 tests and sweeps
+#   bash scripts/ci.sh --quick   before a commit, about a minute: the same but for the 58 tests and sweeps
 #                                over 20 s (.config/nextest.toml, "quick")
 # CAIRN_NO_SKIP=1, which the workflow sets, turns a test that cannot run here into a failure.
 set -euo pipefail

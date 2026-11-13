@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- A sync holds about a quarter of the memory it did: on a tree of 842,000 entries every kind of sync but a
+  device's first peaks at 210 to 430 MB, where each took 0.95 to 1.3 GB: a sync with nothing to do 212 MB, one
+  of one edit 280 MB, a daemon's sync of 1,000 rewritten files 360 MB, its daily check 380 to 430 MB, and the
+  first sync after an update, which rebuilds the ledger, 355 MB; between syncs the daemon keeps 25 to 40 MB.
+  The walk sorts each folder's entries against the ledger as it leaves the folder, on several threads, and
+  keeps whole only what the ledger does not account for: of the rest, the object each is, some 30 bytes an
+  entry, where it held a node of about 800 bytes for every entry, those a daemon's sync takes from the ledger
+  without listing them too. The ledger is held as the state stores it, about 150 bytes an entry instead of
+  300, and asked rather than copied into a map of every row by inode. A sync with nothing to do asks the
+  ledger too, instead of reading every row. What a round takes in of what was sorted away is made again from
+  its ledger entry and row, and checked against what the ledger says was read. A sync takes as long as it
+  did, but for the first after an update, which walks the tree once more (22 s there, 18 before). A harness
+  build keeps every node whole beside what was sorted, and fails a sync unless the rows the walk was given,
+  the check and a rebuild come out the same from either.
+
 ## 0.1.19 (2026-11-12)
 
 **Changed:**

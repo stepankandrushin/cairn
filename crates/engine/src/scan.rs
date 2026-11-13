@@ -9,7 +9,7 @@ use crate::fsops::{
 use crate::metadata::{capture, Accounts};
 use crate::refusal::{describe, Refusal};
 use crate::root::aside_origin;
-use crate::state::{Fingerprint, Known};
+use crate::state::{Fingerprint, Known, Looked};
 use cairn_failpoint::hit;
 use cairn_protocol::name::display_bytes;
 use cairn_protocol::{
@@ -53,10 +53,66 @@ pub struct Scanned {
     pub only_excluded: bool,
 }
 
+/// An entry a scan given a sieve kept nothing of but this: what the ledger has it as, quietly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quiet {
+    /// Its place among every node the walk found, in the order a scan without a sieve keeps them.
+    pub seq: u32,
+    /// The folder it is in, in `folders`.
+    pub folder: u32,
+    pub object: ObjectId,
+}
+
+/// A folder a scan found, read or taken from the agreement: where it is, and where its node and the
+/// quiet entries in it are.
+#[derive(Clone, Debug)]
+pub struct Folder {
+    /// The folder it is in; the root's is itself.
+    pub parent: u32,
+    pub name: Option<Name>,
+    /// Where its own node is kept: `None` for the root, and for one the walk went into and then lost.
+    pub node: Option<Slot>,
+    /// The object its node's inode says it is, which a sieve took what is in it to be in.
+    pub object: Option<ObjectId>,
+    /// The quiet entries in it, read and then taken from the agreement: ranges of `quiet`.
+    pub quiet: (u32, u32),
+    pub vouched: (u32, u32),
+}
+
+/// The root's place in `folders`.
+pub const ROOT_FOLDER: u32 = 0;
+
+/// Where a scan keeps a node: whole, as `nodes[k]`, or quiet, as `quiet[q]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Kept(u32),
+    Quiet(u32),
+}
+
 #[derive(Debug)]
 pub struct ScanResult {
     pub root: Scanned,
+    /// Every node kept whole, in walk order; without a sieve, every node the walk found.
     pub nodes: Vec<Scanned>,
+    /// The place in the walk of each of `nodes`, where a sieve dropped some; `None` where node `i` is the
+    /// walk's `i`-th.
+    pub seqs: Option<Vec<u32>>,
+    /// What a sieve kept of the rest, each folder's together.
+    pub quiet: Vec<Quiet>,
+    /// For a check, the sieve's witness of each of `quiet` as it was read.
+    pub witnesses: Vec<[u8; 16]>,
+    /// How many nodes the walk found, kept whole or quiet.
+    pub total: usize,
+    /// Every folder found, the root first.
+    pub folders: Vec<Folder>,
+    /// `folders` by parent and name, for finding one by its path.
+    pub folders_by_name: Vec<u32>,
+    /// Every node, whole, as a scan without a sieve has them: for the harness's oracle alone.
+    pub all: Option<Vec<Scanned>>,
+    /// What a sync with nothing to do compares itself with (steady.rs), when it was asked for.
+    pub digest: Option<Hash>,
+    /// Where the walk found an inode it had found at another place already.
+    pub inode_twice: Option<String>,
     pub skips: Vec<Skip>,
     /// Entries this scan could not observe, each with everything under it.
     pub unobserved: Vec<Vec<Name>>,
@@ -102,7 +158,16 @@ impl ScanResult {
         let nodes_len = nodes.len();
         ScanResult {
             root: self.root.clone(),
+            total: nodes_len,
             nodes,
+            seqs: None,
+            quiet: Vec::new(),
+            witnesses: Vec::new(),
+            folders: Vec::new(),
+            folders_by_name: Vec::new(),
+            all: None,
+            digest: None,
+            inode_twice: None,
             skips: self.skips.clone(),
             unobserved: self.unobserved.clone(),
             refused: self.refused.clone(),
@@ -123,10 +188,199 @@ impl ScanResult {
         }
     }
 
+    /// A scan of these nodes alone, every one of them read: one made by hand, as a test makes it.
+    pub fn of(root: Scanned, nodes: Vec<Scanned>) -> ScanResult {
+        let part = ScanResult {
+            root: root.clone(),
+            nodes: Vec::new(),
+            seqs: None,
+            quiet: Vec::new(),
+            witnesses: Vec::new(),
+            total: 0,
+            folders: Vec::new(),
+            folders_by_name: Vec::new(),
+            all: None,
+            digest: None,
+            inode_twice: None,
+            skips: Vec::new(),
+            unobserved: Vec::new(),
+            refused: Vec::new(),
+            unobserved_inodes: Vec::new(),
+            unidentified: false,
+            unlisted: Vec::new(),
+            unstable: false,
+            new_manifests: Vec::new(),
+            stale_temps: Vec::new(),
+            rescued_temps: Vec::new(),
+            rescued: Vec::new(),
+            excluded: Vec::new(),
+            excluded_ids: Vec::new(),
+            stopped: false,
+            started: Instant::now(),
+            vouched_from: usize::MAX,
+            listed: None,
+        };
+        let mut out = ScanResult {
+            vouched_from: usize::MAX,
+            ..part.with_nodes(nodes)
+        };
+        // Every folder a node is in or is, as a walk finds them.
+        let mut folders = vec![Folder {
+            parent: ROOT_FOLDER,
+            name: None,
+            node: None,
+            object: None,
+            quiet: (0, 0),
+            vouched: (0, 0),
+        }];
+        let mut at: BTreeMap<Vec<Name>, u32> = BTreeMap::new();
+        at.insert(Vec::new(), ROOT_FOLDER);
+        let mut folder = |path: &[Name], folders: &mut Vec<Folder>| -> u32 {
+            let mut f = ROOT_FOLDER;
+            for i in 1..=path.len() {
+                f = match at.get(&path[..i]) {
+                    Some(f) => *f,
+                    None => {
+                        folders.push(Folder {
+                            parent: f,
+                            name: Some(path[i - 1].clone()),
+                            node: None,
+                            object: None,
+                            quiet: (0, 0),
+                            vouched: (0, 0),
+                        });
+                        let new = (folders.len() - 1) as u32;
+                        at.insert(path[..i].to_vec(), new);
+                        new
+                    }
+                };
+            }
+            f
+        };
+        for (k, n) in out.nodes.iter().enumerate() {
+            for p in &n.paths {
+                if let Some((_, parent)) = p.split_last() {
+                    folder(parent, &mut folders);
+                }
+                if n.content == Content::Dir {
+                    let f = folder(p, &mut folders);
+                    folders[f as usize].node = Some(Slot::Kept(k as u32));
+                }
+            }
+        }
+        let mut by_name: Vec<u32> = (1..folders.len() as u32).collect();
+        by_name.sort_unstable_by(|a, b| {
+            let (a, b) = (&folders[*a as usize], &folders[*b as usize]);
+            (a.parent, &a.name).cmp(&(b.parent, &b.name))
+        });
+        out.folders = folders;
+        out.folders_by_name = by_name;
+        let mut seen = Inodes::default();
+        out.inode_twice = out
+            .nodes
+            .iter()
+            .find(|n| !seen.insert((n.fp.dev, n.fp.ino)))
+            .map(|n| {
+                n.paths
+                    .first()
+                    .map_or_else(String::new, |p| display_path(p))
+            });
+        out
+    }
+
+    /// The same scan with every node whole, as a scan without a sieve has them, where it kept them all.
+    pub fn whole(&self) -> Option<ScanResult> {
+        let all = self.all.clone()?;
+        Some(ScanResult {
+            vouched_from: self.vouched_from,
+            ..self.with_nodes(all)
+        })
+    }
+
     /// Whether node `i` was taken from the last agreement rather than read.
     pub fn vouched(&self, i: usize) -> bool {
         i >= self.vouched_from
     }
+
+    /// The place in the walk of `nodes[k]`.
+    pub fn seq(&self, k: usize) -> usize {
+        match &self.seqs {
+            Some(s) => s[k] as usize,
+            None => k,
+        }
+    }
+
+    /// The folder at this path, if the walk found one there.
+    pub fn folder_at(&self, path: &[Name]) -> Option<u32> {
+        if self.folders.is_empty() {
+            return None;
+        }
+        let mut at = ROOT_FOLDER;
+        for name in path {
+            let i = self
+                .folders_by_name
+                .binary_search_by(|f| {
+                    let f = &self.folders[*f as usize];
+                    (f.parent, f.name.as_ref()).cmp(&(at, Some(name)))
+                })
+                .ok()?;
+            at = self.folders_by_name[i];
+        }
+        Some(at)
+    }
+
+    /// Where a folder is, from the root.
+    pub fn folder_path(&self, mut f: u32) -> Vec<Name> {
+        let mut out = Vec::new();
+        while f != ROOT_FOLDER {
+            let folder = &self.folders[f as usize];
+            if let Some(name) = &folder.name {
+                out.push(name.clone());
+            }
+            f = folder.parent;
+        }
+        out.reverse();
+        out
+    }
+}
+
+/// What a scan knows of a file by its inode, to tell one that has not changed without reading it: a map of
+/// rows, or the ledger and what was written since (incr.rs), asked one inode at a time.
+pub trait KnownRows: Sync {
+    fn known(&self, key: &(u64, u64)) -> Option<Looked<'_>>;
+    /// About how many, for the progress a scan shows.
+    fn count(&self) -> usize;
+}
+
+impl KnownRows for HashMap<(u64, u64), Known<'_>> {
+    fn known(&self, key: &(u64, u64)) -> Option<Looked<'_>> {
+        self.get(key).map(Looked::from)
+    }
+
+    fn count(&self) -> usize {
+        self.len()
+    }
+}
+
+/// What a scan given the ledger keeps of what it reads (incr.rs `Sieve`): every entry the ledger does not
+/// account for, whole, and of the rest the object each is, so that a round holds what changed and not
+/// the tree.
+pub trait Sieve: Sync {
+    /// The object a folder is, by what its node's inode says, once everything in it has been walked.
+    fn folder(&self, node: &Scanned) -> Option<ObjectId>;
+    /// The object this node, in the folder that is `parent`, is quietly: found as the ledger has it.
+    /// `None` keeps it whole.
+    fn quiet(&self, parent: Option<ObjectId>, node: &Scanned) -> Option<ObjectId>;
+    /// The same, of what a scope took from the agreement under a folder it vouches for all the way down,
+    /// in which no entry shares an inode with another: the ledger's own entry, in the folder that is
+    /// `parent`.
+    fn quiet_vouched(&self, parent: Option<ObjectId>, child: &Child<'_>) -> bool;
+    /// What is kept of a quiet node to tell later that it was read as it is made again, for a check of
+    /// the ledger it was sorted by: `None` where nothing is to be checked.
+    fn witness(&self, node: &Scanned) -> Option<[u8; 16]>;
+    /// Whether it keeps a witness of each quiet node, so that one taken from the agreement, never read,
+    /// is not to be quiet.
+    fn witnessing(&self) -> bool;
 }
 
 /// The part of the tree a scan lists, when a daemon's watcher says where things changed (scope.rs): the
@@ -135,6 +389,17 @@ impl ScanResult {
 pub struct Scope<'a> {
     pub list: &'a crate::scope::Folders,
     pub vouch: &'a dyn Vouch,
+}
+
+/// One entry of what the agreement found in a folder: the object, its name, whether it is a folder, its
+/// inode, and where the agreement keeps it, for the sieve.
+#[derive(Clone, Copy, Debug)]
+pub struct Child<'v> {
+    pub object: ObjectId,
+    pub name: &'v [u8],
+    pub dir: bool,
+    pub inode: (u64, u64),
+    pub place: u32,
 }
 
 /// The last agreement's word on the folders a scan does not list (incr.rs `Word`).
@@ -149,18 +414,13 @@ pub trait Vouch: Sync {
     fn takes_all_but(&self, folder: ObjectId, except: &BTreeSet<Name>) -> bool;
     /// Whether the agreement had an entry of this name in this folder.
     fn has_child(&self, folder: ObjectId, name: &Name) -> bool;
-    /// Everything in this folder but `except`, all the way down, as the agreement found it, at `path`:
-    /// but what is at an inode in `found`, which the scan read somewhere.
-    fn under(
-        &self,
-        folder: ObjectId,
-        path: &[Name],
-        except: &BTreeSet<Name>,
-        found: &HashSet<(u64, u64)>,
-        out: &mut Vec<Scanned>,
-    );
-    /// The paths the agreement had this inode at.
-    fn paths_of(&self, inode: (u64, u64)) -> Vec<Vec<Name>>;
+    /// What the agreement found in this folder, each name once.
+    fn children(&self, folder: ObjectId) -> Vec<Child<'_>>;
+    /// What the agreement found of this object, as a node at `path`.
+    fn node(&self, object: ObjectId, path: Vec<Name>) -> Option<Scanned>;
+    /// The folders the agreement had something this scan read at, where the scan did not read it: the
+    /// folder of each such path.
+    fn agreed_elsewhere(&self, scan: &ScanResult) -> Vec<Vec<Name>>;
 }
 
 /// The folders a scan lists, as a tree of names.
@@ -210,7 +470,7 @@ pub struct ScanOptions<'a> {
     pub temp_prefix: &'a [u8],
     pub accounts: &'a Accounts,
     /// What is known by inode, to avoid reading unchanged files.
-    pub rows: &'a HashMap<(u64, u64), Known<'a>>,
+    pub rows: &'a dyn KnownRows,
     pub remove_own_temps: bool,
     /// What this device was about to place, and at which names, by a run that may have been killed.
     pub arriving: &'a [(Content, Vec<Name>)],
@@ -223,6 +483,14 @@ pub struct ScanOptions<'a> {
     pub scope: Option<&'a Scope<'a>>,
     /// When the scan is to say it began, if before the call: when the scope it was given was taken.
     pub started: Option<Instant>,
+    /// Keep of what the ledger accounts for only the object it is.
+    pub sieve: Option<&'a dyn Sieve>,
+    /// Keep every node whole as well, in `all`, for the harness's oracle.
+    pub keep_all: bool,
+    /// Work out the digest a sync with nothing to do compares itself with.
+    pub digest: bool,
+    /// Keep no node but what more names may come to: for a scan that is its digest alone.
+    pub discard: bool,
 }
 
 pub fn fingerprint(st: &Stat) -> Fingerprint {
@@ -272,13 +540,64 @@ pub fn display_path(path: &[Name]) -> String {
     parts.join("/")
 }
 
-/// A directory as it looked when listed: its path, device and inode, mtime and ctime.
-type Listed = (Vec<Name>, (u64, u64), Timestamp, Timestamp);
+/// A directory as it looked when listed: its folder, device and inode, mtime and ctime.
+type Listed = (u32, (u64, u64), Timestamp, Timestamp);
+
+/// How many nodes of folders done with wait before they are sorted together.
+const SETTLE_BATCH: usize = 16_384;
+
+/// The nodes of a folder the walk is in, held until its own node is read: with a sieve, each is then
+/// kept whole or quiet. Each with its place in the walk, and its own folder if it is one.
+struct Open {
+    folder: u32,
+    children: Vec<(u32, Scanned, Option<u32>)>,
+}
+
+/// A cheap hash for the walk's set of inodes, which nobody chooses against it.
+#[derive(Default, Clone, Copy)]
+struct InodeHash(u64);
+
+impl std::hash::Hasher for InodeHash {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(u64::from(*b));
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Inodes = HashSet<(u64, u64), std::hash::BuildHasherDefault<InodeHash>>;
 
 struct Walk<'a> {
     opts: &'a ScanOptions<'a>,
     precision_ns: u32,
+    /// Kept whole, and each one's place in the walk.
     nodes: Vec<Scanned>,
+    seqs: Vec<u32>,
+    quiet: Vec<Quiet>,
+    witnesses: Vec<[u8; 16]>,
+    /// Folders done with, whose nodes wait to be sorted, and how many those are.
+    done: Vec<(Open, Option<ObjectId>)>,
+    done_nodes: usize,
+    /// Nodes found so far.
+    seq: u32,
+    folders: Vec<Folder>,
+    open: Vec<Open>,
+    /// Every inode a node was made for, and the first found at another place already.
+    inodes: Inodes,
+    inode_twice: Option<String>,
+    /// Hard-linked files and symlinks, whose names the walk finds one by one: kept whole from the first,
+    /// and counted into the digest at the end.
+    linked_slots: Vec<u32>,
+    all: Option<Vec<Option<Scanned>>>,
+    digest: Option<crate::steady::Stream>,
     linked: HashMap<(u64, u64), usize>,
     skips: Vec<Skip>,
     unobserved: Vec<Vec<Name>>,
@@ -298,8 +617,8 @@ struct Walk<'a> {
     excluded_ids: Vec<(u64, u64, Option<Timestamp>, bool)>,
     stopped: bool,
     /// What a scan with a scope takes from the agreement once the walk is done: each folder's object,
-    /// path, and the names in it read here.
-    take: Vec<(ObjectId, Vec<Name>, BTreeSet<Name>)>,
+    /// its place in `folders`, the names in it read here, and what its node's inode says it is.
+    take: Vec<(ObjectId, u32, BTreeSet<Name>, Option<ObjectId>)>,
     listed: BTreeSet<Vec<Name>>,
     /// Folders taken from the agreement with something excluded under them, for the folders above.
     hidden_excluded: usize,
@@ -333,7 +652,7 @@ pub fn aside_holds_edit(dir: &Dir, temp: &[u8], opts: &ScanOptions) -> Option<Fi
     };
     let same_inode = opts
         .rows
-        .get(&(st.dev, st.ino))
+        .known(&(st.dev, st.ino))
         .filter(|row| birth_mark(row.fp.btime) == birth_mark(st.btime));
     let on_record = same_inode.is_some_and(|row| Some(&row.content) == content.as_ref());
     let on_its_way = opts.arriving.iter().any(|(on_its_way, names)| {
@@ -359,6 +678,179 @@ fn read_failure(e: &std::io::Error) -> (SkipKind, String) {
 }
 
 impl Walk<'_> {
+    /// A folder found in the one the walk is in, named `name`.
+    fn new_folder(&mut self, name: &Name) -> u32 {
+        let parent = self.open.last().map_or(ROOT_FOLDER, |o| o.folder);
+        self.folders.push(Folder {
+            parent,
+            name: Some(name.clone()),
+            node: None,
+            object: None,
+            quiet: (0, 0),
+            vouched: (0, 0),
+        });
+        (self.folders.len() - 1) as u32
+    }
+
+    /// The walk's next node, in the folder it is in; `folder` if it is a folder's own, `linked` if it is
+    /// a hard link, whose later names come to it.
+    fn push(&mut self, node: Scanned, folder: Option<u32>, linked: bool) {
+        let seq = self.seq;
+        self.seq += 1;
+        if !self.opts.discard
+            && !self.inodes.insert((node.fp.dev, node.fp.ino))
+            && self.inode_twice.is_none()
+        {
+            self.inode_twice = Some(
+                node.paths
+                    .first()
+                    .map_or_else(String::new, |p| display_path(p)),
+            );
+        }
+        if let Some(all) = &mut self.all {
+            all.push((!linked).then(|| node.clone()));
+        }
+        // What a sieve sorts is counted into the digest as it is sorted, on several threads.
+        if let (Some(d), false, None) = (&mut self.digest, linked, self.opts.sieve) {
+            d.node(seq, &node, self.opts.rows);
+        }
+        if self.opts.discard && !linked {
+            return;
+        }
+        // Without a sieve, or a node more names may come to: kept whole, as found.
+        if self.opts.sieve.is_none() || linked {
+            let slot = self.nodes.len() as u32;
+            if linked {
+                self.linked_slots.push(slot);
+            }
+            if let Some(f) = folder {
+                self.folders[f as usize].node = Some(Slot::Kept(slot));
+            }
+            self.nodes.push(node);
+            self.seqs.push(seq);
+            return;
+        }
+        match self.open.last_mut() {
+            Some(open) => open.children.push((seq, node, folder)),
+            None => {
+                self.nodes.push(node);
+                self.seqs.push(seq);
+            }
+        }
+    }
+
+    /// The nodes held for a folder, now that its own is read, which says what it is: each kept whole or
+    /// quiet, as the sieve says. Held with others until there are enough to sort on several threads, in
+    /// the order they came.
+    fn settle(&mut self, open: Open, object: Option<ObjectId>) {
+        if self.opts.sieve.is_none() || open.children.is_empty() {
+            return self.settled(open, object, Vec::new());
+        }
+        self.done_nodes += open.children.len();
+        self.done.push((open, object));
+        if self.done_nodes >= SETTLE_BATCH {
+            self.flush();
+        }
+    }
+
+    /// Every folder held for sorting, sorted.
+    fn flush(&mut self) {
+        let done = std::mem::take(&mut self.done);
+        self.done_nodes = 0;
+        let Some(sieve) = self.opts.sieve else {
+            for (open, object) in done {
+                self.settled(open, object, Vec::new());
+            }
+            return;
+        };
+        let each: Vec<(Option<ObjectId>, u32, &Scanned)> = done
+            .iter()
+            .flat_map(|(open, object)| {
+                open.children
+                    .iter()
+                    .map(move |(seq, n, _)| (*object, *seq, n))
+            })
+            .collect();
+        let (rows, digest) = (self.opts.rows, self.digest.is_some());
+        let sorted = crate::incr::par_map(each.len(), |i| {
+            let (object, seq, node) = each[i];
+            let term = digest.then(|| crate::steady::node_term(seq, node, rows));
+            let quiet = sieve.quiet(object, node).map(|x| (x, sieve.witness(node)));
+            (quiet, term)
+        });
+        drop(each);
+        let mut decided = Vec::with_capacity(sorted.len());
+        for (quiet, term) in sorted {
+            if let (Some(d), Some(term)) = (&mut self.digest, term) {
+                d.add(term);
+            }
+            decided.push(quiet);
+        }
+        let mut sorted = decided.into_iter();
+        for (open, object) in done {
+            let these: Vec<_> = sorted.by_ref().take(open.children.len()).collect();
+            self.settled(open, object, these);
+        }
+    }
+
+    /// A folder's nodes, each as `sorted` says: quiet, with its object and witness, or kept whole.
+    fn settled(
+        &mut self,
+        open: Open,
+        object: Option<ObjectId>,
+        sorted: Vec<Option<(ObjectId, Option<[u8; 16]>)>>,
+    ) {
+        let start = self.quiet.len() as u32;
+        let mut sorted = sorted.into_iter();
+        for (seq, node, folder) in open.children {
+            let slot = match sorted.next().flatten() {
+                Some((x, witness)) => {
+                    if let Some(w) = witness {
+                        self.witnesses.push(w);
+                    }
+                    self.quiet.push(Quiet {
+                        seq,
+                        folder: open.folder,
+                        object: x,
+                    });
+                    Slot::Quiet((self.quiet.len() - 1) as u32)
+                }
+                None => {
+                    self.nodes.push(node);
+                    self.seqs.push(seq);
+                    Slot::Kept((self.nodes.len() - 1) as u32)
+                }
+            };
+            if let Some(f) = folder {
+                self.folders[f as usize].node = Some(slot);
+            }
+        }
+        let f = &mut self.folders[open.folder as usize];
+        f.quiet = (start, self.quiet.len() as u32);
+        f.object = object;
+    }
+
+    /// Into a folder, whose entries are held until it is done, where there is a sieve.
+    fn enter(&mut self, folder: u32) {
+        self.open.push(Open {
+            folder,
+            children: Vec::new(),
+        });
+    }
+
+    /// Out of a folder, whose own node is `node`, `None` where it went before its node was read: what was
+    /// held for it settled by what the node says the folder is.
+    fn leave(&mut self, node: Option<&Scanned>) {
+        let object = node.and_then(|n| self.opts.sieve.and_then(|s| s.folder(n)));
+        self.leave_as(object);
+    }
+
+    fn leave_as(&mut self, object: Option<ObjectId>) {
+        if let Some(open) = self.open.pop() {
+            self.settle(open, object);
+        }
+    }
+
     fn skip(&mut self, path: &[Name], kind: SkipKind, detail: Option<String>) {
         self.skips.push(Skip {
             path: display_path(path),
@@ -444,8 +936,9 @@ impl Walk<'_> {
         } else {
             st
         };
+        let folder = self.open.last().map_or(ROOT_FOLDER, |o| o.folder);
         self.dirs
-            .push((path.clone(), (st.dev, st.ino), st.mtime, st.ctime));
+            .push((folder, (st.dev, st.ino), st.mtime, st.ctime));
         for name in entries {
             if self.stopped {
                 break;
@@ -547,9 +1040,10 @@ impl Walk<'_> {
         }
         let raw = path.last().expect("an entry has a name").as_bytes();
         let fp = fingerprint(&st);
-        if let Some(row) = self.opts.rows.get(&(st.dev, st.ino)) {
+        let linked = st.nlink > 1;
+        if let Some(row) = self.opts.rows.known(&(st.dev, st.ino)) {
             if row.vouches_for(&fp) {
-                self.nodes.push(Scanned {
+                let node = Scanned {
                     paths: vec![path.to_vec()],
                     fp,
                     racy: false,
@@ -558,7 +1052,8 @@ impl Walk<'_> {
                     metadata_incomplete: false,
                     holds_excluded: false,
                     only_excluded: false,
-                });
+                };
+                self.push(node, None, linked);
                 return;
             }
         }
@@ -634,7 +1129,7 @@ impl Walk<'_> {
             let bytes = manifest.encode();
             let hash = Hash::of(&bytes);
             self.new_manifests.insert(hash, bytes);
-            self.nodes.push(Scanned {
+            let node = Scanned {
                 paths: vec![path.to_vec()],
                 fp: fingerprint(&before),
                 racy: is_racy(&before, self.precision_ns),
@@ -646,7 +1141,8 @@ impl Walk<'_> {
                 metadata_incomplete,
                 holds_excluded: false,
                 only_excluded: false,
-            });
+            };
+            self.push(node, None, linked);
             return;
         }
         self.forget_link(&st);
@@ -661,7 +1157,7 @@ impl Walk<'_> {
             && self
                 .opts
                 .rows
-                .get(&(st.dev, st.ino))
+                .known(&(st.dev, st.ino))
                 .is_some_and(|row| row.fp.size > 0);
         match open_for_writing(fd.as_fd()) {
             Some(true) if emptied => {
@@ -687,7 +1183,7 @@ impl Walk<'_> {
         match dir.read_link(raw) {
             Ok(target) => {
                 let (metadata, metadata_incomplete) = self.capture_meta(dir, path, raw, &st);
-                self.nodes.push(Scanned {
+                let node = Scanned {
                     paths: vec![path.to_vec()],
                     fp: fingerprint(&st),
                     racy: is_racy(&st, self.precision_ns),
@@ -698,7 +1194,8 @@ impl Walk<'_> {
                     metadata_incomplete,
                     holds_excluded: false,
                     only_excluded: false,
-                });
+                };
+                self.push(node, None, st.nlink > 1);
             }
             Err(e) => {
                 self.forget_link(&st);
@@ -791,17 +1288,17 @@ impl Walk<'_> {
         scope.vouch.quiet(x, &mut node).then_some((x, node))
     }
 
-    /// The node of a folder taken from the agreement, counted as a walk of it would count it.
-    fn keep_agreed(&mut self, x: ObjectId, node: Scanned, except: BTreeSet<Name>) {
+    /// The node of a folder taken from the agreement, at `folder`, counted as a walk of it would count it.
+    fn keep_agreed(&mut self, x: ObjectId, node: Scanned, except: BTreeSet<Name>, folder: u32) {
         if node.holds_excluded {
             self.hidden_excluded += 1;
         }
         if !node.only_excluded {
             self.solid += 1;
         }
-        let path = node.paths[0].clone();
-        self.nodes.push(node);
-        self.take.push((x, path, except));
+        let is = self.opts.sieve.and_then(|s| s.folder(&node));
+        self.push(node, Some(folder), false);
+        self.take.push((x, folder, except, is));
     }
 
     /// A folder outside the scope, taken from the agreement if it is as the agreement left it.
@@ -809,7 +1306,8 @@ impl Walk<'_> {
         let Some((x, node)) = self.as_agreed(dir, path, st, object, &BTreeSet::new()) else {
             return false;
         };
-        self.keep_agreed(x, node, BTreeSet::new());
+        let folder = self.new_folder(path.last().expect("an entry has a name"));
+        self.keep_agreed(x, node, BTreeSet::new(), folder);
         true
     }
 
@@ -852,12 +1350,15 @@ impl Walk<'_> {
             whole: false,
             object: Some(x),
         };
+        let folder = self.new_folder(&raw);
+        self.enter(folder);
         for name in &except {
             path.push(name.clone());
             self.entry(&child, path, st.mnt_id, at);
             path.pop();
         }
-        self.keep_agreed(x, node, except);
+        self.leave(Some(&node));
+        self.keep_agreed(x, node, except, folder);
         true
     }
 
@@ -868,6 +1369,8 @@ impl Walk<'_> {
             Ok(child) => {
                 let (excluded_before, solid_before) =
                     (self.excluded.len() + self.hidden_excluded, self.solid);
+                let folder = self.new_folder(path.last().expect("an entry has a name"));
+                self.enter(folder);
                 let listed = self.walk_dir(&child, path, st.mnt_id, at);
                 let holds_excluded = self.excluded.len() + self.hidden_excluded > excluded_before;
                 let only_excluded = holds_excluded && listed && self.solid == solid_before;
@@ -879,11 +1382,14 @@ impl Walk<'_> {
                 // Read after the walk: removing a leftover temporary moves the times.
                 let st = match dir.stat(raw) {
                     Ok(s) if s.file_type == FileType::Directory => s,
-                    _ => return self.unobservable(path, SkipKind::VanishedDuringScan, None),
+                    _ => {
+                        self.leave(None);
+                        return self.unobservable(path, SkipKind::VanishedDuringScan, None);
+                    }
                 };
                 let (metadata, incomplete) = self.capture_meta(dir, path, raw, &st);
                 let metadata_incomplete = incomplete || !listed;
-                self.nodes.push(Scanned {
+                let node = Scanned {
                     paths: vec![path.clone()],
                     fp: fingerprint(&st),
                     racy: false,
@@ -892,7 +1398,9 @@ impl Walk<'_> {
                     metadata_incomplete,
                     holds_excluded,
                     only_excluded,
-                });
+                };
+                self.leave(Some(&node));
+                self.push(node, Some(folder), false);
             }
             Err(e) if crate::refusal::of(&e) == Some(Refusal::Permission) => {
                 self.solid += 1;
@@ -901,7 +1409,7 @@ impl Walk<'_> {
                 // A directory no one here can read must not push that state to devices that can:
                 // like its contents, its record stands as it was until it can be observed.
                 let (metadata, _) = self.capture_meta(dir, path, raw, &st);
-                self.nodes.push(Scanned {
+                let node = Scanned {
                     paths: vec![path.clone()],
                     fp: fingerprint(&st),
                     racy: false,
@@ -910,7 +1418,9 @@ impl Walk<'_> {
                     metadata_incomplete: true,
                     holds_excluded: false,
                     only_excluded: false,
-                });
+                };
+                let folder = self.new_folder(path.last().expect("an entry has a name"));
+                self.push(node, Some(folder), false);
             }
             Err(e) if is_not_found(&e) => {
                 self.solid += 1;
@@ -929,17 +1439,126 @@ impl Walk<'_> {
     /// from a folder the walk had yet to list into one it had listed, which neither listing holds, is
     /// a scan to take again, not a delete. Through no symlink, so a folder swapped for one counts.
     fn dirs_unchanged(&self, root: &Dir) -> bool {
-        self.dirs.iter().all(|(path, inode, mtime, ctime)| {
-            root.stat_dir_at(path)
+        self.dirs.iter().all(|(folder, inode, mtime, ctime)| {
+            root.stat_dir_at(&path_of(&self.folders, *folder))
                 .is_ok_and(|s| (s.dev, s.ino) == *inode && s.mtime == *mtime && s.ctime == *ctime)
         })
     }
+
+    /// What a scope took from the agreement, each folder taken all the way down but what the walk read
+    /// elsewhere: quiet where the sieve says so, and otherwise whole, as the agreement found it.
+    fn take_from_agreement(&mut self, vouch: &dyn Vouch) {
+        // What was read stands; of what is taken, an inode taken twice is the tree moving.
+        let mut taken = Inodes::default();
+        for (x, folder, except, is) in std::mem::take(&mut self.take) {
+            // Each folder with the object the ledger has it as, and the one its inode says.
+            let mut stack: Vec<(ObjectId, u32, Option<ObjectId>, bool)> =
+                vec![(x, folder, is, true)];
+            while let Some((f, at, is, top)) = stack.pop() {
+                if self.folders[at as usize].object.is_none() {
+                    self.folders[at as usize].object = is;
+                }
+                let start = self.quiet.len() as u32;
+                let mut path: Option<Vec<Name>> = None;
+                for child in vouch.children(f) {
+                    let (object, dir, inode) = (child.object, child.dir, child.inode);
+                    if top && except.iter().any(|e| e.as_bytes() == child.name) {
+                        continue;
+                    }
+                    if self.inodes.contains(&inode) {
+                        continue;
+                    }
+                    let quiet = self
+                        .opts
+                        .sieve
+                        .is_some_and(|s| !s.witnessing() && s.quiet_vouched(is, &child));
+                    // A name of its own only where something keeps one.
+                    let name = || Name::new(child.name.to_vec()).ok();
+                    let whole = (!quiet || self.all.is_some()).then(|| {
+                        let p = path.get_or_insert_with(|| path_of(&self.folders, at));
+                        let mut p = p.clone();
+                        p.push(name()?);
+                        vouch.node(object, p)
+                    });
+                    let whole = whole.flatten();
+                    if !quiet && whole.is_none() {
+                        continue;
+                    }
+                    let seq = self.seq;
+                    self.seq += 1;
+                    if !taken.insert(inode) && self.inode_twice.is_none() {
+                        let mut p = path_of(&self.folders, at);
+                        p.extend(name());
+                        self.inode_twice = Some(display_path(&p));
+                    }
+                    let sub = dir.then(|| {
+                        self.folders.push(Folder {
+                            parent: at,
+                            name: name(),
+                            node: None,
+                            object: None,
+                            quiet: (0, 0),
+                            vouched: (0, 0),
+                        });
+                        (self.folders.len() - 1) as u32
+                    });
+                    if let Some(all) = &mut self.all {
+                        all.push(whole.clone());
+                    }
+                    let slot = match (quiet, whole) {
+                        (true, _) => {
+                            self.quiet.push(Quiet {
+                                seq,
+                                folder: at,
+                                object,
+                            });
+                            Some(Slot::Quiet((self.quiet.len() - 1) as u32))
+                        }
+                        (false, Some(node)) => {
+                            self.nodes.push(node);
+                            self.seqs.push(seq);
+                            Some(Slot::Kept((self.nodes.len() - 1) as u32))
+                        }
+                        (false, None) => None,
+                    };
+                    if let Some(sub) = sub {
+                        self.folders[sub as usize].node = slot;
+                        // What is in it is in the folder its node's inode says it is.
+                        let in_it = match slot {
+                            Some(Slot::Quiet(_)) => Some(object),
+                            Some(Slot::Kept(k)) => self
+                                .opts
+                                .sieve
+                                .and_then(|s| s.folder(&self.nodes[k as usize])),
+                            None => None,
+                        };
+                        stack.push((object, sub, in_it, false));
+                    }
+                }
+                self.folders[at as usize].vouched = (start, self.quiet.len() as u32);
+            }
+        }
+    }
+}
+
+/// Where a folder is, from the root, in a walk's table of them.
+fn path_of(folders: &[Folder], mut f: u32) -> Vec<Name> {
+    let mut out = Vec::new();
+    while f != ROOT_FOLDER {
+        let folder = &folders[f as usize];
+        if let Some(name) = &folder.name {
+            out.push(name.clone());
+        }
+        f = folder.parent;
+    }
+    out.reverse();
+    out
 }
 
 pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
     let started = opts.started.unwrap_or_else(Instant::now);
     crate::progress::scanning(match opts.scope {
-        None => opts.rows.len() as u64,
+        None => opts.rows.count() as u64,
         Some(_) => 0,
     });
     let precision_ns = root.fstype_precision_ns();
@@ -947,6 +1566,26 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         opts,
         precision_ns,
         nodes: Vec::new(),
+        seqs: Vec::new(),
+        quiet: Vec::new(),
+        witnesses: Vec::new(),
+        done: Vec::new(),
+        done_nodes: 0,
+        seq: 0,
+        folders: vec![Folder {
+            parent: ROOT_FOLDER,
+            name: None,
+            node: None,
+            object: None,
+            quiet: (0, 0),
+            vouched: (0, 0),
+        }],
+        open: Vec::new(),
+        inodes: Inodes::default(),
+        inode_twice: None,
+        linked_slots: Vec::new(),
+        all: opts.keep_all.then(Vec::new),
+        digest: opts.digest.then(crate::steady::Stream::new),
         linked: HashMap::new(),
         skips: Vec::new(),
         unobserved: Vec::new(),
@@ -979,7 +1618,10 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         },
         None => At::WHOLE,
     };
+    walk.enter(ROOT_FOLDER);
     walk.walk_dir(root, &mut path, st.mnt_id, at);
+    walk.leave_as(Some(ObjectId::ROOT));
+    walk.flush();
     if walk.scope_missed {
         hit("scan.scope_missed");
         let whole = ScanOptions {
@@ -992,20 +1634,32 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
     hit("scan.done");
     // A probe that stopped says nothing more, and is not worth the second look.
     let unstable = !walk.stopped && !walk.dirs_unchanged(root);
-    let vouched_from = walk.nodes.len();
-    if let Some(scope) = opts.scope {
-        let found: HashSet<(u64, u64)> = walk.nodes.iter().map(|n| (n.fp.dev, n.fp.ino)).collect();
-        for (x, path, except) in std::mem::take(&mut walk.take) {
-            scope
-                .vouch
-                .under(x, &path, &except, &found, &mut walk.nodes);
+    // Every name of a hard link is found by now.
+    for slot in std::mem::take(&mut walk.linked_slots) {
+        let node = &walk.nodes[slot as usize];
+        if let Some(d) = &mut walk.digest {
+            d.node(walk.seqs[slot as usize], node, opts.rows);
+        }
+        if let Some(all) = &mut walk.all {
+            all[walk.seqs[slot as usize] as usize] = Some(node.clone());
         }
     }
+    let vouched_from = walk.seq as usize;
+    if let Some(scope) = opts.scope {
+        walk.take_from_agreement(scope.vouch);
+    }
+    let mut folders_by_name: Vec<u32> = (1..walk.folders.len() as u32).collect();
+    folders_by_name.sort_unstable_by(|a, b| {
+        let (a, b) = (&walk.folders[*a as usize], &walk.folders[*b as usize]);
+        (a.parent, &a.name).cmp(&(b.parent, &b.name))
+    });
+    // Without a sieve every node is the walk's in order.
+    let seqs = opts.sieve.is_some().then_some(walk.seqs);
 
     let st = root.stat_self()?;
     let mut problems = Vec::new();
     let metadata = capture(root, b".", &st, opts.accounts, precision_ns, &mut problems);
-    Ok(ScanResult {
+    let mut result = ScanResult {
         root: Scanned {
             paths: Vec::new(),
             fp: fingerprint(&st),
@@ -1016,7 +1670,16 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
             holds_excluded: false,
             only_excluded: false,
         },
+        total: walk.seq as usize,
         nodes: walk.nodes,
+        seqs,
+        quiet: walk.quiet,
+        witnesses: walk.witnesses,
+        folders: walk.folders,
+        folders_by_name,
+        all: walk.all.map(|all| all.into_iter().flatten().collect()),
+        digest: None,
+        inode_twice: walk.inode_twice,
         skips: walk.skips,
         unobserved: walk.unobserved,
         refused: walk.refused,
@@ -1034,7 +1697,11 @@ pub fn scan(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanResult> {
         started,
         vouched_from,
         listed: opts.scope.map(|_| walk.listed),
-    })
+    };
+    if let Some(d) = walk.digest {
+        result.digest = Some(d.finish(&result, opts.rows));
+    }
+    Ok(result)
 }
 
 /// A scan with a scope, given again the folders its first walk found an inode read here had been in at
@@ -1051,16 +1718,9 @@ pub fn scan_scoped(root: &Dir, opts: &ScanOptions<'_>) -> std::io::Result<ScanRe
             return Ok(result);
         };
         let mut more = Vec::new();
-        for n in &result.nodes[..result.vouched_from] {
-            for p in scope.vouch.paths_of((n.fp.dev, n.fp.ino)) {
-                if n.paths.contains(&p) {
-                    continue;
-                }
-                if let Some((_, folder)) = p.split_last() {
-                    if !listed.contains(folder) && !list.contains_key(folder) {
-                        more.push(folder.to_vec());
-                    }
-                }
+        for folder in scope.vouch.agreed_elsewhere(&result) {
+            if !listed.contains(&folder) && !list.contains_key(&folder) && !more.contains(&folder) {
+                more.push(folder);
             }
         }
         if more.is_empty() {

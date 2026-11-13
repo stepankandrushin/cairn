@@ -40,6 +40,15 @@ impl Name {
         Ok(Self(bytes))
     }
 
+    /// Whether these bytes are a name `new` takes, without making one.
+    pub fn valid(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes != b"."
+            && bytes != b".."
+            && !bytes.iter().any(|&b| b == b'/' || b == 0)
+            && bytes.len() <= MAX_NAME
+    }
+
     /// Sorts before every valid name: the start of a range scan, never an entry.
     pub(crate) fn lowest() -> Self {
         Self(Vec::new())

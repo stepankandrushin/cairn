@@ -33,7 +33,7 @@ use crate::fsops::birth_mark;
 use crate::merge::LNode;
 use crate::record::{R, W};
 use crate::root::Root;
-use crate::scan::{ScanResult, Scanned};
+use crate::scan::{Quiet, ScanResult, Scanned, Slot, ROOT_FOLDER};
 use crate::selection::Selection;
 use crate::state::{Fingerprint, Known, Row};
 use anyhow::Result;
@@ -75,6 +75,17 @@ impl Seen {
             scan: None,
         }
     }
+
+    /// The same, as a lookup gives it, holding its own fingerprint.
+    pub fn into_looked(self) -> crate::state::Looked<'static> {
+        crate::state::Looked {
+            fp: std::borrow::Cow::Owned(self.fp),
+            racy: false,
+            incomplete: false,
+            content: self.content,
+            scan: None,
+        }
+    }
 }
 
 fn kind_byte(k: ObjectKind) -> u8 {
@@ -83,6 +94,72 @@ fn kind_byte(k: ObjectKind) -> u8 {
         ObjectKind::Dir => 1,
         ObjectKind::Symlink => 2,
     }
+}
+
+/// One entry's scan part, as an entry holds it: what the scan saw of the object, after its kind and
+/// entries. Its device and inode come first, for `seen_inode`.
+fn put_seen(w: &mut W, s: &Seen) {
+    let ctime_same = s.fp.ctime == s.fp.mtime;
+    w.u8(1
+        | u8::from(s.fp.btime.is_some()) << 1
+        | u8::from(ctime_same) << 2
+        | u8::from(s.digest.is_some()) << 3);
+    w.uv(s.fp.dev);
+    w.uv(s.fp.ino);
+    w.uv(s.fp.size);
+    w.time(s.fp.mtime);
+    if !ctime_same {
+        w.time(s.fp.ctime);
+    }
+    if let Some(t) = s.fp.btime {
+        w.time(t);
+    }
+    crate::record::put_content(w, &s.content);
+    if let Some(d) = &s.digest {
+        w.raw(&d.0);
+    }
+}
+
+/// The scan part `put_seen` wrote, after its flags byte.
+fn get_seen(r: &mut R<'_>, flags: u8) -> Option<Seen> {
+    if flags & 1 != 1 || flags >> 4 != 0 {
+        return None;
+    }
+    let dev = r.uv()?;
+    let ino = r.uv()?;
+    let size = r.uv()?;
+    let mtime = r.time()?;
+    let ctime = match flags & 4 != 0 {
+        true => mtime,
+        false => r.time()?,
+    };
+    let btime = match flags & 2 != 0 {
+        true => Some(r.time()?),
+        false => None,
+    };
+    let content = crate::record::get_content(r)?;
+    let digest = match flags & 8 != 0 {
+        true => Some(Hash(r.array::<32>()?)),
+        false => None,
+    };
+    Some(Seen {
+        fp: Fingerprint {
+            dev,
+            ino,
+            size,
+            mtime,
+            ctime,
+            btime,
+        },
+        content,
+        digest,
+    })
+}
+
+/// The device and inode of a scan part `put_seen` wrote.
+fn seen_inode(b: &[u8]) -> Option<(u64, u64)> {
+    let mut r = R(b.get(1..)?);
+    Some((r.uv()?, r.uv()?))
 }
 
 /// An entry: its format, kind and entries, then what the scan saw, its integers as varints and the rest
@@ -95,27 +172,7 @@ impl Entry {
         crate::record::put_links(&mut w, self.links.iter());
         match &self.seen {
             None => w.u8(0),
-            Some(s) => {
-                let ctime_same = s.fp.ctime == s.fp.mtime;
-                w.u8(1
-                    | u8::from(s.fp.btime.is_some()) << 1
-                    | u8::from(ctime_same) << 2
-                    | u8::from(s.digest.is_some()) << 3);
-                w.uv(s.fp.dev);
-                w.uv(s.fp.ino);
-                w.uv(s.fp.size);
-                w.time(s.fp.mtime);
-                if !ctime_same {
-                    w.time(s.fp.ctime);
-                }
-                if let Some(t) = s.fp.btime {
-                    w.time(t);
-                }
-                crate::record::put_content(&mut w, &s.content);
-                if let Some(d) = &s.digest {
-                    w.raw(&d.0);
-                }
-            }
+            Some(s) => put_seen(&mut w, s),
         }
         w.0
     }
@@ -138,38 +195,7 @@ impl Entry {
         }
         let seen = match r.u8()? {
             0 => None,
-            flags if flags & 1 == 1 && flags >> 4 == 0 => {
-                let dev = r.uv()?;
-                let ino = r.uv()?;
-                let size = r.uv()?;
-                let mtime = r.time()?;
-                let ctime = match flags & 4 != 0 {
-                    true => mtime,
-                    false => r.time()?,
-                };
-                let btime = match flags & 2 != 0 {
-                    true => Some(r.time()?),
-                    false => None,
-                };
-                let content = crate::record::get_content(&mut r)?;
-                let digest = match flags & 8 != 0 {
-                    true => Some(Hash(r.array::<32>()?)),
-                    false => None,
-                };
-                Some(Seen {
-                    fp: Fingerprint {
-                        dev,
-                        ino,
-                        size,
-                        mtime,
-                        ctime,
-                        btime,
-                    },
-                    content,
-                    digest,
-                })
-            }
-            _ => return None,
+            flags => Some(get_seen(&mut r, flags)?),
         };
         r.0.is_empty().then_some(Entry { kind, links, seen })
     }
@@ -214,8 +240,40 @@ pub fn digest(n: &Scanned) -> Hash {
     Hash(*h.finalize().as_bytes())
 }
 
-/// The ledger as a sync holds it, in columns by object, sorted: an entry's links as bytes, the scan part
-/// whole, and what finds an entry by inode and by folder, sorted too. A few hundred bytes an entry.
+/// What a rebuild found was seen of each object of a skeleton, in its order, as an entry holds it.
+#[derive(Default)]
+pub struct SeenParts {
+    at: Vec<u32>,
+    off: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+impl SeenParts {
+    /// Empty, with room for what was seen of about this many objects.
+    pub fn with_room(n: usize) -> SeenParts {
+        SeenParts {
+            at: Vec::with_capacity(n),
+            off: Vec::with_capacity(n + 1),
+            bytes: Vec::with_capacity(n * 64),
+        }
+    }
+
+    /// What was seen of skeleton object `si`, after every one before it.
+    pub fn put(&mut self, si: usize, s: &Seen) {
+        if self.off.is_empty() {
+            self.off.push(0);
+        }
+        let mut w = W(std::mem::take(&mut self.bytes));
+        put_seen(&mut w, s);
+        self.bytes = w.0;
+        self.at.push(si as u32);
+        self.off.push(self.bytes.len() as u32);
+    }
+}
+
+/// The ledger as a sync holds it, in columns by object, sorted: an entry's links as bytes, and what the
+/// scan saw of it as an entry stores it, each taken apart when it is asked for; what finds an entry by
+/// inode and by folder, sorted too. About 150 bytes an entry.
 #[derive(Default)]
 pub struct Ledger {
     ids: Vec<ObjectId>,
@@ -224,9 +282,16 @@ pub struct Ledger {
     /// length-prefixed name.
     link_off: Vec<u32>,
     link_bytes: Vec<u8>,
-    seen: Vec<Option<Seen>>,
-    by_inode: Vec<((u64, u64), u32)>,
-    children: Vec<(ObjectId, u32)>,
+    /// What the scan saw of entry `i`, as `put_seen` writes it: `seen_bytes[seen_off[i]..seen_off[i + 1]]`,
+    /// empty where it saw nothing.
+    seen_off: Vec<u32>,
+    seen_bytes: Vec<u8>,
+    /// The entries the scan saw, by inode number, then device and entry: each one's inode number, and
+    /// the entry.
+    inos: Vec<u64>,
+    ino_entries: Vec<u32>,
+    /// Each link by its folder: where it is in `link_bytes`, and its entry.
+    children: Vec<(u32, u32)>,
 }
 
 impl Ledger {
@@ -236,19 +301,26 @@ impl Ledger {
         all.sort_by_key(|(id, _)| *id);
         let mut l = Ledger::default();
         for (id, e) in all {
-            l.push(id, e);
+            l.push(id, e.kind, e.links.iter(), e.seen.as_ref());
         }
         l.index();
         l
     }
 
-    fn push(&mut self, id: ObjectId, e: Entry) {
+    fn push<'l>(
+        &mut self,
+        id: ObjectId,
+        kind: ObjectKind,
+        links: impl Iterator<Item = &'l Link>,
+        seen: Option<&Seen>,
+    ) {
         if self.link_off.is_empty() {
             self.link_off.push(0);
+            self.seen_off.push(0);
         }
         self.ids.push(id);
-        self.kinds.push(e.kind);
-        for link in &e.links {
+        self.kinds.push(kind);
+        for link in links {
             self.link_bytes.extend_from_slice(&link.parent.0);
             let name = link.name.as_bytes();
             self.link_bytes
@@ -256,25 +328,92 @@ impl Ledger {
             self.link_bytes.extend_from_slice(name);
         }
         self.link_off.push(self.link_bytes.len() as u32);
-        self.seen.push(e.seen);
+        if let Some(s) = seen {
+            let mut w = W(std::mem::take(&mut self.seen_bytes));
+            put_seen(&mut w, s);
+            self.seen_bytes = w.0;
+        }
+        self.seen_off.push(self.seen_bytes.len() as u32);
+    }
+
+    /// An entry as it was read from the state: its encoding's links and scan part copied as they are.
+    fn push_encoded(&mut self, id: ObjectId, b: &[u8]) -> Option<()> {
+        let mut r = R(b);
+        if u32::from(r.u8()?) != FORMAT {
+            return None;
+        }
+        let kind = match r.u8()? {
+            0 => ObjectKind::File,
+            1 => ObjectKind::Dir,
+            2 => ObjectKind::Symlink,
+            _ => return None,
+        };
+        let n = r.count(18)?;
+        let mut links = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            links.push(crate::record::get_link(&mut r)?);
+        }
+        let start = b.len() - r.0.len();
+        let seen = match r.u8()? {
+            0 => None,
+            flags => Some(get_seen(&mut r, flags)?),
+        };
+        if !r.0.is_empty() {
+            return None;
+        }
+        if self.link_off.is_empty() {
+            self.link_off.push(0);
+            self.seen_off.push(0);
+        }
+        self.ids.push(id);
+        self.kinds.push(kind);
+        for link in &links {
+            self.link_bytes.extend_from_slice(&link.parent.0);
+            let name = link.name.as_bytes();
+            self.link_bytes
+                .extend_from_slice(&(name.len() as u32).to_le_bytes());
+            self.link_bytes.extend_from_slice(name);
+        }
+        self.link_off.push(self.link_bytes.len() as u32);
+        if seen.is_some() {
+            self.seen_bytes.extend_from_slice(&b[start..]);
+        }
+        self.seen_off.push(self.seen_bytes.len() as u32);
+        Some(())
     }
 
     fn index(&mut self) {
-        let mut by_inode = Vec::with_capacity(self.ids.len());
+        let mut by_inode: Vec<(u64, u64, u32)> = Vec::with_capacity(self.ids.len());
         let mut children = Vec::with_capacity(self.ids.len());
         for i in 0..self.ids.len() {
-            if let Some(s) = &self.seen[i] {
-                by_inode.push(((s.fp.dev, s.fp.ino), i as u32));
+            if let Some((dev, ino)) = seen_inode(self.seen_raw(i)) {
+                by_inode.push((ino, dev, i as u32));
             }
-            for (parent, _) in self.raw_links(i) {
-                children.push((parent, i as u32));
+            for (pos, _) in self.link_positions(i) {
+                children.push((pos, i as u32));
             }
         }
         by_inode.sort_unstable();
-        children.sort_unstable();
+        self.inos = by_inode.iter().map(|(ino, _, _)| *ino).collect();
+        self.ino_entries = by_inode.iter().map(|(_, _, i)| *i).collect();
+        drop(by_inode);
+        let b = &self.link_bytes;
+        let parent = |pos: u32| &b[pos as usize..pos as usize + 16];
+        children.sort_unstable_by(|a, c| (parent(a.0), a.1).cmp(&(parent(c.0), c.1)));
         children.shrink_to_fit();
-        self.by_inode = by_inode;
         self.children = children;
+    }
+
+    /// Empty, with room for about this many entries, as a skeleton of a base of that size takes.
+    pub(crate) fn with_room(n: usize) -> Ledger {
+        Ledger {
+            ids: Vec::with_capacity(n),
+            kinds: Vec::with_capacity(n),
+            link_off: Vec::with_capacity(n + 1),
+            link_bytes: Vec::with_capacity(n * 64),
+            seen_off: Vec::with_capacity(n + 1),
+            ..Ledger::default()
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -292,32 +431,13 @@ impl Ledger {
     /// One more of the base's objects, after every one before it in order, with no entry yet: a
     /// skeleton of the base, which `rebuilt` makes a ledger of.
     pub(crate) fn push_object(&mut self, id: ObjectId, kind: ObjectKind, links: &BTreeSet<Link>) {
-        if self.link_off.is_empty() {
-            self.link_off.push(0);
-        }
-        self.ids.push(id);
-        self.kinds.push(kind);
-        for link in links {
-            self.link_bytes.extend_from_slice(&link.parent.0);
-            let name = link.name.as_bytes();
-            self.link_bytes
-                .extend_from_slice(&(name.len() as u32).to_le_bytes());
-            self.link_bytes.extend_from_slice(name);
-        }
-        self.link_off.push(self.link_bytes.len() as u32);
+        self.push(id, kind, links.iter(), None);
     }
 
     /// What finds a skeleton's objects by folder.
     pub(crate) fn index_children(&mut self) {
-        let mut children = Vec::with_capacity(self.ids.len());
-        for i in 0..self.ids.len() {
-            for (parent, _) in self.raw_links(i) {
-                children.push((parent, i as u32));
-            }
-        }
-        children.sort_unstable();
-        children.shrink_to_fit();
-        self.children = children;
+        self.link_bytes.shrink_to_fit();
+        self.index();
     }
 
     pub(crate) fn ids(&self) -> &[ObjectId] {
@@ -332,14 +452,63 @@ impl Ledger {
         self.kinds[i]
     }
 
+    /// What the scan saw of entry `i`, as stored.
+    fn seen_raw(&self, i: usize) -> &[u8] {
+        &self.seen_bytes[self.seen_off[i] as usize..self.seen_off[i + 1] as usize]
+    }
+
+    /// What the scan saw of entry `i`, if it saw it.
+    pub(crate) fn seen_at(&self, i: usize) -> Option<Seen> {
+        let b = self.seen_raw(i);
+        let (flags, rest) = b.split_first()?;
+        get_seen(&mut R(rest), *flags)
+    }
+
+    /// The device and inode the scan saw entry `i` at.
+    pub(crate) fn inode_at(&self, i: usize) -> Option<(u64, u64)> {
+        seen_inode(self.seen_raw(i))
+    }
+
+    /// Whether the scan saw entry `i`.
+    pub(crate) fn has_seen(&self, i: usize) -> bool {
+        !self.seen_raw(i).is_empty()
+    }
+
+    /// Where each of entry `i`'s links starts in `link_bytes`, and its parent.
+    fn link_positions(&self, i: usize) -> impl Iterator<Item = (u32, ObjectId)> + '_ {
+        let start = self.link_off[i] as usize;
+        let end = self.link_off[i + 1] as usize;
+        let mut at = start;
+        std::iter::from_fn(move || {
+            if at >= end {
+                return None;
+            }
+            let b = &self.link_bytes[at..end];
+            let parent = ObjectId(b[..16].try_into().ok()?);
+            let n = u32::from_le_bytes(b[16..20].try_into().ok()?) as usize;
+            let pos = at as u32;
+            at += 20 + n;
+            Some((pos, parent))
+        })
+    }
+
+    /// The links in one folder, by where each starts, with its entry.
+    fn links_in(&self, parent: &ObjectId) -> &[(u32, u32)] {
+        let b = &self.link_bytes;
+        let p = |pos: u32| &b[pos as usize..pos as usize + 16];
+        let start = self
+            .children
+            .partition_point(|(pos, _)| p(*pos) < &parent.0[..]);
+        let end =
+            start + self.children[start..].partition_point(|(pos, _)| p(*pos) == &parent.0[..]);
+        &self.children[start..end]
+    }
+
     /// The objects with an entry in this folder, by index, each once.
     pub(crate) fn child_indices(&self, parent: &ObjectId) -> impl Iterator<Item = usize> + '_ {
-        let parent = *parent;
-        let start = self.children.partition_point(|(p, _)| *p < parent);
         let mut last = None;
-        self.children[start..]
+        self.links_in(parent)
             .iter()
-            .take_while(move |(p, _)| *p == parent)
             .filter(move |(_, i)| last.replace(*i) != Some(*i))
             .map(|(_, i)| *i as usize)
     }
@@ -361,20 +530,29 @@ impl Ledger {
         mine.next().is_none()
     }
 
-    /// The ledger a skeleton of the base makes: the objects `keep` says, each with what was seen of it.
-    pub(crate) fn rebuilt(self, mut seen: Vec<Option<Seen>>, keep: &[bool]) -> Ledger {
-        let n = keep.iter().filter(|k| **k).count();
+    /// The ledger a skeleton of the base makes: the objects `keep` says, each with what was seen of it,
+    /// which is in the skeleton's order and of kept objects alone, and becomes the ledger's as it is.
+    pub(crate) fn rebuilt(&self, seen: SeenParts, keep: &[bool]) -> Ledger {
+        let kept = keep.iter().filter(|k| **k).count();
+        let link_len: usize = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| (self.link_off[i + 1] - self.link_off[i]) as usize)
+            .sum();
         let mut l = Ledger {
-            ids: Vec::with_capacity(n),
-            kinds: Vec::with_capacity(n),
-            link_off: Vec::with_capacity(n + 1),
-            link_bytes: Vec::new(),
-            seen: Vec::with_capacity(n),
+            ids: Vec::with_capacity(kept),
+            kinds: Vec::with_capacity(kept),
+            link_off: Vec::with_capacity(kept + 1),
+            link_bytes: Vec::with_capacity(link_len),
+            seen_off: Vec::with_capacity(kept + 1),
             ..Ledger::default()
         };
         l.link_off.push(0);
-        for i in 0..self.ids.len() {
-            if !keep[i] {
+        l.seen_off.push(0);
+        let mut part = 0;
+        for (i, kept) in keep.iter().enumerate().take(self.ids.len()) {
+            if !kept {
                 continue;
             }
             l.ids.push(self.ids[i]);
@@ -383,10 +561,17 @@ impl Ledger {
                 &self.link_bytes[self.link_off[i] as usize..self.link_off[i + 1] as usize],
             );
             l.link_off.push(l.link_bytes.len() as u32);
-            l.seen.push(seen[i].take());
+            // The parts are of kept objects alone, in order: one is this object's, or none is.
+            let end = match seen.at.get(part).is_some_and(|si| *si as usize == i) {
+                true => {
+                    part += 1;
+                    seen.off[part]
+                }
+                false => *l.seen_off.last().unwrap_or(&0),
+            };
+            l.seen_off.push(end);
         }
-        drop(self);
-        l.link_bytes.shrink_to_fit();
+        l.seen_bytes = seen.bytes;
         l.index();
         l
     }
@@ -428,23 +613,13 @@ impl Ledger {
         self.find(id).map(|i| self.links_at(i))
     }
 
-    pub fn seen_of(&self, id: &ObjectId) -> Option<&Seen> {
-        self.find(id).and_then(|i| self.seen[i].as_ref())
+    pub fn seen_of(&self, id: &ObjectId) -> Option<Seen> {
+        self.find(id).and_then(|i| self.seen_at(i))
     }
 
     /// Whether these are its entries, without taking them apart.
     fn links_are(&self, id: &ObjectId, links: &[Link]) -> bool {
-        let Some(i) = self.find(id) else {
-            return false;
-        };
-        let mut mine = self.raw_links(i);
-        for l in links {
-            match mine.next() {
-                Some((parent, name)) if parent == l.parent && name == l.name.as_bytes() => {}
-                _ => return false,
-            }
-        }
-        mine.next().is_none()
+        self.find(id).is_some_and(|i| self.links_at_are(i, links))
     }
 
     /// The whole entry, as stored.
@@ -453,31 +628,32 @@ impl Ledger {
         Some(Entry {
             kind: self.kinds[i],
             links: self.links_at(i),
-            seen: self.seen[i].clone(),
+            seen: self.seen_at(i),
         })
     }
 
     /// Every entry the scan saw at this inode.
     pub fn at_inode(&self, key: &(u64, u64)) -> impl Iterator<Item = ObjectId> + '_ {
-        let key = *key;
-        let start = self.by_inode.partition_point(|(k, _)| *k < key);
-        self.by_inode[start..]
+        self.at_inode_places(key).map(|e| self.ids[e])
+    }
+
+    /// The same, by their places, in object order.
+    pub(crate) fn at_inode_places(&self, key: &(u64, u64)) -> impl Iterator<Item = usize> + '_ {
+        let (dev, ino) = *key;
+        let start = self.inos.partition_point(|i| *i < ino);
+        self.inos[start..]
             .iter()
-            .take_while(move |(k, _)| *k == key)
-            .map(|(_, i)| self.ids[*i as usize])
+            .zip(&self.ino_entries[start..])
+            .take_while(move |(i, _)| **i == ino)
+            .filter(move |(_, e)| {
+                seen_inode(self.seen_raw(**e as usize)).is_some_and(|k| k.0 == dev)
+            })
+            .map(|(_, e)| *e as usize)
     }
 
     /// Every entry with a link in this folder.
     pub fn children_of(&self, parent: &ObjectId) -> impl Iterator<Item = ObjectId> + '_ {
-        let parent = *parent;
-        let start = self.children.partition_point(|(p, _)| *p < parent);
-        let mut last = None;
-        self.children[start..]
-            .iter()
-            .take_while(move |(p, _)| *p == parent)
-            // A hard link with two names in one folder is one child.
-            .filter(move |(_, i)| last.replace(*i) != Some(*i))
-            .map(|(_, i)| self.ids[*i as usize])
+        self.child_indices(parent).map(|i| self.ids[i])
     }
 
     /// The entry at this name in this folder, as the ledger has it.
@@ -491,11 +667,49 @@ impl Ledger {
     }
 
     /// Every entry the scan saw, by inode.
-    fn by_inode(&self) -> impl Iterator<Item = ((u64, u64), ObjectId, &Seen)> + '_ {
-        self.by_inode.iter().filter_map(|(key, i)| {
-            let i = *i as usize;
-            Some((*key, self.ids[i], self.seen[i].as_ref()?))
+    fn by_inode(&self) -> impl Iterator<Item = ((u64, u64), ObjectId, Seen)> + '_ {
+        let mut order: Vec<(u64, u64, u32)> = self
+            .ino_entries
+            .iter()
+            .filter_map(|e| {
+                let (dev, ino) = seen_inode(self.seen_raw(*e as usize))?;
+                Some((dev, ino, *e))
+            })
+            .collect();
+        order.sort_unstable();
+        order.into_iter().filter_map(|(dev, ino, e)| {
+            let e = e as usize;
+            Some(((dev, ino), self.ids[e], self.seen_at(e)?))
         })
+    }
+
+    /// Every entry the scan saw at an inode it saw another at, by place: in one pass over the inodes in
+    /// order.
+    pub(crate) fn sharing_inodes(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < self.inos.len() {
+            let mut end = start + 1;
+            while end < self.inos.len() && self.inos[end] == self.inos[start] {
+                end += 1;
+            }
+            if end - start > 1 {
+                let mut run: Vec<(u64, usize)> = self.ino_entries[start..end]
+                    .iter()
+                    .filter_map(|e| Some((self.inode_at(*e as usize)?.0, *e as usize)))
+                    .collect();
+                run.sort_unstable();
+                for (i, (dev, e)) in run.iter().enumerate() {
+                    let before = i > 0 && run[i - 1].0 == *dev;
+                    let after = run.get(i + 1).is_some_and(|(d, _)| d == dev);
+                    if before || after {
+                        out.push(*e);
+                    }
+                }
+            }
+            start = end;
+        }
+        out
     }
 
     /// Whether more than one entry the scan saw is at this inode.
@@ -504,14 +718,11 @@ impl Ledger {
     }
 
     /// Every entry the scan saw.
-    pub fn iter_seen(&self) -> impl Iterator<Item = (ObjectId, &Seen)> + '_ {
-        self.ids
-            .iter()
-            .zip(&self.seen)
-            .filter_map(|(id, s)| s.as_ref().map(|s| (*id, s)))
+    pub fn iter_seen(&self) -> impl Iterator<Item = (ObjectId, Seen)> + '_ {
+        (0..self.ids.len()).filter_map(|i| Some((self.ids[i], self.seen_at(i)?)))
     }
 
-    /// Read from the state, in order, each entry taken apart as it comes.
+    /// Read from the state, in order, each entry checked as it comes and kept as stored.
     fn load(root: &Root) -> Result<Option<Ledger>> {
         let n = root.state.ledger_len()?;
         let mut l = Ledger {
@@ -519,21 +730,23 @@ impl Ledger {
             kinds: Vec::with_capacity(n),
             link_off: Vec::with_capacity(n + 1),
             link_bytes: Vec::with_capacity(n * 36),
-            seen: Vec::with_capacity(n),
+            seen_off: Vec::with_capacity(n + 1),
+            seen_bytes: Vec::with_capacity(n * 64),
             ..Ledger::default()
         };
         let mut bad = false;
-        root.state
-            .each_ledger_entry(&mut |id, bytes| match Entry::decode(bytes) {
-                Some(e) if l.ids.last().is_none_or(|last| *last < id) => l.push(id, e),
-                // An entry that does not parse is a ledger this build cannot read.
-                _ => bad = true,
-            })?;
+        root.state.each_ledger_entry(&mut |id, bytes| {
+            // An entry that does not parse is a ledger this build cannot read.
+            let fits =
+                l.ids.last().is_none_or(|last| *last < id) && l.push_encoded(id, bytes).is_some();
+            bad |= !fits;
+        })?;
         if bad {
             return Ok(None);
         }
         l.ids.shrink_to_fit();
         l.link_bytes.shrink_to_fit();
+        l.seen_bytes.shrink_to_fit();
         l.index();
         Ok(Some(l))
     }
@@ -581,6 +794,10 @@ pub struct Session {
     pub rebuilt: Option<String>,
     pub to_rebuild: bool,
     pub unsettled: BTreeSet<ObjectId>,
+    /// The ledger was rebuilt just now, for the round about to run: what it found unsettled is all it
+    /// does not vouch for, and the rows the selection's view takes are not the scan's.
+    pub just_rebuilt: bool,
+    pub unscanned: BTreeSet<ObjectId>,
     /// How many objects the ledger speaks for, or will once rebuilt: what a round is measured against.
     pub size: usize,
 }
@@ -664,6 +881,8 @@ impl Session {
             rebuilt: None,
             to_rebuild: false,
             unsettled: BTreeSet::new(),
+            just_rebuilt: false,
+            unscanned: BTreeSet::new(),
         }))
     }
 
@@ -682,6 +901,8 @@ impl Session {
             rebuilt: Some(why),
             to_rebuild: true,
             unsettled: BTreeSet::new(),
+            just_rebuilt: false,
+            unscanned: BTreeSet::new(),
         })
     }
 
@@ -766,8 +987,9 @@ impl Before<'_> {
 
     /// Every row's view for the scan, as a map of all of them would give it: on two rows at one inode,
     /// the later object's.
-    pub fn scan_rows(&self) -> HashMap<(u64, u64), Known<'_>> {
-        let mut out: HashMap<(u64, u64), Known<'_>> = HashMap::with_capacity(self.ledger.len());
+    pub fn scan_rows(&self) -> HashMap<(u64, u64), crate::state::Looked<'_>> {
+        let mut out: HashMap<(u64, u64), crate::state::Looked<'_>> =
+            HashMap::with_capacity(self.ledger.len());
         // The ledger's entries by inode, and of several at one inode the later object, then the rows
         // written since where they are later still.
         let mut owner: HashMap<(u64, u64), ObjectId> = HashMap::new();
@@ -780,11 +1002,14 @@ impl Before<'_> {
                     continue;
                 }
             }
-            if out.insert(key, s.known()).is_some() || self.ledger.shares_inode(&key) {
+            if out.insert(key, s.into_looked()).is_some() || self.ledger.shares_inode(&key) {
                 owner.insert(key, id);
             }
         }
         for (id, row) in self.dirty_rows {
+            if self.unscanned.contains(id) {
+                continue;
+            }
             let key = (row.fp.dev, row.fp.ino);
             let later = match owner.get(&key) {
                 Some(o) => o < id,
@@ -796,7 +1021,7 @@ impl Before<'_> {
             };
             if later {
                 owner.insert(key, *id);
-                out.insert(key, row.known());
+                out.insert(key, (&row.known()).into());
             }
         }
         out
@@ -953,12 +1178,12 @@ impl<'a> Word<'a> {
         not_vouched.extend(b.journal.touched.iter().copied());
         not_vouched.extend(named.iter().copied());
         for i in 0..l.len() {
-            let shared = l.seen[i]
-                .as_ref()
-                .is_some_and(|s| l.shares_inode(&(s.fp.dev, s.fp.ino)));
-            if l.link_count(i) > 1 || shared {
+            if l.link_count(i) > 1 {
                 not_vouched.insert(l.ids[i]);
             }
+        }
+        for i in l.sharing_inodes() {
+            not_vouched.insert(l.ids[i]);
         }
         let mut open_here: HashSet<ObjectId> = HashSet::new();
         let mut whole: HashSet<ObjectId> = HashSet::new();
@@ -1058,6 +1283,21 @@ impl<'a> Word<'a> {
     pub fn path(&self, x: &ObjectId) -> Option<Vec<Name>> {
         self.path_of(x)
     }
+
+    /// The paths the agreement had this inode at.
+    fn paths_of(&self, inode: (u64, u64)) -> Vec<Vec<Name>> {
+        let l = self.b.ledger;
+        let mut out = Vec::new();
+        for x in l.at_inode(&inode) {
+            for link in l.links_of(&x).unwrap_or_default() {
+                if let Some(mut p) = self.path_of(&link.parent) {
+                    p.push(link.name);
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl crate::scan::Vouch for Word<'_> {
@@ -1084,7 +1324,7 @@ impl crate::scan::Vouch for Word<'_> {
         let Some(li) = l.find(&folder) else {
             return false;
         };
-        let Some(seen) = l.seen[li].as_ref() else {
+        let Some(seen) = l.seen_at(li) else {
             return false;
         };
         let key = (node.fp.dev, node.fp.ino);
@@ -1131,62 +1371,89 @@ impl crate::scan::Vouch for Word<'_> {
         self.b.ledger.children_named(&folder, name).is_some()
     }
 
-    fn under(
-        &self,
-        folder: ObjectId,
-        path: &[Name],
-        except: &BTreeSet<Name>,
-        found: &HashSet<(u64, u64)>,
-        out: &mut Vec<Scanned>,
-    ) {
-        let l = self.b.ledger;
-        let mut stack: Vec<(ObjectId, Vec<Name>, bool)> = vec![(folder, path.to_vec(), true)];
-        while let Some((f, at, top)) = stack.pop() {
-            for i in l.child_indices(&f) {
-                let Some(seen) = l.seen[i].as_ref() else {
-                    continue;
-                };
-                for (p, n) in l.raw_links(i) {
-                    if p != f {
-                        continue;
-                    }
-                    let Ok(name) = Name::new(n.to_vec()) else {
-                        continue;
-                    };
-                    if top && except.contains(&name) {
-                        continue;
-                    }
-                    if found.contains(&(seen.fp.dev, seen.fp.ino)) {
-                        continue;
-                    }
-                    let mut p = at.clone();
-                    p.push(name);
-                    if l.kinds[i] == ObjectKind::Dir {
-                        stack.push((l.ids[i], p.clone(), false));
-                    }
-                    let known = seen.known();
-                    out.push(Scanned {
-                        paths: vec![p],
-                        fp: seen.fp.clone(),
-                        racy: false,
-                        content: seen.content.clone(),
-                        metadata: known.scan.cloned().unwrap_or_default(),
-                        metadata_incomplete: false,
-                        holds_excluded: false,
-                        only_excluded: false,
-                    });
-                }
-            }
-        }
-    }
-
-    fn paths_of(&self, inode: (u64, u64)) -> Vec<Vec<Name>> {
+    fn children(&self, folder: ObjectId) -> Vec<crate::scan::Child<'_>> {
         let l = self.b.ledger;
         let mut out = Vec::new();
-        for x in l.at_inode(&inode) {
-            for link in l.links_of(&x).unwrap_or_default() {
-                if let Some(mut p) = self.path_of(&link.parent) {
-                    p.push(link.name);
+        for i in l.child_indices(&folder) {
+            let Some(inode) = l.inode_at(i) else {
+                continue;
+            };
+            for (p, n) in l.raw_links(i) {
+                if p != folder || !Name::valid(n) {
+                    continue;
+                }
+                out.push(crate::scan::Child {
+                    object: l.ids[i],
+                    name: n,
+                    dir: l.kinds[i] == ObjectKind::Dir,
+                    inode,
+                    place: i as u32,
+                });
+            }
+        }
+        out
+    }
+
+    fn node(&self, object: ObjectId, path: Vec<Name>) -> Option<Scanned> {
+        let seen = self.b.ledger.seen_of(&object)?;
+        let known = seen.known();
+        Some(Scanned {
+            paths: vec![path],
+            fp: seen.fp.clone(),
+            racy: false,
+            content: seen.content.clone(),
+            metadata: known.scan.cloned().unwrap_or_default(),
+            metadata_incomplete: false,
+            holds_excluded: false,
+            only_excluded: false,
+        })
+    }
+
+    fn agreed_elsewhere(&self, scan: &ScanResult) -> Vec<Vec<Name>> {
+        let l = self.b.ledger;
+        let mut out = Vec::new();
+        let mut at = |inode: (u64, u64), found: &[Vec<Name>]| {
+            for p in self.paths_of(inode) {
+                if found.contains(&p) {
+                    continue;
+                }
+                if let Some((_, folder)) = p.split_last() {
+                    out.push(folder.to_vec());
+                }
+            }
+        };
+        for (k, n) in scan.nodes.iter().enumerate() {
+            if !scan.vouched(scan.seq(k)) {
+                at((n.fp.dev, n.fp.ino), &n.paths);
+            }
+        }
+        // A quiet entry is the one entry of the ledger at its inode, but for some written since, at the
+        // name the ledger has in the folder the walk found it in: elsewhere only if that folder is.
+        let mut folders: HashSet<u32> = HashSet::new();
+        for q in &scan.quiet {
+            if scan.vouched(q.seq as usize) {
+                continue;
+            }
+            let Some(seen) = l.seen_of(&q.object) else {
+                continue;
+            };
+            let inode = (seen.fp.dev, seen.fp.ino);
+            if l.shares_inode(&inode) {
+                let mut path = scan.folder_path(q.folder);
+                if let Some(link) = l.links_of(&q.object).and_then(|v| v.into_iter().next()) {
+                    path.push(link.name);
+                }
+                at(inode, &[path]);
+            } else {
+                folders.insert(q.folder);
+            }
+        }
+        for f in folders {
+            let Some(x) = scan.folders[f as usize].object else {
+                continue;
+            };
+            if let Some(p) = self.path_of(&x) {
+                if p != scan.folder_path(f) {
                     out.push(p);
                 }
             }
@@ -1195,22 +1462,354 @@ impl crate::scan::Vouch for Word<'_> {
     }
 }
 
-/// Where the root stands among a scan's nodes.
-const ROOT_NODE: usize = usize::MAX;
+/// What is at one inode, for a node sorted against the ledger (`Sorting::at_inode`).
+#[derive(Default)]
+struct AtInode {
+    object: Option<ObjectId>,
+    settled: usize,
+    entry: Option<(usize, Seen)>,
+}
 
-/// A scan, entry by entry, against the ledger.
+/// What a round sorts the scan's nodes by against the ledger: the rows written since, by inode, and the
+/// inodes a mark names, where nothing is quiet. As the walk's sieve (scan.rs `Sieve`) it keeps of what
+/// the ledger accounts for only the object it is; as the walk's rows (`KnownRows`) it gives each inode
+/// what a map of every row would, the ledger's entry or the row written since, whichever is the later
+/// object.
+pub struct Sorting<'a> {
+    pub b: &'a Before<'a>,
+    dirty_by_inode: HashMap<(u64, u64), Vec<ObjectId>>,
+    marked: &'a BTreeSet<(u64, u64)>,
+    /// A harness build can take a file of one name as the ledger has it, whatever the scan found, as a
+    /// defect in what follows would: for the tests of the daemon's check on the incremental path.
+    blind: Option<String>,
+    /// For the check: a witness kept of each node made quiet, of what was read of it.
+    witness: bool,
+}
+
+/// What the check judges of a node besides where it is: a file's fingerprint and content, and the digest
+/// of anything else. Kept of each quiet node in a round that checks, to tell whether what is made again
+/// from the ledger and the row is what was read.
+pub fn witness(n: &Scanned) -> [u8; 16] {
+    let whole = match n.content {
+        Content::File { .. } => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"cairn quiet file");
+            let fp = n.fp.current();
+            for v in [fp.dev, fp.ino, fp.size] {
+                h.update(&v.to_le_bytes());
+            }
+            for t in [Some(fp.mtime), Some(fp.ctime), fp.btime] {
+                match t {
+                    Some(t) => {
+                        h.update(&[1]);
+                        h.update(&t.sec.to_le_bytes());
+                        h.update(&t.nsec.to_le_bytes());
+                    }
+                    None => {
+                        h.update(&[0]);
+                    }
+                }
+            }
+            if let Content::File { manifest, size } = &n.content {
+                h.update(&manifest.0);
+                h.update(&size.to_le_bytes());
+            }
+            *h.finalize().as_bytes()
+        }
+        _ => digest(n).0,
+    };
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&whole[..16]);
+    out
+}
+
+impl<'a> Sorting<'a> {
+    pub fn new(b: &'a Before<'a>, marked: &'a BTreeSet<(u64, u64)>) -> Self {
+        let mut dirty_by_inode: HashMap<(u64, u64), Vec<ObjectId>> = HashMap::new();
+        for (id, row) in b.dirty_rows {
+            dirty_by_inode
+                .entry((row.fp.dev, row.fp.ino))
+                .or_default()
+                .push(*id);
+        }
+        let blind = cfg!(feature = "failpoints")
+            .then(|| std::env::var("CAIRN_FP_INCR_BLIND").ok())
+            .flatten();
+        Sorting {
+            b,
+            dirty_by_inode,
+            marked,
+            blind,
+            witness: false,
+        }
+    }
+
+    /// The same, keeping a witness of each node it makes quiet, for the check.
+    pub fn witnessing(self) -> Self {
+        Sorting {
+            witness: true,
+            ..self
+        }
+    }
+
+    fn blind(&self, name: Option<&Name>) -> bool {
+        self.blind
+            .as_ref()
+            .is_some_and(|b| name.is_some_and(|n| n.as_bytes() == b.as_bytes()))
+    }
+
+    /// By inode, as identification goes first: of the rows at it of the same kind and birth, the one
+    /// whose whole fingerprint holds, the later object on a tie.
+    fn provisional_at(
+        &self,
+        key: (u64, u64),
+        kind: ObjectKind,
+        fp: &Fingerprint,
+    ) -> Option<ObjectId> {
+        self.at_inode(key, kind, fp).object
+    }
+
+    /// What is at an inode, in one look: the object it says a node of this kind and birth is, how many
+    /// of the ledger's entries nothing has written since are there, and the ledger's entry of that
+    /// object, where it is one of those.
+    fn at_inode(&self, key: (u64, u64), kind: ObjectKind, fp: &Fingerprint) -> AtInode {
+        let b = self.b;
+        let mut best: Option<(bool, ObjectId)> = None;
+        let mut out = AtInode::default();
+        let mut consider = |id: ObjectId, f: &Fingerprint, k: ObjectKind| {
+            if k == kind && birth_mark(f.btime) == birth_mark(fp.btime) {
+                let here = (f.current() == fp.current(), id);
+                if best.is_none_or(|b| here > b) {
+                    best = Some(here);
+                    return true;
+                }
+            }
+            false
+        };
+        for li in b.ledger.at_inode_places(&key) {
+            let x = b.ledger.id_at(li);
+            if b.is_dirty(&x) {
+                continue;
+            }
+            out.settled += 1;
+            if let Some(s) = b.ledger.seen_at(li) {
+                if consider(x, &s.fp, s.content.kind()) {
+                    out.entry = Some((li, s));
+                }
+            }
+        }
+        for y in self.dirty_by_inode.get(&key).into_iter().flatten() {
+            let row = &b.dirty_rows[y];
+            if consider(*y, &row.fp, row.content.kind()) {
+                out.entry = None;
+            }
+        }
+        out.object = best.map(|(_, id)| id);
+        out
+    }
+
+    /// The object a node's inode says it is.
+    pub fn provisional(&self, n: &Scanned) -> Option<ObjectId> {
+        self.provisional_at((n.fp.dev, n.fp.ino), n.content.kind(), &n.fp)
+    }
+
+    /// The ledger's entry `x` is quietly, if it is: found at its inode and kind, at the entries the
+    /// ledger has (`links`), as the ledger has it (`same`).
+    fn quiet_as(
+        &self,
+        x: ObjectId,
+        key: (u64, u64),
+        kind: ObjectKind,
+        links: impl FnOnce(usize) -> bool,
+        same: impl FnOnce(&Seen) -> bool,
+        blind: bool,
+    ) -> Option<usize> {
+        let b = self.b;
+        if b.is_dirty(&x) || b.journal.touched.contains(&x) {
+            return None;
+        }
+        let li = b.ledger.find(&x)?;
+        let seen = b.ledger.seen_at(li)?;
+        if self.dirty_by_inode.contains_key(&key)
+            // Two entries of the ledger at one inode say nothing about either.
+            || b.ledger.at_inode(&key).filter(|y| !b.is_dirty(y)).count() != 1
+            || b.ledger.kinds[li] != kind
+            || (seen.fp.dev, seen.fp.ino) != key
+        {
+            return None;
+        }
+        if !links(li) {
+            return None;
+        }
+        (same(&seen) || blind).then_some(li)
+    }
+
+    /// The same, of a node the walk found: `digest` its digest unless it is a file, `vouched` if the walk
+    /// took it from the agreement rather than read it.
+    fn quiet_node(
+        &self,
+        n: &Scanned,
+        x: ObjectId,
+        links: impl FnOnce(usize) -> bool,
+        digest: Option<Hash>,
+        vouched: bool,
+    ) -> Option<usize> {
+        let blind = self.blind.is_some() && n.paths.iter().any(|p| self.blind(p.last()));
+        let same = |seen: &Seen| match n.content {
+            Content::File { .. } => seen.known().vouches_for(&n.fp) && n.content == seen.content,
+            _ if vouched => true,
+            // The digest holds the fingerprint too.
+            _ => digest.is_some() && digest == seen.digest,
+        };
+        self.quiet_as(
+            x,
+            (n.fp.dev, n.fp.ino),
+            n.content.kind(),
+            links,
+            same,
+            blind,
+        )
+    }
+
+    /// Whether ledger entry `li` is one entry, `name` in the folder that is `parent`.
+    fn one_link(&self, li: usize, parent: ObjectId, name: &Name) -> bool {
+        let mut mine = self.b.ledger.raw_links(li);
+        mine.next() == Some((parent, name.as_bytes())) && mine.next().is_none()
+    }
+}
+
+impl crate::scan::Sieve for Sorting<'_> {
+    fn folder(&self, node: &Scanned) -> Option<ObjectId> {
+        self.provisional(node)
+    }
+
+    fn quiet(&self, parent: Option<ObjectId>, n: &Scanned) -> Option<ObjectId> {
+        let parent = parent?;
+        let [path] = n.paths.as_slice() else {
+            return None;
+        };
+        let name = path.last()?;
+        let key = (n.fp.dev, n.fp.ino);
+        if self.marked.contains(&key) {
+            return None;
+        }
+        // As `quiet_node` decides it, in one look at the inode.
+        let at = self.at_inode(key, n.content.kind(), &n.fp);
+        let x = at.object?;
+        let (li, seen) = at.entry?;
+        let b = self.b;
+        if b.ledger.id_at(li) != x
+            || at.settled != 1
+            || b.journal.touched.contains(&x)
+            || self.dirty_by_inode.contains_key(&key)
+            || b.ledger.kind_at(li) != n.content.kind()
+            || (seen.fp.dev, seen.fp.ino) != key
+            || !self.one_link(li, parent, name)
+        {
+            return None;
+        }
+        let same = match n.content {
+            Content::File { .. } => seen.known().vouches_for(&n.fp) && n.content == seen.content,
+            _ => Some(digest(n)) == seen.digest,
+        };
+        let blind = self.blind.is_some() && self.blind(Some(name));
+        (same || blind).then_some(x)
+    }
+
+    fn quiet_vouched(&self, parent: Option<ObjectId>, child: &crate::scan::Child<'_>) -> bool {
+        let Some(parent) = parent else {
+            return false;
+        };
+        let b = self.b;
+        let (li, object, key) = (child.place as usize, child.object, child.inode);
+        if b.ledger.id_at(li) != object
+            || self.marked.contains(&key)
+            || b.is_dirty(&object)
+            || b.journal.touched.contains(&object)
+            // No row written since at its inode, which would be the later one there; the folder vouched
+            // for whole holds no other entry of the ledger at it.
+            || self.dirty_by_inode.contains_key(&key)
+        {
+            return false;
+        }
+        let Some(seen) = b.ledger.seen_at(li) else {
+            return false;
+        };
+        let mut mine = b.ledger.raw_links(li);
+        let one = mine.next() == Some((parent, child.name)) && mine.next().is_none();
+        if !one || b.ledger.kind_at(li) != seen.content.kind() {
+            return false;
+        }
+        // Taken as the agreement found it: its fingerprint the entry's own.
+        let same = match seen.content {
+            Content::File { .. } => seen.known().vouches_for(&seen.fp),
+            _ => true,
+        };
+        let blind = self
+            .blind
+            .as_ref()
+            .is_some_and(|b| b.as_bytes() == child.name);
+        same || blind
+    }
+
+    fn witness(&self, node: &Scanned) -> Option<[u8; 16]> {
+        self.witness.then(|| witness(node))
+    }
+
+    fn witnessing(&self) -> bool {
+        self.witness
+    }
+}
+
+impl crate::scan::KnownRows for Sorting<'_> {
+    fn known(&self, key: &(u64, u64)) -> Option<crate::state::Looked<'_>> {
+        let b = self.b;
+        let ledger = b
+            .ledger
+            .at_inode_places(key)
+            .filter(|li| !b.is_dirty(&b.ledger.id_at(*li)))
+            .max();
+        let ledger_id = ledger.map(|li| b.ledger.id_at(li));
+        // Not the rows the selection's view takes, which a full sync's scan is not given either.
+        let dirty = self
+            .dirty_by_inode
+            .get(key)
+            .and_then(|v| v.iter().filter(|y| !b.unscanned.contains(y)).max());
+        let row = |y: &ObjectId| b.dirty_rows.get(y).map(|r| (&r.known()).into());
+        let entry = |li: usize| b.ledger.seen_at(li).map(Seen::into_looked);
+        match (ledger, ledger_id, dirty) {
+            (Some(li), Some(x), Some(y)) if *y < x => entry(li),
+            (_, _, Some(y)) => row(y),
+            (Some(li), _, None) => entry(li),
+            _ => None,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.b.ledger.len()
+    }
+}
+
+/// A scan, entry by entry, against the ledger: what the walk kept whole, sorted here, and what it kept
+/// only the object of, which is quiet.
 pub struct Classified<'s> {
     scan: &'s ScanResult,
-    /// The object each node's inode says it is.
+    /// Of each node kept whole: the object its inode says it is, and whether it is found as the ledger
+    /// has it.
     pub provisional: Vec<Option<ObjectId>>,
-    /// Found as the ledger has it.
     pub quiet: Vec<bool>,
-    pub node_of: FxMap<ObjectId, usize>,
-    pub(crate) dir_at: FxMap<&'s [Name], usize>,
-    local_children: FxMap<usize, Vec<usize>>,
+    /// The node kept whole each object is found at.
+    node_of: FxMap<ObjectId, usize>,
+    /// The quiet entries, by object.
+    quiet_by_object: Vec<u32>,
+    /// The folder of the walk each folder's node is.
+    folder_of_node: FxMap<Slot, u32>,
+    /// The nodes kept whole in each folder of the walk.
+    kept_in: FxMap<u32, Vec<usize>>,
     /// What the ledger cannot vouch for, and the folders whose every name the merge may look at.
     pub seeds: BTreeSet<ObjectId>,
     pub open: BTreeSet<ObjectId>,
+    /// The nodes kept whole that are not quiet.
     pub changed: Vec<usize>,
     /// Rewritten in place: found at the inode, kind and one entry the ledger has, which nothing has
     /// written since and the journal does not name. Such an object takes no name, so the round needs
@@ -1219,29 +1818,115 @@ pub struct Classified<'s> {
 }
 
 impl<'s> Classified<'s> {
-    fn parent_node(&self, path: &[Name]) -> Option<usize> {
-        match path.len() {
-            0 => None,
-            1 => Some(ROOT_NODE),
-            n => self.dir_at.get(&path[..n - 1]).copied(),
+    /// The folder of the walk an entry at this path is in.
+    fn folder_holding(&self, path: &[Name]) -> Option<u32> {
+        let (_, parent) = path.split_last()?;
+        self.scan.folder_at(parent)
+    }
+
+    /// The object a folder of the walk is, by what its node's inode says.
+    fn object_of_folder(&self, f: u32) -> Option<ObjectId> {
+        if f == ROOT_FOLDER {
+            return Some(ObjectId::ROOT);
+        }
+        self.object_of(self.scan.folders[f as usize].node?)
+    }
+
+    /// The object a node is, by its inode.
+    pub fn object_of(&self, s: Slot) -> Option<ObjectId> {
+        match s {
+            Slot::Kept(k) => self.provisional[k as usize],
+            Slot::Quiet(q) => Some(self.scan.quiet[q as usize].object),
         }
     }
 
-    fn object_of_node(&self, i: usize) -> Option<ObjectId> {
-        if i == ROOT_NODE {
-            Some(ObjectId::ROOT)
-        } else {
-            self.provisional[i]
+    /// The object of the folder a path is in, by its inode, as far as the scan saw it.
+    pub fn folder_of(&self, path: &[Name]) -> Option<ObjectId> {
+        self.object_of_folder(self.folder_holding(path)?)
+    }
+
+    /// Where the scan found an object, by its inode.
+    pub fn slot_of(&self, x: &ObjectId) -> Option<Slot> {
+        if let Some(&k) = self.node_of.get(x) {
+            return Some(Slot::Kept(k as u32));
         }
+        let q = &self.scan.quiet;
+        self.quiet_by_object
+            .binary_search_by(|i| q[*i as usize].object.cmp(x))
+            .ok()
+            .map(|i| Slot::Quiet(self.quiet_by_object[i]))
+    }
+
+    /// A node's place in the walk.
+    pub fn seq(&self, s: Slot) -> usize {
+        match s {
+            Slot::Kept(k) => self.scan.seq(k as usize),
+            Slot::Quiet(q) => self.scan.quiet[q as usize].seq as usize,
+        }
+    }
+
+    /// The folders of the walk a node is in.
+    fn folders_of(&self, s: Slot) -> Vec<u32> {
+        match s {
+            Slot::Kept(k) => self.scan.nodes[k as usize]
+                .paths
+                .iter()
+                .filter_map(|p| self.folder_holding(p))
+                .collect(),
+            Slot::Quiet(q) => vec![self.scan.quiet[q as usize].folder],
+        }
+    }
+
+    /// Every node in a folder of the walk.
+    fn children_in(&self, f: u32) -> Vec<Slot> {
+        let folder = &self.scan.folders[f as usize];
+        let mut out: Vec<Slot> = self
+            .kept_in
+            .get(&f)
+            .into_iter()
+            .flatten()
+            .map(|k| Slot::Kept(*k as u32))
+            .collect();
+        for (start, end) in [folder.quiet, folder.vouched] {
+            out.extend((start..end).map(Slot::Quiet));
+        }
+        out
+    }
+
+    /// Where a folder's node is, from the root.
+    pub fn path_of_folder_node(&self, s: Slot) -> Option<Vec<Name>> {
+        match s {
+            Slot::Kept(k) => self.scan.nodes[k as usize].paths.first().cloned(),
+            Slot::Quiet(_) => self
+                .folder_of_node
+                .get(&s)
+                .map(|f| self.scan.folder_path(*f)),
+        }
+    }
+
+    /// The paths of the folders a node is in.
+    pub fn folder_paths(&self, s: Slot) -> Vec<Vec<Name>> {
+        match s {
+            Slot::Kept(k) => self.scan.nodes[k as usize]
+                .paths
+                .iter()
+                .filter_map(|p| p.split_last().map(|(_, f)| f.to_vec()))
+                .collect(),
+            Slot::Quiet(q) => vec![self.scan.folder_path(self.scan.quiet[q as usize].folder)],
+        }
+    }
+
+    /// The scan this classifies.
+    pub fn scan(&self) -> &'s ScanResult {
+        self.scan
     }
 
     /// The entries a node has, by what its folders' inodes say they are.
-    fn links_of(&self, n: &Scanned) -> Option<Vec<Link>> {
+    pub(crate) fn links_of(&self, n: &Scanned) -> Option<Vec<Link>> {
         let mut out = Vec::with_capacity(n.paths.len());
         for p in &n.paths {
-            let parent = self.object_of_node(self.parent_node(p)?)?;
             out.push(Link {
-                parent,
+                parent: self.folder_of(p)?,
                 name: p.last()?.clone(),
             });
         }
@@ -1252,22 +1937,32 @@ impl<'s> Classified<'s> {
 
     /// What classification made of an object, for the oracle's report when it disagrees.
     pub fn explain(&self, b: &Before<'_>, id: &ObjectId, r: &Reach) -> String {
-        let node = self.node_of.get(id).map(|&i| {
-            let n = &self.scan.nodes[i];
-            let digest = (!matches!(n.content, Content::File { .. })).then(|| digest(n));
-            format!(
-                "node {} at {:?}, quiet {}, fp {:?}, racy {}, digest {:?}, links {:?}",
-                i,
-                n.paths
-                    .iter()
-                    .map(|p| crate::scan::display_path(p))
-                    .collect::<Vec<_>>(),
-                self.quiet[i],
-                n.fp,
-                n.racy,
-                digest,
-                self.links_of(n)
-            )
+        let node = self.slot_of(id).map(|s| match s {
+            Slot::Kept(k) => {
+                let n = &self.scan.nodes[k as usize];
+                let digest = (!matches!(n.content, Content::File { .. })).then(|| digest(n));
+                format!(
+                    "node {} at {:?}, quiet {}, fp {:?}, racy {}, digest {:?}, links {:?}",
+                    self.scan.seq(k as usize),
+                    n.paths
+                        .iter()
+                        .map(|p| crate::scan::display_path(p))
+                        .collect::<Vec<_>>(),
+                    self.quiet[k as usize],
+                    n.fp,
+                    n.racy,
+                    digest,
+                    self.links_of(n)
+                )
+            }
+            Slot::Quiet(q) => {
+                let q = &self.scan.quiet[q as usize];
+                format!(
+                    "node {} quiet in {:?}",
+                    q.seq,
+                    crate::scan::display_path(&self.scan.folder_path(q.folder))
+                )
+            }
         });
         let entry = b.ledger.entry(id);
         format!(
@@ -1281,34 +1976,17 @@ impl<'s> Classified<'s> {
         )
     }
 
-    /// The object of the folder a path is in, by its inode, as far as the scan saw it.
-    pub fn folder_of(&self, path: &[Name]) -> Option<ObjectId> {
-        self.object_of_node(self.parent_node(path)?)
-    }
-
-    /// Not to be taken as the ledger has it, whatever the ledger says: a mark names its inode.
-    pub fn unquiet(&mut self, i: usize) {
-        if !self.quiet[i] {
-            return;
-        }
-        self.quiet[i] = false;
-        self.changed.push(i);
-        if let Some(x) = self.provisional[i] {
-            self.seeds.insert(x);
-            self.in_place.remove(&x);
-        }
-        for p in &self.scan.nodes[i].paths {
-            if let Some(o) = self.parent_node(p).and_then(|j| self.object_of_node(j)) {
-                self.open.insert(o);
-            }
-        }
-    }
-
     /// What the scan found as the ledger has it and a round leaves out: live on both sides, and here.
     pub fn quiet_outside(&self, r: &Reach) -> usize {
-        (0..self.quiet.len())
-            .filter(|i| self.quiet[*i])
-            .filter(|i| self.provisional[*i].is_some_and(|x| !r.all.contains(&x)))
+        let kept = (0..self.quiet.len())
+            .filter(|k| self.quiet[*k])
+            .filter(|k| self.provisional[*k].is_some_and(|x| !r.all.contains(&x)))
+            .count();
+        kept + self
+            .scan
+            .quiet
+            .iter()
+            .filter(|q| !r.all.contains(&q.object))
             .count()
     }
 
@@ -1316,32 +1994,53 @@ impl<'s> Classified<'s> {
     /// has it, that identification took for another object than its inode said.
     pub fn misidentified(
         &self,
+        b: &Before<'_>,
         r: &Reach,
         identified: &crate::identify::Identified,
     ) -> Option<String> {
-        for &i in &r.nodes {
-            let n = &self.scan.nodes[i];
-            let Some(p) = self.provisional[i] else {
-                continue;
+        for s in r.nodes.values() {
+            let (p, inode, path) = match *s {
+                Slot::Kept(k) => {
+                    let n = &self.scan.nodes[k as usize];
+                    let Some(p) = self.provisional[k as usize] else {
+                        continue;
+                    };
+                    if !self.quiet[k as usize] && n.content != Content::Dir {
+                        continue;
+                    }
+                    (p, (n.fp.dev, n.fp.ino), n.paths.first().cloned())
+                }
+                // Quiet: at the inode its ledger entry has.
+                Slot::Quiet(q) => {
+                    let x = self.scan.quiet[q as usize].object;
+                    let Some(seen) = b.ledger.seen_of(&x) else {
+                        continue;
+                    };
+                    (x, (seen.fp.dev, seen.fp.ino), self.path_of_quiet(b, q))
+                }
             };
-            if !self.quiet[i] && n.content != Content::Dir {
-                continue;
-            }
             let same = identified
                 .scanned
                 .get(&p)
-                .is_some_and(|s| (s.fp.dev, s.fp.ino) == (n.fp.dev, n.fp.ino));
+                .is_some_and(|s| (s.fp.dev, s.fp.ino) == inode);
             if !same {
                 return Some(format!(
                     "{} was not identified as the object its inode says",
-                    n.paths
-                        .first()
-                        .map(|p| crate::scan::display_path(p))
+                    path.map(|p| crate::scan::display_path(&p))
                         .unwrap_or_default()
                 ));
             }
         }
         None
+    }
+
+    /// Where a quiet entry is: its folder's path and the name the ledger has it at.
+    fn path_of_quiet(&self, b: &Before<'_>, q: u32) -> Option<Vec<Name>> {
+        let q = &self.scan.quiet[q as usize];
+        let link = b.ledger.links_of(&q.object)?.into_iter().next()?;
+        let mut path = self.scan.folder_path(q.folder);
+        path.push(link.name);
+        Some(path)
     }
 }
 
@@ -1415,165 +2114,125 @@ pub fn decided_outside(
     out
 }
 
-/// Every node against the ledger. Nothing here decides anything: a node is quiet only if the full sync
-/// would find in it what it found at the agreement, and everything else is for the round to look at.
-pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
+/// Where a scan's nodes are, with each node kept whole taken to be the object `provisional` says: what
+/// classification starts from, and all a rebuild's judging of rows against the scan needs.
+pub fn placed<'s>(
+    scan: &'s ScanResult,
+    provisional: &(dyn Fn(&Scanned) -> Option<ObjectId> + Sync),
+) -> Classified<'s> {
     let nodes = &scan.nodes;
-    let mut dir_at: FxMap<&'s [Name], usize> = FxMap::default();
-    for (i, n) in nodes.iter().enumerate() {
-        if n.content == Content::Dir {
-            for p in &n.paths {
-                dir_at.insert(p.as_slice(), i);
-            }
-        }
-    }
-    let mut dirty_by_inode: HashMap<(u64, u64), Vec<ObjectId>> = HashMap::new();
-    for (id, row) in b.dirty_rows {
-        dirty_by_inode
-            .entry((row.fp.dev, row.fp.ino))
-            .or_default()
-            .push(*id);
-    }
-
-    // By inode, as identification goes first: of the rows at it of the same kind and birth, the one whose
-    // whole fingerprint holds, the later object on a tie.
-    let provisional: Vec<Option<ObjectId>> = par_map(nodes.len(), |i| {
-        let n = &nodes[i];
-        let key = (n.fp.dev, n.fp.ino);
-        let mut best: Option<(bool, ObjectId)> = None;
-        let mut consider = |id: ObjectId, fp: &Fingerprint, kind: ObjectKind| {
-            if kind == n.content.kind() && birth_mark(fp.btime) == birth_mark(n.fp.btime) {
-                let here = (fp.current() == n.fp.current(), id);
-                if best.is_none_or(|b| here > b) {
-                    best = Some(here);
-                }
-            }
-        };
-        for x in b.ledger.at_inode(&key).filter(|x| !b.is_dirty(x)) {
-            if let Some(s) = b.ledger.seen_of(&x) {
-                consider(x, &s.fp, s.content.kind());
-            }
-        }
-        for y in dirty_by_inode.get(&key).into_iter().flatten() {
-            let row = &b.dirty_rows[y];
-            consider(*y, &row.fp, row.content.kind());
-        }
-        best.map(|(_, id)| id)
-    });
-
+    let provisional: Vec<Option<ObjectId>> = par_map(nodes.len(), |k| provisional(&nodes[k]));
+    let mut quiet_by_object: Vec<u32> = (0..scan.quiet.len() as u32).collect();
+    quiet_by_object.sort_unstable_by_key(|q| scan.quiet[*q as usize].object);
+    let folder_of_node: FxMap<Slot, u32> = scan
+        .folders
+        .iter()
+        .enumerate()
+        .filter_map(|(f, folder)| Some((folder.node?, f as u32)))
+        .collect();
     let mut c = Classified {
         scan,
         provisional,
         quiet: Vec::new(),
         node_of: FxMap::default(),
-        dir_at,
-        local_children: FxMap::default(),
+        quiet_by_object,
+        folder_of_node,
+        kept_in: FxMap::default(),
         seeds: BTreeSet::new(),
         open: BTreeSet::new(),
         changed: Vec::new(),
         in_place: HashSet::new(),
     };
     c.node_of.reserve(nodes.len());
-    for (i, n) in nodes.iter().enumerate() {
-        if let Some(x) = c.provisional[i] {
-            c.node_of.insert(x, i);
+    for (k, n) in nodes.iter().enumerate() {
+        if let Some(x) = c.provisional[k] {
+            c.node_of.insert(x, k);
         }
         for p in &n.paths {
-            if let Some(parent) = c.parent_node(p) {
-                c.local_children.entry(parent).or_default().push(i);
+            if let Some(f) = c.folder_holding(p) {
+                c.kept_in.entry(f).or_default().push(k);
             }
         }
     }
+    c
+}
 
-    // Nodes taken from the agreement were not read: their digests are the agreement's.
-    let read = scan.vouched_from.min(nodes.len());
+/// Every node against the ledger. Nothing here decides anything: a node is quiet only if the full sync
+/// would find in it what it found at the agreement, and everything else is for the round to look at. What
+/// the walk's sieve kept only the object of is quiet already; the rest is sorted here, as the sieve would.
+pub fn classify<'s>(sort: &Sorting<'_>, scan: &'s ScanResult) -> Classified<'s> {
+    let b = sort.b;
+    let nodes = &scan.nodes;
+    let mut c = placed(scan, &|n| sort.provisional(n));
+
+    // Nodes taken from the agreement were not read: their digests are the agreement's. They are the
+    // last of those kept.
+    let read = (0..nodes.len())
+        .find(|k| scan.vouched(scan.seq(*k)))
+        .unwrap_or(nodes.len());
     let mut digests = digests(&nodes[..read]);
     digests.resize(nodes.len(), None);
-    // A harness build can take a file of one name as the ledger has it, whatever the scan found, as a
-    // defect in what follows would: for the tests of the daemon's check on the incremental path.
-    let blind: Option<String> = cfg!(feature = "failpoints")
-        .then(|| std::env::var("CAIRN_FP_INCR_BLIND").ok())
-        .flatten();
-    let blind = |n: &Scanned| {
-        blind.as_ref().is_some_and(|b| {
-            n.paths
-                .iter()
-                .any(|p| p.last().is_some_and(|l| l.as_bytes() == b.as_bytes()))
-        })
-    };
+    let marked = |n: &Scanned| sort.marked.contains(&(n.fp.dev, n.fp.ino));
     // Each node, the ledger's entry it is quietly, if it is.
-    let quiet: Vec<Option<usize>> = par_map(nodes.len(), |i| {
-        let n = &nodes[i];
-        let x = c.provisional[i]?;
-        if b.is_dirty(&x) || b.journal.touched.contains(&x) {
+    let quiet: Vec<Option<usize>> = par_map(nodes.len(), |k| {
+        let n = &nodes[k];
+        let x = c.provisional[k]?;
+        if marked(n) {
             return None;
         }
-        let li = b.ledger.find(&x)?;
-        let seen = b.ledger.seen[li].as_ref()?;
-        let key = (n.fp.dev, n.fp.ino);
-        if dirty_by_inode.contains_key(&key)
-            // Two entries of the ledger at one inode say nothing about either.
-            || b.ledger.at_inode(&key).filter(|y| !b.is_dirty(y)).count() != 1
-            || b.ledger.kinds[li] != n.content.kind()
-            || (seen.fp.dev, seen.fp.ino) != key
-        {
-            return None;
-        }
-        let same_links = if n.paths.len() == 1 {
-            let p = &n.paths[0];
-            let parent = c.object_of_node(c.parent_node(p)?)?;
-            let name = p.last()?.as_bytes();
-            let mut mine = b.ledger.raw_links(li);
-            mine.next() == Some((parent, name)) && mine.next().is_none()
-        } else {
-            b.ledger.links_are(&x, &c.links_of(n)?)
+        let links = |li: usize| {
+            if n.paths.len() == 1 {
+                let p = &n.paths[0];
+                match (c.folder_of(p), p.last()) {
+                    (Some(parent), Some(name)) => sort.one_link(li, parent, name),
+                    _ => false,
+                }
+            } else {
+                c.links_of(n).is_some_and(|l| b.ledger.links_are(&x, &l))
+            }
         };
-        if !same_links {
-            return None;
-        }
-        let same = match n.content {
-            Content::File { .. } => seen.known().vouches_for(&n.fp) && n.content == seen.content,
-            _ if scan.vouched(i) => true,
-            // The digest holds the fingerprint too.
-            _ => digests[i].is_some() && digests[i] == seen.digest,
-        };
-        (same || blind(n)).then_some(li)
+        sort.quiet_node(n, x, links, digests[k], scan.vouched(scan.seq(k)))
     });
     let mut found = vec![false; b.ledger.len()];
     for li in quiet.iter().flatten() {
         found[*li] = true;
     }
+    for q in &scan.quiet {
+        if let Some(li) = b.ledger.find(&q.object) {
+            found[li] = true;
+        }
+    }
     c.quiet = quiet.iter().map(Option::is_some).collect();
-    let in_place: Vec<bool> = par_map(nodes.len(), |i| {
-        !c.quiet[i]
-            && c.provisional[i].is_some_and(|x| {
-                rewritten_in_place(b, &c, &nodes[i], digests[i], x, &dirty_by_inode)
-            })
+    let in_place: Vec<bool> = par_map(nodes.len(), |k| {
+        !c.quiet[k]
+            && !marked(&nodes[k])
+            && c.provisional[k]
+                .is_some_and(|x| rewritten_in_place(sort, &c, &nodes[k], digests[k], x))
     });
     c.in_place = (0..nodes.len())
-        .filter(|i| in_place[*i])
-        .filter_map(|i| c.provisional[i])
+        .filter(|k| in_place[*k])
+        .filter_map(|k| c.provisional[k])
         .collect();
-    for (li, seen) in b.ledger.seen.iter().enumerate() {
-        if seen.is_some() && !found[li] {
+    for (li, found) in found.iter().enumerate() {
+        if !found && b.ledger.has_seen(li) {
             c.seeds.insert(b.ledger.ids[li]);
         }
     }
     c.seeds.extend(b.dirty.iter().copied());
     c.seeds.extend(b.journal.touched.iter().copied());
-    for (i, n) in nodes.iter().enumerate() {
-        if c.quiet[i] {
+    for (k, n) in nodes.iter().enumerate() {
+        if c.quiet[k] {
             continue;
         }
-        c.changed.push(i);
-        if let Some(x) = c.provisional[i] {
+        c.changed.push(k);
+        if let Some(x) = c.provisional[k] {
             c.seeds.insert(x);
             if c.in_place.contains(&x) {
                 continue;
             }
         }
         for p in &n.paths {
-            if let Some(o) = c.parent_node(p).and_then(|j| c.object_of_node(j)) {
+            if let Some(o) = c.folder_of(p) {
                 c.open.insert(o);
             }
         }
@@ -1588,20 +2247,18 @@ pub fn classify<'s>(b: &Before<'_>, scan: &'s ScanResult) -> Classified<'s> {
 /// which its row holds as shared with the server and the scan finds as the row has it, with the journal
 /// naming it in updates alone, and of the commit that pushed it, if one did.
 fn rewritten_in_place(
-    b: &Before<'_>,
+    sort: &Sorting<'_>,
     c: &Classified<'_>,
     n: &Scanned,
     digest: Option<Hash>,
     x: ObjectId,
-    dirty_by_inode: &HashMap<(u64, u64), Vec<ObjectId>>,
 ) -> bool {
+    let b = sort.b;
+    let dirty_by_inode = &sort.dirty_by_inode;
     let [path] = n.paths.as_slice() else {
         return false;
     };
-    let (Some(parent), Some(name)) = (
-        c.parent_node(path).and_then(|j| c.object_of_node(j)),
-        path.last(),
-    ) else {
+    let (Some(parent), Some(name)) = (c.folder_of(path), path.last()) else {
         return false;
     };
     let link = Link {
@@ -1614,7 +2271,7 @@ fn rewritten_in_place(
         let Some(li) = b.ledger.find(&x) else {
             return false;
         };
-        let Some(seen) = &b.ledger.seen[li] else {
+        let Some(seen) = b.ledger.seen_at(li) else {
             return false;
         };
         let as_it_was = || match n.content {
@@ -1711,16 +2368,7 @@ pub type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 /// walk goes does that, from a folder walked to one not yet: the full sync takes the first place for the
 /// object and the second for something new, while the part a round loads keeps one node an inode.
 pub fn inode_twice(scan: &ScanResult) -> Option<String> {
-    let mut seen: std::collections::HashSet<(u64, u64), std::hash::BuildHasherDefault<Fx>> =
-        std::collections::HashSet::with_capacity_and_hasher(scan.nodes.len(), Default::default());
-    scan.nodes
-        .iter()
-        .find(|n| !seen.insert((n.fp.dev, n.fp.ino)))
-        .map(|n| {
-            n.paths
-                .first()
-                .map_or_else(String::new, |p| crate::scan::display_path(p))
-        })
+    scan.inode_twice.clone()
 }
 
 /// The digest of every node but a file's, on as many threads as there are.
@@ -1770,8 +2418,9 @@ pub struct Reach {
     pub core: BTreeSet<ObjectId>,
     /// Those, and their neighbours.
     pub all: BTreeSet<ObjectId>,
-    /// The scan's nodes for them, and every node the ledger does not account for.
-    pub nodes: BTreeSet<usize>,
+    /// The scan's nodes for them, and every node the ledger does not account for, by their place in the
+    /// walk.
+    pub nodes: BTreeMap<usize, Slot>,
     /// Every folder whose every name the round looks at.
     pub opened: HashSet<ObjectId>,
     above: HashSet<ObjectId>,
@@ -1820,9 +2469,10 @@ impl Closing<'_, '_> {
                 out.extend(s.links.iter().map(|l| l.parent));
             }
         }
-        if let Some(&i) = self.c.node_of.get(x) {
-            for p in &self.c.scan.nodes[i].paths {
-                if let Some(o) = self.c.parent_node(p).and_then(|j| self.c.object_of_node(j)) {
+        // What the walk kept quiet is where the ledger has it, which the base's entries say already.
+        if let Some(&k) = self.c.node_of.get(x) {
+            for p in &self.c.scan.nodes[k].paths {
+                if let Some(o) = self.c.folder_of(p) {
                     out.push(o);
                 }
             }
@@ -1844,18 +2494,21 @@ impl Closing<'_, '_> {
     }
 
     /// A node and the folders above it, as the scan found them.
-    fn include(&mut self, i: usize) {
-        let mut stack = vec![i];
-        while let Some(i) = stack.pop() {
-            if i == ROOT_NODE || !self.r.nodes.insert(i) {
+    fn include(&mut self, s: Slot) {
+        let mut stack = vec![s];
+        while let Some(s) = stack.pop() {
+            if self.r.nodes.insert(self.c.seq(s), s).is_some() {
                 continue;
             }
-            if let Some(x) = self.c.provisional[i] {
+            if let Some(x) = self.c.object_of(s) {
                 self.r.add(x);
             }
-            for p in &self.c.scan.nodes[i].paths {
-                if let Some(j) = self.c.parent_node(p) {
-                    stack.push(j);
+            for f in self.c.folders_of(s) {
+                if f == ROOT_FOLDER {
+                    continue;
+                }
+                if let Some(n) = self.c.scan.folders[f as usize].node {
+                    stack.push(n);
                 }
             }
         }
@@ -1884,21 +2537,16 @@ impl Closing<'_, '_> {
         for c in self.b.journal.into.get(&p).cloned().into_iter().flatten() {
             self.r.add(c);
         }
-        let node = if p == ObjectId::ROOT {
-            Some(ROOT_NODE)
+        let folder = if p == ObjectId::ROOT {
+            Some(ROOT_FOLDER)
         } else {
-            self.c.node_of.get(&p).copied()
+            self.c
+                .slot_of(&p)
+                .and_then(|s| self.c.folder_of_node.get(&s).copied())
         };
-        if let Some(node) = node {
-            for i in self
-                .c
-                .local_children
-                .get(&node)
-                .cloned()
-                .into_iter()
-                .flatten()
-            {
-                self.include(i);
+        if let Some(f) = folder {
+            for s in self.c.children_in(f) {
+                self.include(s);
             }
         }
     }
@@ -1922,8 +2570,8 @@ impl Closing<'_, '_> {
                 for p in self.parents(&x) {
                     self.ancestors(p);
                 }
-                if let Some(&i) = self.c.node_of.get(&x) {
-                    self.include(i);
+                if let Some(s) = self.c.slot_of(&x) {
+                    self.include(s);
                 }
                 continue;
             }
@@ -1947,10 +2595,11 @@ impl Closing<'_, '_> {
     }
 
     fn node_is_dir(&self, x: &ObjectId) -> bool {
-        self.c
-            .node_of
-            .get(x)
-            .is_some_and(|i| self.c.scan.nodes[*i].content == Content::Dir)
+        match self.c.slot_of(x) {
+            Some(Slot::Kept(k)) => self.c.scan.nodes[k as usize].content == Content::Dir,
+            Some(s @ Slot::Quiet(_)) => self.c.folder_of_node.contains_key(&s),
+            None => false,
+        }
     }
 }
 
@@ -1992,7 +2641,7 @@ pub fn reach(
         }
     }
     for &i in &c.changed {
-        k.include(i);
+        k.include(Slot::Kept(i as u32));
     }
     // What the scan could not see stands for what was there, whole.
     let scan = c.scan;
@@ -2000,7 +2649,7 @@ pub fn reach(
         let Some((name, _)) = path.split_last() else {
             continue;
         };
-        let Some(parent) = c.parent_node(path).and_then(|j| c.object_of_node(j)) else {
+        let Some(parent) = c.folder_of(path) else {
             continue;
         };
         for x in k.base_children(&parent) {
@@ -2024,12 +2673,11 @@ pub fn reach(
         }
     }
     for path in &scan.unlisted {
-        let node = if path.is_empty() {
-            Some(ROOT_NODE)
-        } else {
-            c.dir_at.get(path.as_slice()).copied()
+        let x = match path.is_empty() {
+            true => Some(ObjectId::ROOT),
+            false => scan.folder_at(path).and_then(|f| c.object_of_folder(f)),
         };
-        if let Some(x) = node.and_then(|j| c.object_of_node(j)) {
+        if let Some(x) = x {
             k.subtree_core(x);
         }
     }
@@ -2098,6 +2746,87 @@ pub fn fill_unread(
 /// Why a round goes the full way instead, when it does.
 pub type Decline = String;
 
+/// A node the walk kept quiet, as the walk read it: its ledger entry, which it was found as, and its
+/// row, which holds what the walk read of it besides. A file is that whole; anything else is checked
+/// against the digest the ledger has of what was read, with each reading of what is excluded under it
+/// tried, as a scope's word on a folder is (`Word::quiet`). `Err` where the row cannot be what was read.
+pub fn again(ledger: &Ledger, scan: &ScanResult, q: &Quiet, row: &Row) -> Result<Scanned, String> {
+    let x = q.object;
+    let (Some(seen), Some(links)) = (ledger.seen_of(&x), ledger.links_of(&x)) else {
+        return Err(format!(
+            "{x}, which the scan found as the ledger has it, has no entry in it"
+        ));
+    };
+    let [link] = links.as_slice() else {
+        return Err(format!(
+            "{x}, which the scan found at one name, has several in the ledger"
+        ));
+    };
+    let mut path = scan.folder_path(q.folder);
+    path.push(link.name.clone());
+    let mut n = Scanned {
+        paths: vec![path],
+        fp: seen.fp.current(),
+        racy: false,
+        content: seen.content.clone(),
+        metadata: row.scan.clone(),
+        metadata_incomplete: false,
+        holds_excluded: false,
+        only_excluded: false,
+    };
+    if matches!(n.content, Content::File { .. }) {
+        return Ok(n);
+    }
+    n.fp = seen.fp.clone();
+    for (holds, only) in [(false, false), (true, false), (true, true)] {
+        n.holds_excluded = holds;
+        n.only_excluded = only;
+        if Some(digest(&n)) == seen.digest {
+            return Ok(n);
+        }
+    }
+    Err(format!(
+        "{} was found as the ledger has it, which its record does not say",
+        crate::scan::display_path(&n.paths[0])
+    ))
+}
+
+/// Where the scan found each object, for the check (rebuild.rs `check`): what the walk kept whole, and
+/// what it kept quiet made again from the ledger it was found as and the row it is judged against.
+pub struct Sifted<'a, 's> {
+    pub c: &'a Classified<'s>,
+    pub ledger: &'a Ledger,
+}
+
+impl crate::rebuild::Found for Sifted<'_, '_> {
+    fn found(
+        &self,
+        id: &ObjectId,
+        row: &Row,
+    ) -> Option<std::result::Result<std::borrow::Cow<'_, Scanned>, &'static str>> {
+        let scan = self.c.scan;
+        Some(match self.c.slot_of(id)? {
+            Slot::Kept(k) => Ok(std::borrow::Cow::Borrowed(&scan.nodes[k as usize])),
+            Slot::Quiet(q) => {
+                let read = scan.witnesses.get(q as usize);
+                match again(self.ledger, scan, &scan.quiet[q as usize], row) {
+                    // What the ledger has is not what the walk read, though the round took it so.
+                    Ok(n) if read.is_some_and(|w| *w != witness(&n)) => Err(match n.content {
+                        Content::File { .. } => "the scan found another file than its record",
+                        _ => "the scan read otherwise of it than its record",
+                    }),
+                    Ok(n) => Ok(std::borrow::Cow::Owned(n)),
+                    Err(_) => Err("the scan read otherwise of it than its record"),
+                }
+            }
+        })
+    }
+
+    fn links_of(&self, n: &Scanned) -> Option<Vec<Link>> {
+        self.c.links_of(n)
+    }
+}
+
 /// The trees, rows and scan of the reach, from the state, the journal and the scan.
 pub fn world(
     root: &Root,
@@ -2130,7 +2859,25 @@ pub fn world(
             )));
         }
     }
-    let mut kept: Vec<Scanned> = r.nodes.iter().map(|i| scan.nodes[*i].clone()).collect();
+    let mut kept: Vec<Scanned> = Vec::with_capacity(r.nodes.len());
+    for s in r.nodes.values() {
+        match *s {
+            Slot::Kept(k) => kept.push(scan.nodes[k as usize].clone()),
+            Slot::Quiet(q) => {
+                let q = &scan.quiet[q as usize];
+                let Some(row) = rows.get(&q.object) else {
+                    anyhow::bail!(
+                        "the row of {}, which the scan found as the ledger has it, is not in the state",
+                        q.object
+                    );
+                };
+                match again(b.ledger, scan, q, row) {
+                    Ok(n) => kept.push(n),
+                    Err(why) => return Ok(Err(why)),
+                }
+            }
+        }
+    }
     fill_unread(b, &mut kept, &rows)?;
     Ok(Ok(World {
         base,
@@ -2268,7 +3015,7 @@ pub fn ledger_write<'a>(
                 let e = Entry {
                     kind: s.ledger.kinds[i],
                     links: s.ledger.links_at(i),
-                    seen: s.ledger.seen[i].clone(),
+                    seen: s.ledger.seen_at(i),
                 };
                 put(id, e.encode())?;
             }
@@ -2715,27 +3462,7 @@ mod tests {
     }
 
     fn scan_of(nodes: Vec<Scanned>) -> ScanResult {
-        ScanResult {
-            root: scanned(&[], fp(1), Content::Dir),
-            nodes,
-            skips: Vec::new(),
-            unobserved: Vec::new(),
-            refused: Vec::new(),
-            unobserved_inodes: Vec::new(),
-            unidentified: false,
-            unlisted: Vec::new(),
-            unstable: false,
-            new_manifests: Vec::new(),
-            stale_temps: Vec::new(),
-            rescued_temps: Vec::new(),
-            rescued: Vec::new(),
-            excluded: Vec::new(),
-            excluded_ids: Vec::new(),
-            stopped: false,
-            started: std::time::Instant::now(),
-            vouched_from: usize::MAX,
-            listed: None,
-        }
+        ScanResult::of(scanned(&[], fp(1), Content::Dir), nodes)
     }
 
     fn file() -> Content {
@@ -2821,7 +3548,9 @@ mod tests {
             unscanned: &BTreeSet::new(),
         };
         let scan = scan_of(nodes);
-        let c = classify(&b, &scan);
+        let marked = BTreeSet::new();
+        let sort = Sorting::new(&b, &marked);
+        let c = classify(&sort, &scan);
         let r = reach(&b, &c, rules, &BTreeSet::new(), &BTreeSet::new());
         (c.quiet.clone(), r)
     }
@@ -3195,6 +3924,111 @@ mod tests {
             let mut other = b.clone();
             other[0] = FORMAT as u8 + 1;
             assert_eq!(Entry::decode(&other), None, "another format");
+        }
+    }
+
+    /// The ledger held as the state stores it answers as the entries it was made of: each entry whole,
+    /// what is at an inode (two objects at one, and the same inode number on another device, apart), what
+    /// is in a folder, the entries that share an inode; and a skeleton of the same objects with what was
+    /// seen of the kept ones put back is the same ledger.
+    #[test]
+    fn the_ledger_as_stored_answers_as_its_entries() {
+        let id = |n: u8| ObjectId([n; 16]);
+        let link = |p: u8, name: &str| Link {
+            parent: id(p),
+            name: Name::new(name).unwrap(),
+        };
+        let seen = |dev: u64, ino: u64, content: Content| Seen {
+            fp: Fingerprint { dev, ..fp(ino) },
+            content,
+            digest: None,
+        };
+        let entries: Vec<(ObjectId, Entry)> = vec![
+            (
+                id(1),
+                Entry {
+                    kind: ObjectKind::Dir,
+                    links: vec![link(0, "d")],
+                    seen: Some(Seen {
+                        digest: Some(Hash([9; 32])),
+                        ..seen(7, 10, Content::Dir)
+                    }),
+                },
+            ),
+            (
+                id(2),
+                Entry {
+                    kind: ObjectKind::File,
+                    links: vec![link(1, "x"), link(1, "y")],
+                    seen: Some(seen(7, 11, file())),
+                },
+            ),
+            (
+                id(3),
+                Entry {
+                    kind: ObjectKind::File,
+                    links: vec![link(1, "z")],
+                    seen: Some(seen(7, 11, file())),
+                },
+            ),
+            (
+                id(4),
+                Entry {
+                    kind: ObjectKind::File,
+                    links: vec![link(0, "w")],
+                    seen: Some(seen(8, 11, file())),
+                },
+            ),
+            (
+                id(5),
+                Entry {
+                    kind: ObjectKind::Dir,
+                    links: vec![link(0, "out of view")],
+                    seen: None,
+                },
+            ),
+        ];
+        let l = Ledger::new(entries.clone());
+        for (x, e) in &entries {
+            assert_eq!(l.entry(x).as_ref(), Some(e));
+            assert_eq!(l.seen_of(x), e.seen);
+        }
+        assert_eq!(l.at_inode(&(7, 11)).collect::<Vec<_>>(), [id(2), id(3)]);
+        assert_eq!(l.at_inode(&(8, 11)).collect::<Vec<_>>(), [id(4)]);
+        assert_eq!(l.at_inode(&(7, 12)).count(), 0);
+        assert_eq!(l.children_of(&id(1)).collect::<Vec<_>>(), [id(2), id(3)]);
+        assert_eq!(
+            l.children_named(&id(1), &Name::new("y").unwrap()),
+            Some(id(2))
+        );
+        assert_eq!(
+            l.children_of(&id(0)).collect::<Vec<_>>(),
+            [id(1), id(4), id(5)]
+        );
+        let mut sharing: Vec<ObjectId> =
+            l.sharing_inodes().into_iter().map(|i| l.id_at(i)).collect();
+        sharing.sort();
+        assert_eq!(sharing, [id(2), id(3)]);
+
+        let mut sk = Ledger::with_room(entries.len());
+        let mut parts = SeenParts::with_room(entries.len());
+        let mut keep = Vec::new();
+        for (si, (x, e)) in entries.iter().enumerate() {
+            sk.push_object(*x, e.kind, &e.links.iter().cloned().collect());
+            // The second is left out, as a rebuild leaves out what is unsettled.
+            keep.push(si != 1);
+            if let (Some(s), true) = (&e.seen, si != 1) {
+                parts.put(si, s);
+            }
+        }
+        sk.index_children();
+        let rebuilt = sk.rebuilt(parts, &keep);
+        assert_eq!(rebuilt.len(), entries.len() - 1);
+        for (si, (x, e)) in entries.iter().enumerate() {
+            match si {
+                1 => assert_eq!(rebuilt.entry(x), None),
+                _ => assert_eq!(rebuilt.entry(x).as_ref(), Some(e)),
+            }
         }
     }
 }

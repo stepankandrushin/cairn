@@ -16,18 +16,19 @@
 use crate::client::Client;
 use crate::metadata::Accounts;
 use crate::root::Root;
-use crate::scan::{scan, ScanOptions, ScanResult, Scanned};
+use crate::scan::{scan, KnownRows, ScanOptions, ScanResult, Scanned};
 use crate::selection::Selection;
-use crate::state::{Fingerprint, Known, Row};
+use crate::state::{Fingerprint, Known};
 use crate::sync::{SyncOptions, SyncOutcome, SyncReport};
 use anyhow::{bail, Result};
-use cairn_protocol::{Content, Hash, Name, ObjectId, OpId, Skip, Timestamp};
+use cairn_protocol::{Content, Hash, Name, OpId, Skip, Timestamp};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Moved whenever what a record means changes, so that none written before is read as one of these.
-const FORMAT: u32 = 2;
+/// 3: the scan's digest a sum of each node's, at its place in the walk.
+const FORMAT: u32 = 3;
 
 /// What a sync that had nothing to do read, and what it said.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +192,7 @@ impl Digest {
         }
     }
 
-    fn node(&mut self, n: &Scanned, rows: &HashMap<(u64, u64), Known>) {
+    fn node(&mut self, n: &Scanned, rows: &dyn KnownRows) {
         self.paths(&n.paths);
         self.fp(&n.fp);
         self.flag(n.racy);
@@ -201,7 +202,7 @@ impl Digest {
         // A file its row speaks for is that row's content and metadata, which the generation fixes.
         let vouched = matches!(n.content, Content::File { .. })
             && rows
-                .get(&(n.fp.dev, n.fp.ino))
+                .known(&(n.fp.dev, n.fp.ino))
                 .is_some_and(|r| r.vouches_for(&n.fp) && r.content == n.content);
         self.flag(vouched);
         if !vouched {
@@ -215,113 +216,117 @@ impl Digest {
     }
 }
 
-/// All a scan saw, with what a row spoke for counted as that row.
-/// Nodes a digest hashes together, the pieces hashed on as many threads as there are: a fixed size, so
-/// that the digest is the same however many there are.
-const PIECE: usize = 32_768;
+/// All a scan saw, with what a row spoke for counted as that row: each node's own digest with its place in
+/// the walk, summed, so that the nodes can be counted in any order and on any thread, as the walk lets
+/// each go; then the root and the rest of what the scan says.
+pub struct Stream {
+    sum: [u64; 4],
+    nodes: u64,
+}
 
-pub fn digest(result: &ScanResult, rows: &HashMap<(u64, u64), Known>) -> Hash {
-    let mut d = Digest::new(b"cairn steady scan");
-    d.node(&result.root, rows);
-    d.u64(result.nodes.len() as u64);
-    for piece in pieces(&result.nodes, rows) {
-        d.bytes(&piece.0);
+/// One node's part of a scan's digest, at its place in the walk.
+pub fn node_term(seq: u32, n: &Scanned, rows: &dyn KnownRows) -> [u64; 4] {
+    let mut d = Digest::new(b"cairn steady node");
+    d.u64(u64::from(seq));
+    d.node(n, rows);
+    let h = d.finish().0;
+    let lane = |i: usize| u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+    [lane(0), lane(1), lane(2), lane(3)]
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self::new()
     }
-    d.u64(result.skips.len() as u64);
-    for s in &result.skips {
-        d.json(s);
-    }
-    d.paths(&result.unobserved);
-    d.paths(&result.refused);
-    d.u64(result.unobserved_inodes.len() as u64);
-    for (dev, ino) in &result.unobserved_inodes {
-        d.u64(*dev);
-        d.u64(*ino);
-    }
-    d.flag(result.unidentified);
-    d.paths(&result.unlisted);
-    d.flag(result.unstable);
-    d.u64(result.new_manifests.len() as u64);
-    for (h, _) in &result.new_manifests {
-        d.bytes(&h.0);
-    }
-    d.u64(result.stale_temps.len() as u64);
-    for (path, name) in &result.stale_temps {
-        d.path(path);
-        d.bytes(name);
-    }
-    d.u64(result.rescued_temps.len() as u64);
-    for (path, name, fp) in &result.rescued_temps {
-        d.path(path);
-        d.bytes(name);
-        d.fp(fp);
-    }
-    d.u64(result.rescued.len() as u64);
-    for id in &result.rescued {
-        d.bytes(&id.0);
-    }
-    d.paths(&result.excluded);
-    // What a filter decided by, for each entry it left out. A folder's own times already move when an
-    // entry in it is replaced, but not on a filesystem whose times are coarser than that replacement.
-    d.u64(result.excluded_ids.len() as u64);
-    for (dev, ino, btime, is_dir) in &result.excluded_ids {
-        d.u64(*dev);
-        d.u64(*ino);
-        match btime {
-            Some(t) => {
-                d.u64(1);
-                d.time(*t);
-            }
-            None => d.u64(0),
+}
+
+impl Stream {
+    pub fn new() -> Self {
+        Stream {
+            sum: [0; 4],
+            nodes: 0,
         }
-        d.flag(*is_dir);
     }
-    d.flag(result.stopped);
-    d.finish()
+
+    pub fn node(&mut self, seq: u32, n: &Scanned, rows: &dyn KnownRows) {
+        self.add(node_term(seq, n, rows));
+    }
+
+    /// A node's part worked out elsewhere, by `node_term`.
+    pub fn add(&mut self, term: [u64; 4]) {
+        for (s, t) in self.sum.iter_mut().zip(term) {
+            *s = s.wrapping_add(t);
+        }
+        self.nodes += 1;
+    }
+
+    pub fn finish(self, result: &ScanResult, rows: &dyn KnownRows) -> Hash {
+        let mut d = Digest::new(b"cairn steady scan");
+        d.u64(self.nodes);
+        for lane in self.sum {
+            d.u64(lane);
+        }
+        d.node(&result.root, rows);
+        d.u64(result.skips.len() as u64);
+        for s in &result.skips {
+            d.json(s);
+        }
+        d.paths(&result.unobserved);
+        d.paths(&result.refused);
+        d.u64(result.unobserved_inodes.len() as u64);
+        for (dev, ino) in &result.unobserved_inodes {
+            d.u64(*dev);
+            d.u64(*ino);
+        }
+        d.flag(result.unidentified);
+        d.paths(&result.unlisted);
+        d.flag(result.unstable);
+        d.u64(result.new_manifests.len() as u64);
+        for (h, _) in &result.new_manifests {
+            d.bytes(&h.0);
+        }
+        d.u64(result.stale_temps.len() as u64);
+        for (path, name) in &result.stale_temps {
+            d.path(path);
+            d.bytes(name);
+        }
+        d.u64(result.rescued_temps.len() as u64);
+        for (path, name, fp) in &result.rescued_temps {
+            d.path(path);
+            d.bytes(name);
+            d.fp(fp);
+        }
+        d.u64(result.rescued.len() as u64);
+        for id in &result.rescued {
+            d.bytes(&id.0);
+        }
+        d.paths(&result.excluded);
+        // What a filter decided by, for each entry it left out. A folder's own times already move when an
+        // entry in it is replaced, but not on a filesystem whose times are coarser than that replacement.
+        d.u64(result.excluded_ids.len() as u64);
+        for (dev, ino, btime, is_dir) in &result.excluded_ids {
+            d.u64(*dev);
+            d.u64(*ino);
+            match btime {
+                Some(t) => {
+                    d.u64(1);
+                    d.time(*t);
+                }
+                None => d.u64(0),
+            }
+            d.flag(*is_dir);
+        }
+        d.flag(result.stopped);
+        d.finish()
+    }
 }
 
-fn pieces(nodes: &[Scanned], rows: &HashMap<(u64, u64), Known>) -> Vec<Hash> {
-    let pieces: Vec<&[Scanned]> = nodes.chunks(PIECE).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .clamp(1, 8)
-        .min(pieces.len().max(1));
-    let mut out: Vec<(usize, Hash)> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(piece) = pieces.get(i) else {
-                            return done;
-                        };
-                        let mut d = Digest::new(b"cairn steady nodes");
-                        for n in *piece {
-                            d.node(n, rows);
-                        }
-                        done.push((i, d.finish()));
-                    }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
-    });
-    out.sort_by_key(|(i, _)| *i);
-    out.into_iter().map(|(_, h)| h).collect()
-}
-
-/// The digest of a full sync's scan, by its rows.
-pub fn digest_of(result: &ScanResult, rows: &BTreeMap<ObjectId, Row>) -> Hash {
-    let by_inode: HashMap<(u64, u64), Known> = rows
-        .values()
-        .map(|r| ((r.fp.dev, r.fp.ino), r.known()))
-        .collect();
-    digest(result, &by_inode)
+/// The digest a scan asked for one worked out.
+pub fn digest(result: &ScanResult) -> Result<Hash> {
+    match result.digest {
+        Some(d) => Ok(d),
+        None => bail!("a scan whose digest was asked for came back without one"),
+    }
 }
 
 pub fn load(root: &Root) -> Option<Steady> {
@@ -398,11 +403,44 @@ pub fn try_fast(
         }
     }
 
-    let glance = root.state.glance_rows()?;
-    let by_inode: HashMap<(u64, u64), Known> = glance
-        .iter()
-        .map(|(_, g)| ((g.fp.dev, g.fp.ino), g.known()))
-        .collect();
+    // What the scan is given of each inode: the ledger and what was written since, as an incremental
+    // round has it, where the ledger speaks for this sync; otherwise a glance at every row.
+    let session = match crate::incr::enabled() {
+        true => crate::incr::Session::open(root, selection, false)?.ok(),
+        false => None,
+    };
+    let mut glance = Vec::new();
+    let mut by_inode: HashMap<(u64, u64), Known> = HashMap::new();
+    let (mut dirty, mut dirty_nodes, mut dirty_rows) = Default::default();
+    if session.is_some() {
+        dirty = root.state.dirty()?;
+        let list: Vec<cairn_protocol::ObjectId> = dirty.iter().copied().collect();
+        dirty_nodes = root.state.nodes_of(&list)?;
+        dirty_rows = root.state.rows_of(&list)?;
+    } else {
+        glance = root.state.glance_rows()?;
+        by_inode = glance
+            .iter()
+            .map(|(_, g)| ((g.fp.dev, g.fp.ino), g.known()))
+            .collect();
+    }
+    let unscanned = std::collections::BTreeSet::new();
+    let none = std::collections::BTreeSet::new();
+    let journal = crate::incr::Journal::default();
+    let before = session.as_ref().map(|s| crate::incr::Before {
+        ledger: &s.ledger,
+        dirty: &dirty,
+        dirty_nodes: &dirty_nodes,
+        dirty_rows: &dirty_rows,
+        journal: &journal,
+        glanced: false,
+        unscanned: &unscanned,
+    });
+    let sorting = before.as_ref().map(|b| crate::incr::Sorting::new(b, &none));
+    let rows: &dyn KnownRows = match &sorting {
+        Some(s) => s,
+        None => &by_inode,
+    };
     let prefix = root.temp_prefix();
     // What the full scan leaves out but without the trees: the digest holds each entry it was asked
     // about, with what it decides by, so where the two would differ this one sees another tree.
@@ -410,13 +448,17 @@ pub fn try_fast(
     let opts = ScanOptions {
         temp_prefix: prefix.as_bytes(),
         accounts,
-        rows: &by_inode,
+        rows,
         remove_own_temps: false,
         arriving: &[],
         excluded: &excluded,
         probe: true,
         scope: None,
         started: None,
+        sieve: None,
+        keep_all: false,
+        digest: true,
+        discard: true,
     };
     let scan_started = Instant::now();
     let result = scan(&root.dir, &opts)?;
@@ -424,7 +466,8 @@ pub fn try_fast(
     if result.stopped || result.unstable {
         return Ok(None);
     }
-    let digest = digest(&result, &by_inode);
+    let digest = digest(&result)?;
+    drop(sorting);
     drop(by_inode);
     drop(glance);
     if digest != steady.scan {

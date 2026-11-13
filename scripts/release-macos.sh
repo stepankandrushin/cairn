@@ -90,4 +90,10 @@ for pair in "Cairn:" "Cairn Tray:-tray"; do
     ls -l "dist/$name"
     (cd dist && shasum -a 256 "$name")
 done
+# LaunchServices takes in every bundle it sees, these too, and keeps knowing them after they are gone: System
+# Settings' Login Items may then name an app after a copy that is no more. So they are forgotten first.
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+for app in "$stage/Cairn.app" "$stage/Cairn Tray.app"; do
+    "$lsregister" -u "$app" 2>/dev/null || true
+done
 rm -rf "$stage"

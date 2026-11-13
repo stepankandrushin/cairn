@@ -352,7 +352,7 @@ for this project's `https://cairn.storage/download/update.json`, or a GitHub rel
 Each signature is over the bytes `cairn release v1\n` followed by `release` as it stands, so no parse and print
 can change what is checked, and a signature made with the key for anything else is never one of a release. The
 release, `{ version, protocol, published, notes, files: [{ program, platform, form, url, size, sha256 }] }`, names
-each program (`cairn`, `cairn-tray`) for each platform (`linux-x86_64`, `windows-x86_64`, `macos-aarch64`,
+each program (`cairn`, `cairn-tray`) for each platform (`linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `macos-aarch64`,
 `macos-x86_64` or `macos-universal`, which serves either Mac) as `binary`, the executable itself, or `app`, a
 gzipped tar holding one macOS bundle; a `url` that is not absolute is beside `update.json`, wherever that was
 fetched from, so one signed file serves from every feed that has the files beside it, as this project's releases

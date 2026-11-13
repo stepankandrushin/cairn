@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- Linux on ARM64: `cairn-<v>-linux-aarch64`, the client (the CLI and daemon), static as the x86_64 one, which
+  installed copies on aarch64 update to. The server stays x86_64 alone. The release builds it on x86_64 with
+  cargo-zigbuild, zig as its C compiler and linker, and runs its checks and the smoke test under qemu-aarch64,
+  against the x86_64 server.
+
 ## 0.1.25 (2026-11-13)
 
 **Added:**

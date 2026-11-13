@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# musl-tools for CI's release build, which links C statically. GitHub's runners once could not resolve any of
+# What CI's release build needs from the system: musl-tools, as it links C statically, and qemu-user, which runs
+# the aarch64 client for its checks and smoke test (scripts/release.sh). GitHub's runners once could not resolve any of
 # Ubuntu's own hosts for hours while everything else resolved, so apt only chooses the packages here, from the
 # image's signed index; each file comes from the first of several mirrors of Ubuntu's archive that serves it,
 # and dpkg installs it only once it matches the SHA256 that index gives it.
@@ -11,13 +12,13 @@ mirrors=(
     https://mirror.math.princeton.edu/pub/ubuntu
     https://mirrors.ocf.berkeley.edu/ubuntu
 )
-packages=(musl-tools)
+packages=(musl-tools qemu-user)
 sudo=; [ "$(id -u)" = 0 ] || sudo=sudo
 
 dir=$(mktemp -d)
 trap 'rm -rf -- "$dir"' EXIT
 # One line a file still to install: 'URI' name size hash, the URI by the image's source.
-apt-get install --print-uris -qq -y "${packages[@]}" > "$dir/uris"
+apt-get install --no-install-recommends --print-uris -qq -y "${packages[@]}" > "$dir/uris"
 if [ ! -s "$dir/uris" ]; then
     echo "${packages[*]}: installed already"
     exit 0
@@ -62,4 +63,4 @@ while read -r uri file _; do
 done < "$dir/uris"
 
 $sudo dpkg -i "$dir"/*.deb
-command -v musl-gcc
+command -v musl-gcc qemu-aarch64

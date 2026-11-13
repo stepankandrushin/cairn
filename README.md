@@ -383,6 +383,10 @@ bash scripts/ci.sh --quick      # the same in about a minute, less the tests tha
 bash scripts/release.sh         # static binaries and checksums in dist/, after a smoke test over TLS
 ```
 
+release.sh builds the client for x86_64 and aarch64 and the server for x86_64, each static (musl). The aarch64
+client is cross-built by cargo-zigbuild (`cargo install cargo-zigbuild --locked`, zig on the PATH, `rustup target
+add aarch64-unknown-linux-musl`), and its checks and smoke test run under qemu-aarch64 (the qemu-user package).
+
 Both run the tests under cargo-nextest (`cargo install cargo-nextest --locked`), each test a process of its own
 and every long sweep split into parts that run at once; the full run is as long as the disk takes over its
 fsyncs, about 11 minutes on two NVMe drives in RAID1, whose every journal commit waits on two cache flushes.

@@ -15,7 +15,7 @@ jobs:
       # The tests run under cargo-nextest (scripts/ci.sh).
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-zigbuild
       # Ubuntu's AppArmor forbids the unprivileged namespaces that the real full-disk test needs.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # A test that cannot run here fails instead of skipping: libtest hides a skip's line, so a change
@@ -24,10 +24,15 @@ jobs:
         env:
           CAIRN_SEEDS: "200"
           CAIRN_NO_SKIP: "1"
-      - run: rustup target add x86_64-unknown-linux-musl
-      # musl-gcc, for the C the release build links statically. Not by apt alone: GitHub's runners once
-      # resolved none of Ubuntu's hosts for hours, which held every run before its first test.
-      - run: bash .github/install-musl-tools.sh
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      # musl-gcc, for the C the release build links statically, and qemu-user, which runs the aarch64 client
+      # it cross-builds. Not by apt alone: GitHub's runners once resolved none of Ubuntu's hosts for hours,
+      # which held every run before its first test.
+      - run: bash .github/install-release-tools.sh
+      # zig, the aarch64 client's C compiler and linker under cargo-zigbuild.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
       # Only that a release builds, static and without build paths: its binary is thrown away, so it
       # needs no feed to update from.
       - run: bash scripts/release.sh

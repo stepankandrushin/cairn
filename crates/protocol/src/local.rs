@@ -380,6 +380,97 @@ pub enum Request {
     /// An address that opens this root's folder on the server's web page, signed in as this root's
     /// token without typing it: [`Reply::SignInLink`]. It signs a browser in once, within two minutes.
     SignInLink,
+    /// The badge of a folder and of each entry in it, for a file manager's icons: [`Reply::Badges`].
+    /// `folder` is relative to the root, its names joined by `/` as `cairn status` prints a path; the
+    /// root is the empty string.
+    Badges {
+        folder: String,
+    },
+    /// A [`Reply::BadgesChanged`] with `all` now, and again whenever badges change, until the program
+    /// closes: what to ask [`Request::Badges`] for again.
+    WatchBadges,
+}
+
+/// What a file manager shows on an entry's icon: what this device's daemon knows of it. An entry this
+/// device does not sync (excluded, or the state directory) has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Badge {
+    /// As the server has it, by the last sync that agreed with the server, and unchanged since, as far
+    /// as the watcher has seen: under a folder, all of it.
+    Synced,
+    /// Changed here since that sync, or still being written, or under a folder, something is: or the
+    /// daemon has not yet agreed with the server since it started, or lost track of the tree.
+    Syncing,
+    /// Under a folder, something is not synced; on a file, the server keeps metadata this filesystem
+    /// refused; on the root, the daemon is paused.
+    Warning,
+    /// This entry is not synced, for a reason `cairn status` gives; on the root, the last sync failed.
+    Error,
+    /// A badge from a newer daemon, which a program shows as none.
+    #[serde(other)]
+    Other,
+}
+
+/// One badge as Explorer shows it: an icon overlay handler of cairn-explorer's DLL, which
+/// `cairn explorer on` registers and the DLL serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    pub badge: Badge,
+    /// The handler's class, as the registry writes it.
+    pub clsid: &'static str,
+    /// Its name among Explorer's overlay handlers. Explorer uses the first 15 by name, four of them its
+    /// own, so every syncing program's begins with spaces to come first: these with two, ahead of
+    /// OneDrive's one.
+    pub key: &'static str,
+    /// Its icon, beside the DLL.
+    pub icon: &'static str,
+}
+
+/// Worst first, as each entry has one badge and Explorer asks the handlers in turn.
+pub const OVERLAYS: [Overlay; 4] = [
+    Overlay {
+        badge: Badge::Error,
+        clsid: "{42E78634-2CE1-4E0F-BF2D-C6126A39756F}",
+        key: "  Cairn1Error",
+        icon: "error.ico",
+    },
+    Overlay {
+        badge: Badge::Warning,
+        clsid: "{90497E0D-40D8-4E2D-98CB-97A9D2966A49}",
+        key: "  Cairn2Warning",
+        icon: "warning.ico",
+    },
+    Overlay {
+        badge: Badge::Syncing,
+        clsid: "{20BE11FD-F653-4689-9C2A-0D4DEAE573D3}",
+        key: "  Cairn3Syncing",
+        icon: "syncing.ico",
+    },
+    Overlay {
+        badge: Badge::Synced,
+        clsid: "{6E1A8EE8-AB24-46F7-BCF8-BC5F620792DA}",
+        key: "  Cairn4Synced",
+        icon: "synced.ico",
+    },
+];
+
+/// [`Reply::Badges`]: one folder as the daemon sees it now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Badges {
+    /// As asked.
+    pub folder: String,
+    /// The folder's own badge, as its own folder would list it; `None` if this device does not sync it,
+    /// or it is not there.
+    pub badge: Option<Badge>,
+    /// Each entry of the folder this device syncs, by name, as a path's last part is printed.
+    pub entries: Vec<BadgeEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BadgeEntry {
+    pub name: String,
+    pub badge: Badge,
 }
 
 pub const DEFAULT_DELETED_DAYS: u32 = 30;
@@ -408,6 +499,15 @@ pub enum Reply {
     },
     SignInLink {
         url: String,
+    },
+    Badges(Box<Badges>),
+    /// Badges that may have changed: of each of `paths`, of everything under it, and of each folder
+    /// above it up to the root; with `all`, every badge. Paths are as in [`Request::Badges`].
+    BadgesChanged {
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        paths: Vec<String>,
     },
     Error {
         text: String,

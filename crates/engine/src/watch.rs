@@ -396,14 +396,13 @@ impl Inner {
         // The folder it is in, whatever the rules say of it: a sync that lists that folder sees it as a
         // scan of the whole tree would, rules and all. A folder made or moved in is new all through.
         marks.mark(&path, false);
-        if is_dir && flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
-            let mut at = path.clone();
-            at.push(name.clone());
-            marks.mark(&at, true);
-        }
-        drop(marks);
         let mut at = path;
         at.push(name);
+        if is_dir && flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
+            marks.mark(&at, true);
+        }
+        marks.entry(&at);
+        drop(marks);
         // A busy log file that is ignored must not keep the daemon scanning.
         if self.rules.excludes(&at, is_dir) {
             return;

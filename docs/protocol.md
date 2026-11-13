@@ -298,6 +298,19 @@ over.
 | `deleted { days }` | `deleted { head, items }`: what was deleted in the last `days` (30 if not given) and is still deleted, newest first, each `{ id, seq, time, device_name, path, kind, bytes, files, folder_gone }`. A folder is listed once, with `files` and `bytes` of what went with it, and what it held is not listed apart. The daemon replays the journal into an index of every object's kind, size and entries, with no bodies, keeps it for 10 minutes after the last request and takes only what is new to answer the next |
 | `undelete { ids }` | `undeleted { seqs, items, already }`, then a sync: each item `{ id, path, was, renamed, objects }`. `already` names what was asked for but is not deleted now. `error` if nothing came back |
 | `sign_in_link` | `sign_in_link { url }`: the server's page at this root's folder, signed in as its token once within two minutes (Web, "Signing in"), which the tray's Open in browser opens; an `error` if the server cannot say, and the tray then opens the page as it is |
+| `badges { folder }` | `badges { folder, badge, entries }`: what a file manager shows on the folder, `folder` relative to the root with `/` between names (`""` the root), and on each entry of it, `[{ name, badge }]`. A badge is `synced`, `syncing`, `warning` or `error` (Badges, below); an entry this device does not sync is left out, and `badge` is `null` for a folder it does not sync or that is not there |
+| `watch_badges` | `badges_changed { all, paths }` now with `all`, then whenever badges change, once they have been quiet for 250 ms or at least every second while they go on, and an empty one every 30 s regardless, until the client closes: the badges of each path, of all under it and of each folder above it may differ, or with `all` every badge. More than 4,096 paths are sent as `all`. A client whose queue of 16 is full is dropped, and its next connection begins with `all` |
+
+**Badges.** What the daemon knows of each entry, with nothing looked up but the folder asked for. `syncing`:
+the watcher has named it since the last sync that agreed with the server, or it is a file still being written,
+or, on a folder, something under it is; and everything is until the daemon's first agreement after it starts,
+or after the watcher lost track of the tree, as it does not know until then. `error`: the last sync skipped it
+(`cairn status` says why), or, on the root, the last sync failed. `warning`: the server keeps metadata this
+filesystem refused for it, or, on a folder, something under it is not synced, or, on the root, the daemon is
+paused. `synced` otherwise. An error outranks syncing, which outranks a warning. Left out, with no badge: the
+state directory, what the rules exclude, the paths of folders excluded by identity and of the copies they
+left here, as the last sync read them. Explorer shows them through cairn-explorer's DLL (`cairn explorer on`),
+which asks for a folder when it is first shown and again when told it changed.
 
 **Deleted, and brought back.** A delete is the unlink that leaves an object with no entry. The server keeps its
 last state, and `link` brings it back as itself, so `undelete` sends only `link`s: each object goes back

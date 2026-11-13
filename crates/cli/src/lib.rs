@@ -19,6 +19,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(windows)]
+mod explorer;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -285,6 +287,13 @@ enum Command {
     },
     /// This device's Cairn and its updates: by default each daemon asks the feed every hour or so and
     /// installs a new release, `cairn` and the tray beside it, restarting into it between syncs.
+    /// Badges on each entry's icon in Windows Explorer, as the daemon of its root says: synced,
+    /// syncing, something not synced inside (a warning), or not synced (an error).
+    #[cfg(windows)]
+    Explorer {
+        #[command(subcommand)]
+        what: ExplorerCommand,
+    },
     Update {
         #[command(subcommand)]
         what: Option<UpdateCommand>,
@@ -341,6 +350,41 @@ enum UpdateCommand {
     /// Put back the version from before the last update, which is then not installed again unless
     /// asked for by `cairn update now`.
     Rollback,
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ExplorerCommand {
+    /// Put the handler and its icons in place and register them, which takes an administrator once.
+    /// Explorer shows the badges once it starts again.
+    On {
+        /// A DLL to use instead of the one this build carries, as `cargo build --profile explorer -p
+        /// cairn-explorer` makes it.
+        #[arg(long)]
+        dll: Option<PathBuf>,
+    },
+    /// Take them away again.
+    Off,
+    /// Whether they are on, from where, and where they come among Explorer's overlay handlers.
+    Status,
+    /// What `on` and `off` run as administrator: Explorer's list of overlay handlers alone.
+    #[command(hide = true)]
+    Handlers {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// What Windows' overlay manager gives each path, as Explorer would show it; with --dll, what that
+    /// DLL's handlers say, loaded here without the registry.
+    #[command(hide = true)]
+    Probe {
+        #[arg(long)]
+        dll: Option<PathBuf>,
+        /// With --dll, ask again this many seconds later, in the same process, as the handler learns
+        /// of changes from the daemon.
+        #[arg(long)]
+        again: Option<u64>,
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -855,6 +899,11 @@ fn run_inner() -> Result<u8> {
                 root.display(),
                 cairn_engine::update::running_version()
             ));
+            // A new version's handler for Explorer's badges, if they are on.
+            #[cfg(windows)]
+            if let Some(line) = explorer::follow_version() {
+                say(&line);
+            }
             // The daemon alone: no other command has macOS know it as an app.
             #[cfg(target_os = "macos")]
             if let Err(e) = macos::check_in() {
@@ -1208,7 +1257,7 @@ fn run_inner() -> Result<u8> {
             } else {
                 serde_json::from_value(serde_json::json!({ "op": request.replace('-', "_") }))
                     .map_err(|_| {
-                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts, deleted, update_now or sign_in_link, or one as JSON")
+                        anyhow!("{request} is not a request: status, subscribe, sync_now, pause, resume, conflicts, deleted, update_now, sign_in_link or watch_badges, or one as JSON")
                     })?
             };
             let root_id = cairn_engine::root::read_root_id(&root_path)
@@ -1218,7 +1267,7 @@ fn run_inner() -> Result<u8> {
             // A subscription lasts until the daemon or this program ends; what has the daemon read the
             // server's journal takes as long as that does.
             let wait = match request {
-                Request::Subscribe => None,
+                Request::Subscribe | Request::WatchBadges => None,
                 Request::Conflicts | Request::Deleted { .. } | Request::Undelete { .. } => {
                     Some(Duration::from_secs(600))
                 }
@@ -1238,6 +1287,25 @@ fn run_inner() -> Result<u8> {
                 }
             }
             Ok(code)
+        }
+        #[cfg(windows)]
+        Command::Explorer { what } => {
+            match what {
+                ExplorerCommand::On { dll } => explorer::on(dll.as_deref())?,
+                ExplorerCommand::Off => explorer::off()?,
+                ExplorerCommand::Status => explorer::status()?,
+                ExplorerCommand::Handlers { state } => explorer::set_handlers(state == "on")
+                    .context("cannot change Explorer's list of overlay handlers")?,
+                ExplorerCommand::Probe {
+                    dll: Some(dll),
+                    again,
+                    paths,
+                } => explorer::probe_dll(&dll, &paths, again)?,
+                ExplorerCommand::Probe {
+                    dll: None, paths, ..
+                } => explorer::probe(&paths)?,
+            }
+            Ok(EXIT_OK)
         }
         Command::Update { what } => {
             update_command(what.unwrap_or(UpdateCommand::Status { json: false }))

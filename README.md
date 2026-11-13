@@ -246,6 +246,22 @@ Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn.exe"   # t
 Its cost: what the client writes into the tree is scanned only when another program opens it. `Get-MpPreference`
 lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
 
+On Windows, Explorer can show each entry's state on its icon: a green check once synced, blue arrows while a
+change here waits or a sync moves it, a red cross on what is not synced (`cairn status` says why), and a yellow
+mark on each folder above one, on a file whose metadata the filesystem refused, and on a paused root. What you
+exclude has none. The daemon decides each badge; Explorer only asks it.
+
+```powershell
+cairn explorer on       # once; Windows asks for an administrator, as Explorer lists overlay handlers per machine
+cairn explorer status   # whether they are on, and where they come among Explorer's overlay handlers
+cairn explorer off
+```
+
+Explorer shows them once it starts again: sign out and in, or restart Windows Explorer from Task Manager. A daemon
+on a newer version moves them to its own handler, which Explorer takes up the same way. Explorer shows only the
+first 11 overlay handlers by name, which other sync programs compete for: Cairn's come before OneDrive's, and
+`cairn explorer status` lists them all.
+
 On macOS, run the daemon from its app bundle, Cairn.app, so that System Settings shows it as Cairn with
 its icon, in Login Items and in the privacy lists, rather than as a bare `cairn`. From tray/, `bash macos/bundle.sh
 ../target/release/cairn "$HOME/Applications/Cairn.app"` makes it around the binary (with Xcode installed,
@@ -372,6 +388,10 @@ and every long sweep split into parts that run at once; the full run is as long 
 fsyncs, about 11 minutes on two NVMe drives in RAID1, whose every journal commit waits on two cache flushes.
 `CAIRN_SEEDS=500 cargo nextest run -p cairn-harness --test random` runs more random seeds, and `CAIRN_SEED=n`
 reproduces one.
+
+On Windows, a cairn.exe that carries Explorer's handler is built after it, as scripts/release-windows.ps1 does:
+`cargo build --profile explorer -p cairn-explorer`, then the build of cairn-cli with `CAIRN_EXPLORER_DLL` set to
+`target\explorer\cairn_explorer.dll`. `cairn explorer on --dll <that file>` takes one without rebuilding.
 
 ## Docs
 

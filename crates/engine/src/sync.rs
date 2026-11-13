@@ -164,6 +164,9 @@ pub struct SyncReport {
     /// This device's user may only read this folder: what changed here is listed in `skips` as
     /// `read_only`, and none of it went up.
     pub read_only: bool,
+    /// What this device leaves out, as the sync read it before it began, for the badges a file manager
+    /// shows (badges.rs); with `not_synced_here`, all of it.
+    pub exclusions: Option<std::sync::Arc<crate::badges::Exclusions>>,
 }
 
 impl SyncReport {
@@ -201,6 +204,7 @@ impl SyncReport {
             migrated: None,
             followed: None,
             read_only: false,
+            exclusions: None,
         }
     }
 }
@@ -1607,6 +1611,16 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let accounts = Accounts::load();
     // Read once, before anything is touched: a rule that cannot be read must stop the sync.
     let selection = Selection::load(&root)?;
+    let exclusions = std::sync::Arc::new(crate::badges::Exclusions {
+        rules: selection.rules.clone(),
+        copies: selection
+            .copies
+            .iter()
+            .filter(|c| !c.path.is_empty())
+            .map(|c| crate::scan::display_path(&c.path))
+            .collect(),
+    });
+    report.exclusions = Some(exclusions.clone());
     // Purely local, and first: anything else may send a person to act on this folder.
     if !opts.dry_run {
         report.events.extend(recover(&mut root)?);
@@ -1628,6 +1642,7 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
         fast.report.migrated = report.migrated.clone();
         fast.report.followed = report.followed.clone();
         fast.report.read_only = client.read_only();
+        fast.report.exclusions = Some(exclusions);
         if !crate::steady::oracle() {
             return Ok(counted(fast.report));
         }

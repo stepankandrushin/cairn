@@ -2375,6 +2375,152 @@ fn every_change_made_while_paused_arrives_after_resume() {
     }
 }
 
+/// One folder's badges as `cairn ask` gives them: the folder's own, `none` if it has none, and each
+/// entry's by name.
+fn badges(
+    d: &Device,
+    env: &[(&str, &str)],
+    folder: &str,
+) -> (String, std::collections::BTreeMap<String, String>) {
+    let request = serde_json::json!({ "op": "badges", "folder": folder }).to_string();
+    let run = d.cairn_env(&["ask", &request], env).expect_ok();
+    let reply = json(&run);
+    assert_eq!(reply["reply"], "badges", "{reply}");
+    let own = reply["badge"].as_str().unwrap_or("none").to_string();
+    let entries = reply["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let text = |k: &str| e[k].as_str().unwrap().to_string();
+            (text("name"), text("badge"))
+        })
+        .collect();
+    (own, entries)
+}
+
+#[test]
+fn badges_say_what_is_synced_what_is_changing_and_what_is_not_synced() {
+    let (_sb, _s, a, _b) = pair("d-badges");
+    let user = UserDir::new();
+    let env = user.env();
+    a.write(".cairn/ignore", "*.log\n");
+    a.write("docs/a.txt", "a");
+    a.write("docs/sub/b.txt", "b");
+    a.write("docs/run.log", "l");
+    let da = Daemon::start_env(&a, &["--reconcile-secs", DAY], &env);
+    da.wait_state("synced");
+    da.wait_rest();
+    let (root, top) = badges(&a, &env, "");
+    assert_eq!(root, "synced", "{top:?}");
+    assert_eq!(
+        top.get("docs").map(String::as_str),
+        Some("synced"),
+        "{top:?}"
+    );
+    // The state directory and what the rules leave out have none.
+    assert!(!top.contains_key(".cairn"), "{top:?}");
+    let (_, docs) = badges(&a, &env, "docs");
+    assert_eq!(docs.get("a.txt").map(String::as_str), Some("synced"));
+    assert!(!docs.contains_key("run.log"), "{docs:?}");
+    let (none, _) = badges(&a, &env, "docs/missing");
+    assert_eq!(none, "none");
+
+    // A program watching is told what changed: first everything, then each path as it changes.
+    let mut watch = Command::new(CAIRN)
+        .arg("--root")
+        .arg(&a.root)
+        .args(["ask", "watch_badges"])
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let told = Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let (told, mut out) = (told.clone(), watch.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = out.read(&mut buf) {
+                told.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    let said = |what: &str| told.lock().unwrap().contains(what);
+    wait_for("everything to be told", &da.log, || said(r#""all":true"#));
+
+    // Paused, a change waits, and shows as changing up to the root; nothing else does.
+    a.cairn_env(&["pause"], &env).expect_ok();
+    da.wait_state("paused");
+    a.write("docs/sub/new.txt", "n");
+    a.write("docs/sub/more.log", "m");
+    wait_for("the change to be told", &da.log, || {
+        said("docs/sub/new.txt")
+    });
+    assert!(!said("more.log"), "{}", told.lock().unwrap());
+    assert_eq!(badges(&a, &env, "").0, "syncing");
+    let (_, docs) = badges(&a, &env, "docs");
+    assert_eq!(
+        docs.get("sub").map(String::as_str),
+        Some("syncing"),
+        "{docs:?}"
+    );
+    assert_eq!(
+        docs.get("a.txt").map(String::as_str),
+        Some("synced"),
+        "{docs:?}"
+    );
+    let (sub_own, sub) = badges(&a, &env, "docs/sub");
+    assert_eq!(sub_own, "syncing");
+    assert_eq!(
+        sub.get("new.txt").map(String::as_str),
+        Some("syncing"),
+        "{sub:?}"
+    );
+    assert_eq!(
+        sub.get("b.txt").map(String::as_str),
+        Some("synced"),
+        "{sub:?}"
+    );
+    assert!(!sub.contains_key("more.log"), "{sub:?}");
+
+    // Synced, it shows so.
+    a.cairn_env(&["resume"], &env).expect_ok();
+    da.wait_state("synced");
+    wait_for("the change to show synced", &da.log, || {
+        badges(&a, &env, "docs/sub")
+            .1
+            .get("new.txt")
+            .map(String::as_str)
+            == Some("synced")
+    });
+    assert_eq!(badges(&a, &env, "").0, "synced");
+
+    // What is not synced is an error, and each folder above it a warning.
+    #[cfg(unix)]
+    {
+        let made = Command::new("mkfifo")
+            .arg(a.path("docs/pipe"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        wait_for("the FIFO to show not synced", &da.log, || {
+            badges(&a, &env, "docs").1.get("pipe").map(String::as_str) == Some("error")
+        });
+        let (root, top) = badges(&a, &env, "");
+        assert_eq!(
+            top.get("docs").map(String::as_str),
+            Some("warning"),
+            "{top:?}"
+        );
+        assert_eq!(root, "warning");
+    }
+    let _ = watch.kill();
+    let _ = watch.wait();
+}
+
 #[test]
 fn a_subscriber_that_never_reads_does_not_stall_syncs() {
     let (_sb, _s, a, b) = pair("d-stuck");

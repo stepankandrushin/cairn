@@ -22,7 +22,9 @@ pub const ASK_WAIT: Duration = Duration::from_secs(2);
 const QUEUE: usize = 16;
 /// The status again when nothing has changed, so a program that has gone is found and let go.
 const HEARTBEAT: Duration = Duration::from_secs(30);
-const MAX_CONNECTIONS: usize = 32;
+/// Each Explorer, and each program showing a file dialog, keeps one watching badges for every root it
+/// has shown, beside the tray's and every `cairn status`.
+const MAX_CONNECTIONS: usize = 64;
 const MAX_REQUEST: usize = 64 * 1024;
 
 pub const DROPPED: &str =
@@ -37,6 +39,8 @@ pub struct Hub {
     notes: Mutex<Vec<String>>,
     wake: Box<dyn Fn() + Send + Sync>,
     connections: AtomicUsize,
+    /// The badges of the root's entries, for a file manager, once the daemon has them.
+    board: std::sync::OnceLock<Arc<crate::badges::Board>>,
 }
 
 impl Hub {
@@ -48,7 +52,17 @@ impl Hub {
             notes: Mutex::new(Vec::new()),
             wake: Box::new(wake),
             connections: AtomicUsize::new(0),
+            board: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Serve the badges of this board: [`Request::Badges`] and [`Request::WatchBadges`].
+    pub fn serve_badges(&self, board: Arc<crate::badges::Board>) {
+        let _ = self.board.set(board);
+    }
+
+    pub fn board(&self) -> Option<&Arc<crate::badges::Board>> {
+        self.board.get()
     }
 
     /// The new status, to every subscriber that keeps up. Never waits.
@@ -164,6 +178,32 @@ fn serve_conn(mut c: impl Conn, hub: &Hub, handler: &Handler) -> io::Result<()> 
     };
     match request {
         Request::Status => c.write_all(hub.current().as_bytes()),
+        Request::Badges { folder } => match hub.board.get() {
+            Some(board) => c.write_all(reply_line(&board.badges(&folder)).as_bytes()),
+            None => c.write_all(reply_line(&no_badges()).as_bytes()),
+        },
+        Request::WatchBadges => {
+            let Some(board) = hub.board.get() else {
+                return c.write_all(reply_line(&no_badges()).as_bytes());
+            };
+            let (first, rx) = board.watch();
+            // Nothing changed, said when nothing has for a while, so a program that has gone is let go.
+            let quiet: Arc<str> = reply_line(&Reply::BadgesChanged {
+                all: false,
+                paths: Vec::new(),
+            })
+            .into();
+            let mut line = first;
+            loop {
+                c.write_all(line.as_bytes())?;
+                line = match rx.recv_timeout(HEARTBEAT) {
+                    Ok(line) => line,
+                    Err(RecvTimeoutError::Timeout) => quiet.clone(),
+                    // Dropped for falling behind: its next connection starts with everything.
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                };
+            }
+        }
         Request::Subscribe => {
             let (first, rx) = hub.subscribe();
             let mut line = first;
@@ -186,6 +226,12 @@ fn serve_conn(mut c: impl Conn, hub: &Hub, handler: &Handler) -> io::Result<()> 
             }
         }
         other => c.write_all(reply_line(&handler(other)).as_bytes()),
+    }
+}
+
+fn no_badges() -> Reply {
+    Reply::Error {
+        text: "this daemon shows no badges yet".into(),
     }
 }
 

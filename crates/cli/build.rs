@@ -23,6 +23,7 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    explorer_dll();
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         println!("cargo:warning=cairn.exe is built without its icon and version: only the MSVC linker takes the .res made here");
         return;
@@ -34,6 +35,20 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("cairn.res");
     fs::write(&out, res).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
     println!("cargo:rustc-link-arg-bin=cairn={}", out.display());
+}
+
+/// The DLL of Explorer's badges (crates/explorer), which cairn.exe carries for `cairn explorer on`: the one
+/// `CAIRN_EXPLORER_DLL` names, as a release builds and signs it first, or none.
+fn explorer_dll() {
+    println!("cargo:rerun-if-env-changed=CAIRN_EXPLORER_DLL");
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("cairn-explorer.dll");
+    match env::var_os("CAIRN_EXPLORER_DLL").filter(|p| !p.is_empty()) {
+        Some(dll) => {
+            println!("cargo:rerun-if-changed={}", PathBuf::from(&dll).display());
+            fs::copy(&dll, &out).unwrap_or_else(|e| panic!("copying CAIRN_EXPLORER_DLL: {e}"));
+        }
+        None => fs::write(&out, b"").unwrap_or_else(|e| panic!("writing {}: {e}", out.display())),
+    }
 }
 
 /// The .res file: an empty first entry, as every one starts, then each image of the icon, the icon

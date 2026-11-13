@@ -188,6 +188,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -211,6 +212,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cairn-explorer"
+version = "0.1.24"
+dependencies = [
+ "cairn-engine",
+ "cairn-protocol",
+ "serde_json",
  "windows-sys 0.61.2",
 ]
 

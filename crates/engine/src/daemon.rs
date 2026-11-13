@@ -199,10 +199,14 @@ fn write_status(path: &Path, status: &Status) {
     let _ = write();
 }
 
-/// Written and shown: the file for whoever reads it, the local API for the rest.
+/// Written and shown: the file for whoever reads it, the local API for the rest, and on the root's
+/// badge whether it is in trouble.
 fn show(path: &Path, status: &Status, hub: &Hub) {
     write_status(path, status);
     hub.publish(status);
+    if let Some(board) = hub.board() {
+        board.set_state(&status.state);
+    }
 }
 
 /// While a sync runs, how often what it is doing goes to the local API, for `cairn status` and the tray.
@@ -548,9 +552,11 @@ fn handler(
                 text: format!("{e:#}"),
             },
         },
-        Request::Status | Request::Subscribe => Reply::Error {
-            text: "not a request for the handler".into(),
-        },
+        Request::Status | Request::Subscribe | Request::Badges { .. } | Request::WatchBadges => {
+            Reply::Error {
+                text: "not a request for the handler".into(),
+            }
+        }
     })
 }
 
@@ -917,6 +923,10 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         }))
     };
 
+    // What a file manager shows on each entry, served with the status.
+    let board = crate::badges::Board::new(path);
+    hub.serve_badges(board.clone());
+
     let live = Arc::new(Live::default());
     {
         let (live, hub, say) = (live.clone(), hub.clone(), opts.say);
@@ -932,11 +942,15 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
 
     raise_open_files(log);
     let watcher = if opts.watch {
-        let tx = wake_tx.clone();
+        let (tx, touched) = (wake_tx.clone(), board.clone());
         match Watcher::start(path, move || {
+            touched.touch();
             let _ = tx.send(Wake::Local(Instant::now()));
         }) {
-            Ok(w) => Some(w),
+            Ok(w) => {
+                board.watch_marks(w.marks());
+                Some(w)
+            }
             Err(e) => {
                 log(&format!(
                     "cannot watch this filesystem ({e}): changes here are found only by the full sync every {} seconds",
@@ -1245,6 +1259,8 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 lines = report_lines(&report);
                 status.skips = report.skips.iter().map(ToString::to_string).collect();
                 note_not_applied(path, &mut status, &mut not_applied, &report);
+                // The marks it agreed past are pruned by now.
+                board.synced(&report, &not_applied);
                 if let Some(w) = &watcher {
                     w.set_in_motion(
                         report

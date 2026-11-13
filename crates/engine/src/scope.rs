@@ -29,13 +29,24 @@ pub struct Marks {
     folders: HashMap<Box<[u8]>, (Instant, bool)>,
     /// When the watcher last lost track, from its start on.
     lost: Instant,
+    /// Each entry an event named, and when: what a file manager shows as changing (badges.rs). A sync
+    /// lists folders and never asks for these.
+    entries: HashMap<Box<[u8]>, Instant>,
+    /// When `entries` last overflowed [`MAX_ENTRIES`], and dropped what came: since then, every entry
+    /// of a folder marked counts as changed.
+    entries_full: Option<Instant>,
 }
+
+/// The most entries kept: a build writing more has its folders count whole.
+pub const MAX_ENTRIES: usize = 65_536;
 
 impl Default for Marks {
     fn default() -> Self {
         Self {
             folders: HashMap::new(),
             lost: Instant::now(),
+            entries: HashMap::new(),
+            entries_full: None,
         }
     }
 }
@@ -99,6 +110,20 @@ impl Marks {
         if whole && !path.is_empty() {
             self.mark(path, true);
         }
+        self.entry(path);
+    }
+
+    /// The entry an event named, for what is shown as changing; its folder is marked apart.
+    pub fn entry(&mut self, path: &[Name]) {
+        let now = Instant::now();
+        let key = join(path);
+        if let Some(at) = self.entries.get_mut(&key) {
+            *at = now;
+        } else if self.entries.len() < MAX_ENTRIES {
+            self.entries.insert(key, now);
+        } else {
+            self.entries_full = Some(now);
+        }
     }
 
     /// Something may have been missed: no scope stands on anything before now.
@@ -124,6 +149,35 @@ impl Marks {
     /// What a scan begun at `t` has listed can go.
     pub fn prune(&mut self, t: Instant) {
         self.folders.retain(|_, (at, _)| *at >= t);
+        self.entries.retain(|_, at| *at >= t);
+        // A build's thousands go back once synced, as the rest of a sync's memory does.
+        if self.entries.capacity() > 4 * self.entries.len().max(1024) {
+            self.entries.shrink_to_fit();
+        }
+        self.entries_full = self.entries_full.filter(|at| *at >= t);
+    }
+
+    /// Whether the watcher has lost track at `t` or since: what it says from before then is not all.
+    pub fn lost_since(&self, t: Instant) -> bool {
+        self.lost >= t
+    }
+
+    /// What is changed as far as the watcher has seen, every mark left (badges.rs): the entries events
+    /// named, the folders new all through, and, once the entries overflowed, every folder marked, whose
+    /// entries then all count. Joined, as `join` makes them.
+    pub fn changed(&self) -> Changed<'_> {
+        Changed {
+            entries: self.entries.keys().map(|k| &k[..]).collect(),
+            whole: self
+                .folders
+                .iter()
+                .filter(|(_, (_, whole))| *whole)
+                .map(|(k, _)| &k[..])
+                .collect(),
+            folders: self
+                .entries_full
+                .map(|_| self.folders.keys().map(|k| &k[..]).collect()),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +187,13 @@ impl Marks {
     pub fn is_empty(&self) -> bool {
         self.folders.is_empty()
     }
+}
+
+/// [`Marks::changed`].
+pub struct Changed<'a> {
+    pub entries: Vec<&'a [u8]>,
+    pub whole: Vec<&'a [u8]>,
+    pub folders: Option<Vec<&'a [u8]>>,
 }
 
 /// A watcher's marks, shared with the daemon.

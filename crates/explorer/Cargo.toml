@@ -1,0 +1,26 @@
+[package]
+name = "cairn-explorer"
+description = "Cairn's badges in Windows Explorer: icon overlay handlers that ask each root's daemon."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The DLL Explorer loads, built on its own: `cargo build --profile explorer -p cairn-explorer`, whose
+# panics unwind to each entry point rather than end Explorer. The rlib is for its tests.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cairn-protocol.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cairn-engine.workspace = true
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+] }

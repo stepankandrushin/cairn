@@ -29,8 +29,8 @@ on the owner's own trees and machines.
   `cairn status --all` show, so a scratch root made without it shows up to the person whose machine it is.
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
-  Windows, the tray on them, updates, accounts and the web interface are the exceptions, at the owner's
-  asking.
+  Windows, the tray on them, Explorer's badges, updates, accounts and the web interface are the exceptions,
+  at the owner's asking.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
 - **The status lines say what is true now**: README.md's status, this file's, and, in the maintainer's

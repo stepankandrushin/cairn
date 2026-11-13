@@ -43,3 +43,9 @@ strip = true
 # stay unoptimized, with their debug assertions.
 [profile.dev.package."*"]
 opt-level = 2
+
+# cairn-explorer's DLL, which Explorer and every program showing a file dialog load: a panic in it is
+# caught at the entry point it came through, where `panic = "abort"` would end Explorer.
+[profile.explorer]
+inherits = "release"
+panic = "unwind"

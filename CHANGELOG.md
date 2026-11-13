@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- On Windows, Explorer shows each entry of a root with a badge on its icon, as Nextcloud's client does: a green
+  check once synced, blue arrows while a change here waits or a sync moves it, a red cross on what is not
+  synced, with the reason in `cairn status`, and a yellow mark on each folder above one, on a file whose metadata
+  this filesystem refused, and on a paused root. What this device excludes has none. `cairn explorer on` turns
+  them on, once, asking for an administrator to list the handlers for Explorer, and Explorer shows them once it
+  starts again; `cairn explorer status` says whether they are on and where they come among Explorer's overlay
+  handlers, of which it shows the first 11; `cairn explorer off` takes them away. cairn.exe carries the handler,
+  and a daemon on a newer version moves the badges to its own. A root shows them once its daemon runs this
+  version.
+- The daemon's badges are on the local API for any program to show: `badges { folder }` and `watch_badges`
+  (docs/protocol.md, "Badges").
+
 ## 0.1.24 (2026-11-13)
 
 **Changed:**

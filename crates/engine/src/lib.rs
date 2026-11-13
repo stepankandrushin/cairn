@@ -1,6 +1,7 @@
 //! The sync engine: everything a client does to a real filesystem and to the server.
 
 pub mod apply;
+pub mod badges;
 pub mod chunker;
 pub mod client;
 pub mod control;

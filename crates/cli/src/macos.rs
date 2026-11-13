@@ -3,18 +3,17 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::Path;
 
-/// Have LaunchServices know this daemon as the app of the bundle it runs from, Cairn Sync.app, as it
-/// knows the tray by Cairn Tray.app. Activity Monitor gives a process its bundle's name and icon only
-/// once LaunchServices knows it so, which AppKit does for an app; launchd starts the daemon without
-/// AppKit, so it showed as its bare program name, beside the tray's "Cairn Tray". `Ok(false)` when
-/// this is not the place.
+/// Have LaunchServices know this daemon as the app of the bundle it runs from, Cairn.app, as it knows
+/// the tray by Cairn Tray.app. Activity Monitor gives a process its bundle's name and icon only once
+/// LaunchServices knows it so, which AppKit does for an app; launchd starts the daemon without AppKit,
+/// so it showed as a bare `cairn`, beside the tray's "Cairn Tray". `Ok(false)` when this is not the place.
 ///
 /// TransformProcessType checks the process in, as the background-only app its Info.plist makes it
 /// (LSBackgroundOnly), and then has nothing to change: no Dock icon, menu or window. As a UI element,
 /// which the tray is, it would be brought to the front when someone opens the bundle, and with no event
 /// loop to answer, it would keep the focus from every other app; a background-only app is never brought
-/// forward. Opening the bundle while the daemon runs now starts nothing, where it used to start the
-/// CLI, which printed its usage. The bundle's identifier and signature are as they were, and with them each
+/// forward. Opening the bundle while the daemon runs now starts nothing, where it used to start a `cairn`
+/// that printed its usage. The bundle's identifier and signature are as they were, and with them each
 /// permission macOS keeps by them. Every command maps ApplicationServices, which the frameworks it links
 /// bring, and dyld leaves it uninitialized until it is used: opened here, for the daemon alone, it costs
 /// the daemon about 2 MB of footprint and no other command anything.
@@ -26,8 +25,8 @@ use std::path::Path;
 ///
 /// HIServices aborts a process that LaunchServices does not take in, so this is done only where a
 /// desktop is, in a session with graphic access, as Activity Monitor's is: not over SSH, nor for a daemon
-/// of the system's. And only from the bundle itself: through a link, as `~/.local/bin/cairn-sync`,
-/// macOS finds no bundle and would name the process for the link. Nothing depends on it, so a failure is only said.
+/// of the system's. And only from the bundle itself: through a link, as `~/.local/bin/cairn`, macOS finds
+/// no bundle and would name the process for the link. Nothing depends on it, so a failure is only said.
 pub fn check_in() -> Result<bool, String> {
     // The path as started, not the file it leads to: where macOS looks for the bundle.
     let exe =
@@ -169,14 +168,14 @@ mod tests {
 
     #[test]
     fn only_a_program_in_a_bundle() {
-        let yes = "/Users/x/Applications/Cairn Sync.app/Contents/MacOS/cairn-sync";
+        let yes = "/Users/x/Applications/Cairn.app/Contents/MacOS/cairn";
         assert!(in_bundle(Path::new(yes)));
         for no in [
-            "/Users/x/.local/bin/cairn-sync",
-            "/Users/x/Cairn Sync/Contents/MacOS/cairn-sync",
-            "/Users/x/Cairn Sync.app/Contents/cairn-sync",
-            "/MacOS/cairn-sync",
-            "cairn-sync",
+            "/Users/x/.local/bin/cairn",
+            "/Users/x/Cairn Tray/Contents/MacOS/cairn",
+            "/Users/x/Cairn.app/Contents/cairn",
+            "/MacOS/cairn",
+            "cairn",
         ] {
             assert!(!in_bundle(Path::new(no)), "{no}");
         }

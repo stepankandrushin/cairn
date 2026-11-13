@@ -58,7 +58,7 @@ fn platform_open(target: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
-/// Takes a root off this device's list of roots, as `cairn-sync forget` does, if the tray shows it as gone:
+/// Takes a root off this device's list of roots, as `cairn forget` does, if the tray shows it as gone:
 /// the window asked first.
 pub fn forget(hub: &Hub, root_id: &str) -> Result<String, String> {
     let r = hub
@@ -66,7 +66,7 @@ pub fn forget(hub: &Hub, root_id: &str) -> Result<String, String> {
         .ok_or("that root is no longer in the registry")?;
     if !crate::model::shown_gone(&r) {
         return Err(format!(
-            "{} is not shown as gone, so it stays on the list; `cairn-sync forget --even-if-present` takes off one still there",
+            "{} is not shown as gone, so it stays on the list; `cairn forget --even-if-present` takes off one still there",
             r.entry.path.display()
         ));
     }
@@ -102,7 +102,7 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Where something a daemon reported is: `rel` is relative to the root, by `/`, as `cairn-sync status`
+/// Where something a daemon reported is: `rel` is relative to the root, by `/`, as `cairn status`
 /// prints it. None for a path that would leave the root.
 pub fn under(root: &Path, rel: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
@@ -573,18 +573,25 @@ pub mod login {
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     #[cfg(windows)]
     const VALUE: &str = "Cairn Tray";
+    /// The value's name up to 0.1.21, when the tray was called "Cairn", now the main program's name. A
+    /// copy updated from one still starts by it: it is the tray's while it names cairn-tray.exe, and is
+    /// removed when the tray is set either way.
+    #[cfg(windows)]
+    const OLD_VALUE: &str = "Cairn";
 
     #[cfg(windows)]
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
     }
 
+    /// What a value of the Run key holds, None when it is not there; empty when it is there but would not
+    /// read.
     #[cfg(windows)]
-    pub fn enabled() -> bool {
+    fn read(name: &str) -> Option<String> {
         use windows_sys::Win32::System::Registry::{
             RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
         };
-        let (key, value) = (wide(RUN_KEY), wide(VALUE));
+        let (key, value) = (wide(RUN_KEY), wide(name));
         let mut len = 0u32;
         // SAFETY: NUL-terminated names; asks only for the size.
         let r = unsafe {
@@ -598,25 +605,64 @@ pub mod login {
                 &mut len,
             )
         };
-        r == 0
+        if r != 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: NUL-terminated names, and a buffer of the length given, in bytes.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if r != 0 {
+            return Some(String::new());
+        }
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n]))
+    }
+
+    #[cfg(windows)]
+    fn old_is_ours() -> bool {
+        read(OLD_VALUE).is_some_and(|d| d.to_ascii_lowercase().contains("cairn-tray.exe"))
+    }
+
+    #[cfg(windows)]
+    fn delete(name: &str) -> Result<(), String> {
+        use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, HKEY_CURRENT_USER};
+        let (key, value) = (wide(RUN_KEY), wide(name));
+        // SAFETY: NUL-terminated names.
+        let r = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
+        // 2: it was not there.
+        if r == 0 || r == 2 {
+            Ok(())
+        } else {
+            Err(format!("cannot change the Run key: error {r}"))
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn enabled() -> bool {
+        read(VALUE).is_some() || old_is_ours()
     }
 
     #[cfg(windows)]
     pub fn set(on: bool) -> Result<(), String> {
-        use windows_sys::Win32::System::Registry::{
-            RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
-        };
-        let (key, value) = (wide(RUN_KEY), wide(VALUE));
-        if !on {
-            // SAFETY: NUL-terminated names.
-            let r = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-            // 2: it was not there.
-            return if r == 0 || r == 2 {
-                Ok(())
-            } else {
-                Err(format!("cannot change the Run key: error {r}"))
-            };
+        use windows_sys::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+        if old_is_ours() {
+            delete(OLD_VALUE)?;
         }
+        if !on {
+            return delete(VALUE);
+        }
+        let (key, value) = (wide(RUN_KEY), wide(VALUE));
         let exe = std::env::current_exe().map_err(|e| format!("cannot tell where this is: {e}"))?;
         let data = wide(&format!("\"{}\"", exe.display()));
         // SAFETY: NUL-terminated names, and data of the length given, in bytes.

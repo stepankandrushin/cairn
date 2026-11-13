@@ -1070,7 +1070,7 @@ fn init_makes_a_root_of_the_folder_given_by_root() {
 
 #[test]
 fn output_nobody_reads_is_no_failure() {
-    // `cairn-sync status | head`: the reader goes away, and the command neither panics nor stops.
+    // `cairn status | head`: the reader goes away, and the command neither panics nor stops.
     let (_sb, _s, a, _b) = pair("pipe");
     for i in 0..20 {
         a.write(&format!("f{i}"), "x");

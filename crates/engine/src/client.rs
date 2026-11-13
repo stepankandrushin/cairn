@@ -677,7 +677,7 @@ impl Client {
     }
 
     /// An address of the server's web page that signs a browser in as this token, once and within two
-    /// minutes, open at `folder`'s top: what `cairn-sync web` and the tray's Open in browser open.
+    /// minutes, open at `folder`'s top: what `cairn web` and the tray's Open in browser open.
     pub fn sign_in_url(&self, folder: Option<&str>) -> Result<String> {
         let url = format!("{}/v1/session/ticket", self.server);
         let body = self

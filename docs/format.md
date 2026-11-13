@@ -22,7 +22,7 @@ the chunks on large, slow disks and the database on a fast one.
 **Backup:** snapshot `meta.sqlite` (the SQLite backup API, or stop the server), then rsync `ns/`.
 Chunks are immutable and named by content, and this release never removes one. After a restore, each
 device notices that the server no longer has what it last saw and pauses. Removing that root's `.cairn`
-and running `cairn-sync init` again merges by name and content and sends the server what it lost.
+and running `cairn init` again merges by name and content and sends the server what it lost.
 
 **Chunks** are the raw bytes, with no compression in this format version. A chunk reaches its final
 path only by: write to `incoming/`, fsync, rename, fsync the directory. An upload request's chunks go
@@ -155,7 +155,7 @@ the root.
 
 | Table | Holds |
 |---|---|
-| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn-sync exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move, and for one a sync kept out of what this device held, that object, whose record does not bring it back into view; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way. `generation`, which triggers in the file move on every write to any table, whatever build makes it, and `steady`, what the last sync that had nothing to do and wrote nothing read: that generation, the cursor and its operation, a hash of the build, configuration and rules, a digest of its scan, and what it reported |
+| `kv` | Root ID, journal cursor, the operation at the cursor, which shows whether the server still has this history, and what `cairn exclude` left out: the objects, and the copies left here, by inode so that they stay left alone wherever they move, and for one a sync kept out of what this device held, that object, whose record does not bring it back into view; and the entries on the server this filesystem cannot hold, each with why and whether a twin here is in its way. `generation`, which triggers in the file move on every write to any table, whatever build makes it, and `steady`, what the last sync that had nothing to do and wrote nothing read: that generation, the cursor and its operation, a hash of the build, configuration and rules, a digest of its scan, and what it reported |
 | `objects` | Per object, its base node and its row, each a binary record or NULL, never both NULL: the node is the server's tree as of the cursor, the common ancestor for merging; the row is what this device knows of it: the entries this device holds, without which an entry missing from disk is not a delete here; the fingerprint and content last read, or last written, or whose metadata alone was set, by a run whose watch on the file saw nothing done to it until a later write would have shown; `applied`, what the filesystem held when the base last matched, from which local changes are measured; `synced`, state shared ahead of the base, naming the commit that carries it: it counts as the common ancestor only once that commit is seen in the journal, whether the filesystem is still to be brought to it, and the time a killed run moved a folder's own timestamp from |
 | `manifests` | Manifests of local content, needed to upload it: `1` and the fields of its canonical JSON (size, then each segment's offset and chunks, each chunk's hash and length), which is made again when it is read and checked against the hash it is stored under; or `0` and the bytes as they came, for any that are not a canonical manifest |
 | `outbox` | Commits not yet acknowledged, sent again with the same ID on the next run. A note to each object, as an older build that takes the queue over reads a note of several as its first alone; they go as one only as they are sent |
@@ -186,8 +186,8 @@ the state's filesystem has room for the new tables in the WAL, and for the file 
 do not hold; short of it, or should the disk fill during it, the state stays version 1 and no sync runs until
 there is room. A kill at any point leaves version 1 or version 2, each whole. The pages the old tables held are
 free after it, which the compaction after the next sync gives back. A build older than the layout refuses the
-state, saying so ("newer than this binary: upgrade cairn-sync"), so an update taken back past this one needs the
-state made again: remove `.cairn` and run `cairn-sync init`, which merges by name and content.
+state, saying so ("newer than this binary: upgrade cairn"), so an update taken back past this one needs the
+state made again: remove `.cairn` and run `cairn init`, which merges by name and content.
 
 The triggers are not a migration: an older build of the same layout opens the file as before, and its writes
 move the generation too. A file found without all of them, or with one changed, gets them all again and loses

@@ -519,7 +519,7 @@ fn an_excluded_folder_stays_excluded_through_a_rename_and_comes_back_when_includ
     assert!(
         status
             .stdout
-            .contains("excluded with `cairn-sync exclude`: pictures"),
+            .contains("excluded with `cairn exclude`: pictures"),
         "{}",
         status.text()
     );
@@ -736,7 +736,7 @@ fn a_copy_of_a_folder_deleted_elsewhere_can_always_be_brought_back() {
     );
     let status = a.cairn(&["status"]);
     assert!(
-        status.stdout.contains("cairn-sync include --merge d"),
+        status.stdout.contains("cairn include --merge d"),
         "{}",
         status.text()
     );
@@ -2405,7 +2405,7 @@ fn a_folder_kept_out_as_a_cycle_of_moves_is_undone_waits_for_what_the_server_add
         assert!(
             run.text()
                 .contains("fill/x/y/cache: something this device excludes is at that name")
-                && run.text().contains("`cairn-sync include --merge`"),
+                && run.text().contains("`cairn include --merge`"),
             "{}",
             run.text()
         );

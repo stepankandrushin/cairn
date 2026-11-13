@@ -222,7 +222,7 @@ pub fn problems(view: &RootView) -> Vec<Problem> {
             out.push(match why {
                 LinkError::NotRunning(_) => p(
                     format!("No daemon answers for this folder, since {}", when(*since)),
-                    "Its changes are kept and wait until one runs: start the service that runs `cairn-sync daemon` here, or run it.",
+                    "Its changes are kept and wait until one runs: start the service that runs `cairn daemon` here, or run it.",
                 ),
                 LinkError::Refused(w) => p(
                     format!("Its daemon's address is not to be trusted: {w}"),
@@ -245,7 +245,7 @@ pub fn problems(view: &RootView) -> Vec<Problem> {
         )),
         "paused" if s.paused_since.is_none() => out.push(p(
             format!("Sync paused itself: {}", s.detail.as_deref().unwrap_or("no reason given")),
-            "It waits for a person: deal with the reason, and it goes on; `cairn-sync status` in the folder says what it would do.",
+            "It waits for a person: deal with the reason, and it goes on; `cairn status` in the folder says what it would do.",
         )),
         "partial" => out.push(p(
             format!(
@@ -305,7 +305,7 @@ pub fn problems(view: &RootView) -> Vec<Problem> {
     if more > 0 {
         out.push(p(
             format!("And {more} more not applied here"),
-            "`cairn-sync status` in the folder lists them.",
+            "`cairn status` in the folder lists them.",
         ));
     }
     out
@@ -323,7 +323,7 @@ fn gone(view: &RootView) -> Option<Problem> {
         Ok(id) if id == view.entry.root_id => None,
         Ok(_) => Some(Problem {
             what: format!("Another root is at {} now", view.entry.path.display()),
-            todo: "This one may have moved: `cairn-sync status` in the folder says which it is. If it is gone for good, Forget takes it off this list.".into(),
+            todo: "This one may have moved: `cairn status` in the folder says which it is. If it is gone for good, Forget takes it off this list.".into(),
         }),
         Err(_) => Some(Problem {
             what: format!(

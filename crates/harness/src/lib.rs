@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Where the harness's `cairn-sync` keeps its lists of roots, and on macOS and Windows its daemons' locks and
+/// Where the harness's `cairn` keeps its lists of roots, and on macOS and Windows its daemons' locks and
 /// sockets: its own, never the user's. One per user, since /tmp is shared, and the first run as root,
 /// as ci.sh's round trip under sudo is, would otherwise make it root's and refuse everyone else.
 pub fn user_dir() -> PathBuf {
@@ -15,7 +15,7 @@ pub fn user_dir() -> PathBuf {
 }
 
 /// The harness's directory for the roots made in `folder`, a test's sandbox, within `user_dir()`. One
-/// for the whole run was a list of every root the run had made, which each `cairn-sync init` and starting
+/// for the whole run was a list of every root the run had made, which each `cairn init` and starting
 /// daemon read and wrote again whole, fsynced and renamed under its lock, so that the tests running at
 /// once took turns at it and waited longer the further the run got. Its name is short, as a socket path
 /// on macOS is 104 bytes at most.
@@ -29,7 +29,7 @@ pub fn user_dir_of(folder: &Path) -> PathBuf {
     user_dir().join(format!("{:012x}", hash >> 16))
 }
 
-/// The root a run of `cairn-sync` with these arguments is of, as the harness passes it: `--root <path>`
+/// The root a run of `cairn` with these arguments is of, as the harness passes it: `--root <path>`
 /// first, or the last argument of `init`.
 pub fn root_in(args: &[OsString]) -> Option<PathBuf> {
     match args.get(1).and_then(|a| a.to_str()) {

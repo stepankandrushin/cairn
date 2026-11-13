@@ -50,7 +50,7 @@ pub struct Paused(pub String);
 
 /// Another process is working on this root right now.
 #[derive(Debug, thiserror::Error)]
-#[error("another cairn-sync is already working on {0}")]
+#[error("another cairn is already working on {0}")]
 pub struct Busy(pub String);
 
 pub struct Root {
@@ -192,7 +192,7 @@ fn read_marker(path: &Path) -> Result<String> {
     match std::fs::read_to_string(state_path.join(MARKER)) {
         Ok(m) => Ok(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Paused(format!(
-            "{} has no {} marker: either it was never set up with `cairn-sync init`, or the filesystem \
+            "{} has no {} marker: either it was never set up with `cairn init`, or the filesystem \
              that holds it is not mounted. Sync is paused and nothing was changed.",
             path.display(),
             String::from_utf8_lossy(STATE_DIR),

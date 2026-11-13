@@ -38,7 +38,7 @@ pub struct Signature {
 /// One version of every program, for every platform it is built for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
-    /// As `cairn-sync --version` prints it after the program's name: `0.1.6`.
+    /// As `cairn --version` prints it after the program's name: `0.1.6`.
     pub version: String,
     /// [`crate::PROTOCOL_VERSION`] of its programs. A client refuses a server on another, so a client
     /// takes a release on another protocol only once every server it syncs with speaks that one.
@@ -53,7 +53,7 @@ pub struct Release {
 /// One program for one platform.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseFile {
-    /// `cairn-sync` (the CLI and daemon) or `cairn-tray`.
+    /// `cairn` (the CLI and daemon) or `cairn-tray`.
     pub program: String,
     /// `linux-x86_64`, `macos-aarch64`, `macos-x86_64`, `macos-universal`, `windows-x86_64`, ...:
     /// [`platform`] of the build that is to take it.
@@ -151,9 +151,9 @@ pub enum Policy {
     /// Download, check and install it, and each program restarts into it: the daemons between syncs.
     #[default]
     Auto,
-    /// Say that it is there, in `cairn-sync update` and the tray, and install it only when a person asks.
+    /// Say that it is there, in `cairn update` and the tray, and install it only when a person asks.
     Notify,
-    /// Never ask the feed. `cairn-sync update now` still installs what a person asks for.
+    /// Never ask the feed. `cairn update now` still installs what a person asks for.
     Off,
 }
 
@@ -168,7 +168,7 @@ impl Policy {
 }
 
 /// `update-settings.json` in the user dir ([`settings_path`]): absent, `auto` from the feed the build
-/// names. The CLI (`cairn-sync update auto|notify|off`) and the tray write it, a new file over the old; a
+/// names. The CLI (`cairn update auto|notify|off`) and the tray write it, a new file over the old; a
 /// file that does not parse is an error, never written over.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -218,7 +218,7 @@ pub struct Status {
     #[serde(default)]
     pub error_since: Secs,
     /// Versions taken back here, by a person or because a daemon did not get through a sync on them:
-    /// never installed again but by a person's `cairn-sync update now`.
+    /// never installed again but by a person's `cairn update now`.
     #[serde(default)]
     pub rejected: Vec<String>,
 }

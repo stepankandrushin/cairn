@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the release binaries, prove them, and put them in dist/: cairn-<v>-linux-x86_64.tar.gz for people, and
-# the bare cairn-<v>-linux-x86_64-sync, cairn-sync alone, for updates, which release-update.sh signs with the macOS and Windows
+# the bare cairn-<v>-linux-x86_64, cairn alone, for updates, which release-update.sh signs with the macOS and Windows
 # halves (release-macos.sh, release-windows.ps1) and lists in the release's one checksum file.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,7 +22,7 @@ export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-ma
 cargo build --release --locked --target "$target" -p cairn-cli -p cairn-server
 out="target/$target/release"
 
-for bin in cairn-sync cairn-server; do
+for bin in cairn cairn-server; do
     if ldd "$out/$bin" 2>&1 | grep -q '=>'; then
         echo "$bin is not statically linked" >&2
         exit 1
@@ -37,23 +37,23 @@ for bin in cairn-sync cairn-server; do
     fi
     test "$("$out/$bin" --version | awk '{print $2}')" = "$version"
 done
-if [[ -n ${CAIRN_UPDATE_FEED-} ]] && ! grep -a -q -F "$CAIRN_UPDATE_FEED" "$out/cairn-sync"; then
-    echo "cairn-sync does not name its feed, $CAIRN_UPDATE_FEED" >&2
+if [[ -n ${CAIRN_UPDATE_FEED-} ]] && ! grep -a -q -F "$CAIRN_UPDATE_FEED" "$out/cairn"; then
+    echo "cairn does not name its feed, $CAIRN_UPDATE_FEED" >&2
     exit 1
 fi
 
 bash scripts/smoke.sh "$out"
 
-# Each file is cairn-<v>-<platform>[-<program>], the program `sync` for cairn-sync and `tray` for cairn-tray, so
-# a release's files sort by platform; the tarball, which holds cairn-sync and cairn-server, names none.
+# Each file is cairn-<v>-<platform>, then -tray for cairn-tray's, so a release's files sort by platform;
+# cairn's, the main program's, and the tarball, which holds cairn and cairn-server, name no program.
 name="cairn-$version-linux-x86_64"
 stage=$(mktemp -d)
 mkdir "$stage/$name"
-cp "$out/cairn-sync" "$out/cairn-server" README.md CHANGELOG.md LICENSE-APACHE LICENSE-AGPL "$stage/$name/"
+cp "$out/cairn" "$out/cairn-server" README.md CHANGELOG.md LICENSE-APACHE LICENSE-AGPL "$stage/$name/"
 mkdir -p dist
 tar -C "$stage" --owner=0 --group=0 --sort=name -czf "dist/$name.tar.gz" "$name"
 rm -rf "$stage"
-# What an installed cairn-sync on Linux updates itself to: the program alone.
-cp "$out/cairn-sync" "dist/$name-sync"
-ls -l "dist/$name.tar.gz" "dist/$name-sync"
-(cd dist && sha256sum "$name.tar.gz" "$name-sync")
+# What an installed cairn on Linux updates itself to: the program alone.
+cp "$out/cairn" "dist/$name"
+ls -l "dist/$name.tar.gz" "dist/$name"
+(cd dist && sha256sum "$name.tar.gz" "$name")

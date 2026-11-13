@@ -34,7 +34,7 @@ filesystem and privileges.
 | Guard against missing disks / mass deletion | ✅ Mount checks; sync pauses and asks | ⚠️ Confirmation before mass deletion | ⚠️ Confirmation above a deletion-count threshold | ✅ Sync stops if the folder's `.stfolder` marker is missing |
 
 [^macos-size]: Installed bundles measured on an Apple Silicon Mac:
-    Cairn 0.1.5 — `Cairn.app` 9.1 MB + `Cairn Sync.app` 8.0 MB; Nextcloud 34.0.5 — `Nextcloud.app` 414.4 MB.
+    Cairn 0.1.5 — `Cairn Tray.app` 9.1 MB + `Cairn.app` 8.0 MB; Nextcloud 34.0.5 — `Nextcloud.app` 414.4 MB.
     Sizes sum regular-file bytes inside each bundle, excluding symlinks, with 1 MB = 1,000,000 bytes.
     These are installed application files, not download sizes or allocated disk space; user data and
     server components are excluded. Nextcloud's executable is universal (Intel + Apple Silicon), while
@@ -105,18 +105,18 @@ cairn-server init --data ~/cairn-data
 cairn-server serve --data ~/cairn-data           # 127.0.0.1:8733; plain HTTP, so loopback only
 
 # A client
-cairn-sync init --server http://127.0.0.1:8733 --token-file ~/cairn-data/token ~/Sync
+cairn init --server http://127.0.0.1:8733 --token-file ~/cairn-data/token ~/Sync
 cd ~/Sync && echo hello > hello.txt
-cairn-sync sync
+cairn sync
 
 # What happened, and going back
-cairn-sync log
-cairn-sync history hello.txt
-cairn-sync restore hello.txt --at 1
-cairn-sync export --at 1 /tmp/as-it-was               # into a new folder; changes nothing else
-cairn-sync conflicts                                  # the copies kept, until each is deleted, renamed or moved
-cairn-sync deleted                                    # what was deleted in the last 30 days, each with its ID
-cairn-sync undelete <ID>                              # bring it back as it was, beside anything now at its name
+cairn log
+cairn history hello.txt
+cairn restore hello.txt --at 1
+cairn export --at 1 /tmp/as-it-was               # into a new folder; changes nothing else
+cairn conflicts                                  # the copies kept, until each is deleted, renamed or moved
+cairn deleted                                    # what was deleted in the last 30 days, each with its ID
+cairn undelete <ID>                              # bring it back as it was, beside anything now at its name
 ```
 
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with
@@ -130,11 +130,11 @@ own, one per device at best. A user reaches only the folders given to it, at one
 `write`, or `manage`, which is write and also saying who else has access. To anyone else a folder answers as
 one that does not exist. `cairn-server init` makes the user `admin`, who manages the folder `cloud`, with
 its token in the data directory's `token` file; a server from before accounts gives that file's token the
-same, managing every folder it has, the first of them `default`. `cairn-sync init` without `--folder` syncs the
+same, managing every folder it has, the first of them `default`. `cairn init` without `--folder` syncs the
 one folder its token reaches, and with several asks which.
 
 A folder's name is what devices, links and commands use. Each user may also call it something of their
-own, which only they see in the web, `cairn-sync folders` and wherever else it is named for them: the name of the
+own, which only they see in the web, `cairn folders` and wherever else it is named for them: the name of the
 directory their first device syncs it into, until they choose another in the web's Settings. Any user adds a
 folder of their own in the web, which they manage; a folder's managers rename it there, in its settings, while
 the server serves, and the administrator on the server with it stopped. Renamed, a folder still answers to its
@@ -156,17 +156,17 @@ cairn-server folder list --data ~/cairn-data     # each folder, its head, former
 cairn-server folder rename team crew --data ~/cairn-data   # with the server stopped; or in the web
 
 # On a device: each folder is a root of its own
-cairn-sync folders --server https://cairn.example --token-file bob.token
-cairn-sync init --server https://cairn.example --token-file bob.token --folder team ~/Team
-cairn-sync access                                     # who has access to this root's folder
-cairn-sync access grant carol write                   # a manager shares it; nobody else can
+cairn folders --server https://cairn.example --token-file bob.token
+cairn init --server https://cairn.example --token-file bob.token --folder team ~/Team
+cairn access                                     # who has access to this root's folder
+cairn access grant carol write                   # a manager shares it; nobody else can
 ```
 
 A folder a user may only read comes down whole, and nothing made on that user's devices goes up or is lost
 there: an edit, a new file, a rename stay as they are, listed by every sync as `read-only`; something deleted
 there comes back from the server; where the server changes something also changed there, both stay, the
 server's at the name. Moved out of the root, a change is kept and the server's version comes back; once the
-user may write, what was held back goes up like any change. `cairn-sync log` says which user made each commit.
+user may write, what was held back goes up like any change. `cairn log` says which user made each commit.
 
 ## The web interface
 
@@ -205,26 +205,26 @@ server {
 ## The daemon
 
 ```sh
-cairn-sync daemon --root ~/Sync       # stays in the foreground; run one per root under your service manager
-cairn-sync status                     # what it last said, and what a sync would do now
-cairn-sync status --all               # every root of yours on this machine, and which have gone
-cairn-sync forget ~/Old               # take one that has gone off that list (--even-if-present for one still there)
-cairn-sync pause                      # no sync starts until `cairn-sync resume`, through restarts too
+cairn daemon --root ~/Sync       # stays in the foreground; run one per root under your service manager
+cairn status                     # what it last said, and what a sync would do now
+cairn status --all               # every root of yours on this machine, and which have gone
+cairn forget ~/Old               # take one that has gone off that list (--even-if-present for one still there)
+cairn pause                      # no sync starts until `cairn resume`, through restarts too
 ```
 
 It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
 events can be lost. A sync takes what changed alone; once a day (`--full-sync-secs`) one decides everything the
 full way as well and takes that answer, and says in its output if the two differed, which would be a bug to
-report. Its output says what it did and what it could not do, each thing once, and `cairn-sync status`
+report. Its output says what it did and what it could not do, each thing once, and `cairn status`
 keeps what this filesystem refused (a mode on a file another user owns, say) until it is put right. A paused or
-failing root keeps being retried, and `cairn-sync sync` beside it works as usual; `cairn-sync log`, `history`, `export`
-and `conflicts` only ask the server, so they answer during a sync too. It answers `cairn-sync status` and the
+failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log`, `history`, `export`
+and `conflicts` only ask the server, so they answer during a sync too. It answers `cairn status` and the
 tray on a local socket only your user can open (`--json` gives the same objects; docs/protocol.md). As a
 systemd user unit:
 
 ```ini
 [Service]
-ExecStart=%h/.local/bin/cairn-sync daemon --root %h/Sync
+ExecStart=%h/.local/bin/cairn daemon --root %h/Sync
 Restart=always
 
 [Install]
@@ -240,17 +240,17 @@ using about a hundred times the client's CPU. A process exclusion, set once from
 spares it:
 
 ```powershell
-Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn-sync.exe"   # the path of the cairn-sync.exe you run
+Add-MpPreference -ExclusionProcess "$env:USERPROFILE\.local\bin\cairn.exe"   # the path of the cairn.exe you run
 ```
 
 Its cost: what the client writes into the tree is scanned only when another program opens it. `Get-MpPreference`
 lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
 
-On macOS, run the daemon from its app bundle, Cairn Sync.app, so that System Settings shows it as Cairn Sync with
-its icon, in Login Items and in the privacy lists, rather than as a bare `cairn-sync`. From tray/, `bash macos/bundle.sh
-../target/release/cairn-sync "$HOME/Applications/Cairn Sync.app"` makes it around the binary (with Xcode installed,
+On macOS, run the daemon from its app bundle, Cairn.app, so that System Settings shows it as Cairn with
+its icon, in Login Items and in the privacy lists, rather than as a bare `cairn`. From tray/, `bash macos/bundle.sh
+../target/release/cairn "$HOME/Applications/Cairn.app"` makes it around the binary (with Xcode installed,
 its icon is compiled for macOS 26 and later, which otherwise draw it on a gray tile at small sizes). Link
-`~/.local/bin/cairn-sync` to `Contents/MacOS/cairn-sync` inside it, and start the daemon with a launchd user agent that
+`~/.local/bin/cairn` to `Contents/MacOS/cairn` inside it, and start the daemon with a launchd user agent that
 names the bundle, one per root, as `~/Library/LaunchAgents/com.cairn.home.plist`:
 
 ```xml
@@ -261,7 +261,7 @@ names the bundle, one per root, as `~/Library/LaunchAgents/com.cairn.home.plist`
   <key>Label</key><string>com.cairn.home</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/you/Applications/Cairn Sync.app/Contents/MacOS/cairn-sync</string>
+    <string>/Users/you/Applications/Cairn.app/Contents/MacOS/cairn</string>
     <string>daemon</string><string>--root</string><string>/Users/you/Sync</string>
   </array>
   <key>AssociatedBundleIdentifiers</key><array><string>com.cairn.sync</string></array>
@@ -283,26 +283,26 @@ where an ad-hoc one was can be left under the certificate's team name in Login I
 an ad-hoc copy, then from the signed bundle with its plist written anew, and it is filed under its app.
 
 On macOS 15 and later, a daemon that launchd starts as a user agent needs the Local Network permission to reach a
-server on the same local network (one started from Terminal or SSH does not, which is why `cairn-sync sync` there
-works). macOS asks once, "Allow "Cairn Sync" to find devices on local networks?"; until someone answers, every
+server on the same local network (one started from Terminal or SSH does not, which is why `cairn sync` there
+works). macOS asks once, "Allow "Cairn" to find devices on local networks?"; until someone answers, every
 connection fails with "No route to host", and nothing syncs, though nothing is lost. A server reached through a
 router, not on the Mac's own network, needs no permission.
 
 ## Updates
 
 A release build keeps itself up to date. Each daemon asks about once an hour for the latest release, at
-cairn.storage, or at GitHub's latest release when that does not answer (`cairn-sync update` says which did), and when
+cairn.storage, or at GitHub's latest release when that does not answer (`cairn update` says which did), and when
 there is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
-it between syncs; the tray installed beside `cairn-sync` is updated with it and restarts too. No permission is asked
+it between syncs; the tray installed beside `cairn` is updated with it and restarts too. No permission is asked
 again: macOS keeps them for a signature by the same team, which every release has, and Windows by the path, which
 does not change.
 
 ```sh
-cairn-sync update                     # what is installed, how updates are set, what the feed offered last
-cairn-sync update now                 # check and install now, whatever the setting, then wait for the daemons
-cairn-sync update check               # only say what there is
-cairn-sync update notify              # only say a new release is there, here and in the tray; `auto` (the default) or `off`
-cairn-sync update rollback            # back to the version before, which is then not installed again unless asked
+cairn update                     # what is installed, how updates are set, what the feed offered last
+cairn update now                 # check and install now, whatever the setting, then wait for the daemons
+cairn update check               # only say what there is
+cairn update notify              # only say a new release is there, here and in the tray; `auto` (the default) or `off`
+cairn update rollback            # back to the version before, which is then not installed again unless asked
 ```
 
 The tray's Settings tab has the same choice and an Update now button. What it installs is only ever what the
@@ -311,7 +311,7 @@ must also be signed by the team of the one it replaces. A kill or a full disk at
 or the new one in place, whole; the one before is kept beside it in `.cairn-update`, and a version on which a
 daemon keeps dying before it gets through a sync is taken back by itself. A release on a newer protocol waits until
 the server speaks it, so upgrade the server first: it is never updated by itself. Where the program's folder is
-not yours to write, as for a `/usr/local/bin` owned by root, `cairn-sync update` says so, and `sudo cairn-sync update now`
+not yours to write, as for a `/usr/local/bin` owned by root, `cairn update` says so, and `sudo cairn update now`
 installs it; the daemons restart into it.
 
 A build of your own names no feed and is never updated by anyone's releases. To update it from releases of your
@@ -334,10 +334,10 @@ node_modules/
 To keep a server folder off this device, including one that does not exist here yet:
 
 ```sh
-cairn-sync exclude photos                  # stays excluded if it is renamed; the copy here stays too
-cairn-sync exclude photos --remove-local   # removes the copy here, except what differs from the server
-cairn-sync include photos                  # brings it back
-cairn-sync include photos --merge          # the same, with a copy left here merging in
+cairn exclude photos                  # stays excluded if it is renamed; the copy here stays too
+cairn exclude photos --remove-local   # removes the copy here, except what differs from the server
+cairn include photos                  # brings it back
+cairn include photos --merge          # the same, with a copy left here merging in
 ```
 
 Either way, what this device does not sync stays untouched on the server and on other devices, and deleting
@@ -347,12 +347,12 @@ out path here is a delete for everyone, as in git. A rule is about paths, so you
 the folder instead, because another device renamed it, what the rule covered stays out and is listed. `cairn
 status` lists what is left out.
 
-`cairn-sync sync` exits 0 when both sides agree (anything excluded is listed), 2 when it paused and is waiting
+`cairn sync` exits 0 when both sides agree (anything excluded is listed), 2 when it paused and is waiting
 for you, 3 when another run is needed, and 1 on an error. In every case nothing is lost.
 
 By default a client applies modes, `user.*` xattrs and POSIX ACLs. Owners (`--owners`), setuid and setgid
-(`--setid`) and capabilities (`--capabilities`) need an explicit choice at `cairn-sync init`; whatever a client
-does not apply stays stored for those that do. `cairn-sync export --exact` applies all of it, given privileges.
+(`--setid`) and capabilities (`--capabilities`) need an explicit choice at `cairn init`; whatever a client
+does not apply stays stored for those that do. `cairn export --exact` applies all of it, given privileges.
 
 ## Build and test
 

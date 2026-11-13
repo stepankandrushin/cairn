@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Draws Cairn's two app icons: the tray (Cairn Tray.app) and the daemon (Cairn Sync.app), a cairn of
+"""Draws Cairn's two app icons: the tray (Cairn Tray.app) and the daemon (Cairn.app), a cairn of
 three stones, the daemon's inside two sync arrows. Run from tray/ with `python3 -I icons/make.py`; needs
 pycairo and Pillow (Debian: python3-cairo python3-pil). It writes, next to this file:
 
 - Cairn.xcassets and Sync.xcassets, the asset catalogs macos/bundle.sh compiles with Xcode's actool;
 - icon.icns and sync.icns, the plain icons a bundle falls back on without actool;
 - icon.png and icon.ico, the app's, which Tauri builds into the tray on Windows;
-- sync.ico, the daemon's, which crates/cli/build.rs builds into cairn-sync.exe on Windows.
+- sync.ico, the daemon's, which crates/cli/build.rs builds into cairn.exe on Windows.
 
 The body follows macOS's app icon grid, an 824 px continuous-corner square on a 1024 px canvas with room for
 its shadow. macOS 26 and later draw an icon they do not take for one of theirs smaller, on a gray tile: a plain
@@ -289,7 +289,7 @@ def sheet(path):
     rowh = 600
     out = Image.new('RGBA', (2200, 120 + rowh * len(names)), (246, 246, 248, 255))
     d = ImageDraw.Draw(out)
-    d.text((40, 36), 'Cairn icons by style. Left: the app (tray). Right: the daemon (Cairn Sync).',
+    d.text((40, 36), 'Cairn icons by style. Left: the app (tray). Right: the daemon (Cairn).',
            font=font(40), fill=(20, 20, 20))
 
     def row(x, y, w, img, name, dark):
@@ -322,7 +322,7 @@ def sheet(path):
                                 outline=None if dark else (200, 200, 200))
             row(1530, py + 10, 620, bigs[0], 'Cairn', dark)
             d.line((1630, py + 115, 2140, py + 115), fill=(70, 70, 72) if dark else (225, 225, 225), width=2)
-            row(1530, py + 120, 620, bigs[1], 'Cairn Sync', dark)
+            row(1530, py + 120, 620, bigs[1], 'Cairn', dark)
     out.convert('RGB').save(path, optimize=True)
 
 

@@ -907,7 +907,7 @@ async fn undelete(root_id: String, ids: Vec<String>) -> Result<String, String> {
     .await
 }
 
-/// Takes a root shown as gone off the registry, as `cairn-sync forget` does; the window asked first.
+/// Takes a root shown as gone off the registry, as `cairn forget` does; the window asked first.
 #[tauri::command]
 async fn forget(root_id: String) -> Result<String, String> {
     blocking(move || actions::forget(hub(), &root_id)).await
@@ -976,7 +976,7 @@ async fn update_now() -> Result<String, String> {
             .map(|r| r.entry.root_id.clone())
             .collect();
         if up.is_empty() {
-            return Err("no daemon is running here to update from: `cairn-sync update now` does it".into());
+            return Err("no daemon is running here to update from: `cairn update now` does it".into());
         }
         let mut last = String::new();
         for id in up {

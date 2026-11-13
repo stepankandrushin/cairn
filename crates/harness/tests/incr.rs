@@ -908,7 +908,7 @@ fn umask_join(
 /// change nothing, so the device's next sync takes what changed alone, which is nothing, under `limit`
 /// or the one a release build has, both below what the notes name. Counted as changed, a join's note of
 /// 367,526 objects sent every other device to the whole tree, for minutes and gigabytes, to apply
-/// nothing, and a note to each, from a server before groups, did by their number. `cairn-sync log` there
+/// nothing, and a note to each, from a server before groups, did by their number. `cairn log` there
 /// still shows the notes and every object they name.
 #[cfg(unix)]
 fn a_join_s_notes_leave_the_others_incremental(
@@ -1063,7 +1063,7 @@ fn where_the_ledger_cannot_vouch_it_is_rebuilt_or_the_whole_tree_taken() {
     incremental(&a);
     incremental(&b);
     assert_eq!(b.read("d/e/f3"), b"edited with no ledger");
-    // A copy kept here by `cairn-sync exclude`, found by inode wherever it goes.
+    // A copy kept here by `cairn exclude`, found by inode wherever it goes.
     let run = a.cairn(&["exclude", "fill"]);
     assert!(run.ok(), "{}", run.text());
     a.write("f1", "edited again");
@@ -1211,7 +1211,7 @@ fn a_folder_deleted_elsewhere_deeper_than_the_widenings_goes_here_too() {
 
 /// The other device moves a deep folder into one this device excludes by identity, then one out of it:
 /// what goes out of view goes from here, unchanged, and what comes into view comes down. There is no rule
-/// to take the moved folder whole: the copy `cairn-sync exclude` keeps sends such a root the whole way.
+/// to take the moved folder whole: the copy `cairn exclude` keeps sends such a root the whole way.
 #[test]
 fn moves_into_and_out_of_a_folder_excluded_by_identity() {
     let (_sb, _s, a, b) = pair("incr-excluded-moves");

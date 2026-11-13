@@ -9,7 +9,7 @@
 //!
 //! A kill at any moment is the crash `sync()` already recovers from, so no signal is handled.
 //!
-//! It also serves the local API (control.rs) to `cairn-sync status` and the tray: its status, and the
+//! It also serves the local API (control.rs) to `cairn status` and the tray: its status, and the
 //! requests that change no tree. Look now is an event like the watcher's; a pause stops it starting a
 //! sync until a resume, and outlives a restart, being kept in `.cairn`; update now asks the updater.
 //!
@@ -106,7 +106,7 @@ enum Wake {
     Control,
 }
 
-/// What the daemon is up to, for `cairn-sync status` and the tray: `.cairn/daemon.json`, and the local
+/// What the daemon is up to, for `cairn status` and the tray: `.cairn/daemon.json`, and the local
 /// API's status. Defined in the protocol crate, so every reader has the same fields.
 pub use cairn_protocol::local::{DaemonStatus as Status, NotApplied, Waiting, MAX_NOT_APPLIED};
 
@@ -205,7 +205,7 @@ fn show(path: &Path, status: &Status, hub: &Hub) {
     hub.publish(status);
 }
 
-/// While a sync runs, how often what it is doing goes to the local API, for `cairn-sync status` and the tray.
+/// While a sync runs, how often what it is doing goes to the local API, for `cairn status` and the tray.
 const PROGRESS_SHOWN: Duration = Duration::from_secs(2);
 /// A sync still running this long after it began says in the log what it is doing, and again every
 /// [`PROGRESS_SAID`] after: a scan that reads a folder just taken in can run for an hour, and a log
@@ -1088,7 +1088,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
         // Held from the first time the marker can be read: a second daemon is refused, not interleaved.
         if lock.is_none() {
             if let Ok(id) = read_root_id(path) {
-                // `cairn-sync status` holds this for an instant to see whether a daemon is running.
+                // `cairn status` holds this for an instant to see whether a daemon is running.
                 let mut taken = take_lock(&id);
                 for _ in 0..LOCK_ATTEMPTS {
                     if taken.is_ok() {
@@ -1105,7 +1105,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                         }
                         if let Err(e) = crate::registry::register(path, &id, &status.server) {
                             log(&format!(
-                                "this root could not be added to the list of roots, so `cairn-sync status --all` and the tray do not show it: {e:#}"
+                                "this root could not be added to the list of roots, so `cairn status --all` and the tray do not show it: {e:#}"
                             ));
                         }
                         if let Err(e) = pause.load(path) {
@@ -1125,7 +1125,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                                 );
                             }
                             Err(e) => log(&format!(
-                                "cannot serve the local API, so `cairn-sync status` reads this daemon's file and the tray does not see it: {e}"
+                                "cannot serve the local API, so `cairn status` reads this daemon's file and the tray does not see it: {e}"
                             )),
                         }
                         lock = Some(l);
@@ -1135,7 +1135,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                         bail!(
-                            "another cairn-sync daemon is already running for {}",
+                            "another cairn daemon is already running for {}",
                             path.display()
                         )
                     }
@@ -1335,7 +1335,7 @@ pub fn run(path: &Path, opts: &DaemonOptions, log: &mut dyn FnMut(&str)) -> Resu
                 }
             }
             Err(e) if e.downcast_ref::<Busy>().is_some() => {
-                // A person's own `cairn-sync sync` or `cairn-sync restore`. It finishes soon, and says how it went.
+                // A person's own `cairn sync` or `cairn restore`. It finishes soon, and says how it went.
                 schedule.retry_at = Some(Instant::now() + MIN_GAP);
                 lines = said.clone();
             }

@@ -282,7 +282,7 @@ pub(super) async fn restore(
             return Ok(bad_request("that is the revision it has now"));
         }
         let revision = RevisionId::random();
-        // The old revision whole, its metadata too, as `cairn-sync restore` brings it back.
+        // The old revision whole, its metadata too, as `cairn restore` brings it back.
         let op = Op::Update {
             object: req.object,
             base,

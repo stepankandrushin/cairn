@@ -58,8 +58,8 @@ These outrank features and speed; each has failure tests.
 | Linux watcher | inotify as the baseline, fanotify with `FAN_REPORT_FID` when privileged | The daemon runs without root, and fanotify's mount and filesystem marks need `CAP_SYS_ADMIN` |
 | Other watchers | FSEvents on macOS, ReadDirectoryChangesW on Windows | All plus periodic full reconcile: a sync lists where events were, so a lost event waits for the reconcile's scan of the whole tree, the safety net |
 | Web UI | Plain HTML, CSS and JavaScript modules, embedded in the server binary, with no build step | Thin client of the same API; stays out of the server's hot path. Building the server needs cargo alone, and no npm package runs in a page that holds a session |
-| Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with. On macOS the tray and the daemon are each a signed app bundle, Cairn Tray.app and Cairn Sync.app; each program has one name everywhere, `cairn-sync` (Cairn Sync, the CLI and daemon) and `cairn-tray` (Cairn Tray), its bundle on macOS and what Windows shows for it named after it | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed. A bundle is how macOS names a background program and shows its icon: in System Settings, and in Activity Monitor once the daemon has checked itself in with LaunchServices, as a background-only app, which nothing can bring to the front. Windows takes the name and icon from the program's file, so `cairn-sync.exe` carries them as resources. One signature across builds keeps its permissions through upgrades |
-| Updates | Each daemon asks its release's feeds about once an hour, the project's own site first and its GitHub mirror only when that does not answer, and installs a newer release itself, `cairn-sync` and the tray beside it, restarting into it between syncs; a person can also ask, by `cairn-sync update now` or in the tray, or set it to only notify, or off. What it installs is an Ed25519-signed list of every file's size and SHA-256, and on macOS also a bundle signed by the team of the one it replaces. The server is not among them | A fix reaches every device within the hour, and nobody stays on an old version by forgetting. No permission is asked again: macOS keeps them for the signing team, which Developer ID gives every release, and Windows by path. A key of the project's own rather than an OS certificate is what is trusted, so Linux is covered alike, and a build from source updates from nobody's releases but its builder's. Because the key is what is trusted, where the file comes from is not: a release's files are named beside `update.json`, so the one signed file serves from the site and from GitHub alike, a release waits for no one else's service, and either being down delays no update. A release is tested before it is published by the full suite on the machine that builds it, with nothing skipped, rather than by waiting for a hosted CI, which still runs on every push as a second check. The server goes first by hand, because a client takes a release on a new protocol only once its server speaks it |
+| Desktop UI | A tray, `cairn-tray` (Tauri), a separate program nobody needs: it shows each daemon through the local API and opens what a person deals with. On macOS the tray and the daemon are each a signed app bundle, Cairn Tray.app and Cairn.app; each program has one name everywhere, `cairn` (Cairn, the CLI and daemon) and `cairn-tray` (Cairn Tray), its bundle on macOS and what Windows shows for it named after it | The daemon runs where no desktop does, the OS starts it, and a tray that crashes or was never installed stops nothing; native integration only where needed. A bundle is how macOS names a background program and shows its icon: in System Settings, and in Activity Monitor once the daemon has checked itself in with LaunchServices, as a background-only app, which nothing can bring to the front. Windows takes the name and icon from the program's file, so `cairn.exe` carries them as resources. One signature across builds keeps its permissions through upgrades |
+| Updates | Each daemon asks its release's feeds about once an hour, the project's own site first and its GitHub mirror only when that does not answer, and installs a newer release itself, `cairn` and the tray beside it, restarting into it between syncs; a person can also ask, by `cairn update now` or in the tray, or set it to only notify, or off. What it installs is an Ed25519-signed list of every file's size and SHA-256, and on macOS also a bundle signed by the team of the one it replaces. The server is not among them | A fix reaches every device within the hour, and nobody stays on an old version by forgetting. No permission is asked again: macOS keeps them for the signing team, which Developer ID gives every release, and Windows by path. A key of the project's own rather than an OS certificate is what is trusted, so Linux is covered alike, and a build from source updates from nobody's releases but its builder's. Because the key is what is trusted, where the file comes from is not: a release's files are named beside `update.json`, so the one signed file serves from the site and from GitHub alike, a release waits for no one else's service, and either being down delays no update. A release is tested before it is published by the full suite on the machine that builds it, with nothing skipped, rather than by waiting for a hosted CI, which still runs on every push as a second check. The server goes first by hand, because a client takes a release on a new protocol only once its server speaks it |
 | Mobile | Swift/SwiftUI and Kotlin, Rust core through uniffi | Native file-provider and background-task integration |
 | Deployment | One binary + storage (+ PostgreSQL at scale) | No fleet of supporting services |
 
@@ -242,7 +242,7 @@ here), and takes everything else as written since. The round then runs as on a l
 writes the ledger whole. A round on a ledger kept that finds one inode at two places in the scan, as when
 something moves while it walks, or that identification takes a folder for another object than its inode
 says, goes again on a fresh scan and the ledger rebuilt. The full sync runs instead, said too, on a first
-sync, with no base to rebuild from; on a dry run; with copies kept by `cairn-sync exclude`, found by inode; with
+sync, with no base to rebuild from; on a dry run; with copies kept by `cairn exclude`, found by inode; with
 a leftover of a run that did not finish; when the journal's operations besides notes, the set or what a
 rebuild finds unsettled comes to more than a quarter of the tree, the set counting only what the state holds something of, so not the
 ID a join's adoption leaves behind for each file it took in; when the journal does not replay on the part
@@ -317,17 +317,17 @@ back for it on the same backoff and holds nothing else back, and the file's own 
 its close does. Nor is one the system refuses: it is come back for alike. Between syncs it rests for twice what the last one did that every sync repeats, loading the
 state, the scan and the merge, so a tree that never rests keeps it busy at most a third of the time, but for 30 s at
 the most, so that a change written as a sync ends waits at most about 30 s and one sync, however big the tree; the
-data a big download moved is no reason to wait, as the next sync does not move it again. `cairn-sync status` says when changes wait, until when, and why, and while a sync runs what it is doing,
+data a big download moved is no reason to wait, as the next sync does not move it again. `cairn status` says when changes wait, until when, and why, and while a sync runs what it is doing,
 how far it has got and when anything in it last moved, which the log says too once it has run a minute, so a
 long scan is told from a stuck one. It serves the local API
 (`cairn_protocol::local`) on a socket only its user can open: its status, pushed on each change, the open
 conflicts, and three requests that change no tree: look now, pause, resume. A pause outlives a restart
 and shows as `paused`. Each user's roots on a device are listed in a registry the CLI and the daemon add
-to, for `cairn-sync status --all` and the tray. A root that has gone stays listed as gone until a person takes it
-off with `cairn-sync forget`, which takes off one still there only when asked, or with the tray's Forget, which never does.
+to, for `cairn status --all` and the tray. A root that has gone stays listed as gone until a person takes it
+off with `cairn forget`, which takes off one still there only when asked, or with the tray's Forget, which never does.
 
 **Selection.** Rules in `.gitignore` syntax in `.cairn/ignore`, and folders excluded by identity with
-`cairn-sync exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree
+`cairn exclude`, which stay excluded through a rename. No ignored names by default, ever, and no in-tree
 rules file: both are one device's choice, as in Syncthing, so they cannot conflict, a rule cannot arrive from
 another device and stop syncing something here, and a new device's rules are in place before anything comes
 down. A project's own `.gitignore` means nothing to Cairn.
@@ -341,15 +341,15 @@ This holds with no rules too, for a delete elsewhere that is undone before this 
 |---|---|
 | Excluded here, on the server or not | Neither side touches it, in either direction; deleting the copy here means nothing to the server |
 | A rule lifted, or a folder included | What this device does not hold comes down, and never reads as deleted. What is here merges as new: what changed keeps both versions |
-| A copy left by `cairn-sync exclude` | Left alone, by inode wherever it moves here, and by path for anything new this device has no record of, so a folder generated again stays out too, whatever the server's folder does, even if that is deleted. It joins in only with `cairn-sync include --merge`, which has to be asked for since an old copy can bring back what was deleted since and leave conflict copies for everyone. If the server gets something else at its path, sync reports what is in the way and waits for a person |
+| A copy left by `cairn exclude` | Left alone, by inode wherever it moves here, and by path for anything new this device has no record of, so a folder generated again stays out too, whatever the server's folder does, even if that is deleted. It joins in only with `cairn include --merge`, which has to be asked for since an old copy can bring back what was deleted since and leave conflict copies for everyone. If the server gets something else at its path, sync reports what is in the way and waits for a person |
 | `mv` into an excluded path here | As in git, a delete of what moved, for everyone: the copy here is out of sight, and the server's history keeps it |
-| `cairn-sync exclude` when what is here is not what the server has at that path, or anything under it differs | Refused: leaving the wrong thing out would read the right one as deleted or as new. A rule needs no such agreement, and a folder this device holds nothing of can always be excluded |
-| A rule by path, when a sync is about to move the folder and the rule would not match there | Stays out by inode, as a copy left by `cairn-sync exclude` does, reported, and listed by `cairn-sync status`: nobody here chose that. So does what this device held there, put there by its own `mv` that a cycle undone takes back, say: its record does not bring it into view. Not a file with another name here, which would take that name out of view with it. `cairn-sync include --merge` brings it in. A person's own `mv` here is a choice: the rule is about paths, so it goes up, as in git |
+| `cairn exclude` when what is here is not what the server has at that path, or anything under it differs | Refused: leaving the wrong thing out would read the right one as deleted or as new. A rule needs no such agreement, and a folder this device holds nothing of can always be excluded |
+| A rule by path, when a sync is about to move the folder and the rule would not match there | Stays out by inode, as a copy left by `cairn exclude` does, reported, and listed by `cairn status`: nobody here chose that. So does what this device held there, put there by its own `mv` that a cycle undone takes back, say: its record does not bring it into view. Not a file with another name here, which would take that name out of view with it. `cairn include --merge` brings it in. A person's own `mv` here is a choice: the rule is about paths, so it goes up, as in git |
 | Moved out of view elsewhere | Goes from here like anything deleted there, if unchanged. Changed here: it stays as a new object, and the server's stays where it moved to |
 | A folder deleted elsewhere, holding what is excluded here | What is excluded stays, and so does the folder, here only: it does not come back for anyone unless something real is put in it, or it is emptied, since an empty folder is real |
 | A folder deleted here, holding on the server what is excluded here | The folder comes back here, empty of that, since the server's copy is not this device's to delete |
 | A name here taken on the server by something out of view | Keep both under a conflict name |
-| `cairn-sync exclude --remove-local` | Syncs first, then goes the way a delete from elsewhere goes: unchanged files only, and nothing excluded. Without the flag, nothing is synced first: what is new in the copy was not meant to go up |
+| `cairn exclude --remove-local` | Syncs first, then goes the way a delete from elsewhere goes: unchanged files only, and nothing excluded. Without the flag, nothing is synced first: what is new in the copy was not meant to go up |
 
 On-demand files are an addition: ordinary fully downloaded folders stay, above all for
 projects and anything needing faithful metadata.
@@ -361,10 +361,10 @@ the system refuses this device, to read or to write (an access list, another pro
 that guards files, a failing disk: told by the kind of error, never by which program, Windows' codes for a
 file blocked or removed as a threat among them), is held as it was: no delete, no revision, nothing of it
 reverted elsewhere. It is named with the system's own words, and on Windows the hint that another program or
-security software may block it, in a sync's report, `cairn-sync status`, the daemon's status, log and tray, and
+security software may block it, in a sync's report, `cairn status`, the daemon's status, log and tray, and
 tried again on the backoff, holding nothing else back, until it clears by itself once let in. A tree most of
 which is refused pauses as one most of which vanished does, and `--allow-mass-delete` does not lift that,
-since nothing is deleted. What is gone, whatever took it, is a delete as before, which `cairn-sync deleted`
+since nothing is deleted. What is gone, whatever took it, is a delete as before, which `cairn deleted`
 lists to bring back. A request
 the network fails in a way that says nothing about the request (no socket buffers, a connection reset,
 refused or closed before the whole answer, a name not found, a proxy's 502 to 504) is tried again within
@@ -389,7 +389,7 @@ for inspection; undo a batch from one device; review permission and rename histo
 
 Deleted files are where a person looks for what is gone, whatever took it: another device, a script, or an
 antivirus that removed a file on one device, which to every sync tool is a delete like any other and reaches
-every device. So the tray's "Recently deleted", `cairn-sync deleted` and `cairn-sync undelete` list what is still
+every device. So the tray's "Recently deleted", `cairn deleted` and `cairn undelete` list what is still
 deleted and bring it back, with no code for any antivirus. A folder is listed once, with what one device
 deleted in it within 10 minutes before. Bringing it back links each object to the entry it last had, as
 itself with what it last held: nothing is reverted, nothing replaced, and a name taken since gets a restored
@@ -417,7 +417,7 @@ asking; too low a level answers 403. The server's administrator adds users, toke
 `cairn-server` on the data directory, while it serves too; any user adds a folder of their own through the
 API, which they manage, and a folder's managers change who has access
 through it. A folder's name is what paths, devices, links and commands use, and a server's first is
-`cloud`, which `cairn-sync init` joins as the only one its token reaches. Names are one space for the server, so a
+`cloud`, which `cairn init` joins as the only one its token reaches. Names are one space for the server, so a
 user asking for one that is taken learns that it is, and nothing more. A folder's managers rename it through
 the API while the server serves, and the administrator with it stopped; its chunks stay where they are, so a
 rename moves and copies nothing; the former name goes on reaching it and no other folder may take it, so
@@ -444,7 +444,7 @@ beside it, by the object's identity, so a move keeps it; it stops while the obje
 once its maker no longer manages the folder. A user's share is reached only through the web's endpoints,
 since the sync protocol's reveal the whole tree; syncing one waits with mounting a shared folder above. A
 browser signs in with a token, or by a one-time ticket a device asks for with its own token, which the tray and
-`cairn-sync web` open it with; either sets a session the server signed, naming the token and never holding it, in a
+`cairn web` open it with; either sets a session the server signed, naming the token and never holding it, in a
 cookie no script can read, and a request signed in by it changes nothing without a header no other site's page
 can send. Auth: local accounts, then OIDC.
 

@@ -1,4 +1,4 @@
-//! The `cairn-sync` command-line client.
+//! The `cairn` command-line client.
 
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_engine::client::{Client, Retries};
@@ -28,7 +28,7 @@ macro_rules! errln {
     }};
 }
 
-/// Set once the output cannot be written. Whoever reads it going away, as `cairn-sync status | head`
+/// Set once the output cannot be written. Whoever reads it going away, as `cairn status | head`
 /// does, is no reason to panic or to stop what the command is doing: the rest goes unprinted.
 static STDOUT_GONE: AtomicBool = AtomicBool::new(false);
 
@@ -40,7 +40,7 @@ fn out(args: std::fmt::Arguments) {
     if let Err(e) = o.write_fmt(args).and_then(|()| o.write_all(b"\n")) {
         STDOUT_GONE.store(true, Ordering::Relaxed);
         if e.kind() != std::io::ErrorKind::BrokenPipe {
-            errln!("cairn-sync: the output cannot be written, so the rest is not shown: {e}");
+            errln!("cairn: the output cannot be written, so the rest is not shown: {e}");
         }
     }
 }
@@ -59,7 +59,7 @@ const EXIT_PARTIAL: u8 = 3;
 
 #[derive(Parser)]
 #[command(
-    name = "cairn-sync",
+    name = "cairn",
     version,
     about = "Sync a real filesystem with a Cairn server, losing nothing about it"
 )]
@@ -89,7 +89,7 @@ enum Command {
         /// A file holding the access token. Or set CAIRN_TOKEN.
         #[arg(long)]
         token_file: Option<PathBuf>,
-        /// The folder on the server to sync here, from those `cairn-sync folders` lists. Default: the one
+        /// The folder on the server to sync here, from those `cairn folders` lists. Default: the one
         /// the token reaches, if it reaches one alone.
         #[arg(long, visible_alias = "folder")]
         namespace: Option<String>,
@@ -169,17 +169,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Take a root that has gone off this user's list of roots, which `cairn-sync status --all` and the
+    /// Take a root that has gone off this user's list of roots, which `cairn status --all` and the
     /// tray show. Nothing in any root changes.
     Forget {
-        /// The root's path as `cairn-sync status --all` lists it, or its ID.
+        /// The root's path as `cairn status --all` lists it, or its ID.
         path: PathBuf,
         /// Take it off even though it is still there. It syncs as before, and its daemon lists it
         /// again when it starts.
         #[arg(long)]
         even_if_present: bool,
     },
-    /// Pause this root's daemon: it starts no sync until `cairn-sync resume`, through restarts too. Changes
+    /// Pause this root's daemon: it starts no sync until `cairn resume`, through restarts too. Changes
     /// here and on the server wait, and none is lost.
     Pause,
     /// Resume this root's daemon, which then syncs what changed while it was paused.
@@ -237,7 +237,7 @@ enum Command {
         /// The sequence number to go back to, for a file or a whole directory, deleted ones too.
         #[arg(long, conflicts_with = "revision")]
         at: Option<u64>,
-        /// One revision of one object, from `cairn-sync history`.
+        /// One revision of one object, from `cairn history`.
         #[arg(long)]
         revision: Option<String>,
         #[arg(long)]
@@ -265,7 +265,7 @@ enum Command {
         all: bool,
     },
     /// What was deleted and is still deleted, newest first, from the server's history: a folder once,
-    /// with what was deleted with it. Each line ends with the ID `cairn-sync undelete` takes.
+    /// with what was deleted with it. Each line ends with the ID `cairn undelete` takes.
     Deleted {
         /// Only what was deleted in the last N days.
         #[arg(long, default_value_t = cairn_protocol::local::DEFAULT_DELETED_DAYS)]
@@ -274,7 +274,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Bring back what `cairn-sync deleted` lists, by its ID, as it was when deleted: a folder with what was
+    /// Bring back what `cairn deleted` lists, by its ID, as it was when deleted: a folder with what was
     /// deleted with it. Nothing is replaced: where a name has been taken since, it comes back beside it
     /// under a restored name. Then syncs, unless --no-sync.
     Undelete {
@@ -284,7 +284,7 @@ enum Command {
         no_sync: bool,
     },
     /// This device's Cairn and its updates: by default each daemon asks the feed every hour or so and
-    /// installs a new release, `cairn-sync` and the tray beside it, restarting into it between syncs.
+    /// installs a new release, `cairn` and the tray beside it, restarting into it between syncs.
     Update {
         #[command(subcommand)]
         what: Option<UpdateCommand>,
@@ -334,12 +334,12 @@ enum UpdateCommand {
     },
     /// Install each new release as it comes, and restart into it: the default.
     Auto,
-    /// Only say that a new release is there, here and in the tray; `cairn-sync update now` installs it.
+    /// Only say that a new release is there, here and in the tray; `cairn update now` installs it.
     Notify,
-    /// Never ask the feed. `cairn-sync update now` still installs.
+    /// Never ask the feed. `cairn update now` still installs.
     Off,
     /// Put back the version from before the last update, which is then not installed again unless
-    /// asked for by `cairn-sync update now`.
+    /// asked for by `cairn update now`.
     Rollback,
 }
 
@@ -448,7 +448,7 @@ fn print_sync(report: &cairn_engine::SyncReport) -> u8 {
     }
     if !report.excluded_here.is_empty() || !report.not_synced_here.is_empty() {
         outln!(
-            "by this device's choice: {} entries here not synced, {} on the server not here; `cairn-sync status` lists them",
+            "by this device's choice: {} entries here not synced, {} on the server not here; `cairn status` lists them",
             report.excluded_here.len(),
             report.not_synced_here.len()
         );
@@ -538,7 +538,7 @@ fn print_view(v: &RootView) {
     }
 }
 
-/// How many of what the daemon's last sync skipped `cairn-sync status` lists.
+/// How many of what the daemon's last sync skipped `cairn status` lists.
 const MAX_SKIPS_SHOWN: usize = 20;
 
 fn print_daemon(s: &cairn_engine::daemon::Status) {
@@ -626,7 +626,7 @@ fn print_daemon(s: &cairn_engine::daemon::Status) {
     }
     if let Some(since) = s.paused_since {
         outln!(
-            "daemon: paused by request since {}: `cairn-sync resume` resumes it",
+            "daemon: paused by request since {}: `cairn resume` resumes it",
             date_time(since)
         );
     }
@@ -676,9 +676,9 @@ fn run_sync(root: &Path, opts: SyncOptions) -> Result<u8> {
 fn compact(root: &Path) {
     match cairn_engine::sync::compact(root) {
         Ok(Compaction::Done { .. } | Compaction::NotDue(_)) => {}
-        Ok(short) => errln!("cairn-sync: {short}"),
+        Ok(short) => errln!("cairn: {short}"),
         Err(e) if e.downcast_ref::<Busy>().is_some() => {}
-        Err(e) => errln!("cairn-sync: the state was not compacted, and stays as it was: {e:#}"),
+        Err(e) => errln!("cairn: the state was not compacted, and stays as it was: {e:#}"),
     }
 }
 
@@ -693,7 +693,7 @@ fn date_time(epoch: i64) -> String {
     )
 }
 
-/// The folder a token reaches, when it reaches one alone: what `cairn-sync init` syncs unless told which.
+/// The folder a token reaches, when it reaches one alone: what `cairn init` syncs unless told which.
 /// A server before accounts had one token for every folder, and `default` first.
 fn only_folder(server: &str, token: &str, allow_http: bool) -> Result<String> {
     let me = match cairn_engine::client::Client::of_server(server, token, allow_http)?.me() {
@@ -797,11 +797,11 @@ fn run_inner() -> Result<u8> {
                 .map_err(anyhow::Error::from)
                 .and_then(|id| registry::register(&dir, &id, &root.config.server));
             if let Err(e) = listed {
-                errln!("cairn-sync: this root could not be added to the list of roots, so `cairn-sync status --all` does not show it until its daemon starts: {e:#}");
+                errln!("cairn: this root could not be added to the list of roots, so `cairn status --all` does not show it until its daemon starts: {e:#}");
             }
             // Its user's own name for the folder, if they have none: the web shows it them.
             if let Some(line) = cairn_engine::root::offer_root_name(&dir) {
-                errln!("cairn-sync: {line}");
+                errln!("cairn: {line}");
             }
             outln!(
                 "{} is a sync root of the folder {namespace}; the server is at sequence {head}",
@@ -858,7 +858,7 @@ fn run_inner() -> Result<u8> {
             // The daemon alone: no other command has macOS know it as an app.
             #[cfg(target_os = "macos")]
             if let Err(e) = macos::check_in() {
-                say(&format!("macOS does not know this daemon as its app, so Activity Monitor shows it as cairn-sync, without its icon; it syncs as before: {e}"));
+                say(&format!("macOS does not know this daemon as its app, so Activity Monitor shows it as cairn, without its icon; it syncs as before: {e}"));
             }
             cairn_engine::daemon::run(&root, &opts, &mut |line| say(line))?;
             // This program was replaced: the new one, in this process where the system allows.
@@ -902,7 +902,7 @@ fn run_inner() -> Result<u8> {
             }
             if views.is_empty() {
                 outln!(
-                    "no roots listed for this user: `cairn-sync init` and a starting daemon list theirs"
+                    "no roots listed for this user: `cairn init` and a starting daemon list theirs"
                 );
             }
             for (i, v) in views.iter().enumerate() {
@@ -967,7 +967,7 @@ fn run_inner() -> Result<u8> {
                 outln!("nothing to do at sequence {}", report.head);
             }
             for path in &report.excluded_here {
-                outln!("not synced, by .cairn/ignore or `cairn-sync exclude`: {path}");
+                outln!("not synced, by .cairn/ignore or `cairn exclude`: {path}");
             }
             for path in &report.not_synced_here {
                 outln!("on the server, not synced here: {path}");
@@ -975,20 +975,17 @@ fn run_inner() -> Result<u8> {
             if let Ok(root) = Root::open(&root_path) {
                 let excluded = selection::excluded_paths(&root).unwrap_or_default();
                 for path in excluded.on_server {
-                    outln!(
-                        "excluded with `cairn-sync exclude`: {}",
-                        display_path(&path)
-                    );
+                    outln!("excluded with `cairn exclude`: {}", display_path(&path));
                 }
                 for (path, there) in excluded.copies {
                     if there {
                         outln!(
-                            "left here when it was excluded: {0}; delete it, or `cairn-sync include --merge {0}`",
+                            "left here when it was excluded: {0}; delete it, or `cairn include --merge {0}`",
                             display_path(&path)
                         );
                     } else {
                         outln!(
-                            "anything new at {0} stays out too, until `cairn-sync include {0}`",
+                            "anything new at {0} stays out too, until `cairn include {0}`",
                             display_path(&path)
                         );
                     }
@@ -1194,7 +1191,7 @@ fn run_inner() -> Result<u8> {
             };
             match ask_daemon(&root_path, &request)? {
                 Reply::Done if pause => outln!(
-                    "paused: the daemon starts no sync until `cairn-sync resume`; changes wait, and none is lost"
+                    "paused: the daemon starts no sync until `cairn resume`; changes wait, and none is lost"
                 ),
                 Reply::Done => outln!("resumed: the daemon syncs what changed meanwhile"),
                 Reply::Error { text } => bail!("{text}"),
@@ -1332,7 +1329,7 @@ fn run_inner() -> Result<u8> {
                 ),
                 Err(e) => {
                     eprintln!(
-                        "cairn-sync: {e}: open this address within two minutes, which signs in once:"
+                        "cairn: {e}: open this address within two minutes, which signs in once:"
                     );
                     outln!("{url}");
                 }
@@ -1428,7 +1425,7 @@ fn update_command(what: UpdateCommand) -> Result<u8> {
                     status
                         .waits
                         .as_deref()
-                        .unwrap_or("`cairn-sync update now` installs it")
+                        .unwrap_or("`cairn update now` installs it")
                 );
             } else if let Some(w) = &status.waits {
                 outln!("{w}");
@@ -1518,9 +1515,8 @@ fn update_command(what: UpdateCommand) -> Result<u8> {
                 match policy {
                     Policy::Auto => "auto: each new release is installed as it comes",
                     Policy::Notify =>
-                        "notify: a new release is shown, and installed by `cairn-sync update now`",
-                    Policy::Off =>
-                        "off: the feed is not asked; `cairn-sync update now` still installs",
+                        "notify: a new release is shown, and installed by `cairn update now`",
+                    Policy::Off => "off: the feed is not asked; `cairn update now` still installs",
                 }
             );
             Ok(EXIT_OK)
@@ -1618,7 +1614,7 @@ pub fn run() -> ExitCode {
                 outln!("paused: {p}");
                 return ExitCode::from(EXIT_PAUSED);
             }
-            errln!("cairn-sync: {e:#}");
+            errln!("cairn: {e:#}");
             ExitCode::from(EXIT_ERROR)
         }
     }

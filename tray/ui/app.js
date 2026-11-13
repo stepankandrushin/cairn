@@ -189,7 +189,7 @@ function draw(force) {
 function noRoots() {
   return [el('div', { class: 'card' },
     el('div', {}, state.registry_error || 'No roots on this device yet.'),
-    el('div', { class: 'todo' }, 'A root appears here once `cairn-sync init` or `cairn-sync clone` made it, or its daemon started.'))];
+    el('div', { class: 'todo' }, 'A root appears here once `cairn init` or `cairn clone` made it, or its daemon started.'))];
 }
 
 function title(r) {
@@ -213,7 +213,7 @@ function drawStatus() {
     forgetControls(r)));
 }
 
-// A root shown as gone: taken off this device's list once confirmed, as `cairn-sync forget` does. Once done,
+// A root shown as gone: taken off this device's list once confirmed, as `cairn forget` does. Once done,
 // its buttons stay waiting until the registry, read again every few seconds, no longer lists it.
 function forgetControls(r) {
   if (!r.gone) return [];

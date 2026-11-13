@@ -47,7 +47,7 @@ enum Command {
         notes: String,
         #[arg(long)]
         out: PathBuf,
-        /// Each `program:platform:form:path`: `cairn-sync:linux-x86_64:binary:dist/cairn-0.1.22-linux-x86_64-sync`.
+        /// Each `program:platform:form:path`: `cairn:linux-x86_64:binary:dist/cairn-0.1.23-linux-x86_64`.
         #[arg(required = true)]
         files: Vec<String>,
     },
@@ -95,8 +95,8 @@ fn file_of(spec: &str, base_url: Option<&str>) -> Result<ReleaseFile> {
     else {
         bail!("{spec}: not program:platform:form:path");
     };
-    if !matches!(program, "cairn-sync" | "cairn-tray") {
-        bail!("{spec}: the program is cairn-sync or cairn-tray");
+    if !matches!(program, "cairn" | "cairn-tray") {
+        bail!("{spec}: the program is cairn or cairn-tray");
     }
     let form = match form {
         "binary" => Form::Binary,

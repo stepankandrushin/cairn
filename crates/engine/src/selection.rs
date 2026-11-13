@@ -1,5 +1,5 @@
 //! What this device does not sync: rules in `.cairn/ignore` by path, in `.gitignore` syntax, and server
-//! folders excluded by identity (`cairn-sync exclude`), which stay excluded however they are renamed. There
+//! folders excluded by identity (`cairn exclude`), which stay excluded however they are renamed. There
 //! is no built-in list of names: with neither, everything syncs.
 //!
 //! The merge never learns about any of it. It works on a view: the base and the server's tree with
@@ -112,12 +112,12 @@ impl Rules {
     }
 }
 
-/// What `cairn-sync exclude` left here, or may yet stand here: what is at its path, for anything this device
+/// What `cairn exclude` left here, or may yet stand here: what is at its path, for anything this device
 /// has no record of, and the copy itself by its inode wherever it is moved to, here or by a rename on
 /// the server. A folder deleted and generated again stays out too, even if the server comes to have
 /// something at that path: sync then says what is in the way. Something this device holds is not this.
 /// A filesystem without birth times cannot tell a reused inode number from the copy, and a new
-/// file that reuses it stays out, listed by `cairn-sync status`, rather than a copy going up.
+/// file that reuses it stays out, listed by `cairn status`, rather than a copy going up.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptCopy {
     pub dev: u64,
@@ -147,7 +147,7 @@ impl KeptCopy {
     }
 }
 
-/// A scan's sighting of something left out by `cairn-sync exclude`.
+/// A scan's sighting of something left out by `cairn exclude`.
 pub struct SeenCopy {
     copy: usize,
     by_inode: bool,
@@ -440,7 +440,7 @@ impl Selection {
     }
 
     /// What a rule leaves out in a folder this sync is about to move, where the rule will not match
-    /// it: nobody here chose that, so it stays out by inode, as a copy left by `cairn-sync exclude` does.
+    /// it: nobody here chose that, so it stays out by inode, as a copy left by `cairn exclude` does.
     /// So does what this device held there, which its record would otherwise bring back into view
     /// where the move takes it, but for a file with another name here, which by inode would take that
     /// name out of view too. Returns the paths, whose records are not durable until `store`.
@@ -525,7 +525,7 @@ impl Selection {
         });
         // A folder excluded by identity while this device still holds it stays in the base, so that
         // it reads as gone from the server and the copy here goes the way anything deleted there
-        // does: only if it has not changed. That is `cairn-sync exclude --remove-local`.
+        // does: only if it has not changed. That is `cairn exclude --remove-local`.
         let base_view = visible(base, &self.rules, &|id, link| {
             (self.objects.contains(&id) && !rows.contains_key(&id)) || self.is_unheld(id, link)
         });
@@ -720,7 +720,7 @@ pub fn exclude(root: &mut Root, path: &[Name], remove_local: bool) -> Result<()>
         _ => false,
     };
     if !same || !under_is_in_step || moved_in {
-        bail!("this device and the server do not agree yet about what is at that path, and nothing was changed. `cairn-sync sync` would settle that, and send the server whatever was deleted or moved here. If that is not wanted, put it back first, or leave the path out with a rule in .cairn/ignore, which needs no agreement");
+        bail!("this device and the server do not agree yet about what is at that path, and nothing was changed. `cairn sync` would settle that, and send the server whatever was deleted or moved here. If that is not wanted, put it back first, or leave the path out with a rule in .cairn/ignore, which needs no agreement");
     }
     let mut copy = KeptCopy {
         dev: 0,
@@ -763,7 +763,7 @@ pub fn include(root: &mut Root, path: &[Name], merge: bool) -> Result<()> {
         .iter()
         .position(|c| c.path == path || here.as_ref().is_some_and(|st| c.is(st)));
     if object.is_none() && copy.is_none() {
-        bail!("that was not excluded with `cairn-sync exclude`, here or on the server; a rule in .cairn/ignore comes out by editing that file");
+        bail!("that was not excluded with `cairn exclude`, here or on the server; a rule in .cairn/ignore comes out by editing that file");
     }
     if let Some(i) = copy {
         if here

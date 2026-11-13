@@ -1,9 +1,9 @@
 //! Keeping this user's Cairn programs on this device up to date, from a signed feed
 //! (`cairn_protocol::update`).
 //!
-//! One updater runs at a time: whichever daemon or `cairn-sync update now` holds `update.lock` in the user
+//! One updater runs at a time: whichever daemon or `cairn update now` holds `update.lock` in the user
 //! dir. It asks the feed for `update.json`, checks the release's signature against the keys this build
-//! trusts, and takes each program installed here, `cairn-sync` and the tray beside it, to that release:
+//! trusts, and takes each program installed here, `cairn` and the tray beside it, to that release:
 //!
 //! 1. each file is downloaded beside what it replaces, into `.cairn-update`, and its size and SHA-256
 //!    checked against the signed release, so a cut, a full disk or a changed file installs nothing;
@@ -13,7 +13,7 @@
 //! 4. it is put in place by renaming, never by writing over the old, which on macOS kills a signed
 //!    program and on Windows cannot be done to a running one: on Unix one rename, a bundle swapped whole,
 //!    on Windows two, the running one renamed aside first;
-//! 5. the one before is kept in `.cairn-update`, for `cairn-sync update rollback`, and for a daemon that
+//! 5. the one before is kept in `.cairn-update`, for `cairn update rollback`, and for a daemon that
 //!    keeps dying on the new version before it gets through a sync, which takes it back by itself.
 //!
 //! Each program then restarts into the new version: a daemon sees its program replaced and restarts
@@ -62,7 +62,7 @@ const PROVEN_AFTER: Duration = Duration::from_secs(3600);
 pub const STAGING: &str = ".cairn-update";
 /// The state file is held for one read and one rename.
 const STATE_WAIT: Duration = Duration::from_secs(10);
-/// A person's `cairn-sync update now` waits this long for another updater to finish.
+/// A person's `cairn update now` waits this long for another updater to finish.
 const ASKED_WAIT: Duration = Duration::from_secs(900);
 const SELF_CHECK_WAIT: Duration = Duration::from_secs(60);
 /// What a daemon exits with on Windows to be started again on the new program, which a process there
@@ -87,7 +87,7 @@ static EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
 pub fn exe() -> Option<&'static Path> {
     EXE.get_or_init(|| {
         let p = std::env::current_exe().ok()?;
-        // Through a link to the bundle on macOS, `~/.local/bin/cairn-sync`, to the program in it.
+        // Through a link to the bundle on macOS, `~/.local/bin/cairn`, to the program in it.
         #[cfg(unix)]
         let p = std::fs::canonicalize(&p).unwrap_or(p);
         Some(p)
@@ -173,7 +173,7 @@ pub fn restart() -> anyhow::Error {
 /// One program installed here, as an update replaces it.
 #[derive(Clone, Debug)]
 pub struct Program {
-    /// `cairn-sync` or `cairn-tray`.
+    /// `cairn` or `cairn-tray`.
     pub name: &'static str,
     /// What a release replaces: the executable, or on macOS the bundle around it.
     pub path: PathBuf,
@@ -218,15 +218,23 @@ fn program(name: &'static str, exe: &Path) -> Program {
     }
 }
 
-/// `cairn-sync`, this program, and the tray where it is installed beside it: in the same folder, or on
-/// macOS as `Cairn Tray.app` beside this program's bundle.
+/// `cairn`, this program, and the tray where it is installed beside it: in the same folder, or on
+/// macOS as `Cairn Tray.app` beside this program's bundle. Up to 0.1.21 the tray's bundle was
+/// `Cairn.app` and this one's `Cairn Sync.app`, and a copy that updated itself from one keeps those
+/// paths, the bundles swapped in under them: there the tray is the `Cairn.app` that holds it.
 pub fn programs() -> Result<Vec<Program>> {
     let exe = exe().ok_or_else(|| anyhow!("cannot tell where this program is"))?;
-    let mut out = vec![program("cairn-sync", exe)];
+    let mut out = vec![program("cairn", exe)];
     let tray = match bundle_of(exe) {
-        Some(app) => app
-            .with_file_name("Cairn Tray.app")
-            .join("Contents/MacOS/cairn-tray"),
+        Some(app) => {
+            let tray = |name: &str| app.with_file_name(name).join("Contents/MacOS/cairn-tray");
+            let (now, before) = (tray("Cairn Tray.app"), tray("Cairn.app"));
+            if !now.is_file() && before.is_file() {
+                before
+            } else {
+                now
+            }
+        }
         None => exe.with_file_name(exe_name("cairn-tray")),
     };
     if tray.is_file() {
@@ -280,7 +288,7 @@ fn version_of(exe: &Path, name: &str) -> Result<String> {
 /// The version of a program as it is installed now: this program's own while its file is still the one
 /// it started from.
 pub fn installed_version(p: &Program) -> Result<String> {
-    if p.name == "cairn-sync" && Some(p.exe.as_path()) == exe() && !replaced() {
+    if p.name == "cairn" && Some(p.exe.as_path()) == exe() && !replaced() {
         return Ok(running_version());
     }
     version_of(&p.exe, p.name)
@@ -501,7 +509,7 @@ pub fn feeds(settings: &Settings) -> Vec<String> {
 }
 
 /// The release of the first of the feeds that answers with one a trusted key signed, and that feed. What
-/// each one before it said is kept in the status, which `cairn-sync update` shows and a daemon says once, so a
+/// each one before it said is kept in the status, which `cairn update` shows and a daemon says once, so a
 /// fallback is never what hides a feed that is down; when none answers, the error says what each did.
 fn ask(source: &Source, status: &mut Status) -> Result<(String, Release)> {
     let mut failed = Vec::new();
@@ -539,7 +547,7 @@ fn agent() -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(30)))
         // The whole of a program, over a slow line: 15 MB at 10 KB/s.
         .timeout_recv_body(Some(Duration::from_secs(1800)))
-        .user_agent(format!("cairn-sync/{}", running_version()))
+        .user_agent(format!("cairn/{}", running_version()))
         .tls_config(
             TlsConfig::builder()
                 .root_certs(RootCerts::PlatformVerifier)
@@ -624,7 +632,7 @@ pub fn verify(bytes: &[u8], keys: &[String]) -> Result<Release> {
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// A person asked, by `cairn-sync update now` or the tray: install whatever the policy, a version taken
+    /// A person asked, by `cairn update now` or the tray: install whatever the policy, a version taken
     /// back included, and wait for another updater rather than leave it to it.
     pub asked: bool,
     /// Install what is found; without it, only say what there is.
@@ -726,9 +734,9 @@ fn attempt(
             .iter()
             .find(|f| f.program == p.name && serves(&f.platform, &here))
         else {
-            if p.name == "cairn-sync" {
+            if p.name == "cairn" {
                 log(&format!(
-                    "{} has no cairn-sync for {here}: nothing here is updated by it",
+                    "{} has no cairn for {here}: nothing here is updated by it",
                     release.version
                 ));
             }
@@ -746,7 +754,7 @@ fn attempt(
         let from = match installed_version(&p) {
             Ok(v) => v,
             // The tray, which does not say what it is: replaced by one that does.
-            Err(e) if p.name != "cairn-sync" => {
+            Err(e) if p.name != "cairn" => {
                 log(&format!("{e:#}; replacing it"));
                 "unknown".into()
             }
@@ -770,7 +778,7 @@ fn attempt(
     let version = release.version.clone();
     if !opts.asked && status.rejected.contains(&version) {
         status.waits = Some(format!(
-            "{version} was taken back on this device, so it is installed only when a person asks, `cairn-sync update now`"
+            "{version} was taken back on this device, so it is installed only when a person asks, `cairn update now`"
         ));
         return Ok(Outcome::Waits(version));
     }
@@ -785,13 +793,13 @@ fn attempt(
     }
     if !opts.install {
         status.waits = Some(format!(
-            "{version} is not installed yet: `cairn-sync update now` installs it"
+            "{version} is not installed yet: `cairn update now` installs it"
         ));
         return Ok(Outcome::Waits(version));
     }
     if !opts.asked && settings.policy != Policy::Auto {
         status.waits = Some(format!(
-            "updates here are set to {}: `cairn-sync update now` installs {version}",
+            "updates here are set to {}: `cairn update now` installs {version}",
             settings.policy.name()
         ));
         return Ok(Outcome::Waits(version));
@@ -852,7 +860,7 @@ fn staging_of(target: &Path) -> Result<PathBuf> {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
-            "{} cannot be written by this user, so nothing can be installed there: its owner can, with `cairn-sync update now`",
+            "{} cannot be written by this user, so nothing can be installed there: its owner can, with `cairn update now`",
             parent.display()
         ),
         Err(e) => return Err(e).with_context(|| format!("make {}", dir.display())),
@@ -1228,7 +1236,7 @@ pub fn rollback(why: &str, log: &mut dyn FnMut(&str)) -> Result<String> {
             was.as_deref().unwrap_or("?"),
             p.path.display()
         ));
-        if p.name == "cairn-sync" {
+        if p.name == "cairn" {
             taken = was;
         }
         back.push(to);

@@ -1,5 +1,5 @@
 //! Updates as the tray shows them. The updater is the daemons' (update.rs in the engine): it puts a new
-//! tray in place beside `cairn-sync`, the bundle Cairn Tray.app beside Cairn Sync.app on macOS. The tray reads
+//! tray in place beside `cairn`, the bundle Cairn Tray.app beside Cairn.app on macOS. The tray reads
 //! what the updater wrote, writes the policy a person chooses, asks a daemon to update now, and starts
 //! itself again once its program has been replaced.
 
@@ -192,7 +192,7 @@ fn policy_in(p: &Path) -> Result<Policy, String> {
     }
 }
 
-/// Writes the policy and keeps everything else in the file, a feed and keys `cairn-sync` reads included.
+/// Writes the policy and keeps everything else in the file, a feed and keys `cairn` reads included.
 /// A file that does not read is not written over.
 pub fn set_policy(policy: Policy) -> Result<(), String> {
     set_policy_in(&settings_file()?, policy)

@@ -398,7 +398,7 @@ fn what_a_folder_gives_a_new_file_is_no_change_after_a_kill() {
     }
 }
 
-/// After a kill, a dry run, and so `cairn-sync status`, asks the filesystem as a sync does: a chmod made here in
+/// After a kill, a dry run, and so `cairn status`, asks the filesystem as a sync does: a chmod made here in
 /// that moment shows as about to go up.
 #[test]
 #[cfg(unix)]

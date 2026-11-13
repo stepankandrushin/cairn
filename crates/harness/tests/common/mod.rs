@@ -508,7 +508,7 @@ impl Device {
         d
     }
 
-    /// A root of `folder` with `token_file`'s token, or the run of `cairn-sync init` that refused it.
+    /// A root of `folder` with `token_file`'s token, or the run of `cairn init` that refused it.
     pub fn try_as_user(
         sandbox: &Sandbox,
         server: &Server,
@@ -552,7 +552,7 @@ impl Device {
     ) -> Self {
         match Self::try_as_user(sandbox, server, name, token_file, folder) {
             Ok(d) => d,
-            Err(run) => panic!("cairn-sync init: {}", run.text()),
+            Err(run) => panic!("cairn init: {}", run.text()),
         }
     }
 
@@ -1512,7 +1512,7 @@ pub fn notes_in_journal(data: &Path) -> (Vec<(cairn_protocol::ObjectId, String)>
     (pairs, notes)
 }
 
-/// How many losers the notes in `cairn-sync log`'s lines say: one to a line, or the count a line of a
+/// How many losers the notes in `cairn log`'s lines say: one to a line, or the count a line of a
 /// note naming more says.
 pub fn losers_in_log(log: &str) -> usize {
     log.lines()

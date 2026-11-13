@@ -333,6 +333,9 @@ mod tests {
     #[test]
     fn the_root_and_a_folder_are_marked_apart() {
         let mut m = Marks::default();
+        // A clock may give the same instant twice (an aarch64 timer's 52 ns did, beside the full suite),
+        // and a loss at the scan's start counts as one since it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let t0 = Instant::now();
         m.mark(&[], false);
         m.mark(&names("a"), true);

@@ -22,7 +22,7 @@ filesystem and privileges.
 | Feature | **Cairn**[^cairn] | Nextcloud[^nextcloud] | Seafile[^seafile] | Syncthing[^syncthing] |
 |---|---|---|---|---|
 | Installed application size (macOS)[^macos-size] | **17.1 MB** — tray + sync daemon, Apple Silicon | **414.4 MB** — desktop client, universal Intel + Apple Silicon | Not measured | Not measured |
-| Application download size (Linux x86-64)[^downloads] | **7.1 MiB** — CLI + server archive | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
+| Application download size (Linux x86-64)[^downloads] | **10.4 MiB** — CLI and daemon; server separate | 60.3 MiB — desktop AppImage; server separate | 13.7 MiB CLI / 184.3 MiB desktop AppImage; server separate | 13.4 MiB — archive, including web UI |
 | RAM use / requirements[^performance] | Chunk-buffered file I/O; tree and chunk metadata also consume RAM; no measured baseline | Server: 128 MB minimum / 512 MB recommended per PHP process, plus other services | CE server stack: 2 GB minimum | Depends on files, peers and concurrency; buffers and Go memory target are tunable |
 | Implementation languages | **Rust** — CLI, daemon and server; HTML/JavaScript web UI | C++ desktop; PHP server | C sync engine; C++ desktop; C/Go server; Python/JavaScript web UI | Go sync engine; HTML/JavaScript web UI |
 | Run without a separate database server or language runtime | ✅ Native binaries with embedded SQLite | ❌ PHP and a web server; usually a separate database | ❌ Server stack includes a database, cache and web services | ✅ Native binary; no central server required |
@@ -39,13 +39,13 @@ filesystem and privileges.
     These are installed application files, not download sizes or allocated disk space; user data and
     server components are excluded. Nextcloud's executable is universal (Intel + Apple Silicon), while
     these Cairn builds are Apple Silicon only. Seafile and Syncthing were not installed for measurement.
-[^downloads]: Download sizes: [Cairn 0.1.19](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.19),
+[^downloads]: Download sizes: [Cairn 0.1.23](https://github.com/stepankandrushin/cairn/releases/tag/v0.1.23),
     [Nextcloud Desktop 35.0.3](https://download.nextcloud.com/desktop/releases/Linux/),
     [Seafile Client 9.0.22](https://github.com/haiwen/seafile-client/releases/tag/v9.0.22),
     [Syncthing 2.1.7](https://github.com/syncthing/syncthing/releases/tag/v2.1.7).
-    Cairn's archive is 7,483,009 bytes; 1 MiB = 1,048,576 bytes.
-    Archives are `.tar.gz`; AppImages bundle desktop or CLI dependencies. These packages contain different
-    components, and their download sizes are not installed sizes. Cairn's archive does not include its tray.
+    Cairn's client, `cairn-0.1.23-linux-x86_64`, is 10,869,968 bytes, the program alone and uncompressed,
+    without its tray or server; 1 MiB = 1,048,576 bytes. Archives are `.tar.gz`; AppImages bundle desktop or CLI
+    dependencies. These packages contain different components, and their download sizes are not installed sizes.
 [^performance]: RAM entries describe implementation behavior or upstream requirements, not measured
     consumption on the same workload. Cairn has no published RAM or comparative throughput benchmark.
     Sync speed depends on file count, edit patterns, disk, network and settings; the speed row compares
@@ -251,20 +251,22 @@ its icon, in Login Items and in the privacy lists, rather than as a bare `cairn`
 ../target/release/cairn "$HOME/Applications/Cairn.app"` makes it around the binary (with Xcode installed,
 its icon is compiled for macOS 26 and later, which otherwise draw it on a gray tile at small sizes). Link
 `~/.local/bin/cairn` to `Contents/MacOS/cairn` inside it, and start the daemon with a launchd user agent that
-names the bundle, one per root, as `~/Library/LaunchAgents/com.cairn.home.plist`:
+names the bundle's identifier, `storage.cairn`: one agent per root, each with a label of its own, as
+`~/Library/LaunchAgents/storage.cairn.daemon.home.plist` for a root called home (`daemon` in it keeps a root
+called tray off the tray's agent, `storage.cairn.tray`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.cairn.home</string>
+  <key>Label</key><string>storage.cairn.daemon.home</string>
   <key>ProgramArguments</key>
   <array>
     <string>/Users/you/Applications/Cairn.app/Contents/MacOS/cairn</string>
     <string>daemon</string><string>--root</string><string>/Users/you/Sync</string>
   </array>
-  <key>AssociatedBundleIdentifiers</key><array><string>com.cairn.sync</string></array>
+  <key>AssociatedBundleIdentifiers</key><array><string>storage.cairn</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/Users/you/Library/Logs/cairn-home.log</string>
@@ -273,9 +275,10 @@ names the bundle, one per root, as `~/Library/LaunchAgents/com.cairn.home.plist`
 </plist>
 ```
 
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cairn.home.plist` starts it. The tray's Cairn Tray.app
-is made the same way (`bash macos/bundle.sh target/release/cairn-tray "$HOME/Applications/Cairn Tray.app"`), and
-`cairn-tray --login on` writes its agent. Sign both with a certificate Apple issued: `CAIRN_SIGN` for bundle.sh,
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/storage.cairn.daemon.home.plist` starts it. The tray's
+Cairn Tray.app is made the same way
+(`bash macos/bundle.sh target/release/cairn-tray "$HOME/Applications/Cairn Tray.app"`), and
+`cairn-tray --login on` writes its agent, `storage.cairn.tray`. Sign both with a certificate Apple issued: `CAIRN_SIGN` for bundle.sh,
 one of `security find-identity -v -p codesigning`. Login Items ties an agent to its app only for such a
 signature, and macOS keeps the Local Network answer below for the same certificate and identifier from one
 build to the next, where an ad-hoc build is a new program at each upgrade and asks again. A signed bundle put
@@ -294,8 +297,9 @@ A release build keeps itself up to date. Each daemon asks about once an hour for
 cairn.storage, or at GitHub's latest release when that does not answer (`cairn update` says which did), and when
 there is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
 it between syncs; the tray installed beside `cairn` is updated with it and restarts too. No permission is asked
-again: macOS keeps them for a signature by the same team, which every release has, and Windows by the path, which
-does not change.
+again: macOS keeps them for the same bundle identifier signed by the same team, which every release has, and
+Windows by the path, which does not change. Only the update from 0.1.23 or before asks once more on macOS, for
+Local Network, as 0.1.24 changed the identifiers (CHANGELOG.md says what else to change then).
 
 ```sh
 cairn update                     # what is installed, how updates are set, what the feed offered last

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- On macOS the bundles have new identifiers, named for the project's domain, cairn.storage: Cairn.app is
+  `storage.cairn`, where it was `com.cairn.sync`, and Cairn Tray.app `storage.cairn.tray`, where it was
+  `com.cairn.tray`. macOS keeps its permissions by them, so a Mac that updates from 0.1.23 or before asks once
+  more, "Allow "Cairn" to find devices on local networks?", if its daemon reaches a server on the same local
+  network; until it is answered nothing syncs there, though nothing is lost. The tray set to start at login moves
+  itself to its new agent, `storage.cairn.tray`, as it starts, and removes `com.cairn.tray.plist`. A daemon's
+  agent written from README.md names the old identifier, and goes on starting the daemon, but Login Items may no
+  longer show it as Cairn: `launchctl bootout` it, write it anew as README.md has it, with
+  `AssociatedBundleIdentifiers` `storage.cairn` and the label `storage.cairn.daemon.<root>` (the word `daemon`
+  keeps a root called tray apart from the tray's agent), and `launchctl bootstrap` it. The old identifiers' rows
+  in Local Network stay until removed, and the tray's web view leaves its old data unused, which can be deleted:
+  `~/Library/WebKit/com.cairn.tray` and `~/Library/Caches/com.cairn.tray` on macOS,
+  `%LOCALAPPDATA%\com.cairn.tray` on Windows.
+- On Linux the client and the server are files of their own, as each goes on a different machine:
+  `cairn-<v>-linux-x86_64`, cairn, the CLI and daemon, which installed copies update to as before, and
+  `cairn-<v>-linux-x86_64-server`, cairn-server, each the program alone, where `cairn-<v>-linux-x86_64.tar.gz`
+  held both.
+
 ## 0.1.23 (2026-11-13)
 
 **Changed:**

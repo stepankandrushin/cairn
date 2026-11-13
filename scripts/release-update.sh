@@ -5,7 +5,7 @@
 #   cairn-<v>-macos-<arch>.app.tar.gz and cairn-<v>-macos-<arch>-tray.app.tar.gz, arch universal,
 #   aarch64 or x86_64.
 # An installed copy finds its file by program and platform, never by name, and installs it under its own.
-# Then write dist/cairn-<v>.sha256, the SHA-256 of every file of the version in dist/, the tarball too, for
+# Then write dist/cairn-<v>.sha256, the SHA-256 of every file of the version in dist/, the server's too, for
 # people to check what they downloaded by: `sha256sum -c --ignore-missing cairn-<v>.sha256`.
 # Needs CAIRN_UPDATE_SIGNING_KEY, the secret of a key the release was built to trust, which is checked
 # against CAIRN_UPDATE_KEYS here. Each file is named beside update.json, wherever that is fetched from, so

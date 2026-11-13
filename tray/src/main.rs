@@ -105,6 +105,12 @@ fn tray(open: Option<&str>) -> ExitCode {
         "cairn-tray {} starting",
         env!("CARGO_PKG_VERSION")
     ));
+    #[cfg(target_os = "macos")]
+    match actions::login::carry_over() {
+        Some(Ok(done)) => log(&done),
+        Some(Err(e)) => log(&format!("cannot move start at login to its new label: {e}")),
+        None => {}
+    }
     if let Some(e) = settings::load() {
         log(&format!(
             "{e}: using the defaults until a setting is changed"

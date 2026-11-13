@@ -4,7 +4,7 @@
 <dict>
     <key>CFBundleName</key><string>Cairn Tray</string>
     <key>CFBundleDisplayName</key><string>Cairn Tray</string>
-    <key>CFBundleIdentifier</key><string>com.cairn.tray</string>
+    <key>CFBundleIdentifier</key><string>storage.cairn.tray</string>
     <key>CFBundleExecutable</key><string>cairn-tray</string>
     <key>CFBundleIconFile</key><string>icon</string>
     <key>CFBundlePackageType</key><string>APPL</string>

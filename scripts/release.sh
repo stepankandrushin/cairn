@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Build the release binaries, prove them, and put them in dist/: cairn-<v>-linux-x86_64.tar.gz for people, and
-# the bare cairn-<v>-linux-x86_64, cairn alone, for updates, which release-update.sh signs with the macOS and Windows
-# halves (release-macos.sh, release-windows.ps1) and lists in the release's one checksum file.
+# Build the release binaries, prove them, and put them in dist/, each program a file of its own, as a client and a
+# server are installed on different machines: cairn-<v>-linux-x86_64, the client (the CLI and daemon), which
+# installed copies also update to, and cairn-<v>-linux-x86_64-server. release-update.sh signs the client's with
+# the macOS and Windows halves (release-macos.sh, release-windows.ps1) and lists both in the release's one checksum
+# file.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/update-env.sh
@@ -44,16 +46,11 @@ fi
 
 bash scripts/smoke.sh "$out"
 
-# Each file is cairn-<v>-<platform>, then -tray for cairn-tray's, so a release's files sort by platform;
-# cairn's, the main program's, and the tarball, which holds cairn and cairn-server, name no program.
+# Each file is cairn-<v>-<platform>, then -tray for cairn-tray's and -server for cairn-server's, so a release's
+# files sort by platform; cairn's, the main program's, names no program.
 name="cairn-$version-linux-x86_64"
-stage=$(mktemp -d)
-mkdir "$stage/$name"
-cp "$out/cairn" "$out/cairn-server" README.md CHANGELOG.md LICENSE-APACHE LICENSE-AGPL "$stage/$name/"
 mkdir -p dist
-tar -C "$stage" --owner=0 --group=0 --sort=name -czf "dist/$name.tar.gz" "$name"
-rm -rf "$stage"
-# What an installed cairn on Linux updates itself to: the program alone.
 cp "$out/cairn" "dist/$name"
-ls -l "dist/$name.tar.gz" "dist/$name"
-(cd dist && sha256sum "$name.tar.gz" "$name")
+cp "$out/cairn-server" "dist/$name-server"
+ls -l "dist/$name" "dist/$name-server"
+(cd dist && sha256sum "$name" "$name-server")

@@ -4,7 +4,7 @@
 <dict>
     <key>CFBundleName</key><string>Cairn</string>
     <key>CFBundleDisplayName</key><string>Cairn</string>
-    <key>CFBundleIdentifier</key><string>com.cairn.sync</string>
+    <key>CFBundleIdentifier</key><string>storage.cairn</string>
     <key>CFBundleExecutable</key><string>cairn</string>
     <key>CFBundleIconFile</key><string>sync</string>
     <key>CFBundlePackageType</key><string>APPL</string>

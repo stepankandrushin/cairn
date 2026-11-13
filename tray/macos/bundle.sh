@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Makes a macOS app bundle around a built binary, from tray/:
-#   bash macos/bundle.sh target/release/cairn-tray "out/Cairn Tray.app"   # the tray, com.cairn.tray
-#   bash macos/bundle.sh ../target/release/cairn out/Cairn.app             # the CLI and daemon, com.cairn.sync
+#   bash macos/bundle.sh target/release/cairn-tray "out/Cairn Tray.app"   # the tray, storage.cairn.tray
+#   bash macos/bundle.sh ../target/release/cairn out/Cairn.app             # the CLI and daemon, storage.cairn
 # Each bundle is named as its program is shown, Cairn.app around cairn and Cairn Tray.app around cairn-tray,
 # as Windows shows cairn.exe as "Cairn" and cairn-tray.exe as "Cairn Tray".
 # The daemon runs from inside its bundle, so that System Settings shows "Cairn" with its icon, in Login

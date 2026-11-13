@@ -505,20 +505,57 @@ pub fn conflict(
 /// Starting at login: a LaunchAgent on macOS, the Run key on Windows, an autostart entry on Linux.
 pub mod login {
     #[cfg(target_os = "macos")]
-    pub const LABEL: &str = "com.cairn.tray";
+    pub const LABEL: &str = "storage.cairn.tray";
+    /// The label, and Cairn Tray.app's bundle id, up to 0.1.23.
+    #[cfg(target_os = "macos")]
+    const OLD_LABEL: &str = "com.cairn.tray";
 
     #[cfg(target_os = "macos")]
-    fn plist() -> Option<std::path::PathBuf> {
+    fn agent(label: &str) -> Option<std::path::PathBuf> {
         std::env::var_os("HOME").map(|h| {
             std::path::Path::new(&h)
                 .join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist"))
+                .join(format!("{label}.plist"))
         })
     }
 
     #[cfg(target_os = "macos")]
+    fn plist() -> Option<std::path::PathBuf> {
+        agent(LABEL)
+    }
+
+    /// The agent of a tray up to 0.1.23, if it starts a tray: README then named a daemon's agent
+    /// com.cairn.<root>, so one for a root called "tray" has its name, and is left alone.
+    #[cfg(target_os = "macos")]
+    fn old_is_ours() -> bool {
+        agent(OLD_LABEL)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|t| t.contains("/cairn-tray</string>"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn remove(path: &std::path::Path) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("cannot remove {}: {e}", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn enabled() -> bool {
-        plist().is_some_and(|p| p.exists())
+        plist().is_some_and(|p| p.exists()) || old_is_ours()
+    }
+
+    /// A tray updated from 0.1.23 or before, set to start at login, has its agent under the old label,
+    /// which names a bundle id there no longer is, so Login Items cannot show it as Cairn Tray: written
+    /// anew under this one. The old job stays loaded until the session ends, and starts nothing after.
+    #[cfg(target_os = "macos")]
+    pub fn carry_over() -> Option<Result<String, String>> {
+        old_is_ours().then(|| {
+            set(true).map(|()| format!("start at login moved from {OLD_LABEL} to {LABEL}"))
+        })
     }
 
     /// Restarted after a crash, not after Quit, and only in a desktop session. The label is also Cairn
@@ -526,13 +563,10 @@ pub mod login {
     #[cfg(target_os = "macos")]
     pub fn set(on: bool) -> Result<(), String> {
         let path = plist().ok_or("HOME is not set")?;
+        let old = agent(OLD_LABEL).filter(|_| old_is_ours());
         if !on {
-            return match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    Err(format!("cannot remove {}: {e}", path.display()))
-                }
-                _ => Ok(()),
-            };
+            remove(&path)?;
+            return old.map_or(Ok(()), |p| remove(&p));
         }
         let exe = std::env::current_exe().map_err(|e| format!("cannot tell where this is: {e}"))?;
         let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
@@ -566,7 +600,8 @@ pub mod login {
         let tmp = path.with_extension("plist.new");
         std::fs::write(&tmp, text)
             .and_then(|()| std::fs::rename(&tmp, &path))
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        old.map_or(Ok(()), |p| remove(&p))
     }
 
     #[cfg(windows)]

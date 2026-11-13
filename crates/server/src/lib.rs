@@ -488,13 +488,14 @@ async fn download(
     let body = blocking(move || {
         let store = app.repo.chunks(&ns)?;
         let mut out = Vec::new();
-        for hash in &req.hashes {
-            match store.get(hash)? {
-                Some(data) => wire::write_frame(&mut out, hash, &data),
-                None => return Ok(Err(*hash)),
-            }
-        }
-        Ok(Ok(out))
+        // Many read at once, framed in the order asked.
+        let missing = store.get_in_order(&req.hashes, &mut |hash, data| {
+            wire::write_frame(&mut out, hash, &data)
+        })?;
+        Ok(match missing {
+            None => Ok(out),
+            Some(hash) => Err(hash),
+        })
     })
     .await?;
     Ok(match body {

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- The server reads a download's chunks 32 at once, handing them on in the order asked, where it read one
+  after the other: a store on hard disks reorders what it has queued, and on a mirror of two, cold chunks
+  of under 64 KiB came 4 to 5 times as fast, both disks at work. A device's first sync is bound by this. What
+  is read ahead is bounded (16 MiB, or 64 chunks, beyond the next to be sent), and a download still ends at
+  the first chunk missing or damaged in the order asked, as before.
+
 ## 0.1.26 (2026-11-13)
 
 **Added:**

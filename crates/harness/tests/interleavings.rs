@@ -597,6 +597,44 @@ fn a_damaged_chunk_on_the_server_is_replaced_by_the_next_upload_of_it() {
 }
 
 #[test]
+fn a_chunk_damaged_on_the_server_fails_a_download_of_many_read_at_once() {
+    // The server reads a download's chunks many at once: one damaged among hundreds is still found,
+    // the download fails saying so, and nothing of that chunk is placed.
+    let (_sb, mut server, a, b) = pair("damaged-many");
+    for i in 0..300 {
+        a.write(&format!("d/f{i:03}"), format!("file {i:03}"));
+    }
+    a.synced();
+    server.kill();
+    let mut damaged = 0;
+    let mut stack = vec![server.data.join("ns")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else if std::fs::read(e.path()).unwrap() == b"file 150" {
+                std::fs::write(e.path(), b"FILE 150").unwrap();
+                damaged += 1;
+            }
+        }
+    }
+    assert_eq!(damaged, 1);
+    server.restart();
+    let run = b.sync();
+    assert_ne!(run.code, Some(0), "{}", run.text());
+    assert!(run.text().contains("is damaged on disk"), "{}", run.text());
+    assert!(!b.exists("d/f150"), "{}", run.text());
+    // Sent again, the chunk is whole on the server, and every file comes down as written.
+    a.write("again", "file 150");
+    a.synced();
+    b.synced();
+    for i in 0..300 {
+        let name = format!("d/f{i:03}");
+        assert_eq!(b.read(&name), format!("file {i:03}").into_bytes(), "{name}");
+    }
+}
+
+#[test]
 fn a_new_directory_that_cannot_be_read_waits_without_blocking_anything_else() {
     if skip_as_root() {
         return;

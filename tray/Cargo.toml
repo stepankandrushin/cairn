@@ -2,7 +2,7 @@
 name = "cairn-tray"
 description = "A tray for Cairn's daemons: what each is doing, and what a person deals with."
 license = "Apache-2.0"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 rust-version = "1.89"
 publish = false

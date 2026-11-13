@@ -1,5 +1,5 @@
 //! The local API's two ends (`cairn_protocol::local`): what a daemon serves on its socket, and what
-//! `cairn status`, `cairn pause` and the tray ask it with. One JSON object per line each way.
+//! `cairn-sync status`, `cairn-sync pause` and the tray ask it with. One JSON object per line each way.
 //!
 //! Serving never holds up the daemon's syncs: each program has a thread of its own, a status goes to a
 //! subscriber through a short queue that is never waited on, and a program that stops reading is
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 /// For a program to send its request, and for each status to be taken by a subscriber.
 pub const IO_WAIT: Duration = Duration::from_secs(5);
-/// For `cairn status` to be answered before it reads the daemon's file instead: a daemon from before
+/// For `cairn-sync status` to be answered before it reads the daemon's file instead: a daemon from before
 /// the local API holds the same socket and never answers.
 pub const ASK_WAIT: Duration = Duration::from_secs(2);
 /// Statuses waiting for one subscriber. One that falls this far behind is dropped.
@@ -130,7 +130,7 @@ pub fn serve(listener: Listener, hub: Arc<Hub>, handler: Arc<Handler>) {
     std::thread::spawn(move || {
         if let Err(e) = listener.run(&hub, &handler) {
             hub.note(format!(
-                "the local API stopped, so `cairn status` reads this daemon's file and the tray does not see it: {e}"
+                "the local API stopped, so `cairn-sync status` reads this daemon's file and the tray does not see it: {e}"
             ));
         }
     });
@@ -212,7 +212,7 @@ fn read_line(c: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-/// A connection to a daemon, from `cairn` or the tray.
+/// A connection to a daemon, from `cairn-sync` or the tray.
 pub struct Client {
     conn: Box<dyn ClientConn>,
     pending: Vec<u8>,

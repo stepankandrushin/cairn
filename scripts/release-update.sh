@@ -24,11 +24,11 @@ add() {
         files+=("$1:dist/$2")
     fi
 }
-add cairn:linux-x86_64:binary "cairn-$version-linux-x86_64-sync"
-add cairn:windows-x86_64:binary "cairn-$version-windows-x86_64-sync.exe"
+add cairn-sync:linux-x86_64:binary "cairn-$version-linux-x86_64-sync"
+add cairn-sync:windows-x86_64:binary "cairn-$version-windows-x86_64-sync.exe"
 add cairn-tray:windows-x86_64:binary "cairn-$version-windows-x86_64-tray.exe"
 for arch in universal aarch64 x86_64; do
-    add "cairn:macos-$arch:app" "cairn-$version-macos-$arch-sync.app.tar.gz"
+    add "cairn-sync:macos-$arch:app" "cairn-$version-macos-$arch-sync.app.tar.gz"
     add "cairn-tray:macos-$arch:app" "cairn-$version-macos-$arch-tray.app.tar.gz"
 done
 if [[ ${#files[@]} -eq 0 ]]; then

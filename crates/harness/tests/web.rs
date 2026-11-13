@@ -1351,7 +1351,7 @@ fn the_session_cookie_reads_and_changes_nothing_without_the_webs_header() {
     assert_ne!(get(&server, "/web/../meta.sqlite", Auth::None).code, 200);
 }
 
-/// A program with a token, the tray or `cairn web`, signs a browser in by a ticket: once, and only by the
+/// A program with a token, the tray or `cairn-sync web`, signs a browser in by a ticket: once, and only by the
 /// server that made it. The session names the token and holds it nowhere, outlives a restart, and ends
 /// when the token is removed. A device's daemon gives the same address, as the tray asks for it.
 #[test]
@@ -1521,7 +1521,7 @@ fn a_ticket_signs_a_browser_in_once_and_its_session_ends_with_its_token() {
         "admin"
     );
 
-    // `cairn web` gives the address it would open, at this root's folder.
+    // `cairn-sync web` gives the address it would open, at this root's folder.
     let d = Device::new(&sb, &server, "d");
     let printed = d.cairn(&["web", "--print"]).expect_ok();
     let ticket = ticket_in(printed.stdout.trim(), &server);
@@ -1578,7 +1578,7 @@ fn a_ticket_signs_a_browser_in_once_and_its_session_ends_with_its_token() {
 }
 
 /// Each user's own name for a folder: theirs alone, offered by a device only while they have none, set
-/// or taken away in the web; `cairn init` without --folder joins the only folder there is and asks
+/// or taken away in the web; `cairn-sync init` without --folder joins the only folder there is and asks
 /// which of several; and a folder renamed answers by its former name, to someone without access as for
 /// a folder that does not exist.
 #[test]

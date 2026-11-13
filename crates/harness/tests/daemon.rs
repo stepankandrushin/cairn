@@ -1,4 +1,4 @@
-//! `cairn daemon` as a real process: what it is for, and each way the things it relies on can fail.
+//! `cairn-sync daemon` as a real process: what it is for, and each way the things it relies on can fail.
 //! Wherever the point is that the watcher or the feed did it, the reconcile is set to a day, so that the
 //! safety net cannot be what passes the test.
 
@@ -162,7 +162,7 @@ fn pair(label: &str) -> (Sandbox, Server, Device, Device) {
     (sb, server, a, b)
 }
 
-/// One-shot `cairn sync` beside a running daemon, which may hold the lock for a moment.
+/// One-shot `cairn-sync sync` beside a running daemon, which may hold the lock for a moment.
 #[track_caller]
 fn sync_when_free(d: &Device) -> Run {
     let start = Instant::now();
@@ -1194,7 +1194,7 @@ fn a_long_sync_holds_the_next_change_back_only_for_its_scan() {
     );
 }
 
-/// A change that waits says so in `cairn status`, with until when and why.
+/// A change that waits says so in `cairn-sync status`, with until when and why.
 #[test]
 fn status_says_when_changes_wait_and_why() {
     let (_sb, mut server, a, b) = pair("d-waiting");
@@ -2382,7 +2382,7 @@ fn a_subscriber_that_never_reads_does_not_stall_syncs() {
     let db = Daemon::events_only(&b);
     da.wait_state("synced");
     db.wait_state("synced");
-    // A program that subscribes and then stops reading: `cairn ask` with nobody reading its output,
+    // A program that subscribes and then stops reading: `cairn-sync ask` with nobody reading its output,
     // so that once its pipe is full it reads no more from the daemon.
     let mut stuck = Command::new(CAIRN)
         .arg("--root")
@@ -2639,7 +2639,7 @@ fn an_init_the_server_does_not_take_leaves_no_root_and_no_entry() {
     assert_eq!(all[0]["present"], true, "{all:?}");
 }
 
-/// The harness's own `cairn` keeps its list of roots, and on macOS and Windows its daemons' locks and
+/// The harness's own `cairn-sync` keeps its list of roots, and on macOS and Windows its daemons' locks and
 /// sockets, out of the user's own directory, where test runs once left a lock file for each root made.
 #[test]
 fn the_harness_leaves_nothing_in_the_users_own_directory() {
@@ -2649,7 +2649,7 @@ fn the_harness_leaves_nothing_in_the_users_own_directory() {
     std::fs::create_dir_all(&home).unwrap();
     let h = home.to_str().unwrap();
     let (state, local) = (format!("{h}/state"), format!("{h}/local"));
-    // Empty counts as unset, for the harness as for `cairn`.
+    // Empty counts as unset, for the harness as for `cairn-sync`.
     let env = [
         ("HOME", h),
         ("XDG_STATE_HOME", state.as_str()),
@@ -2813,7 +2813,7 @@ fn a_long_sync_says_how_far_it_has_got_and_a_stuck_one_says_so() {
         "{}",
         da.log()
     );
-    // `--all`, as the tray asks: `cairn status` alone would also run a dry sync, which reads the
+    // `--all`, as the tray asks: `cairn-sync status` alone would also run a dry sync, which reads the
     // files the daemon is about to.
     let status = a.cairn(&["status", "--all"]);
     assert!(

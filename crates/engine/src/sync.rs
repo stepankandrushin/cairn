@@ -330,7 +330,7 @@ pub(crate) fn history_gone(
         format!(
             "the server no longer has the history this device last saw (sequence {cursor}; it is at {}): was it \
              restored from a backup? Sync is paused and nothing was changed. Files only here are safe. To \
-             rejoin, remove this root's .cairn folder and run `cairn init` again: the next sync merges by \
+             rejoin, remove this root's .cairn folder and run `cairn-sync init` again: the next sync merges by \
              name and content, keeps every difference as a conflict copy, and sends the server what it lost.",
             resp.head
         )
@@ -818,7 +818,7 @@ fn check_vanished(
     most(gone).then(|| Hold {
         why: format!(
             "{gone} of {live} synced entries have vanished from this folder. If a disk is not mounted, mount it. \
-             If you did delete them, run `cairn sync --allow-mass-delete`. Sync is paused and nothing was changed."
+             If you did delete them, run `cairn-sync sync --allow-mass-delete`. Sync is paused and nothing was changed."
         ),
         overridable: true,
     })
@@ -2165,7 +2165,7 @@ fn sync_full(
             selection.store(&root)?;
             for path in &kept_out {
                 report.events.push(format!(
-                    "{}: its folder is moving, and the rule that leaves it out would not match there; it stays out, and `cairn include --merge` brings it in",
+                    "{}: its folder is moving, and the rule that leaves it out would not match there; it stays out, and `cairn-sync include --merge` brings it in",
                     crate::scan::display_path(path)
                 ));
             }

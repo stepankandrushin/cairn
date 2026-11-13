@@ -1,5 +1,5 @@
-//! Recently deleted: `cairn deleted` lists what is deleted and still deleted, from the server's history,
-//! a folder once with what was deleted with it; `cairn undelete` brings it back as it was when deleted,
+//! Recently deleted: `cairn-sync deleted` lists what is deleted and still deleted, from the server's history,
+//! a folder once with what was deleted with it; `cairn-sync undelete` brings it back as it was when deleted,
 //! as a new commit that reaches every device, replacing nothing. A kill leaves nothing or all of it.
 mod common;
 use common::*;

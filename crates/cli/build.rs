@@ -1,6 +1,6 @@
-//! On Windows, cairn.exe carries the daemon's icon and a version resource, so that Task Manager and
+//! On Windows, cairn-sync.exe carries the daemon's icon and a version resource, so that Task Manager and
 //! Explorer show it as "Cairn Sync" with its icon, as macOS shows the daemon, rather than a bare
-//! cairn.exe. They are written here as a .res file, the format a resource compiler makes, which the
+//! cairn-sync.exe. They are written here as a .res file, the format a resource compiler makes, which the
 //! MSVC linker takes as an input: no resource compiler and no crate. On other targets, nothing.
 
 use std::env;
@@ -24,7 +24,7 @@ fn main() {
         return;
     }
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
-        println!("cargo:warning=cairn.exe is built without its icon and version: only the MSVC linker takes the .res made here");
+        println!("cargo:warning=cairn-sync.exe is built without its icon and version: only the MSVC linker takes the .res made here");
         return;
     }
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -33,7 +33,7 @@ fn main() {
     let res = resources(&ico, &version);
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("cairn.res");
     fs::write(&out, res).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
-    println!("cargo:rustc-link-arg-bin=cairn={}", out.display());
+    println!("cargo:rustc-link-arg-bin=cairn-sync={}", out.display());
 }
 
 /// The .res file: an empty first entry, as every one starts, then each image of the icon, the icon
@@ -128,8 +128,8 @@ fn version_info(version: &str) -> Vec<u8> {
         ("CompanyName", "cairn"),
         ("FileDescription", "Cairn Sync"),
         ("FileVersion", version),
-        ("InternalName", "cairn"),
-        ("OriginalFilename", "cairn.exe"),
+        ("InternalName", "cairn-sync"),
+        ("OriginalFilename", "cairn-sync.exe"),
         ("ProductName", "Cairn"),
         ("ProductVersion", version),
     ]

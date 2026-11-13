@@ -1,4 +1,4 @@
-//! The local API: what a device's daemons tell the programs that show them (`cairn status --all`, the
+//! The local API: what a device's daemons tell the programs that show them (`cairn-sync status --all`, the
 //! tray), and the few things those may ask. One definition on every side, so none of them drops a field
 //! it does not know. It never leaves the device; docs/protocol.md has the wire to the server.
 //!
@@ -8,7 +8,7 @@
 //! an ordinary file operation a person could make, such as removing a conflict copy.
 //!
 //! The roots of this user on this device are listed in the registry, [`registry_path`], which
-//! `cairn init` and a starting daemon add to. A root listed there that has gone is shown as gone, never
+//! `cairn-sync init` and a starting daemon add to. A root listed there that has gone is shown as gone, never
 //! dropped quietly.
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub struct RootEntry {
     pub added: Secs,
 }
 
-/// One root as `cairn status --all --json` shows it: its entry in the registry, whether it is still
+/// One root as `cairn-sync status --all --json` shows it: its entry in the registry, whether it is still
 /// there, and what its daemon says, if one runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootView {
@@ -222,7 +222,7 @@ impl Progress {
         format!("{}, for {}", self.doing(), span(now - self.started))
     }
 
-    /// What it is doing, in one line, as `cairn status`, the tray and the daemon's log say it: how long
+    /// What it is doing, in one line, as `cairn-sync status`, the tray and the daemon's log say it: how long
     /// the sync has run, what it is at and how far it has got there, what it has read and moved, and
     /// how long since anything moved.
     pub fn describe(&self, now: Secs) -> String {
@@ -320,7 +320,7 @@ pub struct Activity {
     pub time: Secs,
     pub direction: Direction,
     pub change: Change,
-    /// Relative to the root, as `cairn status` prints it.
+    /// Relative to the root, as `cairn-sync status` prints it.
     pub path: String,
     /// Where it went, for [`Change::Moved`].
     #[serde(default)]
@@ -423,16 +423,16 @@ pub struct OpenConflict {
     pub copy: Option<PathBuf>,
     /// The version it competes with, on this device, if that is here and has not been deleted.
     pub original: Option<PathBuf>,
-    /// Both relative to the root, as `cairn conflicts` prints them, for when a path above is `None`.
+    /// Both relative to the root, as `cairn-sync conflicts` prints them, for when a path above is `None`.
     pub copy_display: String,
     pub original_display: Option<String>,
 }
 
 /// Something deleted and still deleted, from the server's history: a file, or a folder with what was
-/// deleted with it. `cairn deleted --json` prints the same.
+/// deleted with it. `cairn-sync deleted --json` prints the same.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletedItem {
-    /// What [`Request::Undelete`] and `cairn undelete` take: the object's ID.
+    /// What [`Request::Undelete`] and `cairn-sync undelete` take: the object's ID.
     pub id: String,
     /// The commit that deleted it, and when, by which device.
     pub seq: u64,

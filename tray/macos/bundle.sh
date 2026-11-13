@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Makes a macOS app bundle around a built binary, from tray/:
-#   bash macos/bundle.sh target/release/cairn-tray out/Cairn.app        # the tray, com.cairn.tray
-#   bash macos/bundle.sh ../target/release/cairn "out/Cairn Sync.app"   # the CLI and daemon, com.cairn.sync
+#   bash macos/bundle.sh target/release/cairn-tray "out/Cairn Tray.app"      # the tray, com.cairn.tray
+#   bash macos/bundle.sh ../target/release/cairn-sync "out/Cairn Sync.app"   # the CLI and daemon, com.cairn.sync
+# Each bundle is named as its program is, Cairn Sync.app around cairn-sync and Cairn Tray.app around
+# cairn-tray, as Windows shows cairn-sync.exe as "Cairn Sync" and cairn-tray.exe as "Cairn Tray".
 # The daemon runs from inside its bundle, so that System Settings shows "Cairn Sync" with its icon, in Login
-# Items and in the privacy lists, rather than a bare "cairn", and Activity Monitor too, as the daemon checks
-# itself in with LaunchServices when it starts on a desktop (crates/cli/src/macos.rs). ~/.local/bin/cairn can
-# be a link to it, though a daemon started through the link shows as "cairn". Neither is in the Dock: the tray
-# is a UI element (LSUIElement), the daemon background-only (LSBackgroundOnly), so that opening its bundle
-# never brings to the front a process with no event loop to answer.
+# Items and in the privacy lists, rather than a bare "cairn-sync", and Activity Monitor too, as the daemon
+# checks itself in with LaunchServices when it starts on a desktop (crates/cli/src/macos.rs).
+# ~/.local/bin/cairn-sync can be a link to it, though a daemon started through the link shows as
+# "cairn-sync". Neither is in the Dock: the tray is a UI element (LSUIElement), the daemon background-only
+# (LSBackgroundOnly), so that opening its bundle never brings to the front a process with no event loop to
+# answer.
 #
 # The icons come from icons/ (make.py): an asset catalog compiled by Xcode's actool when there is one, which
 # macOS 26 and later draw properly at every size, and a plain .icns either way.
@@ -22,7 +25,7 @@
 # hardened runtime and a secure timestamp, which needs the network. A Developer ID is what installs on any Mac.
 #
 # Install a bundle by moving the new one into place, never by copying over the binary of a running one:
-# macOS kills what starts from a signed binary changed in place. `cairn update` does just that.
+# macOS kills what starts from a signed binary changed in place. `cairn-sync update` does just that.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=$1
@@ -32,12 +35,12 @@ case $(basename "$binary") in
         plist=macos/Info.plist icons=icons/Cairn.xcassets icns=icon exe=cairn-tray
         version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
         ;;
-    cairn)
-        plist=macos/Sync-Info.plist icons=icons/Sync.xcassets icns=sync exe=cairn
+    cairn-sync)
+        plist=macos/Sync-Info.plist icons=icons/Sync.xcassets icns=sync exe=cairn-sync
         version=$("$binary" --version | awk '{print $2}')
         ;;
     *)
-        echo "bundle.sh: $binary is neither cairn-tray nor cairn" >&2
+        echo "bundle.sh: $binary is neither cairn-tray nor cairn-sync" >&2
         exit 2
         ;;
 esac

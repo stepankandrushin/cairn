@@ -853,7 +853,7 @@ impl<'a> Applier<'a> {
                     "this disk would be full: what comes down needs about {} free here ({} of files, \
                      {} for chunks on their way, {} for this device's records), and {} is free. \
                      Nothing was changed: free some space, or leave folders out with .cairn/ignore or \
-                     `cairn exclude`, and sync again",
+                     `cairn-sync exclude`, and sync again",
                     human(needed),
                     human(created + grows.max(0) as u64 + biggest),
                     human(cached),

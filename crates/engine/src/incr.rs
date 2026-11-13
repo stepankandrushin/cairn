@@ -836,7 +836,7 @@ impl Session {
         }
         if !selection.copies.is_empty() {
             return closed(
-                "copies kept here by `cairn exclude` are found by inode, which needs the whole tree",
+                "copies kept here by `cairn-sync exclude` are found by inode, which needs the whole tree",
                 false,
             );
         }

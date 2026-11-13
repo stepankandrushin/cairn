@@ -1,4 +1,4 @@
-//! What was deleted lately and is still deleted, and bringing it back as `cairn undelete` does: each
+//! What was deleted lately and is still deleted, and bringing it back as `cairn-sync undelete` does: each
 //! object linked again to the entry it last had, as itself, with nothing reverted or replaced.
 //!
 //! Both are answered from an index of each namespace's journal, replayed when the server starts and

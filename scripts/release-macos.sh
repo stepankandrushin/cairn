@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The macOS half of a release, on a Mac: cairn and the tray built for both kinds of Mac and joined with lipo,
-# each in its app bundle (tray/macos/bundle.sh), Cairn Sync.app and Cairn.app, signed with CAIRN_SIGN for
+# The macOS half of a release, on a Mac: cairn-sync and the tray built for both kinds of Mac and joined with
+# lipo, each in its app bundle (tray/macos/bundle.sh), Cairn Sync.app and Cairn Tray.app, signed with CAIRN_SIGN for
 # notarization, notarized and stapled, then packed for updates as
 #   dist/cairn-<version>-macos-universal-sync.app.tar.gz and dist/cairn-<version>-macos-universal-tray.app.tar.gz,
 # named as release.sh names its files. CAIRN_MACOS_ARCH=aarch64 (or x86_64) builds for that kind alone, named so
@@ -41,20 +41,20 @@ universal=$PWD/target/macos-$arch
 mkdir -p "$universal"
 cairns=() trays=()
 for t in "${targets[@]}"; do
-    cairns+=("target/$t/release/cairn")
+    cairns+=("target/$t/release/cairn-sync")
     trays+=("tray/target/$t/release/cairn-tray")
 done
-lipo -create -output "$universal/cairn" "${cairns[@]}"
+lipo -create -output "$universal/cairn-sync" "${cairns[@]}"
 lipo -create -output "$universal/cairn-tray" "${trays[@]}"
-for bin in cairn cairn-tray; do
+for bin in cairn-sync cairn-tray; do
     if strings -a "$universal/$bin" | grep -q 'CAIRN_FP_'; then
         echo "$bin was built with failpoints" >&2
         exit 1
     fi
     test "$("$universal/$bin" --version | awk '{print $2}')" = "$version"
 done
-if [[ -n ${CAIRN_UPDATE_FEED-} ]] && ! grep -a -q -F "$CAIRN_UPDATE_FEED" "$universal/cairn"; then
-    echo "cairn does not name its feed, $CAIRN_UPDATE_FEED" >&2
+if [[ -n ${CAIRN_UPDATE_FEED-} ]] && ! grep -a -q -F "$CAIRN_UPDATE_FEED" "$universal/cairn-sync"; then
+    echo "cairn-sync does not name its feed, $CAIRN_UPDATE_FEED" >&2
     exit 1
 fi
 
@@ -63,10 +63,10 @@ export CAIRN_SIGN
 if [[ $notarize != off ]]; then
     export CAIRN_NOTARIZE=1
 fi
-bash tray/macos/bundle.sh "$universal/cairn" "$stage/Cairn Sync.app"
-bash tray/macos/bundle.sh "$universal/cairn-tray" "$stage/Cairn.app"
+bash tray/macos/bundle.sh "$universal/cairn-sync" "$stage/Cairn Sync.app"
+bash tray/macos/bundle.sh "$universal/cairn-tray" "$stage/Cairn Tray.app"
 mkdir -p dist
-for pair in "Cairn Sync:sync" "Cairn:tray"; do
+for pair in "Cairn Sync:sync" "Cairn Tray:tray"; do
     app="$stage/${pair%%:*}.app"
     name="cairn-$version-macos-$arch-${pair#*:}.app.tar.gz"
     codesign --verify --strict --deep "$app"

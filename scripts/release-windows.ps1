@@ -1,7 +1,7 @@
-# The Windows half of a release, on Windows: cairn.exe and cairn-tray.exe built, each signed with
+# The Windows half of a release, on Windows: cairn-sync.exe and cairn-tray.exe built, each signed with
 # Authenticode by CAIRN_SIGN_COMMAND, a script given the file's path, and copied to dist\ for updates as
 #   cairn-<version>-windows-x86_64-sync.exe and cairn-<version>-windows-x86_64-tray.exe,
-# named as release.sh names its files; installed, they are cairn.exe and cairn-tray.exe.
+# named as release.sh names its files; installed, they are cairn-sync.exe and cairn-tray.exe.
 # The signature is what keeps SmartScreen and antivirus from taking a program that downloads and replaces
 # programs for something worse; permissions on Windows go by path, so nothing else rests on it.
 # CAIRN_SIGN=off skips it, for a build that is only tried. Also needs what release.sh does
@@ -27,7 +27,7 @@ cargo build --release --locked --bin cairn-tray
 if ($LASTEXITCODE) { throw 'cargo build of the tray failed' }
 Pop-Location
 New-Item -ItemType Directory -Force dist | Out-Null
-foreach ($p in @(@('cairn', 'sync', 'target\release\cairn.exe'), @('cairn-tray', 'tray', 'tray\target\release\cairn-tray.exe'))) {
+foreach ($p in @(@('cairn-sync', 'sync', 'target\release\cairn-sync.exe'), @('cairn-tray', 'tray', 'tray\target\release\cairn-tray.exe'))) {
     $name, $program, $built = $p
     if (Select-String -Path $built -Pattern 'CAIRN_FP_' -SimpleMatch -Quiet) { throw "$name was built with failpoints" }
     $said = (& $built --version | Out-String).Trim()

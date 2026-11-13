@@ -87,12 +87,12 @@ impl SkipKind {
             }
             SkipKind::KeepsChanging => "sync again once it has stopped changing",
             SkipKind::VanishedDuringScan => "sync again",
-            SkipKind::CannotApply => "the server keeps the data; read it with `cairn export`",
+            SkipKind::CannotApply => "the server keeps the data; read it with `cairn-sync export`",
             SkipKind::CannotHoldName => {
-                "the server and other devices keep it, and it comes here once renamed there or the name in its way here is gone; read it with `cairn export`"
+                "the server and other devices keep it, and it comes here once renamed there or the name in its way here is gone; read it with `cairn-sync export`"
             }
             SkipKind::ExcludedInTheWay => {
-                "move what is here, and the server's comes; or bring it in, by `cairn include --merge` for a copy `cairn status` lists as left here, or by changing the rule"
+                "move what is here, and the server's comes; or bring it in, by `cairn-sync include --merge` for a copy `cairn-sync status` lists as left here, or by changing the rule"
             }
             SkipKind::ReadError => "check the disk, then sync again",
             SkipKind::SameNameOnServer => {

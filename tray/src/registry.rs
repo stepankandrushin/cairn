@@ -1,6 +1,6 @@
-//! Taking a root that has gone off this user's registry of roots, as `cairn forget` does
+//! Taking a root that has gone off this user's registry of roots, as `cairn-sync forget` does
 //! (crates/engine/src/registry.rs, `forget`): under the same `roots.lock`, by a new file renamed over the
-//! old, and never a root whose folder still holds it. Written here rather than run through `cairn`,
+//! old, and never a root whose folder still holds it. Written here rather than run through `cairn-sync`,
 //! which a tray started by launchd or at logon may not find on its PATH.
 
 use cairn_protocol::local::{Registry, RootEntry};

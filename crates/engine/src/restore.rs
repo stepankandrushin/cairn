@@ -311,7 +311,7 @@ fn commit(client: &Client, root: &Root, ops: Vec<Op>) -> Result<RestoreOutcome> 
     }
 }
 
-/// Bring `path` back to its state as of sequence `at`, as a new commit. `cairn sync` then applies it.
+/// Bring `path` back to its state as of sequence `at`, as a new commit. `cairn-sync sync` then applies it.
 pub fn restore_at(root: &Root, path: &[Name], at: u64) -> Result<RestoreOutcome> {
     let client = Client::new(&root.config, Retries::Short)?;
     let (then, seq) = tree_at(&client, Some(at))?;

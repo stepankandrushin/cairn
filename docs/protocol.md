@@ -75,7 +75,7 @@ and a client keeps the one it is told from then on.
 
 Each user may also have their own name for a namespace, which only they see, in place of its name: 1 to 64
 characters of any script, no control character, and no space at either end. A device offers the name of the
-directory it syncs the namespace into, `PUT /name` with `if_none`, as `cairn init` joins and once each time
+directory it syncs the namespace into, `PUT /name` with `if_none`, as `cairn-sync init` joins and once each time
 its daemon starts, so that it holds only until they choose one; the web sets it and takes it away. It
 changes nothing else: what a path, a device or another user says is the namespace's name.
 
@@ -177,7 +177,7 @@ session, `<token hash>.<end>.<mac>`: the BLAKE3 of the token that signed in, the
 BLAKE3 of both under the server's key, `web/session.key`. It never holds the token, it outlives a restart, and
 removing the token signs out every browser it signed in. `DELETE /v1/session` clears it. A ticket comes from
 `POST /v1/session/ticket` with a token, `{ticket, expires_in}`: 32 random bytes as base64url, in memory only,
-taken once within 120 s. A program with a token (the tray's Open in browser, `cairn web`) opens
+taken once within 120 s. A program with a token (the tray's Open in browser, `cairn-sync web`) opens
 `<server>/#/signin/<ticket>/f/<folder>/root`; the ticket is in the fragment, which no browser sends, and the page
 takes it out of the address before it signs in with it, so nobody types a token. A request
 with no `Authorization` header is taken as the session's token's, and one that is not `GET` or `HEAD` must then
@@ -237,7 +237,7 @@ days (30 if not given): `{items, complete}`, newest first, each `{object, kind, 
 device_name, size, files}`, where `path` is the folder it was in, as it is now, and a folder deleted in one
 commit with what was in it is one item, `files` and `size` counting what it held. The server answers it from an
 index of the whole journal kept in memory, so `complete` is true. `POST
-/v1/ns/{ns}/undelete` with `{objects}` brings each back in one commit, as `cairn undelete` does: to the entry it
+/v1/ns/{ns}/undelete` with `{objects}` brings each back in one commit, as `cairn-sync undelete` does: to the entry it
 last had, a deleted folder above it first, what was deleted with a folder with it, and to `name (conflict
 restored seq N).ext` where the name is taken. It answers `{seq, items}`, each `{object, display, path,
 renamed}`. Needs `write`.
@@ -267,7 +267,7 @@ mounting one into another root's tree (PLAN.md, "Sharing and access").
 
 ## Local API
 
-Not on the wire to the server: what a device's daemons tell the programs that show them (`cairn status`,
+Not on the wire to the server: what a device's daemons tell the programs that show them (`cairn-sync status`,
 the tray), in `cairn_protocol::local`. Each daemon serves it on a socket of its own, one JSON object per
 line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out.
 
@@ -280,8 +280,8 @@ line each way: a request `{"op": "..."}` in, replies `{"reply": "...", ...}` out
 The user dir is `$XDG_STATE_HOME/cairn` or `~/.local/state/cairn` on Linux, `~/Library/Application
 Support/Cairn` on macOS, `%LOCALAPPDATA%\Cairn` on Windows, or `CAIRN_USER_DIR`, for tests. It holds
 `roots.json`, the registry of this user's roots (`{ roots: [{ path, root_id, server, added }] }`), which
-`cairn init`, once its server has answered, and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
-whose folder no longer holds its ID is listed as gone, not dropped, until `cairn forget` takes it off, by
+`cairn-sync init`, once its server has answered, and a starting daemon add to under `roots.lock`, writing a new file over the old. A root
+whose folder no longer holds its ID is listed as gone, not dropped, until `cairn-sync forget` takes it off, by
 its path or ID, under the same lock: it refuses a root still there unless given `--even-if-present`, and
 that root's daemon lists it again when it starts. The tray's Forget, offered for a root it shows as gone, does
 the same without the flag, writing the file itself under the same lock. A file that does not parse is an error, never written
@@ -307,9 +307,9 @@ they take. A deleted folder above it comes back holding only what was asked for.
 the name a restore gives, `name (conflict restored seq N).ext`, beside what has it now. One commit holds
 it all, so a kill leaves nothing or all of it; a restore over 100,000 operations or 48 MiB goes in several,
 each leaving a valid tree with every folder before what is in it. A commit refused because something
-changed is planned again from the journal once, and then reported. `cairn deleted` and `cairn undelete`
-do the same without a daemon, and `cairn ask` sends any request as JSON:
-`cairn ask '{"op":"undelete","ids":["..."]}'`.
+changed is planned again from the journal once, and then reported. `cairn-sync deleted` and `cairn-sync undelete`
+do the same without a daemon, and `cairn-sync ask` sends any request as JSON:
+`cairn-sync ask '{"op":"undelete","ids":["..."]}'`.
 
 A malformed request gets an `error { text }`. The status adds only fields with defaults, so a reader of
 an older file keeps working: `recent` lists the last 100 changes the daemon sent (`up`) or applied
@@ -320,9 +320,9 @@ the file is written after each sync, and with it `progress`, sent again every 2 
 shows one it does not know as `other`), its `round`, when it began and came to that phase, the entries its
 scan has looked at of about how many, the files and bytes it has read to hash them and the file being read,
 the phase's own `done` of `total`, the bytes downloaded and uploaded of how many, and `moved`, when any of
-it last went up. `cairn status` and the tray say it in words, and the daemon's log every 5 minutes once a
+it last went up. `cairn-sync status` and the tray say it in words, and the daemon's log every 5 minutes once a
 sync has run for one, and once when nothing in it has moved for 10 minutes. A daemon from before this API holds the Linux socket
-without answering, so `cairn status` waits 2 s for an answer and then reads its lock and file. `update` is what
+without answering, so `cairn-sync status` waits 2 s for an answer and then reads its lock and file. `update` is what
 this user's updater on this device knows, the same in every daemon's status, and `version` the daemon's own.
 
 ## Updates
@@ -339,7 +339,7 @@ for this project's `https://cairn.storage/download/update.json`, or a GitHub rel
 Each signature is over the bytes `cairn release v1\n` followed by `release` as it stands, so no parse and print
 can change what is checked, and a signature made with the key for anything else is never one of a release. The
 release, `{ version, protocol, published, notes, files: [{ program, platform, form, url, size, sha256 }] }`, names
-each program (`cairn`, `cairn-tray`) for each platform (`linux-x86_64`, `windows-x86_64`, `macos-aarch64`,
+each program (`cairn-sync`, `cairn-tray`) for each platform (`linux-x86_64`, `windows-x86_64`, `macos-aarch64`,
 `macos-x86_64` or `macos-universal`, which serves either Mac) as `binary`, the executable itself, or `app`, a
 gzipped tar holding one macOS bundle; a `url` that is not absolute is beside `update.json`, wherever that was
 fetched from, so one signed file serves from every feed that has the files beside it, as this project's releases
@@ -352,11 +352,11 @@ fallback never hides a feed that is down; when none answers, the error says what
 ask cairn.storage, then GitHub. `update-settings.json` in the user dir can name other feeds and their keys, and
 holds the `policy`: `auto` (the default), `notify` or `off`. A file that does not parse is an error, never written over. One
 updater runs at a time, under `update.lock` in the user dir: a daemon's, about once an hour, give or take a
-tenth, and a person's `cairn update now`, which waits for another. It installs a release only if one of the trusted
+tenth, and a person's `cairn-sync update now`, which waits for another. It installs a release only if one of the trusted
 keys signed it, its version is above what is installed, it was not taken back on this device (unless a person
 asks), and its `protocol` is this build's or the one every server of this user's roots here answers `/info` with
-(unless `--any-protocol`). Then, for each program installed here, `cairn` and the tray beside it (in the same
-folder, or `Cairn.app` beside the bundle `cairn` is in on macOS):
+(unless `--any-protocol`). Then, for each program installed here, `cairn-sync` and the tray beside it (in the same
+folder, or `Cairn Tray.app` beside the bundle `cairn-sync` is in on macOS):
 
 1. download into `.cairn-update` beside it, checking the size and SHA-256 the release gives;
 2. for a bundle, unpack it, and on macOS check its signature, which must be by the team of the installed bundle
@@ -374,7 +374,7 @@ those before it said, `unanswered`, `available` and why it `waits`,
 `update`, and the version on probation. A daemon whose program has been replaced, by an update or a person,
 restarts into the new one between syncs: on Unix in the same process, by exec, and on Windows by exiting with 75
 for the loop that runs it to start it again. A daemon that starts more than three times for one root on a version
-just installed without getting through a sync, or running an hour, takes the version back as `cairn update
+just installed without getting through a sync, or running an hour, takes the version back as `cairn-sync update
 rollback` does: the previous program put back, the version added to `rejected`. The tray, too, restarts once its
 program has been replaced, but never by exec on macOS, whose menu bar gives a program exec'd in another's process
 no icon: under its LaunchAgent it exits with 75 for launchd to start it again, and otherwise starts a new process

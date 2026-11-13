@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cairn",
+  "productName": "Cairn Tray",
   "version": "0.1.21",
   "identifier": "com.cairn.tray",
   "build": {

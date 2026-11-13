@@ -15,7 +15,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# This user's own list of roots is left as it was: every `cairn` here keeps to the test's own, and the end
+# This user's own list of roots is left as it was: every `cairn-sync` here keeps to the test's own, and the end
 # checks that nothing reached the user's. Release runs once left their roots in it, listed as gone.
 user_dir=${CAIRN_USER_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cairn}
 user_names() { if [ -d "$user_dir" ]; then find "$user_dir" -mindepth 1 -printf '%P\n' | LC_ALL=C sort; fi; }
@@ -66,10 +66,10 @@ url="https://localhost:$(first_line "$work/proxy.out" "$proxy_pid" "the TLS prox
 
 export SSL_CERT_FILE="$work/ca.pem"
 mkdir "$work/a" "$work/b"
-"$bin/cairn" init --server "$url" --token-file "$work/data/token" --device-name a "$work/a" >/dev/null
-"$bin/cairn" init --server "$url" --token-file "$work/data/token" --device-name b "$work/b" >/dev/null
+"$bin/cairn-sync" init --server "$url" --token-file "$work/data/token" --device-name a "$work/a" >/dev/null
+"$bin/cairn-sync" init --server "$url" --token-file "$work/data/token" --device-name b "$work/b" >/dev/null
 # Both listed, in the test's own list.
-listed=$("$bin/cairn" status --all --json)
+listed=$("$bin/cairn-sync" status --all --json)
 grep -qF "\"$work/a\"" <<<"$listed"
 grep -qF "\"$work/b\"" <<<"$listed"
 
@@ -80,8 +80,8 @@ ln -s hello.txt "$work/a/link"
 ln "$work/a/hello.txt" "$work/a/hard"
 truncate -s 1T "$work/a/sparse"
 mkdir "$work/a/node_modules"; echo kept >"$work/a/node_modules/x"
-"$bin/cairn" --root "$work/a" sync >/dev/null
-"$bin/cairn" --root "$work/b" sync >/dev/null
+"$bin/cairn-sync" --root "$work/a" sync >/dev/null
+"$bin/cairn-sync" --root "$work/b" sync >/dev/null
 test "$(cat "$work/b/hello.txt")" = hello
 test "$(stat -c %a "$work/b/script.sh")" = 755
 test "$(readlink "$work/b/link")" = hello.txt
@@ -92,27 +92,27 @@ test "$(cat "$work/b/node_modules/x")" = kept
 
 # A conflict keeps both, and a restore brings an old version back.
 echo from-a >"$work/a/hello.txt"
-"$bin/cairn" --root "$work/a" sync >/dev/null
+"$bin/cairn-sync" --root "$work/a" sync >/dev/null
 echo from-b >"$work/b/hello.txt"
-"$bin/cairn" --root "$work/b" sync >/dev/null
+"$bin/cairn-sync" --root "$work/b" sync >/dev/null
 test "$(cat "$work/b/hello.txt")" = from-a
 test "$(cat "$work/b/"hello\ \(conflict\ b\ *\).txt)" = from-b
-"$bin/cairn" --root "$work/b" conflicts | grep -q " (conflict b [0-9-]*)[^:]*: the competing version of "
-"$bin/cairn" --root "$work/a" sync >/dev/null
-"$bin/cairn" --root "$work/a" restore hello.txt --at 1 >/dev/null
+"$bin/cairn-sync" --root "$work/b" conflicts | grep -q " (conflict b [0-9-]*)[^:]*: the competing version of "
+"$bin/cairn-sync" --root "$work/a" sync >/dev/null
+"$bin/cairn-sync" --root "$work/a" restore hello.txt --at 1 >/dev/null
 test "$(cat "$work/a/hello.txt")" = hello
 
 # A folder with no marker pauses.
 mkdir "$work/gone"
-status=0; "$bin/cairn" --root "$work/gone" sync >"$work/paused.out" || status=$?
+status=0; "$bin/cairn-sync" --root "$work/gone" sync >"$work/paused.out" || status=$?
 test "$status" = 2
 grep -q "Sync is paused" "$work/paused.out"
 
 # Daemons keep two roots in step through the proxy, from the watcher and the change feed alone.
-"$bin/cairn" --root "$work/b" sync >/dev/null
-"$bin/cairn" --root "$work/a" daemon --reconcile-secs 86400 >"$work/daemon-a.out" &
+"$bin/cairn-sync" --root "$work/b" sync >/dev/null
+"$bin/cairn-sync" --root "$work/a" daemon --reconcile-secs 86400 >"$work/daemon-a.out" &
 daemon_a=$!
-"$bin/cairn" --root "$work/b" daemon --reconcile-secs 86400 >"$work/daemon-b.out" &
+"$bin/cairn-sync" --root "$work/b" daemon --reconcile-secs 86400 >"$work/daemon-b.out" &
 daemon_b=$!
 wait_for() {
     for _ in $(seq 400); do
@@ -132,14 +132,14 @@ kill "$daemon_a" "$daemon_b"; wait "$daemon_a" "$daemon_b" 2>/dev/null || true; 
 # Rules leave a path out, and nothing about it reaches the server.
 echo '*.secret' >"$work/a/.cairn/ignore"
 echo s >"$work/a/x.secret"
-"$bin/cairn" --root "$work/a" sync >/dev/null
-"$bin/cairn" --root "$work/b" sync >/dev/null
+"$bin/cairn-sync" --root "$work/a" sync >/dev/null
+"$bin/cairn-sync" --root "$work/b" sync >/dev/null
 test ! -e "$work/b/x.secret"
 test -e "$work/a/x.secret"
 
 # A server's TLS certificate is checked.
 unset SSL_CERT_FILE
-if SSL_CERT_FILE=/dev/null "$bin/cairn" --root "$work/a" sync >/dev/null 2>&1; then
+if SSL_CERT_FILE=/dev/null "$bin/cairn-sync" --root "$work/a" sync >/dev/null 2>&1; then
     echo "an untrusted certificate was accepted" >&2
     exit 1
 fi

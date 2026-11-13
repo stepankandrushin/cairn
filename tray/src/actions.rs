@@ -58,7 +58,7 @@ fn platform_open(target: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
-/// Takes a root off this device's list of roots, as `cairn forget` does, if the tray shows it as gone:
+/// Takes a root off this device's list of roots, as `cairn-sync forget` does, if the tray shows it as gone:
 /// the window asked first.
 pub fn forget(hub: &Hub, root_id: &str) -> Result<String, String> {
     let r = hub
@@ -66,7 +66,7 @@ pub fn forget(hub: &Hub, root_id: &str) -> Result<String, String> {
         .ok_or("that root is no longer in the registry")?;
     if !crate::model::shown_gone(&r) {
         return Err(format!(
-            "{} is not shown as gone, so it stays on the list; `cairn forget --even-if-present` takes off one still there",
+            "{} is not shown as gone, so it stays on the list; `cairn-sync forget --even-if-present` takes off one still there",
             r.entry.path.display()
         ));
     }
@@ -102,7 +102,7 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Where something a daemon reported is: `rel` is relative to the root, by `/`, as `cairn status`
+/// Where something a daemon reported is: `rel` is relative to the root, by `/`, as `cairn-sync status`
 /// prints it. None for a path that would leave the root.
 pub fn under(root: &Path, rel: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
@@ -521,8 +521,8 @@ pub mod login {
         plist().is_some_and(|p| p.exists())
     }
 
-    /// Restarted after a crash, not after Quit, and only in a desktop session. The label is also Cairn.app's
-    /// bundle id, which the plist names so that Login Items shows the app with its icon.
+    /// Restarted after a crash, not after Quit, and only in a desktop session. The label is also Cairn
+    /// Tray.app's bundle id, which the plist names so that Login Items shows the app with its icon.
     #[cfg(target_os = "macos")]
     pub fn set(on: bool) -> Result<(), String> {
         let path = plist().ok_or("HOME is not set")?;
@@ -572,7 +572,7 @@ pub mod login {
     #[cfg(windows)]
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     #[cfg(windows)]
-    const VALUE: &str = "Cairn";
+    const VALUE: &str = "Cairn Tray";
 
     #[cfg(windows)]
     fn wide(s: &str) -> Vec<u16> {
@@ -666,7 +666,7 @@ pub mod login {
         }
         let exe = std::env::current_exe().map_err(|e| format!("cannot tell where this is: {e}"))?;
         let text = format!(
-            "[Desktop Entry]\nType=Application\nName=Cairn\nExec=\"{}\"\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName=Cairn Tray\nExec=\"{}\"\nX-GNOME-Autostart-enabled=true\n",
             exe.display()
         );
         if let Some(dir) = path.parent() {

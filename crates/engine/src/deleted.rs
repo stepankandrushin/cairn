@@ -1,5 +1,5 @@
-//! What was deleted, and bringing it back: the tray's "Recently deleted", `cairn deleted` and
-//! `cairn undelete`. Read from the journal, as the conflict inbox is, until the server keeps a trash of
+//! What was deleted, and bringing it back: the tray's "Recently deleted", `cairn-sync deleted` and
+//! `cairn-sync undelete`. Read from the journal, as the conflict inbox is, until the server keeps a trash of
 //! its own (PLAN.md, milestone 4).
 //!
 //! A delete is the unlink that leaves an object with no entry. The server keeps that object's last
@@ -617,7 +617,7 @@ fn commit_all(client: &Client, config: &Config, ops: Vec<Op>) -> Result<Vec<u64>
 }
 
 impl Deleted {
-    /// As the local API and `cairn deleted --json` carry it.
+    /// As the local API and `cairn-sync deleted --json` carry it.
     pub fn item(&self) -> DeletedItem {
         DeletedItem {
             id: self.object.to_string(),
@@ -645,13 +645,13 @@ impl Undeleted {
     }
 }
 
-/// The IDs `cairn deleted` and the local API give, read back.
+/// The IDs `cairn-sync deleted` and the local API give, read back.
 pub fn parse_ids(ids: &[String]) -> Result<Vec<ObjectId>> {
     ids.iter()
         .map(|s| {
             s.trim()
                 .parse::<ObjectId>()
-                .map_err(|_| anyhow!("{s} is not an ID that `cairn deleted` gives"))
+                .map_err(|_| anyhow!("{s} is not an ID that `cairn-sync deleted` gives"))
         })
         .collect()
 }

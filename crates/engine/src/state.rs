@@ -1002,7 +1002,9 @@ impl State {
         conn.pragma_update(None, "cache_size", -(cache as i64))?;
         let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
-            bail!("this root's state is schema {version}, newer than this binary: upgrade cairn");
+            bail!(
+                "this root's state is schema {version}, newer than this binary: upgrade cairn-sync"
+            );
         }
         let mut migrated = None;
         match version {
@@ -3007,7 +3009,7 @@ mod tests {
             .expect("refused");
         assert!(
             err.to_string()
-                .contains("newer than this binary: upgrade cairn"),
+                .contains("newer than this binary: upgrade cairn-sync"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);

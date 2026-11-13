@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Cairn</string>
-    <key>CFBundleDisplayName</key><string>Cairn</string>
+    <key>CFBundleName</key><string>Cairn Tray</string>
+    <key>CFBundleDisplayName</key><string>Cairn Tray</string>
     <key>CFBundleIdentifier</key><string>com.cairn.tray</string>
     <key>CFBundleExecutable</key><string>cairn-tray</string>
     <key>CFBundleIconFile</key><string>icon</string>

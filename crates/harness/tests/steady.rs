@@ -842,7 +842,7 @@ fn a_folder_included_again_comes_down_past_the_fast_path() {
     same_trees(&a, &b, "included again");
 }
 
-/// `cairn exclude` syncs at once, and that sync is the full one: the state changed, the tree did not.
+/// `cairn-sync exclude` syncs at once, and that sync is the full one: the state changed, the tree did not.
 /// Once it has, the fast path works with what is left out by identity too.
 #[test]
 fn a_folder_excluded_is_left_out_by_the_full_sync_and_then_the_fast_one() {

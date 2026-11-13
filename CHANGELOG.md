@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- Each program is named as it is shown, the same on every platform. The CLI and daemon, which macOS and
+  Windows show as "Cairn Sync", is `cairn-sync`, where it was `cairn`: `cairn-sync.exe` on Windows, and
+  `Contents/MacOS/cairn-sync` in Cairn Sync.app on macOS. So the command is `cairn-sync init`, `cairn-sync
+  status` and so on, and `--version` says `cairn-sync <v>`. The tray is "Cairn Tray", where it was shown as
+  "Cairn": still `cairn-tray`, now in `Cairn Tray.app` on macOS, where it was Cairn.app. That name is also in its
+  Windows version information, its window's title, its menu's Quit, the Run key's value on Windows and the
+  autostart entry on Linux. update.json names the programs `cairn-sync` and `cairn-tray`. Roots, their state,
+  the user dir, the update settings, the bundle identifiers and with them each permission macOS keeps are
+  unchanged.
+- **A copy before 0.1.22 does not update itself to it.** It looks in update.json for a program named `cairn`
+  and finds none, though it may update a tray installed beside it. Install 0.1.22 by hand:
+  1. Stop the daemon.
+  2. Put `cairn-sync` where `cairn` was and remove the old one. On macOS put the new Cairn Sync.app in place
+     of the old, Cairn Tray.app in place of Cairn.app, and link `~/.local/bin/cairn-sync` into the bundle; on
+     Windows put `cairn-sync.exe` beside `cairn-tray.exe`.
+  3. Point whatever starts the daemon at the new name: the systemd unit's `ExecStart`, the launchd agent's
+     `ProgramArguments`, the scheduled task, and a Defender exclusion by path.
+  4. Run `cairn-tray --login on` once more, so the tray's agent or Run key is written under the new names. On
+     Windows, also remove the Run key's old value, `Cairn`.
+
 ## 0.1.21 (2026-11-13)
 
 **Changed:**

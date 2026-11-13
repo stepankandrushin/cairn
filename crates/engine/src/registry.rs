@@ -1,7 +1,7 @@
-//! This user's roots on this device, for `cairn status --all` and the tray: the registry of
-//! `cairn_protocol::local`. `cairn init` and a starting daemon add to it. Nothing removes an entry
+//! This user's roots on this device, for `cairn-sync status --all` and the tray: the registry of
+//! `cairn_protocol::local`. `cairn-sync init` and a starting daemon add to it. Nothing removes an entry
 //! because its folder has gone: it reads as gone, so nobody is left thinking a root still syncs, until a
-//! person takes it off with `cairn forget`.
+//! person takes it off with `cairn-sync forget`.
 
 use anyhow::{anyhow, Context, Result};
 use cairn_protocol::local::{registry_path, Registry, RootEntry, RootView};
@@ -82,7 +82,7 @@ pub fn forget(path_or_id: &Path, even_if_present: bool) -> Result<Forgotten> {
     };
     let Some(entry) = by_path.or_else(by_id).cloned() else {
         return Err(anyhow!(
-            "no root is listed at {}: `cairn status --all` lists them",
+            "no root is listed at {}: `cairn-sync status --all` lists them",
             path_or_id.display()
         ));
     };

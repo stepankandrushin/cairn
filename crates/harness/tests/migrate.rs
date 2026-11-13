@@ -147,7 +147,8 @@ fn a_state_newer_than_this_build_is_refused_and_left_as_it_is() {
     let run = a.sync();
     assert!(!run.ok(), "{}", run.text());
     assert!(
-        run.stderr.contains("newer than this binary: upgrade cairn"),
+        run.stderr
+            .contains("newer than this binary: upgrade cairn-sync"),
         "{}",
         run.text()
     );

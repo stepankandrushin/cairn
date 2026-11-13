@@ -633,7 +633,7 @@ function showSignIn(message) {
     brand(false),
     h('h1', { text: 'Sign in' }),
     form,
-    h('p', { class: 'hint' }, 'Opened from Cairn on a computer that syncs (its Open in browser, or ', h('code', { text: 'cairn web' }), ' in a synced folder), this page signs in by itself.'),
+    h('p', { class: 'hint' }, 'Opened from Cairn on a computer that syncs (its Open in browser, or ', h('code', { text: 'cairn-sync web' }), ' in a synced folder), this page signs in by itself.'),
     h('p', { class: 'hint' }, 'Or sign in with a token: ', h('code', { text: 'cairn-server token add <user> --label browser' }), ' on the server makes one.'))));
   input.focus();
 }
@@ -2074,7 +2074,7 @@ function renderFolder(gen, ns) {
     rename = h('p', { class: 'hint', text: 'Only a manager of this folder renames it.' });
   }
   const page = (p, text) => h('a', { class: 'btn subtle', href: `#/${p}/${enc(ns)}` }, text);
-  const command = `cairn init --server ${location.origin} --folder ${ns} <directory>`;
+  const command = `cairn-sync init --server ${location.origin} --folder ${ns} <directory>`;
   show(gen, h('section', { class: 'settings' },
     h('div', { class: 'screen-head' }, h('h1', { text: folderName(ns) })),
     h('div', { class: 'panel' },
@@ -2096,7 +2096,7 @@ function renderFolder(gen, ns) {
       h('h2', { text: 'Sync it on a computer' }),
       h('p', { class: 'muted', text: 'Each folder is a root of its own on a computer. In a terminal there, with a token of yours in CAIRN_TOKEN or given by --token-file:' }),
       h('pre', { class: 'command' }, h('code', { text: command })),
-      h('p', { class: 'hint' }, 'Then ', h('code', { text: 'cairn daemon --root <directory>' }), ' keeps it in sync.'))), folderName(ns));
+      h('p', { class: 'hint' }, 'Then ', h('code', { text: 'cairn-sync daemon --root <directory>' }), ' keeps it in sync.'))), folderName(ns));
 }
 
 async function renderShares(gen, ns) {

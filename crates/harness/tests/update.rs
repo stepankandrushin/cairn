@@ -53,7 +53,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
-/// A program as an installed one: a copy of the harness's `cairn`, and for a new release one that tells
+/// A program as an installed one: a copy of the harness's `cairn-sync`, and for a new release one that tells
 /// apart from it: the same with bytes after its end, which the loader ignores, or on macOS, where those
 /// would break its signature, the same signed again under another identifier.
 fn program_bytes(new: bool) -> Vec<u8> {
@@ -109,7 +109,7 @@ fn signed_ad_hoc(program: &[u8], identifier: &str) -> Vec<u8> {
     signed
 }
 
-/// A folder holding an installed `cairn`, a user dir of its own, and a release beside it.
+/// A folder holding an installed `cairn-sync`, a user dir of its own, and a release beside it.
 struct Lab {
     sandbox: Sandbox,
     bin: PathBuf,
@@ -130,7 +130,7 @@ impl Lab {
         for d in [&bin, &dist, &user] {
             std::fs::create_dir_all(d).unwrap();
         }
-        let cairn = bin.join(exe("cairn"));
+        let cairn = bin.join(exe("cairn-sync"));
         write_exe(&cairn, &program_bytes(false));
         Self {
             sandbox,
@@ -174,11 +174,11 @@ impl Lab {
         self.publish(
             VERSION,
             cairn_protocol::PROTOCOL_VERSION,
-            &[("cairn", "cairn-new", program_bytes(true))],
+            &[("cairn-sync", "cairn-new", program_bytes(true))],
         );
     }
 
-    /// The installed `cairn`, as an old version if it is still the old program, with this lab's feed.
+    /// The installed `cairn-sync`, as an old version if it is still the old program, with this lab's feed.
     fn cairn(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
         let mut cmd = Command::new(&self.cairn);
         cmd.args(args).env("CAIRN_USER_DIR", &self.user);
@@ -216,7 +216,7 @@ impl Lab {
     }
 
     fn previous(&self) -> Option<Vec<u8>> {
-        std::fs::read(self.staging().join(exe("cairn-previous"))).ok()
+        std::fs::read(self.staging().join(exe("cairn-sync-previous"))).ok()
     }
 
     /// Nothing half-made left beside the program.
@@ -237,12 +237,12 @@ impl Lab {
             .unwrap_or(serde_json::Value::Null)
     }
 
-    /// Whatever is installed must run, and say it is `cairn`.
+    /// Whatever is installed must run, and say it is `cairn-sync`.
     #[track_caller]
     fn runs(&self) {
         let r = self.cairn(&["--version"], &[]);
         assert!(
-            r.ok() && r.stdout.starts_with("cairn "),
+            r.ok() && r.stdout.starts_with("cairn-sync "),
             "the installed program does not run: {}",
             r.text()
         );
@@ -434,7 +434,7 @@ fn an_older_or_the_same_version_is_never_installed() {
         lab.publish(
             version,
             cairn_protocol::PROTOCOL_VERSION,
-            &[("cairn", "cairn-new", program_bytes(true))],
+            &[("cairn-sync", "cairn-new", program_bytes(true))],
         );
         let r = lab.update_now(&[]).expect_ok();
         assert!(r.stdout.contains("up to date"), "{version}: {}", r.text());
@@ -455,18 +455,18 @@ fn a_new_program_that_does_not_say_it_is_that_version_is_not_installed() {
     for (what, bytes, why) in [
         (
             "another version",
-            program_saying("cairn 9.9.9", 0),
+            program_saying("cairn-sync 9.9.9", 0),
             "says it is 9.9.9",
         ),
         (
             "failing",
-            program_saying(&format!("cairn {VERSION}"), 1),
+            program_saying(&format!("cairn-sync {VERSION}"), 1),
             "exit status: 1",
         ),
         (
-            "not cairn",
+            "not cairn-sync",
             program_saying(&format!("other {VERSION}"), 0),
-            "not `cairn <version>`",
+            "not `cairn-sync <version>`",
         ),
         (
             "not a program",
@@ -477,7 +477,7 @@ fn a_new_program_that_does_not_say_it_is_that_version_is_not_installed() {
         lab.publish(
             VERSION,
             cairn_protocol::PROTOCOL_VERSION,
-            &[("cairn", "cairn-new", bytes)],
+            &[("cairn-sync", "cairn-new", bytes)],
         );
         let r = lab.update_now(&[]);
         assert!(!r.ok(), "{what}: installed: {}", r.text());
@@ -496,12 +496,12 @@ fn a_program_whose_signature_does_not_hold_is_not_installed() {
     let lab = Lab::new("update-signature");
     let mut changed = program_bytes(false);
     changed.extend_from_slice(b"\0after its end\0");
-    let script = format!("#!/bin/sh\necho cairn {VERSION}\n").into_bytes();
+    let script = format!("#!/bin/sh\necho cairn-sync {VERSION}\n").into_bytes();
     for (what, bytes) in [("changed after signing", changed), ("not signed", script)] {
         lab.publish(
             VERSION,
             cairn_protocol::PROTOCOL_VERSION,
-            &[("cairn", "cairn-new", bytes)],
+            &[("cairn-sync", "cairn-new", bytes)],
         );
         let r = lab.update_now(&[]);
         assert!(!r.ok(), "{what}: installed: {}", r.text());
@@ -570,7 +570,7 @@ fn a_kill_at_any_step_leaves_a_whole_program_and_the_next_run_finishes() {
             // Between Windows's two renames, the running one set aside and the new one not yet in its
             // place: the old one is whole as the previous, and the loop that runs the daemon puts it back.
             assert_eq!(lab.previous(), Some(program_bytes(false)), "{step}");
-            std::fs::copy(lab.staging().join(exe("cairn-previous")), &lab.cairn).unwrap();
+            std::fs::copy(lab.staging().join(exe("cairn-sync-previous")), &lab.cairn).unwrap();
         }
         let now = lab.installed();
         assert!(
@@ -617,7 +617,7 @@ fn a_release_on_another_protocol_waits_until_the_server_speaks_it() {
     lab.publish(
         VERSION,
         next,
-        &[("cairn", "cairn-new", program_bytes(true))],
+        &[("cairn-sync", "cairn-new", program_bytes(true))],
     );
     let r = lab.update_now(&[]);
     assert_eq!(r.code, Some(3), "{}", r.text());
@@ -665,7 +665,7 @@ fn the_tray_beside_it_is_updated_too() {
         VERSION,
         cairn_protocol::PROTOCOL_VERSION,
         &[
-            ("cairn", &sync, program_bytes(true)),
+            ("cairn-sync", &sync, program_bytes(true)),
             ("cairn-tray", &tray_file, new_tray.clone()),
         ],
     );

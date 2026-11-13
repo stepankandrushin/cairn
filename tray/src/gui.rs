@@ -437,7 +437,7 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
         }
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&item(app, "quit", "Quit Cairn", true)?)?;
+    menu.append(&item(app, "quit", "Quit Cairn Tray", true)?)?;
     Ok((menu, recent_at))
 }
 
@@ -512,7 +512,7 @@ fn show_window(app: &AppHandle, tab: &str) {
             return;
         }
         let built = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
-            .title("Cairn")
+            .title("Cairn Tray")
             .inner_size(780.0, 560.0)
             .min_inner_size(480.0, 320.0)
             .build();
@@ -907,7 +907,7 @@ async fn undelete(root_id: String, ids: Vec<String>) -> Result<String, String> {
     .await
 }
 
-/// Takes a root shown as gone off the registry, as `cairn forget` does; the window asked first.
+/// Takes a root shown as gone off the registry, as `cairn-sync forget` does; the window asked first.
 #[tauri::command]
 async fn forget(root_id: String) -> Result<String, String> {
     blocking(move || actions::forget(hub(), &root_id)).await
@@ -976,7 +976,7 @@ async fn update_now() -> Result<String, String> {
             .map(|r| r.entry.root_id.clone())
             .collect();
         if up.is_empty() {
-            return Err("no daemon is running here to update from: `cairn update now` does it".into());
+            return Err("no daemon is running here to update from: `cairn-sync update now` does it".into());
         }
         let mut last = String::new();
         for id in up {

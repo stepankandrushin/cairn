@@ -47,7 +47,7 @@ enum Command {
         notes: String,
         #[arg(long)]
         out: PathBuf,
-        /// Each `program:platform:form:path`: `cairn:linux-x86_64:binary:dist/cairn-0.1.6-linux-x86_64`.
+        /// Each `program:platform:form:path`: `cairn:linux-x86_64:binary:dist/cairn-0.1.21-linux-x86_64-sync`.
         #[arg(required = true)]
         files: Vec<String>,
     },

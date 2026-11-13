@@ -656,12 +656,17 @@ fn the_tray_beside_it_is_updated_too() {
     let tray = lab.bin.join("cairn-tray");
     write_exe(&tray, &program_saying(&format!("cairn-tray {OLD}"), 0));
     let new_tray = program_saying(&format!("cairn-tray {VERSION}"), 0);
+    // Named as a release names them, by platform and then program: each installed by its program, under the
+    // name it has here, whatever the file's.
+    let platform = cairn_protocol::update::platform();
+    let sync = format!("cairn-{VERSION}-{platform}-sync");
+    let tray_file = format!("cairn-{VERSION}-{platform}-tray");
     lab.publish(
         VERSION,
         cairn_protocol::PROTOCOL_VERSION,
         &[
-            ("cairn", "cairn-new", program_bytes(true)),
-            ("cairn-tray", "cairn-tray-new", new_tray.clone()),
+            ("cairn", &sync, program_bytes(true)),
+            ("cairn-tray", &tray_file, new_tray.clone()),
         ],
     );
     let r = lab.update_now(&[]).expect_ok();

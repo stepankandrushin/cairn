@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the release binaries, prove them, and put them with checksums in dist/: the tarball for people, and
-# the bare cairn for updates, which release-update.sh signs with the macOS and Windows halves
-# (release-macos.sh, release-windows.ps1).
+# Build the release binaries, prove them, and put them in dist/: cairn-<v>-linux-x86_64.tar.gz for people, and
+# the bare cairn-<v>-linux-x86_64-sync for updates, which release-update.sh signs with the macOS and Windows
+# halves (release-macos.sh, release-windows.ps1) and lists in the release's one checksum file.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/update-env.sh
@@ -44,16 +44,16 @@ fi
 
 bash scripts/smoke.sh "$out"
 
-name="cairn-$version-$target"
+# Each file is cairn-<v>-<platform>[-<program>], the program `sync` for cairn and `tray` for the tray, so a
+# release's files sort by platform; the tarball, which holds cairn and cairn-server, names none.
+name="cairn-$version-linux-x86_64"
 stage=$(mktemp -d)
 mkdir "$stage/$name"
 cp "$out/cairn" "$out/cairn-server" README.md CHANGELOG.md LICENSE-APACHE LICENSE-AGPL "$stage/$name/"
 mkdir -p dist
 tar -C "$stage" --owner=0 --group=0 --sort=name -czf "dist/$name.tar.gz" "$name"
 rm -rf "$stage"
-(cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
 # What an installed cairn on Linux updates itself to: the program alone.
-cp "$out/cairn" "dist/cairn-$version-linux-x86_64"
-(cd dist && sha256sum "cairn-$version-linux-x86_64" >"cairn-$version-linux-x86_64.sha256")
-ls -l "dist/$name.tar.gz" "dist/cairn-$version-linux-x86_64"
-cat "dist/$name.tar.gz.sha256" "dist/cairn-$version-linux-x86_64.sha256"
+cp "$out/cairn" "dist/$name-sync"
+ls -l "dist/$name.tar.gz" "dist/$name-sync"
+(cd dist && sha256sum "$name.tar.gz" "$name-sync")

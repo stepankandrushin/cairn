@@ -2,9 +2,9 @@
 # The macOS half of a release, on a Mac: cairn and the tray built for both kinds of Mac and joined with lipo,
 # each in its app bundle (tray/macos/bundle.sh), Cairn Sync.app and Cairn.app, signed with CAIRN_SIGN for
 # notarization, notarized and stapled, then packed for updates as
-#   dist/Cairn-Sync-<version>-macos-universal.app.tar.gz and dist/Cairn-<version>-macos-universal.app.tar.gz.
-# CAIRN_MACOS_ARCH=aarch64 (or x86_64) builds for that kind alone, named so in place of universal; both
-# need `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+#   dist/cairn-<version>-macos-universal-sync.app.tar.gz and dist/cairn-<version>-macos-universal-tray.app.tar.gz,
+# named as release.sh names its files. CAIRN_MACOS_ARCH=aarch64 (or x86_64) builds for that kind alone, named so
+# in place of universal; both need `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 #
 # CAIRN_SIGN is a Developer ID Application identity: the only kind another Mac lets run, and the one whose
 # team every later release keeps, as installed copies refuse an update by another team and macOS keeps
@@ -66,9 +66,9 @@ fi
 bash tray/macos/bundle.sh "$universal/cairn" "$stage/Cairn Sync.app"
 bash tray/macos/bundle.sh "$universal/cairn-tray" "$stage/Cairn.app"
 mkdir -p dist
-for pair in "Cairn Sync:Cairn-Sync" "Cairn:Cairn"; do
+for pair in "Cairn Sync:sync" "Cairn:tray"; do
     app="$stage/${pair%%:*}.app"
-    name="${pair#*:}-$version-macos-$arch.app.tar.gz"
+    name="cairn-$version-macos-$arch-${pair#*:}.app.tar.gz"
     codesign --verify --strict --deep "$app"
     if [[ $notarize != off ]]; then
         zip="$stage/${pair#*:}.zip"
@@ -86,7 +86,7 @@ for pair in "Cairn Sync:Cairn-Sync" "Cairn:Cairn"; do
     fi
     # No ._ files for extended attributes: the signature covers the files alone.
     COPYFILE_DISABLE=1 tar -C "$stage" -czf "dist/$name" "${pair%%:*}.app"
-    (cd dist && shasum -a 256 "$name" >"$name.sha256")
     ls -l "dist/$name"
+    (cd dist && shasum -a 256 "$name")
 done
 rm -rf "$stage"

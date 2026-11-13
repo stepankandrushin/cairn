@@ -1,6 +1,7 @@
 # The Windows half of a release, on Windows: cairn.exe and cairn-tray.exe built, each signed with
 # Authenticode by CAIRN_SIGN_COMMAND, a script given the file's path, and copied to dist\ for updates as
-#   cairn-<version>-windows-x86_64.exe and cairn-tray-<version>-windows-x86_64.exe.
+#   cairn-<version>-windows-x86_64-sync.exe and cairn-<version>-windows-x86_64-tray.exe,
+# named as release.sh names its files; installed, they are cairn.exe and cairn-tray.exe.
 # The signature is what keeps SmartScreen and antivirus from taking a program that downloads and replaces
 # programs for something worse; permissions on Windows go by path, so nothing else rests on it.
 # CAIRN_SIGN=off skips it, for a build that is only tried. Also needs what release.sh does
@@ -26,12 +27,12 @@ cargo build --release --locked --bin cairn-tray
 if ($LASTEXITCODE) { throw 'cargo build of the tray failed' }
 Pop-Location
 New-Item -ItemType Directory -Force dist | Out-Null
-foreach ($p in @(@('cairn', 'target\release\cairn.exe'), @('cairn-tray', 'tray\target\release\cairn-tray.exe'))) {
-    $name, $built = $p
+foreach ($p in @(@('cairn', 'sync', 'target\release\cairn.exe'), @('cairn-tray', 'tray', 'tray\target\release\cairn-tray.exe'))) {
+    $name, $program, $built = $p
     if (Select-String -Path $built -Pattern 'CAIRN_FP_' -SimpleMatch -Quiet) { throw "$name was built with failpoints" }
     $said = (& $built --version | Out-String).Trim()
     if ($said -ne "$name $version") { throw "$built --version said '$said'" }
-    $out = "dist\$name-$version-windows-x86_64.exe"
+    $out = "dist\cairn-$version-windows-x86_64-$program.exe"
     Copy-Item -Force $built $out
     if ($env:CAIRN_SIGN -ne 'off') {
         if (-not $env:CAIRN_SIGN_COMMAND) { throw 'set CAIRN_SIGN_COMMAND, the script that signs a file, or CAIRN_SIGN=off' }
@@ -41,7 +42,6 @@ foreach ($p in @(@('cairn', 'target\release\cairn.exe'), @('cairn-tray', 'tray\t
         if ($sig.Status -ne 'Valid') { throw "$out is not validly signed: $($sig.Status) $($sig.StatusMessage)" }
         Write-Output "$out signed by $($sig.SignerCertificate.Subject)"
     }
-    $hash = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLower()
-    "$hash  $(Split-Path -Leaf $out)" | Set-Content -Encoding ascii "$out.sha256"
     Get-Item $out | Format-Table -AutoSize Name, Length
+    Write-Output "$((Get-FileHash -Algorithm SHA256 $out).Hash.ToLower())  $(Split-Path -Leaf $out)"
 }

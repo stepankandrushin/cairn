@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**Changed:**
+
+- The release's files are named by platform, then program, so a release page that sorts by name groups each
+  platform's together, and each program has one name everywhere: `cairn-<v>-linux-x86_64-sync` (cairn alone),
+  `cairn-<v>-linux-x86_64.tar.gz` (cairn and cairn-server), `cairn-<v>-macos-universal-sync.app.tar.gz` (Cairn
+  Sync.app) and `-tray.app.tar.gz` (Cairn.app), `cairn-<v>-windows-x86_64-sync.exe` (cairn.exe) and
+  `-tray.exe` (cairn-tray.exe). One file, `cairn-<v>.sha256`, holds every file's SHA-256, in place of a
+  `.sha256` beside each: `sha256sum -c --ignore-missing cairn-<v>.sha256`. Installed copies update from the new
+  names as before, as each finds its file by program and platform in update.json; installed, the programs keep
+  their names. Releases before keep theirs.
+
 ## 0.1.20 (2026-11-13)
 
 **Changed:**

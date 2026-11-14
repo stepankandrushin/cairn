@@ -21,6 +21,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 mod admin;
+mod file;
 mod web;
 
 struct App {
@@ -691,6 +692,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/name", put(set_name).delete(clear_name))
         .route("/rename", post(rename_folder))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
+        // A streamed body, of any size: outside the limit above.
+        .route("/file", put(file::put).options(file::options))
         .merge(web::namespace_routes())
         .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .with_state(app.clone());

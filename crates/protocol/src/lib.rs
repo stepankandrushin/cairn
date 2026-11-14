@@ -1,6 +1,7 @@
 //! Types shared by the Cairn server, CLI and engine: one definition, so no component can quietly
 //! strip a field it does not understand. See docs/protocol.md and docs/format.md.
 
+pub mod file;
 pub mod ids;
 pub mod local;
 pub mod manifest;

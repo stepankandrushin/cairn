@@ -17,7 +17,7 @@ use cairn_store::MetaStore;
 use std::sync::Arc;
 
 /// Why a commit was refused, in words a person acts on.
-pub(super) fn refusal(reject: &RejectReason) -> String {
+pub(crate) fn refusal(reject: &RejectReason) -> String {
     match reject {
         RejectReason::Op { reason, .. } => match reason {
             OpReject::NameTaken(_) => "that name is taken: reload to see what has it".into(),
@@ -62,7 +62,7 @@ pub(super) fn commit(app: &App, view: &View, ops: Vec<Op>) -> Result<Result<u64,
 }
 
 /// Now, as a revision's time.
-pub(super) fn now_ts() -> Timestamp {
+pub(crate) fn now_ts() -> Timestamp {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

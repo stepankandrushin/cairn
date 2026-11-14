@@ -15,10 +15,15 @@ path = "src/bin/h_cairn.rs"
 name = "h-cairn-server"
 path = "src/bin/h_cairn_server.rs"
 
+[[bin]]
+name = "h-mobile"
+path = "src/bin/h_mobile.rs"
+
 [dependencies]
 cairn-cli = { workspace = true, features = ["failpoints"] }
 cairn-server = { workspace = true, features = ["failpoints"] }
 cairn-engine = { workspace = true, features = ["failpoints"] }
+cairn-mobile = { workspace = true, features = ["failpoints"] }
 cairn-protocol.workspace = true
 cairn-store.workspace = true
 cairn-failpoint.workspace = true

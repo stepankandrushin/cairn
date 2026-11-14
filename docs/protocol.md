@@ -33,6 +33,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `POST /chunks/upload` | chunk batch | 204: all durable, made so together. 400: damaged batch, of which nothing is kept. Needs `write` |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404: one is missing |
 | `POST /commit` | `CommitRequest` | `CommitResponse`. Needs `write` |
+| `PUT /file?…` | the file's bytes | A new file, stored and committed in one request ([One-request uploads](#one-request-uploads)). Needs `write` |
 | `GET /changes?after=N&limit=M&wait=S&ops=false` | | `{changes, head}`: journal entries after sequence N, in order: at most M (1000 if not given, at most 10,000), and fewer once about 16 MiB of operations are in the answer, but always one if there is one. With `wait`, see [Waiting](#waiting). With `ops=false`, each without its operations: where a client stands, for the price of one entry however large its commit |
 | `GET /conflicts` | | The conflict inbox |
 | `GET /access` | | `[{user, access}]`: who has access here, at which level |
@@ -117,6 +118,34 @@ So neither an edit nor a delete can land on top of the other unseen: the second 
 
 A batch that swaps names or nests a directory under its former child moves one party through a name
 starting `.cairn-stage-` inside the same commit. Such a name is never visible after the commit.
+
+## One-request uploads
+
+`PUT /file` takes one new file's bytes and does a device's whole upload with them: what a phone sends,
+and what its system sends for it in the background, a request built once and sent later, whose answer
+it keeps only the headers of. In `cairn_protocol::file`.
+
+Everything but the token is in the query: `parent` (an `ObjectId`; absent for the root), `path` (names
+joined by `/`, the last the file's), `object` and `revision` (the new file's IDs, the client's choice),
+`device` and `device_name` (whose commit it is), `mtime` and `btime` (seconds since the epoch, with up to
+nine digits after a `.`, as many as the time is known to, which give its precision), and `taken`
+(`fail`, the default, or `rename`). `Content-Length` is required (411 without it). The bytes are cut and
+hashed as they arrive, as a client cuts a file with no holes, so the manifest is the one a client makes
+of them, and every chunk is durable before the commit that names them.
+
+The commit's `op_id` is the revision's 16 bytes, so a request sent again, after an answer that was lost,
+is the same commit: if the revision is already the server's, it is answered as the first was, and
+nothing is stored or committed again. Any folder of `path` that is missing is made in the same commit,
+mode 0755; one that is a symbolic link or a file refuses it (409), as nothing goes through a symbolic
+link. If the name is taken by a file with the same bytes, that file is the answer (200, `existed`), with
+no commit; by anything else, `fail` refuses it (409) and `rename` takes the first free `stem (n).ext`
+from 2 on, so both stay. The new file has mode 0644 and the times given.
+
+The answer, 201 for a file made and 200 for one that was there, is `{object, revision, seq, name,
+existed?}`, and the same in headers: `X-Cairn-Object`, `X-Cairn-Revision`, `X-Cairn-Seq`,
+`X-Cairn-Name` (base64 of the name's bytes) and `X-Cairn-Existed: 1`. A refusal says why in its body
+and in `X-Cairn-Error`, printable ASCII with any other byte as `%XX`; 507 is a full disk; a body that
+stops short of its length commits nothing. `OPTIONS` answers 501: uploads are not resumable yet.
 
 ## Revisions
 

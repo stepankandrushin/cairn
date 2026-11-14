@@ -393,6 +393,40 @@ pub(crate) fn chunk_file(
     Ok(Manifest::new(size, vec![Segment { offset: 0, chunks }]))
 }
 
+/// Cut `size` bytes of `file` as `chunk_file` does, and make every chunk durable, in batches of about
+/// `BATCH_BYTES`, each told to `stored` by its size, and then the manifest: its hash.
+pub(crate) fn store_bytes(
+    chunks: &dyn ChunkStore,
+    file: impl Read,
+    size: u64,
+    stored: &mut dyn FnMut(u64),
+) -> Result<Hash> {
+    let mut batch: Vec<(Hash, Vec<u8>)> = Vec::new();
+    let mut pending = 0usize;
+    let mut flush = |batch: &mut Vec<(Hash, Vec<u8>)>, pending: &mut usize| -> Result<()> {
+        let frames: Vec<(Hash, &[u8])> = batch.iter().map(|(h, d)| (*h, d.as_slice())).collect();
+        chunks.put_all(&frames)?;
+        let n: u64 = batch.iter().map(|(_, d)| d.len() as u64).sum();
+        batch.clear();
+        *pending = 0;
+        stored(n);
+        Ok(())
+    };
+    let manifest = chunk_file(file, size, &mut |h, d| {
+        pending += d.len();
+        batch.push((h, d));
+        if pending >= BATCH_BYTES {
+            flush(&mut batch, &mut pending)?;
+        }
+        Ok(())
+    })?;
+    flush(&mut batch, &mut pending)?;
+    let encoded = manifest.encode();
+    let mhash = Hash::of(&encoded);
+    chunks.put(&mhash, &encoded)?;
+    Ok(mhash)
+}
+
 /// Cut, store and commit an upload: `Ok(Err)` is a refusal a person reads.
 fn store(app: &App, view: &View, up: &Mutex<Upload>) -> Result<Result<w::UploadDone, String>> {
     let (path, start) = {
@@ -404,33 +438,12 @@ fn store(app: &App, view: &View, up: &Mutex<Upload>) -> Result<Result<w::UploadD
     if file.metadata()?.len() != start.size {
         bail!("the upload's file is not the size it was given");
     }
-    let mut batch: Vec<(Hash, Vec<u8>)> = Vec::new();
-    let mut pending = 0usize;
-    let flush = |batch: &mut Vec<(Hash, Vec<u8>)>, pending: &mut usize| -> Result<()> {
-        let frames: Vec<(Hash, &[u8])> = batch.iter().map(|(h, d)| (*h, d.as_slice())).collect();
-        chunks.put_all(&frames)?;
-        let n: u64 = batch.iter().map(|(_, d)| d.len() as u64).sum();
-        batch.clear();
-        *pending = 0;
-        up.lock().expect("a panic aborts the process").stored += n;
-        Ok(())
-    };
-    let manifest = chunk_file(
+    let mhash = store_bytes(
+        &*chunks,
         std::io::BufReader::with_capacity(1 << 20, file),
         start.size,
-        &mut |h, d| {
-            pending += d.len();
-            batch.push((h, d));
-            if pending >= BATCH_BYTES {
-                flush(&mut batch, &mut pending)?;
-            }
-            Ok(())
-        },
+        &mut |n| up.lock().expect("a panic aborts the process").stored += n,
     )?;
-    flush(&mut batch, &mut pending)?;
-    let encoded = manifest.encode();
-    let mhash = Hash::of(&encoded);
-    chunks.put(&mhash, &encoded)?;
     cairn_failpoint::hit("server.web.upload.stored");
 
     // Every chunk is durable; now the commit, against what the browser saw.

@@ -9,7 +9,7 @@ use cairn_protocol::{Bytes, Metadata, ObjectKind, Owner, RecordKey};
 /// Where this platform's xattrs go in a record. Another platform's stay stored and untouched here.
 #[cfg(target_os = "linux")]
 use cairn_protocol::NS_LINUX_XATTR as NS_XATTR;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use cairn_protocol::NS_MACOS_XATTR as NS_XATTR;
 /// Windows reads none yet: alternate data streams would go here. Every other platform's records stay
 /// stored and untouched.
@@ -71,11 +71,11 @@ fn default_xattr_deny() -> Vec<String> {
     vec!["security.selinux".into()]
 }
 /// macOS's names have no namespaces that say who may write them.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn default_xattr_allow() -> Vec<String> {
     vec![String::new()]
 }
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn default_xattr_deny() -> Vec<String> {
     MACHINE_LOCAL_XATTRS.map(String::from).to_vec()
 }
@@ -91,7 +91,7 @@ fn default_xattr_deny() -> Vec<String> {
 /// What macOS keeps on a file about this machine rather than about the file: database keys, access
 /// grants, the time it was last opened. Copied elsewhere they mean nothing or something false, and
 /// the last changes on every open, so they are neither stored nor applied.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MACHINE_LOCAL_XATTRS: [&str; 5] = [
     "com.apple.provenance",
     "com.apple.quarantine",
@@ -102,14 +102,14 @@ const MACHINE_LOCAL_XATTRS: [&str; 5] = [
 
 /// A record travels inside the metadata. A big resource fork would need the streams the format has a
 /// place for and no client writes yet, so past this it is reported and not stored.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_XATTR_STORED: usize = 1 << 20;
 
 #[cfg(any(target_os = "linux", windows))]
 fn stored_xattr(_: &[u8]) -> bool {
     true
 }
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn stored_xattr(name: &[u8]) -> bool {
     !MACHINE_LOCAL_XATTRS.iter().any(|x| x.as_bytes() == name)
 }
@@ -135,7 +135,7 @@ impl ApplyPolicy {
         let xattr_allow = ["user.", "system.posix_acl_", "security.", "trusted."]
             .map(String::from)
             .to_vec();
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_vendor = "apple", windows))]
         let xattr_allow = default_xattr_allow();
         Self {
             owners: OwnerPolicy::ByNumber,
@@ -230,7 +230,7 @@ pub fn capture(
                     continue;
                 }
                 match dir.get_xattr(name, &key) {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(target_vendor = "apple")]
                     Ok(value) if value.len() > MAX_XATTR_STORED => problems.push(format!(
                         "xattr {}: {} bytes, too big to store yet",
                         cairn_protocol::name::display_bytes(&key),
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(out.unknown["from_the_future"], 1);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn what_is_about_this_machine_stays_on_it() {
         let p = ApplyPolicy::default();

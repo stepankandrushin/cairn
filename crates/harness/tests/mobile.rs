@@ -1,0 +1,614 @@
+//! The phone apps: a file sent in one request (`PUT /file`) arrives on every device byte for byte, once
+//! however often it is sent and wherever the server or the phone was killed, and nothing is committed of
+//! one that did not arrive whole; a name taken by other bytes is numbered or refused, never replaced; a
+//! path through a symbolic link is refused; a download killed midway leaves nothing at its destination;
+//! and the change feed tells the Files app what changed.
+
+mod common;
+use base64::Engine;
+use cairn_engine::client::{Client, RawAnswer, Retries};
+use cairn_engine::root::Config;
+use cairn_mobile::{new_device_id, Session};
+use cairn_protocol::file::{self as f, FileQuery, Taken};
+use cairn_protocol::{DeviceId, ObjectId, RevisionId};
+use common::*;
+use std::io::{Read, Write};
+use std::path::Path;
+
+const MOBILE: &str = env!("CARGO_BIN_EXE_h-mobile");
+
+fn token(server: &Server) -> String {
+    std::fs::read_to_string(&server.token_file)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn client(server: &Server) -> Client {
+    Client::new(
+        &Config {
+            server: server.url.clone(),
+            namespace: "cloud".into(),
+            token: token(server),
+            device: DeviceId::random(),
+            device_name: "test".into(),
+            policy: Default::default(),
+            filenames: Default::default(),
+            allow_http: false,
+        },
+        Retries::Short,
+    )
+    .unwrap()
+}
+
+fn query(path: &str, taken: Taken) -> FileQuery {
+    FileQuery {
+        parent: None,
+        path: path.into(),
+        object: ObjectId::random(),
+        revision: RevisionId::random(),
+        device: DeviceId([7; 16]),
+        device_name: "Phone of the test".into(),
+        mtime: "1691920214.250".into(),
+        btime: Some("1691920214.250".into()),
+        taken,
+    }
+}
+
+fn put(c: &Client, q: &FileQuery, bytes: &[u8]) -> RawAnswer {
+    c.put_file(&f::query_string(q), &mut &bytes[..], bytes.len() as u64)
+        .unwrap()
+}
+
+fn header<'a>(a: &'a RawAnswer, name: &str) -> Option<&'a str> {
+    a.headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+#[track_caller]
+fn created(a: &RawAnswer) -> (String, u64) {
+    assert!(
+        (200..300).contains(&a.status),
+        "{} {:?} {}",
+        a.status,
+        a.headers,
+        String::from_utf8_lossy(&a.body)
+    );
+    let name = base64::engine::general_purpose::STANDARD
+        .decode(header(a, f::HEADER_NAME).unwrap())
+        .unwrap();
+    (
+        String::from_utf8(name).unwrap(),
+        header(a, f::HEADER_SEQ).unwrap().parse().unwrap(),
+    )
+}
+
+fn bytes(n: usize, seed: u8) -> Vec<u8> {
+    let mut x = u64::from(seed) | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// The names in a device's folder, sorted.
+fn names(d: &Device, dir: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d.path(dir))
+        .map(|r| {
+            r.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_file_sent_in_one_request_arrives_whole_with_its_times_and_the_phone_named() {
+    let sb = Sandbox::on_disk("mobile-put");
+    let server = Server::start(sb.path("data"));
+    let c = client(&server);
+    // Larger than a chunk batch, so it is stored in batches as it arrives.
+    let data = bytes(40 * 1024 * 1024 + 12345, 1);
+    let q = query("phone/iPhone/23-08-13 16-50-14 0003.heic", Taken::Rename);
+    let a = put(&c, &q, &data);
+    assert_eq!(a.status, 201, "{}", String::from_utf8_lossy(&a.body));
+    let (name, seq) = created(&a);
+    assert_eq!(name, "23-08-13 16-50-14 0003.heic");
+    assert_eq!(
+        header(&a, f::HEADER_OBJECT),
+        Some(q.object.to_string().as_str())
+    );
+    assert_eq!(header(&a, f::HEADER_EXISTED), None);
+
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    let rel = "phone/iPhone/23-08-13 16-50-14 0003.heic";
+    assert!(d.read(rel) == data, "the bytes differ");
+    assert_eq!(mtime_of(&d.path(rel)).0, 1_691_920_214);
+    assert_eq!(mode_of(&d.path(rel)) & 0o777, other_mode(0o644) & 0o777);
+    // One commit, with the folders, as the phone.
+    let change = c.change_with_ops(seq).unwrap().unwrap();
+    assert_eq!(change.device_name, "Phone of the test");
+    assert_eq!(change.device, DeviceId([7; 16]));
+    assert_eq!(change.ops.len(), 3, "phone, iPhone and the file");
+}
+
+#[test]
+fn the_same_request_twice_is_one_file_and_the_same_answer() {
+    let sb = Sandbox::on_disk("mobile-twice");
+    let server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let data = bytes(3 * 1024 * 1024, 2);
+    let q = query("Photos/a.heic", Taken::Rename);
+    let first = created(&put(&c, &q, &data));
+    let head = c.info().unwrap().head;
+    let again = put(&c, &q, &data);
+    assert_eq!(again.status, 201);
+    assert_eq!(created(&again), first);
+    assert_eq!(c.info().unwrap().head, head, "a retry commits nothing");
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert_eq!(names(&d, "Photos"), ["a.heic"]);
+}
+
+#[test]
+fn a_name_taken_by_the_same_bytes_is_that_file_and_by_other_bytes_numbered_or_refused() {
+    let sb = Sandbox::on_disk("mobile-taken");
+    let server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let one = bytes(100_000, 3);
+    let other = bytes(100_000, 4);
+    let (_, first_seq) = created(&put(&c, &query("P/x.jpg", Taken::Fail), &one));
+
+    // A phone that sends it again as a new request, as after a reinstall: that file, nothing committed.
+    let head = c.info().unwrap().head;
+    let same = put(&c, &query("P/x.jpg", Taken::Fail), &one);
+    assert_eq!(same.status, 200);
+    assert_eq!(header(&same, f::HEADER_EXISTED), Some("1"));
+    assert_eq!(created(&same).1, first_seq);
+    assert_eq!(c.info().unwrap().head, head);
+
+    let refused = put(&c, &query("P/x.jpg", Taken::Fail), &other);
+    assert_eq!(refused.status, 409);
+    assert!(
+        header(&refused, f::HEADER_ERROR).is_some_and(|e| f::from_header_text(e).contains("taken"))
+    );
+    assert_eq!(c.info().unwrap().head, head);
+
+    let numbered = put(&c, &query("P/x.jpg", Taken::Rename), &other);
+    assert_eq!(created(&numbered).0, "x (2).jpg");
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert_eq!(names(&d, "P"), ["x (2).jpg", "x.jpg"]);
+    assert!(d.read("P/x.jpg") == one && d.read("P/x (2).jpg") == other);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_through_a_symlink_or_a_file_is_refused() {
+    let sb = Sandbox::on_disk("mobile-path");
+    let server = Server::start(sb.path("data"));
+    let d = Device::new(&sb, &server, "laptop");
+    std::fs::create_dir_all(d.path("real")).unwrap();
+    std::os::unix::fs::symlink("real", d.path("link")).unwrap();
+    d.write("file", b"x");
+    d.synced();
+    let c = client(&server);
+    let head = c.info().unwrap().head;
+    for path in ["link/a.jpg", "link/deeper/a.jpg", "file/a.jpg"] {
+        let a = put(&c, &query(path, Taken::Rename), b"photo");
+        assert_eq!(a.status, 409, "{path}");
+        assert!(header(&a, f::HEADER_ERROR).is_some(), "{path}");
+    }
+    assert_eq!(c.info().unwrap().head, head, "nothing was committed");
+    for bad in ["", "a//b", "../a", "a/./b"] {
+        assert_eq!(
+            put(&c, &query(bad, Taken::Rename), b"x").status,
+            400,
+            "{bad:?}"
+        );
+    }
+    d.synced();
+    assert_eq!(names(&d, "real"), Vec::<String>::new());
+}
+
+#[test]
+fn a_read_only_folder_refuses_and_says_why() {
+    let sb = Sandbox::on_disk("mobile-read-only");
+    let server = Server::start(sb.path("data"));
+    let bob = server.user("bob");
+    server.admin(&["grant", "cloud", "bob", "read"]).expect_ok();
+    let c = Client::new(
+        &Config {
+            server: server.url.clone(),
+            namespace: "cloud".into(),
+            token: std::fs::read_to_string(bob).unwrap().trim().into(),
+            device: DeviceId::random(),
+            device_name: "bob's phone".into(),
+            policy: Default::default(),
+            filenames: Default::default(),
+            allow_http: false,
+        },
+        Retries::Short,
+    )
+    .unwrap();
+    let a = put(&c, &query("a.jpg", Taken::Rename), b"x");
+    assert_eq!(a.status, 403);
+    assert!(header(&a, f::HEADER_ERROR).is_some_and(|e| e.contains("read-only")));
+}
+
+/// A request whose body stops short of its length, and then its connection closed.
+fn cut_short(server: &Server, q: &FileQuery, data: &[u8], sent: usize) {
+    let addr = server.url.strip_prefix("http://").unwrap();
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let head = format!(
+        "PUT /v1/ns/cloud/file?{} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+        f::query_string(q),
+        token(server),
+        data.len()
+    );
+    conn.write_all(head.as_bytes()).unwrap();
+    conn.write_all(&data[..sent]).unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut sink = Vec::new();
+    let _ = conn.read_to_end(&mut sink);
+}
+
+#[test]
+fn a_body_cut_short_commits_nothing_and_the_retry_arrives() {
+    let sb = Sandbox::on_disk("mobile-cut");
+    let server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let data = bytes(20 * 1024 * 1024, 5);
+    let q = query("V/clip.mov", Taken::Rename);
+    let head = c.info().unwrap().head;
+    cut_short(&server, &q, &data, 9 * 1024 * 1024);
+    assert_eq!(c.info().unwrap().head, head, "half a file was committed");
+    assert_eq!(created(&put(&c, &q, &data)).0, "clip.mov");
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert!(d.read("V/clip.mov") == data);
+}
+
+#[test]
+fn a_full_disk_while_storing_commits_nothing_and_says_so() {
+    let sb = Sandbox::on_disk("mobile-full");
+    let mut server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let head = c.info().unwrap().head;
+    server.set_env(vec![(
+        "CAIRN_FP_ENOSPC".into(),
+        "server.chunk.before_write".into(),
+    )]);
+    server.restart();
+    let q = query("Photos/b.heic", Taken::Rename);
+    let data = bytes(5 * 1024 * 1024, 6);
+    let a = put(&c, &q, &data);
+    assert_eq!(a.status, 507, "{}", String::from_utf8_lossy(&a.body));
+    assert!(header(&a, f::HEADER_ERROR).is_some_and(|e| e.contains("disk is full")));
+    server.set_env(vec![]);
+    server.restart();
+    assert_eq!(c.info().unwrap().head, head);
+    assert_eq!(created(&put(&c, &q, &data)).0, "b.heic");
+}
+
+#[test]
+fn a_server_killed_at_each_step_leaves_one_whole_file_after_the_retry() {
+    for point in [
+        "server.chunk.before_write",
+        "server.file.stored",
+        "server.file.before_ack",
+    ] {
+        let sb = Sandbox::on_disk("mobile-kill");
+        let mut server = Server::start(sb.path("data"));
+        let c = client(&server);
+        server.set_env(vec![("CAIRN_FP_CRASH".into(), point.into())]);
+        server.restart();
+        let data = bytes(6 * 1024 * 1024, 7);
+        let q = query("Photos/c.heic", Taken::Rename);
+        let lost = c.put_file(&f::query_string(&q), &mut &data[..], data.len() as u64);
+        assert!(
+            lost.as_ref().is_err() || lost.as_ref().is_ok_and(|a| a.status >= 500),
+            "{point}: answered {:?}",
+            lost.map(|a| a.status)
+        );
+        assert!(!server.alive_after_a_kill(), "{point} was not reached");
+        server.set_env(vec![]);
+        server.restart();
+        let (name, _) = created(&put(&c, &q, &data));
+        assert_eq!(name, "c.heic", "{point}");
+        let d = Device::new(&sb, &server, "laptop");
+        d.synced();
+        assert_eq!(names(&d, "Photos"), ["c.heic"], "{point}");
+        assert!(d.read("Photos/c.heic") == data, "{point}: the bytes differ");
+        server.fsck();
+    }
+}
+
+fn h_mobile(args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = std::process::Command::new(MOBILE);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    Run {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn a_phone_killed_at_each_step_of_an_upload_sends_it_once() {
+    for point in [
+        "mobile.upload.planned",
+        "mobile.upload.sending",
+        "mobile.upload.answered",
+    ] {
+        let sb = Sandbox::on_disk("mobile-phone-kill");
+        let server = Server::start(sb.path("data"));
+        let db = sb.path("cairn.db");
+        let photo = sb.path("IMG_0003.HEIC");
+        let data = bytes(2 * 1024 * 1024 + 7, 8);
+        std::fs::write(&photo, &data).unwrap();
+        let args = [
+            "upload",
+            db.to_str().unwrap(),
+            &server.url,
+            server.token_file.to_str().unwrap(),
+            "cloud",
+            "phone/iPhone",
+            photo.to_str().unwrap(),
+            "asset-1",
+            "IMG_0003.HEIC",
+            "1691920214",
+        ];
+        let killed = h_mobile(&args, &[("CAIRN_FP_CRASH", point)]);
+        assert!(killed.was_killed(), "{point}: {}", killed.text());
+        let done = h_mobile(&args, &[]).expect_ok();
+        assert!(
+            done.text().contains("\"state\":\"Done\""),
+            "{point}: {}",
+            done.text()
+        );
+        // And once more: done stays done, and sends nothing.
+        h_mobile(&args, &[]).expect_ok();
+        let d = Device::new(&sb, &server, "laptop");
+        d.synced();
+        assert_eq!(
+            names(&d, "phone/iPhone"),
+            ["23-08-13 09-50-14 0003.heic"],
+            "{point}"
+        );
+        assert!(d.read("phone/iPhone/23-08-13 09-50-14 0003.heic") == data);
+    }
+}
+
+#[test]
+fn a_download_killed_midway_leaves_nothing_at_its_destination() {
+    let sb = Sandbox::on_disk("mobile-download");
+    let server = Server::start(sb.path("data"));
+    let d = Device::new(&sb, &server, "laptop");
+    let data = bytes(9 * 1024 * 1024, 9);
+    d.write("big.mov", &data);
+    d.synced();
+    let s = Session::new(
+        server.url.clone(),
+        token(&server),
+        new_device_id(),
+        "iPhone".into(),
+        false,
+    )
+    .unwrap();
+    let folder = s.folder("cloud".into()).unwrap();
+    let entry = folder
+        .list("root".into())
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.display == "big.mov")
+        .unwrap();
+    let dest = sb.path("big.mov");
+    let args = [
+        "download",
+        &server.url,
+        server.token_file.to_str().unwrap(),
+        "cloud",
+        &entry.object,
+        &entry.revision,
+        dest.to_str().unwrap(),
+        &data.len().to_string(),
+    ];
+    let killed = h_mobile(&args, &[("CAIRN_FP_CRASH", "mobile.download.written")]);
+    assert!(killed.was_killed(), "{}", killed.text());
+    assert!(!dest.exists(), "a half-made file is at the destination");
+    h_mobile(&args, &[]).expect_ok();
+    assert!(std::fs::read(&dest).unwrap() == data);
+    // A size that is not the file's is refused, and leaves nothing.
+    let wrong = sb.path("wrong.mov");
+    let err = folder
+        .download(
+            entry.object.clone(),
+            entry.revision.clone(),
+            wrong.to_string_lossy().into_owned(),
+            123,
+            None,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("bytes"), "{err}");
+    assert!(!wrong.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_files_app_is_told_what_changed_and_what_it_cannot_show() {
+    let sb = Sandbox::on_disk("mobile-fp");
+    let server = Server::start(sb.path("data"));
+    let d = Device::new(&sb, &server, "laptop");
+    d.write("keep.txt", b"one");
+    d.write("dir/edit.txt", b"two");
+    d.write("dir/gone.txt", b"three");
+    d.synced();
+    let s = Session::new(
+        server.url.clone(),
+        token(&server),
+        new_device_id(),
+        "iPhone".into(),
+        false,
+    )
+    .unwrap();
+    let folder = s.folder("cloud".into()).unwrap();
+    let start = folder.head().unwrap();
+    let root = folder.fp_list("root".into()).unwrap();
+    let names_of = |items: &[cairn_mobile::fp::FpItem]| {
+        let mut v: Vec<String> = items.iter().map(|i| i.filename.clone()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names_of(&root.items), ["dir", "keep.txt"]);
+    let dir = root
+        .items
+        .iter()
+        .find(|i| i.filename == "dir")
+        .unwrap()
+        .clone();
+    assert!(dir.is_dir && dir.writable);
+    let inner = folder.fp_list(dir.identifier.clone()).unwrap();
+    let edit = inner
+        .items
+        .iter()
+        .find(|i| i.filename == "edit.txt")
+        .unwrap()
+        .clone();
+    let gone = inner
+        .items
+        .iter()
+        .find(|i| i.filename == "gone.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(edit.parent, dir.identifier);
+
+    d.write("dir/edit.txt", b"two, edited");
+    std::fs::rename(d.path("keep.txt"), d.path("dir/moved.txt")).unwrap();
+    std::fs::remove_file(d.path("dir/gone.txt")).unwrap();
+    std::os::unix::fs::symlink("keep.txt", d.path("link")).unwrap();
+    d.write("new.txt", b"four");
+    d.synced();
+
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    let mut at = start;
+    loop {
+        // One look-up at a time, so that the batches are cut.
+        let c = folder.fp_changes(at, 1).unwrap();
+        updated.extend(c.updated);
+        deleted.extend(c.deleted);
+        skipped.extend(c.skipped);
+        assert!(c.next >= at);
+        at = c.next;
+        if !c.more {
+            break;
+        }
+    }
+    let last = |name: &str| {
+        updated
+            .iter()
+            .rev()
+            .find(|i| i.filename == name)
+            .unwrap_or_else(|| panic!("{name} not reported: {updated:?}"))
+            .clone()
+    };
+    let edited = last("edit.txt");
+    assert_eq!(edited.identifier, edit.identifier);
+    assert_ne!(edited.content_version, edit.content_version);
+    let moved = last("moved.txt");
+    assert_eq!(moved.parent, dir.identifier);
+    assert_eq!(last("new.txt").parent, "root");
+    assert!(deleted.contains(&gone.identifier), "{deleted:?}");
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.display == "link" && s.reason.contains("symbolic link")),
+        "{skipped:?}"
+    );
+    assert_eq!(at, folder.head().unwrap());
+
+    // Listed again, the same: the link skipped with its reason.
+    let root = folder.fp_list("root".into()).unwrap();
+    assert_eq!(names_of(&root.items), ["dir", "new.txt"]);
+    assert_eq!(root.skipped.len(), 1);
+    assert!(folder.fp_item(gone.identifier.clone()).unwrap().is_none());
+    assert_eq!(
+        folder
+            .fp_item(moved.identifier.clone())
+            .unwrap()
+            .unwrap()
+            .filename,
+        "moved.txt"
+    );
+}
+
+#[test]
+fn a_folder_made_and_a_file_added_from_the_files_app_arrive() {
+    let sb = Sandbox::on_disk("mobile-add");
+    let server = Server::start(sb.path("data"));
+    let s = Session::new(
+        server.url.clone(),
+        token(&server),
+        new_device_id(),
+        "iPhone".into(),
+        false,
+    )
+    .unwrap();
+    let folder = s.folder("cloud".into()).unwrap();
+    let made = folder.mkdir("root".into(), "Scans".into()).unwrap();
+    let local = sb.path("doc.pdf");
+    std::fs::write(&local, b"%PDF-1.7 a scan").unwrap();
+    let sent = folder
+        .put_file(
+            made.object.clone(),
+            "doc.pdf".into(),
+            local.to_string_lossy().into_owned(),
+            1_700_000_000,
+            0,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(sent.name, "doc.pdf");
+    // The same name again, other bytes: refused, for the Files app to choose another.
+    std::fs::write(&local, b"%PDF-1.7 another").unwrap();
+    let err = folder
+        .put_file(
+            made.object.clone(),
+            "doc.pdf".into(),
+            local.to_string_lossy().into_owned(),
+            1_700_000_000,
+            0,
+            false,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, cairn_mobile::CairnError::Refused { status: 409, .. }),
+        "{err:?}"
+    );
+    assert!(matches!(
+        folder.mkdir("root".into(), "Scans".into()),
+        Err(cairn_mobile::CairnError::Refused { .. })
+    ));
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert_eq!(d.read("Scans/doc.pdf"), b"%PDF-1.7 a scan");
+    assert_eq!(mtime_of(&d.path("Scans/doc.pdf")).0, 1_700_000_000);
+    assert!(Path::new(&d.path("Scans")).is_dir());
+}

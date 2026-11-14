@@ -18,7 +18,7 @@ pub fn has_holes(m: &Manifest) -> bool {
 /// writes already left them. APFS fills such a gap when the file is flushed unless it is told otherwise,
 /// and the next scan would then send this file back without its holes, to every device. Where this
 /// is refused the file is whole, only bigger than it should be.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn restore_holes(fd: BorrowedFd<'_>, m: &Manifest) {
     const BLOCK: u64 = 4096;
     let punch = |from: u64, to: u64| {
@@ -35,7 +35,7 @@ pub fn restore_holes(fd: BorrowedFd<'_>, m: &Manifest) {
     punch(at, m.size);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn restore_holes(_: BorrowedFd<'_>, _: &Manifest) {}
 
 /// Whether an open file holds the bytes of `m`, wherever its own holes are: each chunk of `m`, read

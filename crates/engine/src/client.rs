@@ -10,7 +10,7 @@ use cairn_protocol::wire::{
     self, ChangesResponse, CommitRequest, CommitResponse, ConflictEntry, HashList, Info,
 };
 use cairn_protocol::wire::{Access, FolderName, Grant, Me, Member};
-use cairn_protocol::{Hash, Op};
+use cairn_protocol::{Hash, ObjectId, Op, RevisionId};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,6 +88,26 @@ pub fn is_forbidden(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Forbidden>())
 }
 
+/// The server answered 404: no such object, or none this token reaches.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct NotFound(pub String);
+
+/// Whether an error chain is a [`NotFound`] answer.
+pub fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NotFound>())
+}
+
+/// An answer as it came, whatever its status: what `put_file` gives, read as the Photos system's
+/// answer to the same request is read.
+#[derive(Clone, Debug)]
+pub struct RawAnswer {
+    pub status: u16,
+    /// Names in lower case.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// How hard a client tries a request again that the network failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retries {
@@ -137,12 +157,12 @@ fn next_wait(
 }
 
 /// ENOBUFS: the kernel had no memory for the socket's buffers. std gives it no kind of its own.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const ENOBUFS: i32 = 55;
 /// WSAENOBUFS.
 #[cfg(windows)]
 const ENOBUFS: i32 = 10055;
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_vendor = "apple", windows)))]
 const ENOBUFS: i32 = 105;
 
 /// Where new tries are said. Unset, each try is, on standard error, for a person watching.
@@ -492,6 +512,10 @@ impl Client {
                 "{what}: {}",
                 String::from_utf8_lossy(&body)
             ))))),
+            404 => Err(refused(anyhow::Error::new(NotFound(format!(
+                "{what}: server answered 404: {}",
+                String::from_utf8_lossy(&body)
+            ))))),
             other => Err(refused(anyhow!(
                 "{what}: server answered {other}: {}",
                 String::from_utf8_lossy(&body)
@@ -770,6 +794,162 @@ impl Client {
     }
 }
 
+/// What the phone apps ask of a folder, keeping no replica of it: the web's views of the tree, a file's
+/// bytes, and a file sent in one request (docs/protocol.md, "Web" and "One-request uploads").
+impl Client {
+    /// A folder's entries now, `None` for the namespace's root.
+    pub fn listing(&self, dir: Option<ObjectId>) -> Result<cairn_protocol::web::Listing> {
+        let at = dir.map_or_else(|| "root".to_string(), |o| o.to_string());
+        self.get_json("listing a folder", "client.listing", &format!("/dir/{at}"))
+    }
+
+    /// An object as it is now, with its path: `None` once it is deleted, or if it was never there.
+    pub fn item(&self, object: ObjectId) -> Result<Option<cairn_protocol::web::ItemView>> {
+        match self.get_json("reading an item", "client.item", &format!("/item/{object}")) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A file's bytes at `revision`, from byte `from` on, written to `out` as they come. `keep_going`
+    /// hears the count so far and stops the transfer by answering false. The count written.
+    pub fn content(
+        &self,
+        object: ObjectId,
+        revision: RevisionId,
+        from: u64,
+        out: &mut dyn Write,
+        keep_going: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<u64> {
+        let url = format!("{}/content/{object}?revision={revision}", self.base);
+        cairn_failpoint::network("client.content", false)?;
+        let mut req = self.agent.get(&url).header("Authorization", &self.auth);
+        if from > 0 {
+            req = req.header("Range", &format!("bytes={from}-"));
+        }
+        let mut resp = req.call().map_err(|e| {
+            anyhow::Error::new(e).context("downloading a file: cannot reach the server")
+        })?;
+        let status = resp.status().as_u16();
+        let want = if from > 0 { 206 } else { 200 };
+        if status != want {
+            let body = resp
+                .body_mut()
+                .with_config()
+                .limit(1 << 20)
+                .read_to_vec()
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).into_owned();
+            return Err(match status {
+                404 => anyhow::Error::new(NotFound(format!("downloading a file: {text}"))),
+                403 => anyhow::Error::new(Forbidden(format!("downloading a file: {text}"))),
+                401 => anyhow!("downloading a file: the server refused the access token"),
+                _ => anyhow!("downloading a file: server answered {status}: {text}"),
+            });
+        }
+        let mut reader = resp.body_mut().with_config().limit(MAX_RESPONSE).reader();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut n = 0u64;
+        loop {
+            if !keep_going(n) {
+                bail!("downloading a file: stopped");
+            }
+            let got = io::Read::read(&mut reader, &mut buf).context("downloading a file")?;
+            if got == 0 {
+                return Ok(n);
+            }
+            out.write_all(&buf[..got])?;
+            n += got as u64;
+        }
+    }
+
+    /// `PUT /file` with `query` (`cairn_protocol::file::query_string`) and `len` bytes of `body`, and
+    /// the answer whatever its status. Not tried again here: the caller sends the bytes again, and
+    /// the server takes the same request twice as once.
+    pub fn put_file(&self, query: &str, body: &mut dyn io::Read, len: u64) -> Result<RawAnswer> {
+        let url = format!("{}/file?{query}", self.base);
+        cairn_failpoint::network("client.put_file", false)?;
+        let mut resp = self
+            .agent
+            .put(&url)
+            .header("Authorization", &self.auth)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", &len.to_string())
+            .send(ureq::SendBody::from_reader(body))
+            .map_err(|e| {
+                anyhow::Error::new(e).context("sending a file: cannot reach the server")
+            })?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(1 << 20)
+            .read_to_vec()
+            .context("sending a file: reading the answer")?;
+        cairn_failpoint::network("client.put_file", true)?;
+        Ok(RawAnswer {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    /// The URL of a path in this namespace, for a request something else sends: the Photos system, or
+    /// a player streaming a video.
+    pub fn url_of(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
+    /// The `Authorization` header such a request carries.
+    pub fn authorization(&self) -> &str {
+        &self.auth
+    }
+
+    /// The server's own URL, with no namespace.
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// A web session signed in by this client's token: the value of the `cairn` cookie, which a
+    /// player streaming a video sends in place of a header it cannot be given.
+    pub fn session_cookie(&self) -> Result<String> {
+        let url = format!("{}/v1/session", self.server);
+        let token = self.auth.strip_prefix("Bearer ").unwrap_or(&self.auth);
+        let body = serde_json::to_vec(&cairn_protocol::web::SignIn {
+            token: Some(token.to_string()),
+            ticket: None,
+        })?;
+        let resp = self
+            .agent
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .send(&body[..])
+            .map_err(|e| anyhow::Error::new(e).context("signing in: cannot reach the server"))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            bail!("signing in: server answered {status}");
+        }
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|v| v.split(';').next()?.trim().strip_prefix("cairn="))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("signing in: the server set no session"))
+    }
+}
+
 /// Each frame is valid by its own hash; it must also be the chunk asked for, in the place asked.
 fn check_answer(asked: &[Hash], frames: &[(Hash, &[u8])]) -> Result<()> {
     if frames.len() != asked.len() {
@@ -1005,7 +1185,7 @@ mod tests {
                 "{errno}"
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         for errno in [55, 12, 54, 53, 32, 60, 61, 50, 51, 65] {
             assert!(
                 transient_io(&io::Error::from_raw_os_error(errno)),

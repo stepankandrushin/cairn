@@ -1,0 +1,33 @@
+[package]
+name = "cairn-mobile"
+description = "The core of Cairn's phone apps, for Swift and Kotlin through uniffi: the server's folders as they are opened, files downloaded only when asked for, and photo uploads that a kill or a lost answer neither loses nor doubles."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cairn_mobile"
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+
+[dependencies]
+cairn-protocol.workspace = true
+cairn-engine.workspace = true
+cairn-failpoint.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+blake3.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uniffi = { version = "0.32", features = ["cli"] }
+
+[features]
+failpoints = ["cairn-engine/failpoints", "cairn-failpoint/enabled"]

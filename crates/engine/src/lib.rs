@@ -5,6 +5,8 @@ pub mod badges;
 pub mod chunker;
 pub mod client;
 pub mod control;
+// No daemon on iOS: an app or extension runs only while the system lets it.
+#[cfg(not(target_os = "ios"))]
 pub mod daemon;
 pub mod deleted;
 pub mod export;
@@ -31,6 +33,7 @@ pub mod steady;
 pub mod sync;
 pub mod twins;
 pub mod update;
+#[cfg(not(target_os = "ios"))]
 #[cfg_attr(target_os = "macos", path = "watch_fsevents.rs")]
 #[cfg_attr(windows, path = "watch_windows.rs")]
 pub mod watch;

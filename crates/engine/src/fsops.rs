@@ -62,7 +62,7 @@ pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     )?))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     Ok(from_stat(fs::fstat(fd)?))
 }
@@ -269,7 +269,7 @@ const STATX_WANT: StatxFlags = StatxFlags::BASIC_STATS
     .union(StatxFlags::BTIME)
     .union(StatxFlags::MNT_ID);
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn from_stat(s: fs::Stat) -> Stat {
     let at = |sec: i64, nsec: i64| Timestamp {
         sec,
@@ -295,7 +295,7 @@ fn from_stat(s: fs::Stat) -> Stat {
 pub fn is_no_xattr(e: &io::Error) -> bool {
     #[cfg(target_os = "linux")]
     let absent = Errno::NODATA;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let absent = Errno::NOATTR;
     e.raw_os_error() == Some(absent.raw_os_error())
 }
@@ -303,7 +303,7 @@ pub fn is_no_xattr(e: &io::Error) -> bool {
 /// What survives a power cut. On macOS a plain `fsync` stops at the drive's cache, and only
 /// `F_FULLFSYNC` goes past it; the filesystems that refuse it get what they do offer.
 pub fn sync_fd(fd: BorrowedFd<'_>) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     if fs::fcntl_fullfsync(fd).is_ok() {
         return Ok(());
     }
@@ -536,7 +536,7 @@ pub fn free_space(dir: &Dir) -> io::Result<Option<u64>> {
 }
 
 /// `F_PUNCHHOLE`, which rustix does not have. Both must be multiples of the filesystem's block.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn punch_hole(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
     use rustix::fd::AsRawFd;
     #[repr(C)]
@@ -672,7 +672,7 @@ impl Dir {
         )?))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub fn stat_self(&self) -> io::Result<Stat> {
         Ok(from_stat(fs::fstat(&self.0)?))
     }
@@ -687,7 +687,7 @@ impl Dir {
         )?))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub fn stat(&self, name: &[u8]) -> io::Result<Stat> {
         Ok(from_stat(fs::statat(
             &self.0,
@@ -851,7 +851,7 @@ impl Dir {
     /// macOS has no such link and no xattr call relative to a descriptor, so this asks the kernel for
     /// the directory's path as it is now. A parent swapped for a symlink in the instant after that can
     /// redirect this one call: the one place here where invariant 6 is weaker than on Linux.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn proc_entry(&self, name: &[u8]) -> io::Result<PathBuf> {
         let dir = fs::getpath(&self.0)?;
         let mut path = PathBuf::from(OsStr::from_bytes(dir.as_bytes()));
@@ -954,7 +954,7 @@ impl Dir {
 
     /// macOS can do this directly: the flag never follows a symlink, so one swapped in at the last
     /// moment gets the mode itself and nothing else does. Refuses symlinks otherwise.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub fn chmod(&self, name: &[u8], mode: u32) -> io::Result<()> {
         if self.stat(name)?.file_type == fs::FileType::Symlink {
             return Err(Errno::LOOP.into());

@@ -527,7 +527,7 @@ fn memory() -> Option<u64> {
     Some(info.totalram as u64 * u64::from(info.mem_unit.max(1)))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn memory() -> Option<u64> {
     let mut bytes: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -555,7 +555,7 @@ fn memory() -> Option<u64> {
     (ok && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
 fn memory() -> Option<u64> {
     None
 }

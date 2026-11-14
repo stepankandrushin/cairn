@@ -15,6 +15,7 @@ cairn-engine = { path = "crates/engine" }
 cairn-server = { path = "crates/server" }
 cairn-cli = { path = "crates/cli" }
 cairn-failpoint = { path = "crates/failpoint" }
+cairn-mobile = { path = "crates/mobile" }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
@@ -43,6 +44,12 @@ strip = true
 # stay unoptimized, with their debug assertions.
 [profile.dev.package."*"]
 opt-level = 2
+
+# cairn-mobile's library in the iOS app and its extensions: a panic in it is caught where Swift called,
+# and answered as an error, where `panic = "abort"` would end the app.
+[profile.mobile]
+inherits = "release"
+panic = "unwind"
 
 # cairn-explorer's DLL, which Explorer and every program showing a file dialog load: a panic in it is
 # caught at the entry point it came through, where `panic = "abort"` would end Explorer.

@@ -348,7 +348,13 @@ pub fn status_of(path: &Path, root_id: &str) -> Option<DaemonStatus> {
     if let Ok(Reply::Status(s)) = ask(root_id, &Request::Status, ASK_WAIT) {
         return Some(*s);
     }
-    crate::daemon::running_status(path)
+    #[cfg(not(target_os = "ios"))]
+    return crate::daemon::running_status(path);
+    #[cfg(target_os = "ios")]
+    {
+        let _ = path;
+        None
+    }
 }
 
 // --- Unix ---
@@ -370,7 +376,7 @@ fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     Ok(rustix::net::sockopt::socket_peercred(s)?.uid.as_raw())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
     let (mut uid, mut gid) = (0, 0);
@@ -424,7 +430,7 @@ pub fn listen(lock: &UnixListener, _root_id: &str) -> io::Result<Listener> {
 
 /// macOS: a socket file beside the lock, which the caller holds, so a file left there by a daemon that
 /// was killed can be nobody else's.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn listen(_lock: &std::fs::File, root_id: &str) -> io::Result<Listener> {
     use std::os::unix::fs::PermissionsExt;
     let Some(LocalAddress::Path(path)) = control_address(root_id) else {

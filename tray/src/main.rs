@@ -5,6 +5,7 @@
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod actions;
+mod glyph;
 #[cfg(feature = "gui")]
 mod gui;
 mod hub;

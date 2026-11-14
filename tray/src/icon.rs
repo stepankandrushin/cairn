@@ -4,7 +4,7 @@ use crate::model::Light;
 
 pub const SIZE: u32 = 64;
 
-type Rgb = [u8; 3];
+pub type Rgb = [u8; 3];
 
 /// RGBA, `SIZE` square.
 pub fn draw(light: Light) -> Vec<u8> {
@@ -21,15 +21,7 @@ pub fn draw(light: Light) -> Vec<u8> {
     let (bx, by, r) = (50.0, 47.0, 13.0);
     // A ring of nothing round the badge, so it stands off the stones.
     clear_circle(&mut px, bx, by, r + 2.5);
-    let colour: Rgb = match light {
-        Light::Synced => [0x2e, 0x9d, 0x4f],
-        Light::Syncing => [0x2f, 0x7f, 0xd8],
-        Light::Waiting => [0xe0, 0xa0, 0x20],
-        Light::Paused => [0x8e, 0x8e, 0x8e],
-        Light::Error => [0xd6, 0x45, 0x41],
-        Light::NotRunning => [0x5c, 0x5c, 0x5c],
-    };
-    ellipse(&mut px, bx, by, r, r, colour);
+    ellipse(&mut px, bx, by, r, r, colour(light));
     let white = [0xff, 0xff, 0xff];
     match light {
         Light::Paused => {
@@ -45,6 +37,18 @@ pub fn draw(light: Light) -> Vec<u8> {
         Light::Synced | Light::Waiting => {}
     }
     px
+}
+
+/// The badge's colour for a light, and the menu's dot for a root's.
+pub fn colour(light: Light) -> Rgb {
+    match light {
+        Light::Synced => [0x2e, 0x9d, 0x4f],
+        Light::Syncing => [0x2f, 0x7f, 0xd8],
+        Light::Waiting => [0xe0, 0xa0, 0x20],
+        Light::Paused => [0x8e, 0x8e, 0x8e],
+        Light::Error => [0xd6, 0x45, 0x41],
+        Light::NotRunning => [0x5c, 0x5c, 0x5c],
+    }
 }
 
 /// Coverage of a pixel by an ellipse, from its distance to the edge: smooth edges at any size.

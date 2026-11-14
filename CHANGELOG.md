@@ -16,6 +16,13 @@
   asks each daemon for both lists once it answers, and again when its activity shows a conflict made or its
   copy dealt with, or a delete (at most once a minute), where it asked for conflicts only when one was made and
   for what was deleted only when its tab was opened.
+- Each item of the tray's menu has an icon: a gear by Settings, a clock by Recent activity, a bin by Recently
+  deleted, a warning sign by Problems, a branch by Conflicts, circling arrows by Sync now, and so on to a power
+  sign by Quit, and by each root's status a dot in its light's colour, the tray badge's. On macOS they are the
+  system's own symbols (SF Symbols), which follow the menu's light or dark and its highlight; on Windows they
+  are drawn by the tray, in white on a dark menu and black on a light one, as the system's setting for apps
+  says. A root's status line can be clicked now, and opens the window at Status: Windows draws an item that
+  cannot be clicked in grey, its icon too, so the dot would have lost its colour.
 
 **Fixed:**
 

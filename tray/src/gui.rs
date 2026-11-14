@@ -2,6 +2,7 @@
 //! and passes a person's choice on to the daemon or to `actions`.
 
 use crate::actions::{self, ConflictAction};
+use crate::glyph::{self, Glyph};
 use crate::hub::{Hub, Link, RootView, State, DELETED_WAIT};
 use crate::icon;
 use crate::link;
@@ -21,7 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{
-    IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu,
+    IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, MenuItemKind, PredefinedMenuItem,
+    Submenu,
 };
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
@@ -106,6 +108,8 @@ struct MenuModel {
     recent: Vec<RecentLine>,
     /// A daemon is running, so an empty `recent` means nothing has synced since it started.
     any_up: bool,
+    /// Windows' menus are dark, so its glyphs are drawn light (`native::dark_menus`).
+    dark: bool,
 }
 
 /// As many of each list as Recent activity shows; the window has the rest.
@@ -151,6 +155,7 @@ struct RootLine {
     id: String,
     name: String,
     line: String,
+    light: Light,
     up: bool,
     paused_by_you: bool,
 }
@@ -186,6 +191,7 @@ fn menu_model(s: &State) -> MenuModel {
             id: r.entry.root_id.clone(),
             name: model::name(r),
             line: format!("{}: {}", model::name(r), model::headline(r, now)),
+            light: model::light(r, now),
             up: matches!(r.link, Link::Up(_)),
             paused_by_you: matches!(&r.link, Link::Up(st) if st.paused_since.is_some()),
         })
@@ -209,6 +215,7 @@ fn menu_model(s: &State) -> MenuModel {
             .and_then(|s| s.available),
         recent: recent_lines(s),
         any_up: s.roots.iter().any(|r| matches!(r.link, Link::Up(_))),
+        dark: native::dark_menus(),
     }
 }
 
@@ -499,14 +506,78 @@ fn copy_path(path: &Path) {
     }
 }
 
+/// An item, with its glyph if its id has one (`Glyph::of`).
 fn item(app: &AppHandle, id: impl Into<MenuId>, text: &str, on: bool) -> tauri::Result<Kind> {
-    Ok(Kind::MenuItem(MenuItem::with_id(
+    let id = id.into();
+    match Glyph::of(id.as_ref()) {
+        Some(g) => look_item(app, id, text, on, Look::Glyph(g)),
+        None => Ok(Kind::MenuItem(MenuItem::with_id(
+            app,
+            id,
+            model::menu_label(text),
+            on,
+            None::<&str>,
+        )?)),
+    }
+}
+
+/// What an item shows by its name: its glyph, or a root's light.
+#[derive(Clone, Copy)]
+enum Look {
+    Glyph(Glyph),
+    Light(Light),
+}
+
+/// Whether Windows' menus are dark, for the glyphs of the menu being built.
+static DARK: AtomicBool = AtomicBool::new(false);
+
+/// The image muda is given for an item titled `text`. On macOS a glyph is the system's own symbol,
+/// which `native` sets by the title, and a light is drawn at 18 points, as muda shows it, at twice
+/// that for a Retina screen; on Windows each is drawn at the 16 px it is shown at.
+fn look_image(look: Look, text: &str) -> Option<Image<'static>> {
+    let mac = cfg!(target_os = "macos");
+    let size = if mac { 36 } else { glyph::SIZE };
+    let px = match look {
+        Look::Glyph(g) if mac => {
+            native::mark(&model::menu_label(text).replace("&&", "&"), g.symbol());
+            return None;
+        }
+        Look::Glyph(g) => glyph::draw(g, glyph::ink(DARK.load(Ordering::SeqCst)), size),
+        Look::Light(l) => glyph::dot(l, size),
+    };
+    Some(Image::new_owned(px, size, size))
+}
+
+fn look_item(
+    app: &AppHandle,
+    id: impl Into<MenuId>,
+    text: &str,
+    on: bool,
+    look: Look,
+) -> tauri::Result<Kind> {
+    Ok(Kind::Icon(IconMenuItem::with_id(
         app,
         id,
         model::menu_label(text),
         on,
+        look_image(look, text),
         None::<&str>,
     )?))
+}
+
+fn look_submenu(
+    app: &AppHandle,
+    id: impl Into<MenuId>,
+    text: &str,
+    look: Option<Look>,
+) -> tauri::Result<Submenu<Wry>> {
+    Submenu::with_id_and_icon(
+        app,
+        id,
+        model::menu_label(text),
+        true,
+        look.and_then(|l| look_image(l, text)),
+    )
 }
 
 type Kind = MenuItemKind<Wry>;
@@ -526,7 +597,12 @@ fn root_items(app: &AppHandle, r: &RootLine) -> tauri::Result<Vec<Kind>> {
 }
 
 fn recent_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<Submenu<Wry>> {
-    let sub = Submenu::with_id(app, "recent", "Recent activity", true)?;
+    let sub = look_submenu(
+        app,
+        "recent",
+        "Recent activity",
+        Some(Look::Glyph(Glyph::Recent)),
+    )?;
     if m.recent.is_empty() {
         let why = if m.any_up {
             "Nothing synced since the daemon started"
@@ -551,7 +627,9 @@ fn list_menu<T>(
     list: &Listing<T>,
     line: impl Fn(&T) -> tauri::Result<Kind>,
 ) -> tauri::Result<Submenu<Wry>> {
-    let sub = Submenu::with_id(app, format!("menu:{tab}"), title, true)?;
+    let id = format!("menu:{tab}");
+    let look = Glyph::of(&id).map(Look::Glyph);
+    let sub = look_submenu(app, id, title, look)?;
     for n in &list.notes {
         sub.append(&item(app, "note", n, false)?)?;
     }
@@ -570,7 +648,12 @@ fn list_menu<T>(
         )?)?;
     }
     sub.append(&PredefinedMenuItem::separator(app)?)?;
-    sub.append(&item(app, tab, "Open in the window…", true)?)?;
+    sub.append(&item(
+        app,
+        format!("open:{tab}"),
+        "Open in the window…",
+        true,
+    )?)?;
     Ok(sub)
 }
 
@@ -579,6 +662,8 @@ fn list_menu<T>(
 /// actions, then what each root is doing, then Quit, furthest from the icon, laid out by
 /// `model::from_icon`: down on macOS, and on Windows the same upside down.
 fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry>, usize)> {
+    DARK.store(m.dark, Ordering::SeqCst);
+    native::unmark();
     let count = |word: &str, n: usize| {
         if n == 0 {
             word.to_string()
@@ -590,7 +675,7 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
     if let Some(v) = &m.update {
         settings.push(item(
             app,
-            "settings",
+            "update",
             &format!("Cairn {v} is available…"),
             true,
         )?);
@@ -641,22 +726,27 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
                 let items = root_items(app, r)?;
                 let refs: Vec<&dyn IsMenuItem<Wry>> =
                     items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
-                subs.push(Kind::Submenu(Submenu::with_items(
-                    app,
-                    model::menu_label(&r.name),
-                    true,
-                    &refs,
-                )?));
+                let look = Some(Look::Light(r.light));
+                let sub = look_submenu(app, format!("root:{}", r.id), &r.name, look)?;
+                sub.append_items(&refs)?;
+                subs.push(Kind::Submenu(sub));
             }
             subs
         }
     };
     let mut lines = Vec::new();
     if let Some(e) = &m.registry_error {
-        lines.push(item(app, "line:registry", e, false)?);
+        lines.push(look_item(
+            app,
+            "line:registry",
+            e,
+            true,
+            Look::Light(Light::Error),
+        )?);
     }
     for r in &m.roots {
-        lines.push(item(app, format!("line:{}", r.id), &r.line, false)?);
+        let id = format!("line:{}", r.id);
+        lines.push(look_item(app, id, &r.line, true, Look::Light(r.light))?);
     }
     let quit = vec![item(app, "quit", "Quit Cairn Tray", true)?];
     let sections = model::from_icon(
@@ -691,6 +781,10 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
     match what.as_str() {
         "quit" => app.exit(0),
         "problems" | "conflicts" | "deleted" | "settings" => show_window(app, &what),
+        "update" => show_window(app, "settings"),
+        "open" => show_window(app, &root),
+        // A root's status, or the list of roots' error: the window says more.
+        "line" => show_window(app, "status"),
         "conflict" => {
             let Some((root_id, seq)) = root
                 .rsplit_once(':')

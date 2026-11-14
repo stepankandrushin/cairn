@@ -41,15 +41,19 @@ objc2-app-kit = { version = "0.3", optional = true, default-features = false, fe
     "std",
     "NSApplication",
     "NSEvent",
+    "NSImage",
     "NSMenu",
+    "NSMenuItem",
     "NSResponder",
 ] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
     "std",
     "block2",
+    "NSDictionary",
     "NSNotification",
     "NSOperation",
     "NSString",
+    "NSValue",
 ] }
 
 [target.'cfg(windows)'.dependencies]

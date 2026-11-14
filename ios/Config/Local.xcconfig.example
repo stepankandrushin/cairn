@@ -1,0 +1,5 @@
+// Copy to Local.xcconfig, which git leaves out, and fill in.
+CAIRN_IOS_TEAM = ABCDE12345
+// The server the Photos extension's background uploads go to: the system sends them nowhere else.
+// `//` begins a comment in an xcconfig, hence `$()` between the slashes.
+CAIRN_UPLOAD_URL_BASE = https:/$()/cairn.example.org

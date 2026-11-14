@@ -115,7 +115,7 @@ pub struct Header {
 
 /// Told how far a transfer is; answering false stops it.
 #[uniffi::export(with_foreign)]
-pub trait Progress: Send + Sync {
+pub trait TransferProgress: Send + Sync {
     fn progress(&self, done: u64, total: u64) -> bool;
 }
 

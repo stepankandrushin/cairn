@@ -4,6 +4,15 @@
 
 **Added:**
 
+- An iPhone app (ios/, built from source with `scripts/release-ios.sh`): photos and videos backed up to a folder
+  and path of the server, originals as they are, named as Nextcloud's iOS app named them or as on the phone,
+  sent by the system in the background and by the app; the server's folders browsed live, with thumbnails, a
+  file downloaded only when opened; and the Files app, which shows a folder, downloads on demand and adds new
+  files and folders. Its core, crates/mobile, is Rust through uniffi, ready for Android.
+- `PUT /v1/ns/{ns}/file`: a new file in one request, stored as it arrives and committed as the device that sent
+  it, missing folders on its path made with it, a name taken by other bytes refused or numbered, and a retry of
+  a request whose answer was lost the same commit (docs/protocol.md, "One-request uploads").
+
 - The web interface's preview steps through the folder's files, in the order the list shows them: → or Space
   to the next, ← or Shift+Space to the one before, or the arrows at the preview's foot, beside "3 of 12". The
   preview keeps one size while stepping, so the arrows stay under the pointer whatever each photo's shape, and

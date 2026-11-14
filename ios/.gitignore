@@ -1,0 +1,8 @@
+# Made by scripts/release-ios.sh from crates/mobile: the library and its Swift bindings.
+/Generated/
+/Shared/Generated/
+# This Mac's signing team and the server the Photos extension may send to.
+/Config/Local.xcconfig
+/build/
+xcuserdata/
+*.xcworkspace/xcuserdata/

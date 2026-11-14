@@ -10,7 +10,7 @@
 
 use crate::folder::{read_answer, Folder, Sent};
 use crate::naming::{dest_path, file_name, NameStyle};
-use crate::{bad, CairnError, Header, HttpRequest, Progress, Result};
+use crate::{bad, CairnError, Header, HttpRequest, Result, TransferProgress};
 use cairn_protocol::file::{self as f, FileQuery, Taken};
 use cairn_protocol::{Name, ObjectId, RevisionId, Timestamp};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -256,10 +256,10 @@ impl Store {
                     params![id, reason, now()],
                 )?;
             }
-            // Not answered, or stopped: it goes again as it is.
+            // Not answered, or stopped: it goes again as it is, by whoever takes it up next.
             Err(e) => {
                 c.execute(
-                    "UPDATE upload SET error = ?2, updated = ?3 WHERE id = ?1 AND state != 'done'",
+                    "UPDATE upload SET error = ?2, job = NULL, updated = ?3 WHERE id = ?1 AND state != 'done'",
                     params![id, e.to_string(), now()],
                 )?;
             }
@@ -497,7 +497,7 @@ impl Store {
         id: i64,
         folder: Arc<Folder>,
         file: String,
-        progress: Option<Arc<dyn Progress>>,
+        progress: Option<Arc<dyn TransferProgress>>,
     ) -> Result<Upload> {
         let u = self.upload(id)?;
         if matches!(u.state, UploadState::Done) {

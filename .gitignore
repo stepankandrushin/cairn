@@ -9,3 +9,6 @@ next-prompts/
 
 # Downloads kept beside their notes in sources/ (binaries; the .md gives the URL and sha256)
 sources/**/*.zip
+
+# What scripts/release-ios.sh builds: Xcode's derived data, archives, test results
+/build/

@@ -1,9 +1,9 @@
 //! What a photo or video is called on the server.
 //!
 //! By default the name Nextcloud's iOS app gave, so that a folder its uploads went to goes on as it
-//! was: `yy-MM-dd HH-mm-ss NNNN.ext`, the time the photo was taken where it was taken, `NNNN` the
-//! original name's characters after its first four (`IMG_0003.HEIC` gives `0003`), and the extension in
-//! lower case. A Live Photo's video, `IMG_0003.MOV`, so lands beside its photo with the same stem.
+//! was: `yy-MM-dd HH-mm-ss NNNN.ext`, the time the photo was taken where it was taken, `NNNN` the four
+//! characters after a camera's `IMG_` (`IMG_0003.HEIC` gives `0003`) or else the name's stem whole, and
+//! the extension in lower case. A Live Photo's video, `IMG_0003.MOV`, so lands beside its photo with the same stem.
 
 /// How an upload is named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -48,9 +48,10 @@ pub fn file_name(style: NameStyle, original: &str, created_sec: i64, offset: i32
                 Some(i) if i > 0 => (&original[..i], Some(original[i + 1..].to_lowercase())),
                 _ => (original.as_str(), None),
             };
-            let chars: Vec<char> = original.chars().collect();
-            // Nextcloud took the four characters after `IMG_`, of a name longer than eight.
-            let number: String = if chars.len() > 8 {
+            let chars: Vec<char> = stem.chars().collect();
+            // Nextcloud took the four characters after a camera's `IMG_`, `DSC_` or the like; a name
+            // of another kind is kept whole.
+            let number: String = if chars.len() >= 8 && chars[3] == '_' {
                 chars[4..8].iter().collect()
             } else {
                 stem.to_string()
@@ -123,6 +124,18 @@ mod tests {
         assert_eq!(
             file_name(NameStyle::Nextcloud, "a.png", t, off),
             "23-08-13 16-50-14 a.png"
+        );
+        assert_eq!(
+            file_name(NameStyle::Nextcloud, "Tree.heic", t, off),
+            "23-08-13 16-50-14 Tree.heic"
+        );
+        assert_eq!(
+            file_name(NameStyle::Nextcloud, "iMac Blue.heic", t, off),
+            "23-08-13 16-50-14 iMac Blue.heic"
+        );
+        assert_eq!(
+            file_name(NameStyle::Nextcloud, "DSC_1234.ARW", t, off),
+            "23-08-13 16-50-14 1234.arw"
         );
         assert_eq!(
             file_name(NameStyle::Original, "IMG_0003.HEIC", t, off),

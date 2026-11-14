@@ -6,7 +6,9 @@ every version; clients sync a real filesystem. Files only: no groupware, no app 
 
 **Status: 0.1.27, early.** Clients for Linux (x86_64 and aarch64), macOS and Windows, with only Linux in CI, and on Windows each file's state on its icon in Explorer; the server on Linux;
 users with their own folders and shared ones, read-only or not; since 0.1.14, a web interface in the server,
-which a device opens signed in, with shares of any file or folder and public links. It has
+which a device opens signed in, with shares of any file or folder and public links; and an iPhone app, built
+from source and not yet in the App Store, that backs up photos and videos and opens the server's files on
+demand. It has
 been through a harsh failure harness and now syncs real trees, but for days, not yet weeks, so keep another
 copy of anything you put through it. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
@@ -202,6 +204,32 @@ server {
 }
 ```
 
+## The iPhone app
+
+ios/ is the app, for iOS 26.4 and later, on a Rust core shared with what will be the Android one
+(crates/mobile). Sign in with the server's address, a token made for the phone (`cairn-server token add alice
+--label iphone`), and a name for the device.
+
+- **Photos:** each photo and video goes to the folder and path chosen, as it was taken: HEIC, MOV and RAW
+  originals, a Live Photo's video beside its photo, none converted. By default each is named as Nextcloud's iOS
+  app named them, `24-05-12 11-49-15 0003.heic`, so that a folder it filled goes on as it was; or as on the phone,
+  `IMG_0003.HEIC`; optionally in a folder for each year and month. The system sends them in the background
+  through Photos' upload extension, also while the app is closed, on its own schedule; the app sends what waits
+  while it is open, overnight on power, and at Upload now, which goes on in the background. A photo deleted from
+  the phone stays on the server. What could not be sent is listed with the server's reason, and Retry.
+- **Browse:** the server's folders as they are now, photos and videos by their thumbnails; a file is downloaded
+  only when it is opened, into a cache the system empties as it needs room, and a video streams.
+- **Files:** each folder chosen in Settings is a location in the Files app, where a file is downloaded when it is
+  opened and kept only if Keep Downloaded is chosen. New files and folders can be added there, as can anything
+  shared into it from another app; renaming, moving, deleting and editing in place are not offered yet.
+
+A photo is sent as one request, `PUT /v1/ns/{ns}/file` (docs/protocol.md, "One-request uploads"), whose IDs the
+phone chooses and keeps before it is sent: a phone or a server killed at any step, an answer lost, or the system
+and the app sending the same photo, still makes one file, and a name taken by other bytes gets `(2)`.
+`bash scripts/release-ios.sh --sim` builds it for the simulator on a Mac with Xcode, `--device` for the phones
+registered to the team, signed by the team in `ios/Config/Local.xcconfig`. Photos' upload extension sends only
+to the server named there (`CAIRN_UPLOAD_URL_BASE`) and does not run in the simulator.
+
 ## The daemon
 
 ```sh
@@ -384,6 +412,8 @@ bash scripts/ci.sh --quick      # the same in about a minute, less the tests tha
 bash scripts/release.sh         # static binaries and checksums in dist/, after a smoke test over TLS
 ```
 
+`bash scripts/release-ios.sh --sim`, on a Mac with Xcode, builds the iPhone app (above).
+
 release.sh builds the client for x86_64 and aarch64 and the server for x86_64, each static (musl). The aarch64
 client is cross-built by cargo-zigbuild (`cargo install cargo-zigbuild --locked`, zig on the PATH, `rustup target
 add aarch64-unknown-linux-musl`), and its checks and smoke test run under qemu-aarch64 (the qemu-user package).
@@ -407,5 +437,5 @@ On Windows, a cairn.exe that carries Explorer's handler is built after it, as sc
 ## License
 
 The server and storage (`cairn-server`, `cairn-store`, and the test harness) are
-[AGPL-3.0-only](LICENSE-AGPL). The protocol, engine, client and failpoint crates are
-[Apache-2.0](LICENSE-APACHE), so any client can embed them.
+[AGPL-3.0-only](LICENSE-AGPL). The protocol, engine, client, mobile and failpoint crates, and the iPhone
+app, are [Apache-2.0](LICENSE-APACHE), so any client can embed them.

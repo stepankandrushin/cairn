@@ -2,7 +2,9 @@
 //! files and folders sent. Nothing of it is kept here but what is asked for.
 
 use crate::session::access_text;
-use crate::{bad, object_of, revision_of, CairnError, Header, HttpRequest, Progress, Result};
+use crate::{
+    bad, object_of, revision_of, CairnError, Header, HttpRequest, Result, TransferProgress,
+};
 use cairn_engine::client::{Client, RawAnswer};
 use cairn_protocol::file::{self as f, FileQuery, Taken};
 use cairn_protocol::web;
@@ -211,7 +213,7 @@ impl Folder {
         q: &FileQuery,
         open: &dyn Fn() -> std::io::Result<File>,
         len: u64,
-        progress: Option<&Arc<dyn Progress>>,
+        progress: Option<&Arc<dyn TransferProgress>>,
     ) -> Result<Sent> {
         let query = f::query_string(q);
         let mut tries = 0;
@@ -250,7 +252,7 @@ struct Counting {
     inner: File,
     done: u64,
     total: u64,
-    progress: Option<Arc<dyn Progress>>,
+    progress: Option<Arc<dyn TransferProgress>>,
     stopped: bool,
 }
 
@@ -288,6 +290,14 @@ impl Folder {
         Ok(self.client.info()?.head)
     }
 
+    /// The head once it is past `after`, or after `seconds` (at most 120) whatever it is: what the
+    /// app waits on in the foreground, to tell the Files app something changed.
+    pub fn wait_for_head(&self, after: u64, seconds: u32) -> Result<u64> {
+        Ok(self
+            .client
+            .wait_for_head(after, Duration::from_secs(u64::from(seconds.min(120))))?)
+    }
+
     /// A folder's entries now; `dir` is an object's hex, or `root`.
     pub fn list(&self, dir: String) -> Result<Listing> {
         let o = object_of(&dir)?;
@@ -318,7 +328,7 @@ impl Folder {
         revision: String,
         dest: String,
         size: u64,
-        progress: Option<Arc<dyn Progress>>,
+        progress: Option<Arc<dyn TransferProgress>>,
     ) -> Result<u64> {
         let object = object_of(&object)?;
         let revision = revision_of(&revision)?;
@@ -472,7 +482,7 @@ impl Folder {
         mtime_sec: i64,
         mtime_nsec: u32,
         rename: bool,
-        progress: Option<Arc<dyn Progress>>,
+        progress: Option<Arc<dyn TransferProgress>>,
     ) -> Result<Sent> {
         let parent = object_of(&parent)?;
         name_of(&name)?;

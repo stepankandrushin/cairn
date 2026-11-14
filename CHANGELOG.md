@@ -23,6 +23,10 @@
   found a status in the file and then asked the daemon, through `cairn status` or the tray, could be told the
   one before, when a busy machine held the daemon up between the two. The local API now has it first, so the
   file is never ahead of what the daemon answers.
+- On Windows the tray's menu is macOS's upside down, every item of it, as it rises from the taskbar where
+  macOS drops it from the menu bar: Quit is at the top, furthest from the icon, as it is at the bottom on
+  macOS, where it sat at the bottom next to Settings; each root's actions and status lines now read up from
+  the icon too, Sync now nearest it.
 
 ## 0.1.26 (2026-11-13)
 

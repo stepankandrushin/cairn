@@ -45,13 +45,14 @@ pub fn now_secs() -> Secs {
         .map_or(0, |d| d.as_secs() as Secs)
 }
 
-/// The menu's four sections, given in order out from its icon. macOS drops the menu from the menu bar
-/// at the top of the screen, so they go down as given; Windows raises it from the taskbar at the bottom,
-/// so they, and the items of the first two, go up, and what is nearest the icon is so on both.
-pub fn from_icon<T>(mut sections: [Vec<T>; 4], downward: bool) -> [Vec<T>; 4] {
+/// The menu's sections, given in order out from its icon, Quit's last. macOS drops the menu from the menu
+/// bar at the top of the screen, so they go down as given; Windows raises it from the taskbar at the
+/// bottom, so the whole of it, every item, goes up: read from the icon, the menu is the same on both.
+pub fn from_icon<T, const N: usize>(mut sections: [Vec<T>; N], downward: bool) -> [Vec<T>; N] {
     if !downward {
-        sections[0].reverse();
-        sections[1].reverse();
+        for s in &mut sections {
+            s.reverse();
+        }
         sections.reverse();
     }
     sections
@@ -363,47 +364,40 @@ mod tests {
         assert_eq!(when_at(at(3, 9, 5), day(6), Clock::H12), "3 Nov 9:05 AM");
     }
 
-    /// Settings is nearest the icon, Recent activity next to it and Recently deleted next to that, on a
-    /// menu that drops from the top of the screen as on one raised from the bottom.
+    /// Settings is nearest the icon, Recent activity next to it and Recently deleted next to that, Quit
+    /// furthest, on a menu that drops from the top of the screen as on one raised from the bottom, which
+    /// is the other upside down, each root's items and lines too.
     #[test]
     fn the_menu_keeps_what_matters_by_its_icon() {
         let given = || {
             [
                 vec!["Settings", "update"],
                 vec!["Recent", "Deleted", "Problems", "Conflicts"],
-                vec!["Sync now", "Pause"],
-                vec!["root: synced"],
+                vec!["Sync now", "Pause", "Open folder"],
+                vec!["a: synced", "b: syncing"],
+                vec!["Quit"],
             ]
         };
-        let flat = |s: [Vec<&'static str>; 4]| s.concat();
-        assert_eq!(
-            flat(from_icon(given(), true)),
-            [
-                "Settings",
-                "update",
-                "Recent",
-                "Deleted",
-                "Problems",
-                "Conflicts",
-                "Sync now",
-                "Pause",
-                "root: synced"
-            ]
-        );
-        assert_eq!(
-            flat(from_icon(given(), false)),
-            [
-                "root: synced",
-                "Sync now",
-                "Pause",
-                "Conflicts",
-                "Problems",
-                "Deleted",
-                "Recent",
-                "update",
-                "Settings"
-            ]
-        );
+        let flat = |s: [Vec<&'static str>; 5]| s.concat();
+        let down = [
+            "Settings",
+            "update",
+            "Recent",
+            "Deleted",
+            "Problems",
+            "Conflicts",
+            "Sync now",
+            "Pause",
+            "Open folder",
+            "a: synced",
+            "b: syncing",
+            "Quit",
+        ];
+        assert_eq!(flat(from_icon(given(), true)), down);
+        let mut up = down;
+        up.reverse();
+        assert_eq!(flat(from_icon(given(), false)), up);
+        assert_eq!(flat(from_icon(given(), false))[0], "Quit");
     }
 
     #[test]

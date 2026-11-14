@@ -576,7 +576,8 @@ fn list_menu<T>(
 
 /// The menu, and where its Recent activity is in it: Settings nearest the icon, then Recent activity,
 /// Recently deleted, Problems and Conflicts, each a submenu that hovering opens, then each root's
-/// actions, then what each root is doing, laid out by `model::from_icon`; Quit last.
+/// actions, then what each root is doing, then Quit, furthest from the icon, laid out by
+/// `model::from_icon`: down on macOS, and on Windows the same upside down.
 fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry>, usize)> {
     let count = |word: &str, n: usize| {
         if n == 0 {
@@ -657,7 +658,11 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
     for r in &m.roots {
         lines.push(item(app, format!("line:{}", r.id), &r.line, false)?);
     }
-    let sections = model::from_icon([settings, deal, actions, lines], cfg!(target_os = "macos"));
+    let quit = vec![item(app, "quit", "Quit Cairn Tray", true)?];
+    let sections = model::from_icon(
+        [settings, deal, actions, lines, quit],
+        cfg!(target_os = "macos"),
+    );
     let menu = Menu::new(app)?;
     let mut at = 0;
     let mut recent_at = 0;
@@ -674,8 +679,6 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
             at += 1;
         }
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&item(app, "quit", "Quit Cairn Tray", true)?)?;
     Ok((menu, recent_at))
 }
 

@@ -156,6 +156,8 @@ const ICONS = {
   history: ['M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5', 'M3.5 3.5v5h5', 'M12 7.5V12l3 2'],
   close: ['M6 6l12 12M18 6L6 18'],
   chevron: ['M6 9l6 6 6-6'],
+  'chevron-left': ['M15 6l-6 6 6 6'],
+  'chevron-right': ['M9 6l6 6-6 6'],
   people: ['M9 11a3.2 3.2 0 1 0 0-6.4A3.2 3.2 0 0 0 9 11z', 'M3 20a6 6 0 0 1 12 0', 'M16 4.8a3.2 3.2 0 0 1 0 6.2', 'M21 20a6 6 0 0 0-3.6-5.5'],
   settings: ['M10.29 5.62L10.4 2.94L13.6 2.94L13.71 5.62A6.6 6.6 0 0 1 15.3 6.28L17.28 4.46L19.54 6.72L17.72 8.7A6.6 6.6 0 0 1 18.38 10.29L21.06 10.4L21.06 13.6L18.38 13.71A6.6 6.6 0 0 1 17.72 15.3L19.54 17.28L17.28 19.54L15.3 17.72A6.6 6.6 0 0 1 13.71 18.38L13.6 21.06L10.4 21.06L10.29 18.38A6.6 6.6 0 0 1 8.7 17.72L6.72 19.54L4.46 17.28L6.28 15.3A6.6 6.6 0 0 1 5.62 13.71L2.94 13.6L2.94 10.4L5.62 10.29A6.6 6.6 0 0 1 6.28 8.7L4.46 6.72L6.72 4.46L8.7 6.28A6.6 6.6 0 0 1 10.29 5.62z', 'M12 14.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2z'],
   shared: ['M18 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M18 22a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M8.6 10.5l6.8-4M8.6 13.5l6.8 4'],
@@ -1239,19 +1241,77 @@ function details(item, path) {
   return h('dl', { class: 'details' }, rows.map(([k, v]) => [h('dt', { text: k }), h('dd', { text: v, class: k === 'Mode' ? 'mono' : '' })]));
 }
 
+/**
+ * A file's preview, stepping through the folder's files in the order the list shows them: ← and → and
+ * their buttons, Space to the next and Shift+Space back. Keys in a playing video or audio stay theirs.
+ */
 function openPreview(ctx, e) {
   const { view, listing } = ctx;
-  const path = [...(listing.path || []), { display: e.display }];
-  const d = dialog({
-    title: e.display,
-    wide: true,
-    body: h('div', { class: 'preview' }, h('div', { class: 'pv-main' }, previewEl(view, e)), details(e, path)),
-    actions: [
-      view.kind !== 'link' && h('button', { class: 'btn', onclick: () => { d.close(); openHistory(view, e, ctx.access, refresh); } }, icon('history'), 'History'),
-      ctx.canShare && h('button', { class: 'btn', onclick: () => { d.close(); openShareDialog(view.ns, e); } }, icon('share'), 'Share'),
-      h('button', { class: 'btn primary', onclick: () => download(contentUrl(view, e.object, { download: true })) }, icon('download'), 'Download'),
-    ],
-  });
+  const files = sortedEntries(ctx).filter((x) => x.kind === 'file');
+  let at = files.indexOf(e);
+  if (at < 0) { files.splice(0, files.length, e); at = 0; }
+  const many = files.length > 1;
+  const main = h('div', { class: 'pv-main', tabindex: '-1' });
+  const side = h('div', { class: 'pv-side' });
+  const prev = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Previous file', title: 'Previous (←)', onclick: () => go(-1) }, icon('chevron-left'));
+  const next = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Next file', title: 'Next (→ or Space)', onclick: () => go(1) }, icon('chevron-right'));
+  const count = h('span', { class: 'pv-count', 'aria-live': 'polite' });
+  const nav = many && h('div', { class: 'pv-nav' }, prev, count, next);
+  const actions = (item) => [
+    nav,
+    view.kind !== 'link' && h('button', { class: 'btn', onclick: () => { d.close(); openHistory(view, item, ctx.access, refresh); } }, icon('history'), 'History'),
+    ctx.canShare && h('button', { class: 'btn', onclick: () => { d.close(); openShareDialog(view.ns, item); } }, icon('share'), 'Share'),
+    h('button', { class: 'btn primary', onclick: () => download(contentUrl(view, item.object, { download: true })) }, icon('download'), 'Download'),
+  ].filter(Boolean);
+  const d = dialog({ title: e.display, wide: true, body: h('div', { class: `preview${many ? ' flip' : ''}` }, main, side), actions: actions(e) });
+  let ahead = null; // the next image, loaded before it is asked for
+  const show = () => {
+    const item = files[at];
+    d.setTitle(item.display);
+    main.replaceChildren(previewEl(view, item));
+    side.replaceChildren(details(item, [...(listing.path || []), { display: item.display }]));
+    d.foot.replaceChildren(...actions(item));
+    if (!many) return;
+    count.textContent = `${at + 1} of ${files.length}`;
+    prev.disabled = at === 0;
+    next.disabled = at === files.length - 1;
+    const after = files[at + 1];
+    ahead = null;
+    if (after && typeOf(after.display) === 'image') {
+      ahead = new Image();
+      ahead.src = contentUrl(view, after.object, { revision: after.revision });
+    }
+  };
+  const go = (step) => {
+    const to = at + step;
+    // Focus leaves a clicked button, so the next Space goes to the next file rather than pressing it again.
+    main.focus({ preventScroll: true });
+    if (to < 0 || to >= files.length || to === at) return;
+    at = to;
+    show();
+  };
+  show();
+  main.focus({ preventScroll: true });
+  if (!many) return;
+  // On the document, as a click on the dialog's plain content leaves the focus on the page's body.
+  const onKey = (ev) => {
+    if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.isComposing || ev.defaultPrevented) return;
+    const t = ev.target;
+    if (!(t instanceof Element) || !(d.dlg.contains(t) || t === document.body)) return;
+    if (t.closest('input, textarea, select, video, audio, [contenteditable]')) return;
+    let step;
+    if (ev.key === 'ArrowLeft') step = -1;
+    else if (ev.key === 'ArrowRight') step = 1;
+    else if (ev.key === ' ') {
+      // A button reached by Tab keeps Space, as anywhere else.
+      if (t.closest('button, a') && t.matches(':focus-visible')) return;
+      step = ev.shiftKey ? -1 : 1;
+    } else return;
+    ev.preventDefault();
+    go(step);
+  };
+  document.addEventListener('keydown', onKey);
+  d.dlg.addEventListener('close', () => document.removeEventListener('keydown', onKey));
 }
 
 /** A view's root that is a file: a share of one, or a link to one. */

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- The web interface's preview steps through the folder's files, in the order the list shows them: → or Space
+  to the next, ← or Shift+Space to the one before, or the arrows at the preview's foot, beside "3 of 12". The
+  preview keeps one size while stepping, so the arrows stay under the pointer whatever each photo's shape, and
+  the next photo is loaded before it is asked for. In a video or audio clicked to play, the keys stay its own.
+
 ## 0.1.27 (2026-11-14)
 
 **Changed:**

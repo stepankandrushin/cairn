@@ -383,6 +383,14 @@ dialog.dlg::backdrop { background: rgba(10, 12, 14, 0.5); }
   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); background: var(--panel);
 }
 .pv-none { color: var(--muted); padding: 32px; text-align: center; }
+.pv-main:focus { outline: none; }
+/* Stepping through a folder: one height for every file, so the dialog and its buttons stay where they are. */
+.preview.flip .pv-main { height: max(220px, min(72vh, calc(100vh - 210px))); }
+.preview.flip .pv-img, .preview.flip .pv-media, .preview.flip .pv-text { max-height: 100%; }
+.preview.flip .pv-pdf { height: 100%; }
+.pv-nav { display: flex; align-items: center; gap: 2px; margin-right: auto; }
+.pv-nav .icon-btn:disabled { opacity: 0.35; cursor: default; background: transparent; }
+.pv-count { min-width: 64px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 .details { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; align-content: start; }
 .details dt { color: var(--muted); }

@@ -10,6 +10,13 @@
   is read ahead is bounded (16 MiB, or 64 chunks, beyond the next to be sent), and a download still ends at
   the first chunk missing or damaged in the order asked, as before.
 
+**Fixed:**
+
+- A daemon wrote each status to `.cairn/daemon.json` a moment before its local API had it: a program that
+  found a status in the file and then asked the daemon, through `cairn status` or the tray, could be told the
+  one before, when a busy machine held the daemon up between the two. The local API now has it first, so the
+  file is never ahead of what the daemon answers.
+
 ## 0.1.26 (2026-11-13)
 
 **Added:**

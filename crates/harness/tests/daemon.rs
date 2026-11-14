@@ -1194,13 +1194,16 @@ fn a_long_sync_holds_the_next_change_back_only_for_its_scan() {
     );
 }
 
-/// A change that waits says so in `cairn status`, with until when and why.
+/// A change that waits says so in `cairn status`, with until when and why, as soon as the daemon's
+/// file does. Here each status reaches the file 300 ms after the local API, as a busy machine can hold
+/// the daemon up between the two: what the file says is still what `cairn status` is told.
 #[test]
 fn status_says_when_changes_wait_and_why() {
     let (_sb, mut server, a, b) = pair("d-waiting");
-    let da = Daemon::start(
+    let da = Daemon::start_env(
         &a,
         &["--no-feed", "--reconcile-secs", DAY, "--retry-secs", "30"],
+        &[("CAIRN_FP_DELAY", "daemon.shown:300")],
     );
     da.wait_state("synced");
     da.wait_rest();

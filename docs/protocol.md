@@ -289,7 +289,7 @@ over.
 
 | Request | Replies |
 |---|---|
-| `status` | one `status`, the same object as `.cairn/daemon.json` |
+| `status` | one `status`, the same object as `.cairn/daemon.json`, which the daemon writes after it answers with it: the file is never newer than the answer |
 | `subscribe` | a `status` now, on every change, and every 30 s regardless, until the client closes. A client whose queue of 16 is full, or that takes more than 5 s over a write, is dropped, and the daemon's log says so |
 | `sync_now` | `done`: an event like the watcher's, so it brings the next sync forward; an `error` while paused |
 | `pause`, `resume` | `done` once kept in `.cairn/paused`, so a pause outlives a kill; while paused no sync starts, the state is `paused` and `paused_since` is set, and on resume a full sync runs at once |

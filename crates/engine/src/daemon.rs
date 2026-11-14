@@ -199,14 +199,18 @@ fn write_status(path: &Path, status: &Status) {
     let _ = write();
 }
 
-/// Written and shown: the file for whoever reads it, the local API for the rest, and on the root's
-/// badge whether it is in trouble.
+/// Shown and written: on the local API, which `cairn status` and the tray ask, on the root's badge
+/// whether it is in trouble, and then in the file for whoever reads it. In that order, a status found
+/// in the file is one the daemon already answers with: the other way round, a program that read the
+/// file and then asked was told the status before it whenever the daemon was held up between the two,
+/// as a busy machine does for longer than that program takes to ask.
 fn show(path: &Path, status: &Status, hub: &Hub) {
-    write_status(path, status);
     hub.publish(status);
     if let Some(board) = hub.board() {
         board.set_state(&status.state);
     }
+    hit("daemon.shown");
+    write_status(path, status);
 }
 
 /// While a sync runs, how often what it is doing goes to the local API, for `cairn status` and the tray.

@@ -383,7 +383,8 @@ folder, or `Cairn Tray.app` beside the bundle `cairn` is in on macOS):
 
 `update-state.json` in the user dir holds what it found (`checked`, `latest`, the feed that `answered` and what
 those before it said, `unanswered`, `available` and why it `waits`,
-`installed` and when, the last `error` and since when, the versions `rejected` here), which is the status's
+`installed` and when, the last `error` and since when, the versions `rejected` here, and when a run last ended,
+`tried`, which the tray waits for after a person asks), which is the status's
 `update`, and the version on probation. A daemon whose program has been replaced, by an update or a person,
 restarts into the new one between syncs: on Unix in the same process, by exec, and on Windows by exiting with 75
 for the loop that runs it to start it again. A daemon that starts more than three times for one root on a version

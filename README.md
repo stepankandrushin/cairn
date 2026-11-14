@@ -325,7 +325,8 @@ cairn update notify              # only say a new release is there, here and in 
 cairn update rollback            # back to the version before, which is then not installed again unless asked
 ```
 
-The tray's Settings tab has the same choice and an Update now button. What it installs is only ever what the
+The tray's Settings tab has the same choice and a Check for updates button, which says it is checking and then
+whether everything here is up to date, what it installed, or why it could not. What it installs is only ever what the
 release's own key signed: every file's size and SHA-256 are in a signed `update.json`, and on macOS the new bundle
 must also be signed by the team of the one it replaces. A kill or a full disk at any step leaves the old program
 or the new one in place, whole; the one before is kept beside it in `.cairn-update`, and a version on which a

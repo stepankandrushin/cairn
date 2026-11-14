@@ -692,6 +692,7 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(&str)) -> Result<(Outcome, Status
     let mut probation = None;
     let result = attempt(opts, &settings, &source, &mut status, &mut probation, log);
     let now = now_secs();
+    status.tried = now;
     match &result {
         Ok(_) => status.error = None,
         Err(e) => {

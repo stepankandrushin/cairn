@@ -10,10 +10,10 @@ use crate::model::{self, Light, Problem};
 use crate::native;
 use crate::settings::{self, Clock};
 use cairn_protocol::local::{
-    self as local_api, Activity, Change, DeletedItem, Direction, Reply, Request,
+    self as local_api, Activity, Change, DeletedItem, Direction, Reply, Request, Secs,
     DEFAULT_DELETED_DAYS, MAX_RECENT,
 };
-use cairn_protocol::update::Policy;
+use cairn_protocol::update::{Policy, Status as UpdateStatus, Version};
 use cairn_protocol::ObjectKind;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -956,6 +956,57 @@ struct UiUpdate {
     problem: Option<String>,
     /// A daemon is running to ask.
     can_ask: bool,
+    /// Check for updates was clicked then, and no run has ended since: shown as checking.
+    asking: Option<String>,
+    /// Check for updates was clicked then, and no run has ended in the time one takes at most.
+    unanswered: Option<String>,
+    /// The feed's latest is what this tray and every daemon here runs, with no error since.
+    up_to_date: bool,
+    /// The latest is installed, and this tray or a daemon still runs the one before it.
+    restarting: bool,
+}
+
+/// When Check for updates was last clicked here, in seconds: the window shows checking until a run ends after it.
+static ASKED: Mutex<Option<Secs>> = Mutex::new(None);
+
+/// How long checking is shown with no run ended: a run a person asks for waits up to 15 minutes for
+/// another updater here, and then downloads.
+const ASKED_FOR: Secs = 20 * 60;
+
+/// What a click on Check for updates has come to, and whether what runs here is the latest.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Progress {
+    asking: Option<Secs>,
+    unanswered: Option<Secs>,
+    up_to_date: bool,
+    restarting: bool,
+}
+
+/// `running` is this tray's version and each running daemon's; `asked`, when Check for updates was clicked.
+fn progress(st: &UpdateStatus, running: &[&str], asked: Option<Secs>, now: Secs) -> Progress {
+    // A daemon from before `tried` wrote only these.
+    let ended = st.tried.max(st.checked).max(if st.error.is_some() {
+        st.error_since
+    } else {
+        0
+    });
+    let waiting = asked.filter(|&a| ended < a);
+    let current = st
+        .latest
+        .as_deref()
+        .and_then(Version::parse)
+        .is_some_and(|l| {
+            running
+                .iter()
+                .all(|v| Version::parse(v).is_some_and(|v| v >= l))
+        });
+    let settled = st.available.is_none() && st.error.is_none();
+    Progress {
+        asking: waiting.filter(|&a| now - a < ASKED_FOR),
+        unanswered: waiting.filter(|&a| now - a >= ASKED_FOR),
+        up_to_date: settled && current,
+        restarting: settled && !current && st.installed.is_some() && st.installed == st.latest,
+    }
 }
 
 fn ui_update(s: &State) -> UiUpdate {
@@ -968,9 +1019,17 @@ fn ui_update(s: &State) -> UiUpdate {
         Err(e) => (Default::default(), Some(e)),
     };
     let when = |t: i64| (t > 0).then(|| model::when(t));
+    let tray = env!("CARGO_PKG_VERSION");
+    let mut running = vec![tray];
+    running.extend(s.roots.iter().filter_map(|r| match &r.link {
+        Link::Up(d) if !d.version.is_empty() => Some(d.version.as_str()),
+        _ => None,
+    }));
+    let asked = *ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let p = progress(&st, &running, asked, model::now_secs());
     UiUpdate {
         policy,
-        tray_version: env!("CARGO_PKG_VERSION"),
+        tray_version: tray,
         checked_when: when(st.checked),
         latest: st.latest,
         available: st.available,
@@ -982,6 +1041,10 @@ fn ui_update(s: &State) -> UiUpdate {
         rejected: st.rejected,
         problem: policy_problem.or(state_problem),
         can_ask: s.roots.iter().any(|r| matches!(r.link, Link::Up(_))),
+        asking: p.asking.map(model::when),
+        unanswered: p.unanswered.map(model::when),
+        up_to_date: p.up_to_date,
+        restarting: p.restarting,
     }
 }
 
@@ -1319,7 +1382,8 @@ async fn set_update_policy(policy: Policy) -> Result<(), String> {
     blocking(move || crate::update::set_policy(policy)).await
 }
 
-/// Asks the first daemon that answers: there is one updater for all of them.
+/// Asks the first daemon that answers: there is one updater for all of them. Nothing is said here, as
+/// the Updates card shows it checking and then how it went.
 #[tauri::command]
 async fn update_now() -> Result<String, String> {
     blocking(move || {
@@ -1331,13 +1395,18 @@ async fn update_now() -> Result<String, String> {
             .map(|r| r.entry.root_id.clone())
             .collect();
         if up.is_empty() {
-            return Err("no daemon is running here to update from: `cairn update now` does it".into());
+            return Err(
+                "no daemon is running here to update from: `cairn update now` does it".into(),
+            );
         }
         let mut last = String::new();
+        // Before it is asked, so that a run ending within the same second counts as its answer.
+        let at = model::now_secs();
         for id in up {
             match link::tell(&id, Request::UpdateNow) {
                 Ok(()) => {
-                    return Ok("Asked: the daemons and the tray restart into a new version as it is installed, and this tab says how it went".into())
+                    *ASKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+                    return Ok(String::new());
                 }
                 Err(e) => last = e,
             }
@@ -1522,5 +1591,93 @@ mod tests {
             "{:?}",
             two.lines
         );
+    }
+
+    fn checked(latest: &str, at: Secs) -> UpdateStatus {
+        UpdateStatus {
+            checked: at,
+            tried: at,
+            latest: Some(latest.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn checking_is_shown_until_a_run_ends_after_the_click() {
+        let before = checked("0.1.27", 100);
+        let p = progress(&before, &["0.1.27"], Some(200), 205);
+        assert_eq!(p.asking, Some(200));
+        assert_eq!(p.unanswered, None);
+        // Still up to date by the last answer, which the card shows once checking is over.
+        assert!(p.up_to_date);
+
+        // A run that fails as the one before did moves only `tried`.
+        let failed = UpdateStatus {
+            error: Some("cannot be reached".into()),
+            error_since: 50,
+            tried: 201,
+            ..checked("0.1.27", 40)
+        };
+        let p = progress(&failed, &["0.1.27"], Some(200), 205);
+        assert_eq!((p.asking, p.up_to_date), (None, false));
+
+        // An answer within the second of the click is its answer.
+        let p = progress(&checked("0.1.27", 200), &["0.1.27"], Some(200), 200);
+        assert_eq!(p.asking, None);
+
+        // A daemon from before `tried`: the feed's answer, or a new error, ends it.
+        let old = UpdateStatus {
+            tried: 0,
+            ..checked("0.1.27", 202)
+        };
+        assert_eq!(progress(&old, &["0.1.27"], Some(200), 205).asking, None);
+
+        // Nothing at all, long enough: said so, not shown checking for ever.
+        let p = progress(&before, &["0.1.27"], Some(200), 200 + ASKED_FOR);
+        assert_eq!((p.asking, p.unanswered), (None, Some(200)));
+        assert_eq!(
+            progress(&before, &["0.1.27"], None, 205),
+            Progress {
+                up_to_date: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn up_to_date_only_when_everything_here_runs_the_latest() {
+        let st = checked("0.1.27", 100);
+        assert!(progress(&st, &["0.1.27", "0.1.27"], None, 0).up_to_date);
+        assert!(progress(&st, &["0.1.28", "0.1.27"], None, 0).up_to_date);
+        // A daemon still on the one before, with nothing installed by the updater: not up to date, and
+        // not said to be restarting either.
+        let p = progress(&st, &["0.1.27", "0.1.26"], None, 0);
+        assert_eq!((p.up_to_date, p.restarting), (false, false));
+        // Never asked.
+        assert!(!progress(&UpdateStatus::default(), &["0.1.27"], None, 0).up_to_date);
+        // A newer one waits, or the last run failed.
+        let waits = UpdateStatus {
+            available: Some("0.1.28".into()),
+            ..checked("0.1.28", 100)
+        };
+        assert!(!progress(&waits, &["0.1.27"], None, 0).up_to_date);
+        let failed = UpdateStatus {
+            error: Some("cannot be reached".into()),
+            ..st.clone()
+        };
+        assert!(!progress(&failed, &["0.1.27"], None, 0).up_to_date);
+    }
+
+    #[test]
+    fn installed_and_not_yet_running_is_restarting() {
+        let st = UpdateStatus {
+            installed: Some("0.1.28".into()),
+            installed_at: 100,
+            ..checked("0.1.28", 100)
+        };
+        let p = progress(&st, &["0.1.27", "0.1.28"], None, 0);
+        assert_eq!((p.up_to_date, p.restarting), (false, true));
+        let p = progress(&st, &["0.1.28", "0.1.28"], None, 0);
+        assert_eq!((p.up_to_date, p.restarting), (true, false));
     }
 }

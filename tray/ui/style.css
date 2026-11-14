@@ -39,6 +39,8 @@ ul.list { list-style: none; margin: 6px 0 0; padding: 0; }
 ul.list li { padding: 6px 0; border-top: 1px solid var(--line); }
 ul.list li:first-child { border-top: 0; }
 .todo { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.ok { color: var(--synced); font-size: 12px; margin-top: 2px; }
+.bad { color: var(--error); font-size: 12px; margin-top: 2px; }
 table { border-collapse: collapse; width: 100%; margin-top: 6px; }
 td { padding: 3px 8px 3px 0; vertical-align: top; border-top: 1px solid var(--line); }
 tr:first-child td { border-top: 0; }

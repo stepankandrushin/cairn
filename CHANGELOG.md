@@ -9,6 +9,15 @@
   preview keeps one size while stepping, so the arrows stay under the pointer whatever each photo's shape, and
   the next photo is loaded before it is asked for. In a video or audio clicked to play, the keys stay its own.
 
+**Changed:**
+
+- The tray's Update now button is Check for updates, or Update to 0.1.x when one is waiting, and it says how
+  the check went where it only said it had asked: "Checking for a new version…" until the updater has finished,
+  then, in green, "✓ Up to date: 0.1.x is the latest" once the tray and every daemon run it, or what it
+  installed and that the tray and the daemons restart into it, or, in red, why it could not. The updater now
+  writes when each run ended (`tried` in `update-state.json`), so a check that fails just as the one before
+  did is seen to have ended too.
+
 ## 0.1.27 (2026-11-14)
 
 **Changed:**

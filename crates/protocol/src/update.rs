@@ -221,6 +221,10 @@ pub struct Status {
     /// never installed again but by a person's `cairn update now`.
     #[serde(default)]
     pub rejected: Vec<String>,
+    /// When a run last ended, whether the feed answered or not: what a person who asked waits for, as a
+    /// run that fails as the one before did changes nothing else here.
+    #[serde(default)]
+    pub tried: Secs,
 }
 
 /// Where the settings are, in the user dir.

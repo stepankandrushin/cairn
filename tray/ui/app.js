@@ -460,7 +460,8 @@ function drawLogin() {
 }
 
 // One updater for every daemon of this user here and the tray beside them: what it last found, and how
-// it is set. Update now asks a daemon, which installs whatever the setting.
+// it is set. Its button asks a daemon, which installs whatever the setting; the card says it is checking
+// until a run ends after the click, and then how it went.
 function drawUpdates() {
   const u = state.update;
   const choice = (value, label, about) => el('label', { class: 'choice' },
@@ -473,29 +474,33 @@ function drawUpdates() {
   const lines = [
     el('div', { class: 'meta' }, 'This tray ' + u.tray_version
       + (versions.length ? '; daemons ' + versions.join(', ') : '')),
-    u.checked_when
-      ? el('div', { class: 'meta' }, 'Last asked ' + u.checked_when + (u.latest ? ': the latest is ' + u.latest : ''))
-      : el('div', { class: 'meta' }, 'Not asked yet'),
   ];
+  if (u.asking) lines.push(el('div', { class: 'meta' }, 'Checking for a new version…'));
+  else if (u.up_to_date) lines.push(el('div', { class: 'ok' }, '✓ Up to date: ' + u.latest + ' is the latest, checked ' + u.checked_when));
+  else if (u.checked_when) lines.push(el('div', { class: 'meta' }, 'Last checked ' + u.checked_when + (u.latest ? ': the latest is ' + u.latest : '')));
+  else lines.push(el('div', { class: 'meta' }, 'Not checked yet'));
+  if (u.unanswered) lines.push(el('div', { class: 'bad' }, 'Asked at ' + u.unanswered + ', and the updater has not said how it went: `cairn update now` in a terminal shows what it does'));
   if (u.available) lines.push(el('div', { class: 'todo' }, u.available + ' is available' + (u.waits ? ': ' + u.waits : '')));
   else if (u.waits) lines.push(el('div', { class: 'meta' }, u.waits));
-  if (u.installed && u.installed_when) lines.push(el('div', { class: 'meta' }, u.installed + ' installed ' + u.installed_when));
-  if (u.error) lines.push(el('div', { class: 'todo' }, 'Could not update' + (u.error_when ? ' since ' + u.error_when : '') + ': ' + u.error));
+  if (u.installed && u.installed_when) lines.push(el('div', { class: 'meta' }, u.installed + ' installed ' + u.installed_when
+    + (u.restarting ? '; the tray and the daemons restart into it, a daemon between syncs' : '')));
+  if (u.error && !u.asking) lines.push(el('div', { class: 'bad' }, 'Could not update' + (u.error_when ? ' since ' + u.error_when : '') + ': ' + u.error));
   if (u.rejected.length) lines.push(el('div', { class: 'meta' }, 'Taken back here, not installed again unless asked: ' + u.rejected.join(', ')));
   if (u.problem) lines.push(el('div', { class: 'todo' }, u.problem));
+  const label = u.asking ? 'Checking…' : u.available ? 'Update to ' + u.available : 'Check for updates';
   return el('div', { class: 'card' },
     el('h2', {}, 'Updates'),
     el('div', { class: 'choices' },
       choice('auto', 'Automatic', 'install each release as it comes'),
       choice('notify', 'Notify only', 'show it here and in the menu'),
-      choice('off', 'Off', 'never ask')),
+      choice('off', 'Off', 'never check')),
     ...lines,
     el('div', { class: 'buttons' },
       el('button', {
-        class: 'act', disabled: !u.can_ask,
-        title: u.can_ask ? '' : 'No daemon is running here to ask',
+        class: 'act', disabled: !u.can_ask || !!u.asking,
+        title: u.can_ask ? 'Checks now and installs what is newer, whatever the setting above' : 'No daemon is running here to ask',
         onclick: async () => { await call('update_now', {}); await tick(); draw(true); },
-      }, 'Update now')));
+      }, label)));
 }
 
 setInterval(tick, 1000);

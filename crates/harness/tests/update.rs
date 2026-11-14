@@ -1057,6 +1057,56 @@ fn a_feed_that_does_not_answer_is_passed_over_for_the_next_and_said() {
 }
 
 #[test]
+fn every_run_says_when_it_ended_one_that_fails_as_before_too() {
+    // The tray, asked to update, waits for `tried`: a run that fails as the one before did changes
+    // nothing else in the state, and a person would be left waiting on it.
+    let lab = Lab::new("update-tried");
+    let closed = closed_feed();
+    let ask = |feed: &str| {
+        lab.cairn(
+            &["update", "now", "--feed", feed, "--key", &lab.key.public],
+            &[],
+        )
+    };
+    let state_file = lab.user.join("update-state.json");
+    let as_if_long_ago = || {
+        let mut s = lab.state();
+        s["tried"] = 1.into();
+        std::fs::write(&state_file, s.to_string()).unwrap();
+    };
+    let r = ask(&closed);
+    assert!(!r.ok(), "{}", r.text());
+    let first = lab.state();
+    let since = first["error_since"].as_i64().unwrap_or(0);
+    assert!(since > 0, "{first}");
+    assert!(first["tried"].as_i64().unwrap_or(0) >= since, "{first}");
+
+    as_if_long_ago();
+    let r = ask(&closed);
+    assert!(!r.ok(), "{}", r.text());
+    let again = lab.state();
+    assert_eq!(again["error"], first["error"], "{again}");
+    assert_eq!(again["error_since"], first["error_since"], "{again}");
+    assert!(again["tried"].as_i64().unwrap_or(0) >= since, "{again}");
+
+    // One that installs, and one that finds nothing newer.
+    lab.publish_new();
+    for what in ["installed", "up to date"] {
+        as_if_long_ago();
+        let r = ask(&lab.feed()).expect_ok();
+        let st = lab.state();
+        assert!(st["error"].is_null(), "{what}: {st}");
+        assert!(
+            st["tried"].as_i64().unwrap_or(0) >= since,
+            "{what}: {st}\n{}",
+            r.text()
+        );
+    }
+    assert_eq!(lab.installed(), program_bytes(true));
+    lab.runs();
+}
+
+#[test]
 fn a_daemon_says_a_feed_passed_over_once_and_again_when_it_answers() {
     let lab = Lab::new("update-daemon-fallback");
     let server = Server::start(lab.sandbox.path("server"));

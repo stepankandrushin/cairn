@@ -40,8 +40,8 @@ const USAGE: &str =
   --open TAB   the same, with its window open at status, recent, problems, conflicts,
                deleted or settings
   --probe      print, with no window, what the tray would show for each root; exit 2 if the
-               registry of roots cannot be read. With --conflicts, the open conflicts too, which
-               has the server replay its journal
+               registry of roots cannot be read. With --conflicts, the open conflicts too, as
+               each daemon lists them
   --login on   start the tray at login (off: no longer)";
 
 fn main() -> ExitCode {

@@ -29,7 +29,7 @@ use anyhow::{bail, Result};
 use cairn_failpoint::hit;
 use cairn_protocol::local::{OpenConflict, Reply, Request, DEFAULT_DELETED_DAYS, MAX_RECENT};
 use cairn_protocol::SkipKind;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
@@ -415,7 +415,11 @@ impl Pause {
 }
 
 /// The open conflicts, with where their copies are on this device: a path only if something is there.
-fn open_conflicts(root: &Path) -> Result<Vec<OpenConflict>> {
+/// `made` is where each copy was made, kept between requests.
+fn open_conflicts(
+    root: &Path,
+    made: &Mutex<BTreeMap<cairn_protocol::ObjectId, cairn_protocol::Link>>,
+) -> Result<Vec<OpenConflict>> {
     let config = read_config(root)?;
     let here = |names: Option<&[cairn_protocol::Name]>| {
         let names = names?;
@@ -425,9 +429,10 @@ fn open_conflicts(root: &Path) -> Result<Vec<OpenConflict>> {
         }
         std::fs::symlink_metadata(&at).is_ok().then_some(at)
     };
-    Ok(crate::restore::conflicts(&config)?
+    let mut made = made.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(crate::restore::open_conflicts(&config, root, &mut made)?
+        .open
         .into_iter()
-        .filter(|c| c.open)
         .map(|c| OpenConflict {
             seq: c.entry.seq,
             time: c.entry.time,
@@ -460,6 +465,7 @@ fn handler(
         Arc::downgrade(hub),
     );
     let deleted = crate::deleted::Cache::new();
+    let made = Mutex::new(BTreeMap::new());
     Arc::new(move |request: Request| match request {
         Request::Deleted { days } => {
             let since = crate::deleted::days_ago(days.unwrap_or(DEFAULT_DELETED_DAYS));
@@ -550,7 +556,7 @@ fn handler(
                 },
             }
         }
-        Request::Conflicts => match open_conflicts(&root) {
+        Request::Conflicts => match open_conflicts(&root, &made) {
             Ok(open) => Reply::Conflicts { open },
             Err(e) => Reply::Error {
                 text: format!("{e:#}"),

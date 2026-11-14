@@ -26,6 +26,13 @@
 
 **Fixed:**
 
+- The tray's Conflicts tab could stay at "Asking its daemon…" and then say "the daemon did not answer within
+  60 s", on a root that had ever had a conflict, all of them long dealt with: to list the open ones the
+  daemon replayed the server's whole journal, 13 s for a large root's on a fast machine and more than a minute
+  on a Mac. It now reads them from its base, the server's tree at its last sync, brought up to the head by
+  the journal since, with the one commit that made each copy still there, and answers in a few hundredths of
+  a second; `cairn conflicts` does the same, and `--all`, which says where each copy dealt with was made,
+  still reads the whole journal.
 - A daemon wrote each status to `.cairn/daemon.json` a moment before its local API had it: a program that
   found a status in the file and then asked the daemon, through `cairn status` or the tray, could be told the
   one before, when a busy machine held the daemon up between the two. The local API now has it first, so the

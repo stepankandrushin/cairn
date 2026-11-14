@@ -101,8 +101,8 @@ document.getElementById('deleted-days').addEventListener('change', (e) => {
 });
 document.getElementById('deleted-refresh').addEventListener('click', () => { askDeleted(true); draw(true); });
 
-// Each answer has the server replay its journal, so only when a person opens the tab or acts, and not
-// twice within a few seconds of clicking.
+// Each answer costs the daemon a few requests to the server, so only when a person opens the tab or
+// acts, and not twice within a few seconds of clicking.
 async function askConflicts() {
   if (Date.now() - conflictsAskedAt < 3000) return;
   conflictsAskedAt = Date.now();

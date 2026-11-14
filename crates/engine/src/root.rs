@@ -71,7 +71,7 @@ const FULL_CHECKED: &str = "full-checked";
 impl Root {
     /// The state's own file.
     pub fn state_file(&self) -> PathBuf {
-        self.path.join(name_path(STATE_DIR)).join("state.sqlite")
+        state_file_at(&self.path)
     }
 
     pub fn full_checked(&self) -> Option<i64> {
@@ -171,6 +171,11 @@ pub fn offer_root_name(path: &Path) -> Option<String> {
             "offering this root's name, {name:?}, as its user's name for the folder: {e:#}; offered again at the next start"
         )),
     }
+}
+
+/// The state file of the root at `path`, to read beside its sync (`State::open_to_read`).
+pub fn state_file_at(path: &Path) -> PathBuf {
+    path.join(name_path(STATE_DIR)).join("state.sqlite")
 }
 
 /// This root's marker, without taking its lock.

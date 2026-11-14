@@ -110,8 +110,9 @@ impl RootView {
     /// Whether `list` is to be asked for now: once each time a daemon answers, as one that started
     /// again knows what happened meanwhile; again when its activity says the list changed, a
     /// conflict made or a copy dealt with, a delete; again when the window did something to it; and
-    /// again a while after it could not be had. Never on a timer alone: the daemon has the server
-    /// replay its whole journal to answer, but for no open conflicts at all, which one request says.
+    /// again a while after it could not be had. Never on a timer alone: each answer costs the daemon
+    /// the server's inbox and the journal since its last sync, and Recently deleted a replay of the
+    /// whole journal the first time.
     fn due(&self, list: List, now: Secs) -> bool {
         let Link::Up(s) = &self.link else {
             return false;

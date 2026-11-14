@@ -200,6 +200,69 @@ fn content_on_both_keeps_both_and_fills_the_inbox() {
     assert!(all.stdout.contains(&line), "{}", all.text());
 }
 
+/// The inbox is read from this device's base and the journal since, not the whole journal: what came
+/// after its last sync counts, a copy made, its folder renamed, the copy moved.
+#[test]
+fn the_inbox_is_the_server_s_now_however_far_behind_this_device_is() {
+    let (_sb, _s, a, b) = pair("inbox-behind");
+    a.write("d/doc.txt", "base");
+    a.synced();
+    b.synced();
+    a.write("d/doc.txt", "from a");
+    b.write("d/doc.txt", "from b");
+    a.synced();
+    b.synced();
+    let copies = b.conflict_copies("d", "doc");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copy = &copies[0];
+    // Never by the whole journal, which it falls back to when the base does not do.
+    let ask = || {
+        let run = a.cairn(&["conflicts"]).expect_ok();
+        assert!(!run.stderr.contains("whole journal"), "{}", run.text());
+        run
+    };
+
+    // a has not synced since the copy was made.
+    let inbox = ask();
+    let line = format!("d/{copy}: the competing version of d/doc.txt");
+    assert!(inbox.stdout.contains(&line), "{}", inbox.text());
+    assert_eq!(inbox.stdout.lines().count(), 1, "{}", inbox.text());
+    // Synced, the copy is in its base, and still open.
+    a.synced();
+    let inbox = ask();
+    assert!(inbox.stdout.contains(&line), "{}", inbox.text());
+
+    // Renaming the folder above the copy is not dealing with it, and the inbox says where it is now.
+    std::fs::rename(b.path("d"), b.path("e")).unwrap();
+    b.synced();
+    let inbox = ask();
+    let line = format!("e/{copy}: the competing version of e/doc.txt");
+    assert!(inbox.stdout.contains(&line), "{}", inbox.text());
+
+    // Moving the copy out of its folder is, before a has synced it and after.
+    b.write("kept/.keep", "");
+    std::fs::rename(
+        b.path(&format!("e/{copy}")),
+        b.path(&format!("kept/{copy}")),
+    )
+    .unwrap();
+    b.synced();
+    for _ in 0..2 {
+        let inbox = ask();
+        assert!(
+            inbox
+                .stdout
+                .starts_with("no conflict waits for a person\n1 more dealt with"),
+            "{}",
+            inbox.text()
+        );
+        a.synced();
+    }
+    let all = a.cairn(&["conflicts", "--all"]).expect_ok();
+    let line = format!("dealt with: d/{copy}, now kept/{copy}");
+    assert!(all.stdout.contains(&line), "{}", all.text());
+}
+
 #[test]
 fn edit_against_delete_the_edit_survives_either_way() {
     let (_sb, _s, a, b) = pair("editdelete");

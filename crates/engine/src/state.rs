@@ -1020,6 +1020,27 @@ impl State {
         Ok(Self { conn, migrated })
     }
 
+    /// Opened only to read, beside the sync that holds the root's lock and writes it, in this process
+    /// or another: nothing is made or moved, so a state of another layout is refused rather than
+    /// migrated, and SQLite refuses any write on this connection.
+    pub fn open_to_read(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open {}", path.display()))?;
+        conn.pragma_update(None, "query_only", true)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            bail!("this root's state is schema {version}, and this binary reads {SCHEMA_VERSION}");
+        }
+        Ok(Self {
+            conn,
+            migrated: None,
+        })
+    }
+
     /// What opening this state moved it from an older layout, if it did.
     pub fn migrated(&self) -> Option<&Migration> {
         self.migrated.as_ref()
@@ -1143,6 +1164,19 @@ impl State {
             nodes.insert(id, node);
         }
         Ok(Tree::from_nodes(nodes))
+    }
+
+    /// The cursor, and the base's nodes for these objects and everything above them, read in one
+    /// transaction: the server's tree at that cursor, as much of it as says where they are.
+    pub fn base_subset_at(
+        &self,
+        objects: impl IntoIterator<Item = ObjectId>,
+    ) -> Result<(u64, Tree)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let cursor = self.cursor()?;
+        let tree = self.base_subset(objects)?;
+        tx.commit()?;
+        Ok((cursor, tree))
     }
 
     /// How many objects the base holds, the root and those deleted among them.

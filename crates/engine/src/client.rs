@@ -629,6 +629,16 @@ impl Client {
         )
     }
 
+    /// The journal entry at `seq` with its operations, if the journal has it.
+    pub fn change_with_ops(&self, seq: u64) -> Result<Option<wire::Change>> {
+        let resp: ChangesResponse = self.get_json(
+            "reading the journal",
+            "client.changes",
+            &format!("/changes?after={}&limit=1", seq.saturating_sub(1)),
+        )?;
+        Ok(resp.changes.into_iter().find(|c| c.seq == seq))
+    }
+
     /// The head, once it is not `after` or `wait` has gone by. A plain request and answer, so it
     /// passes through any reverse proxy. Bounded here too: a connection a firewall silently dropped
     /// answers nothing, ever.

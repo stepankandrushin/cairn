@@ -1405,9 +1405,19 @@ fn run_inner() -> Result<u8> {
             Ok(EXIT_OK)
         }
         Command::Conflicts { all } => {
-            let list = restore::conflicts(&open_config(&find_root(cli.root)?)?)?;
+            let root = find_root(cli.root)?;
+            let config = open_config(&root)?;
+            // Those dealt with say where they were made, which only the whole journal knows.
+            let (list, closed) = if all {
+                let list = restore::conflicts(&config)?;
+                let closed = list.iter().filter(|c| !c.open).count();
+                (list, closed)
+            } else {
+                let inbox = restore::open_conflicts(&config, &root, &mut Default::default())?;
+                (inbox.open, inbox.closed)
+            };
             let path = |p: &Option<Vec<Name>>| p.as_deref().map(display_path);
-            for c in list.iter().filter(|c| all || c.open) {
+            for c in &list {
                 let e = &c.entry;
                 let made = path(&c.made_at).unwrap_or_else(|| format!("copy {}", e.copy));
                 let against = path(&c.object_now).unwrap_or_else(|| "what is since deleted".into());
@@ -1427,14 +1437,12 @@ fn run_inner() -> Result<u8> {
                     e.device_name
                 );
             }
-            let open = list.iter().filter(|c| c.open).count();
-            if open == 0 {
+            if list.iter().all(|c| !c.open) {
                 outln!("no conflict waits for a person");
             }
-            if !all && open < list.len() {
+            if !all && closed > 0 {
                 outln!(
-                    "{} more dealt with, the copy deleted, renamed or moved: --all lists them",
-                    list.len() - open
+                    "{closed} more dealt with, the copy deleted, renamed or moved: --all lists them"
                 );
             }
             Ok(EXIT_OK)

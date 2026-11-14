@@ -26,8 +26,12 @@ pub struct HistoryEntry {
 
 /// Every change in the journal.
 pub fn journal(client: &Client) -> Result<Vec<Change>> {
+    journal_after(client, 0)
+}
+
+/// Every change in the journal after `after`.
+fn journal_after(client: &Client, mut after: u64) -> Result<Vec<Change>> {
     let mut out = Vec::new();
-    let mut after = 0;
     loop {
         let resp = client.changes(after)?;
         let Some(last) = resp.changes.last() else {
@@ -148,6 +152,146 @@ pub fn conflicts(config: &Config) -> Result<Vec<Conflict>> {
             }
         })
         .collect())
+}
+
+/// What the conflict inbox has waiting, and how many more are dealt with.
+#[derive(Debug, Default)]
+pub struct Inbox {
+    /// The open ones; `made_at` is where the copy's entry is now, renamed folders above it and all.
+    pub open: Vec<Conflict>,
+    pub closed: usize,
+}
+
+/// The open conflicts, without the whole journal [`conflicts`] replays, which on a large root takes a
+/// minute: this device's base is the server's tree at its cursor, and the journal since, a sync's worth,
+/// brings what of it says where the copies and their objects are up to the head. A copy that is not
+/// there is dealt with; for one that is, the commit that made it, which the server's inbox names, says
+/// where it was made, and `made` keeps that between calls, as it never changes. When the base cannot
+/// be read or does not replay, the whole journal is.
+pub fn open_conflicts(
+    config: &Config,
+    root: &std::path::Path,
+    made: &mut BTreeMap<ObjectId, Link>,
+) -> Result<Inbox> {
+    let client = Client::new(config, Retries::Short)?;
+    let entries = client.conflicts()?;
+    if entries.is_empty() {
+        return Ok(Inbox::default());
+    }
+    let (tree, since) = match tree_now(&client, root, &entries) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cairn: conflicts are read from the whole journal, as {e:#}");
+            let all = conflicts(config)?;
+            let closed = all.iter().filter(|c| !c.open).count();
+            let open = all.into_iter().filter(|c| c.open).collect();
+            return Ok(Inbox { open, closed });
+        }
+    };
+    let path_now = |o: ObjectId| {
+        tree.get_live(o)
+            .and_then(|n| n.links.iter().next())
+            .and_then(|l| tree.path_of_link(l))
+    };
+    let total = entries.len();
+    let mut open = Vec::new();
+    for entry in entries {
+        if !tree.is_live(entry.copy) {
+            continue;
+        }
+        if !made.contains_key(&entry.copy) {
+            let change = match since.iter().find(|c| c.seq == entry.seq) {
+                Some(c) => Some(c.clone()),
+                None => client.change_with_ops(entry.seq)?,
+            };
+            for op in change.iter().flat_map(|c| &c.ops) {
+                if let Op::Create {
+                    object,
+                    link,
+                    conflict_of: Some(_),
+                    ..
+                } = op
+                {
+                    made.insert(*object, link.clone());
+                }
+            }
+        }
+        // By the entry, not the path: renaming a folder above the copy is not dealing with it.
+        let Some(link) = made.get(&entry.copy) else {
+            continue;
+        };
+        if tree.entry_at(link) != Some(entry.copy) {
+            continue;
+        }
+        open.push(Conflict {
+            made_at: tree.path_of_link(link),
+            copy_now: path_now(entry.copy),
+            object_now: path_now(entry.object),
+            open: true,
+            entry,
+        });
+    }
+    let closed = total - open.len();
+    Ok(Inbox { open, closed })
+}
+
+/// The server's tree now, as much of it as says where `entries`' copies and objects are: the base at
+/// the cursor, read in one transaction, with every object the journal since touches, and that journal
+/// replayed on it. Tried again if a sync moves the cursor between the two reads.
+fn tree_now(
+    client: &Client,
+    root: &std::path::Path,
+    entries: &[ConflictEntry],
+) -> Result<(Tree, Vec<Change>)> {
+    let state = crate::state::State::open_to_read(&crate::root::state_file_at(root))?;
+    if state.get(crate::state::KEY_ROOT_ID)? != Some(crate::root::read_root_id(root)?) {
+        bail!("this root's state is not its marker's");
+    }
+    for _ in 0..3 {
+        let cursor = state.cursor()?;
+        let since = journal_after(client, cursor)?;
+        let mut want: BTreeSet<ObjectId> =
+            entries.iter().flat_map(|e| [e.copy, e.object]).collect();
+        for op in since.iter().flat_map(|c| &c.ops) {
+            want.extend(touched(op));
+        }
+        let (at, mut tree) = state.base_subset_at(want)?;
+        if at != cursor {
+            continue;
+        }
+        for change in &since {
+            for op in &change.ops {
+                tree.apply(op).map_err(|e| {
+                    anyhow!(
+                        "the journal since this device's base does not replay at seq {}: {e}",
+                        change.seq
+                    )
+                })?;
+            }
+        }
+        return Ok((tree, since));
+    }
+    bail!("this device's syncs kept moving its base while it was read")
+}
+
+/// Every object an operation looks at, its parents' included.
+fn touched(op: &Op) -> Vec<ObjectId> {
+    match op {
+        Op::Create {
+            object,
+            link,
+            conflict_of,
+            ..
+        } => {
+            let mut v = vec![*object, link.parent];
+            v.extend(conflict_of.as_ref().map(|c| c.object));
+            v
+        }
+        Op::Link { object, link } | Op::Unlink { object, link, .. } => vec![*object, link.parent],
+        Op::Move { object, from, to } => vec![*object, from.parent, to.parent],
+        Op::Update { object, .. } => vec![*object],
+        Op::Note { .. } => op.noted().collect(),
+    }
 }
 
 fn topo(tree: &Tree) -> Topo {

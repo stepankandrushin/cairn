@@ -18,6 +18,12 @@
   writes when each run ended (`tried` in `update-state.json`), so a check that fails just as the one before
   did is seen to have ended too.
 
+**Fixed:**
+
+- On macOS 27 the tray's menu showed none of its icons, the symbols by its items and the coloured dot by each
+  root's status, which macOS 26 and Windows show: macOS 27 hides a menu item's image unless the item asks for
+  it to be shown (`preferredImageVisibility`), and each item with an image now asks.
+
 ## 0.1.27 (2026-11-14)
 
 **Changed:**

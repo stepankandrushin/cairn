@@ -255,13 +255,16 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use block2::RcBlock;
-    use objc2::MainThreadMarker;
+    use objc2::runtime::NSObjectProtocol;
+    use objc2::{msg_send, sel, MainThreadMarker};
     use objc2_app_kit::{
         NSApplication, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu,
         NSMenuDidAddItemNotification, NSMenuDidBeginTrackingNotification,
         NSMenuDidEndTrackingNotification, NSMenuItem, NSMenuWillSendActionNotification,
     };
-    use objc2_foundation::{ns_string, NSNotification, NSNotificationCenter, NSNumber, NSString};
+    use objc2_foundation::{
+        ns_string, NSInteger, NSNotification, NSNotificationCenter, NSNumber, NSString,
+    };
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::Mutex;
@@ -287,25 +290,39 @@ mod imp {
         MARKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    /// Gives an item its symbol, should it be marked and have none yet.
+    /// Gives an item its symbol, should it be marked and have none yet, and has an item with an image,
+    /// a symbol or a root's light from muda, show it.
     fn adorn(item: &NSMenuItem) {
-        if item.image().is_some() {
-            return;
-        }
-        let title = item.title().to_string();
-        let symbol = {
-            let marks = MARKS.lock().unwrap_or_else(|e| e.into_inner());
-            marks.iter().find(|(t, _)| *t == title).map(|(_, s)| *s)
-        };
-        let Some(symbol) = symbol else { return };
-        // A template, as symbols are: the menu draws it in its text's colour, light or dark, and in
-        // the highlight's.
-        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            None,
-        );
-        if let Some(image) = image {
+        if item.image().is_none() {
+            let title = item.title().to_string();
+            let symbol = {
+                let marks = MARKS.lock().unwrap_or_else(|e| e.into_inner());
+                marks.iter().find(|(t, _)| *t == title).map(|(_, s)| *s)
+            };
+            let Some(symbol) = symbol else { return };
+            // A template, as symbols are: the menu draws it in its text's colour, light or dark, and
+            // in the highlight's.
+            let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                None,
+            );
+            let Some(image) = image else { return };
             item.setImage(Some(&image));
+        }
+        shown(item);
+    }
+
+    /// macOS 27 hides a menu item's image unless the item asks for it, by `preferredImageVisibility`
+    /// `.visible`, which no earlier one has (its SDK's NSMenuItem.h). A Mac on 27 showed none of the
+    /// menu's icons without it, one on 26 each.
+    fn shown(item: &NSMenuItem) {
+        if item.respondsToSelector(sel!(setPreferredImageVisibility:)) {
+            const VISIBLE: NSInteger = 1;
+            // SAFETY: the setter of macOS 27's `NSMenuItemImageVisibility preferredImageVisibility`, an
+            // NSInteger enum, on the main thread, as the menu is.
+            unsafe {
+                let _: () = msg_send![item, setPreferredImageVisibility: VISIBLE];
+            }
         }
     }
 
@@ -331,8 +348,8 @@ mod imp {
     pub fn watch(_on_right_click: fn(usize), _on_command: fn(MenuId)) -> Result<(), String> {
         let mtm = MainThreadMarker::new().ok_or("the menu is watched from the main thread")?;
         let center = NSNotificationCenter::defaultCenter();
-        // Each item is given its symbol as muda adds it, while the menu is built; and again, should
-        // one have been missed, as a menu opens, before it is drawn.
+        // Each item is given its symbol, and on macOS 27 its image shown, as muda adds it, while the
+        // menu is built; and again, should one have been missed, as a menu opens, before it is drawn.
         let added = RcBlock::new(|n: NonNull<NSNotification>| {
             let Some(menu) = menu_of(n) else { return };
             // SAFETY: as above.

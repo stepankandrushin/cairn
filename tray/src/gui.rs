@@ -2,14 +2,15 @@
 //! and passes a person's choice on to the daemon or to `actions`.
 
 use crate::actions::{self, ConflictAction};
-use crate::hub::{Hub, Link, State};
+use crate::hub::{Hub, Link, RootView, State, DELETED_WAIT};
 use crate::icon;
 use crate::link;
 use crate::model::{self, Light, Problem};
 use crate::native;
 use crate::settings::{self, Clock};
 use cairn_protocol::local::{
-    self as local_api, Activity, Change, DeletedItem, Direction, Reply, Request, MAX_RECENT,
+    self as local_api, Activity, Change, DeletedItem, Direction, Reply, Request,
+    DEFAULT_DELETED_DAYS, MAX_RECENT,
 };
 use cairn_protocol::update::Policy;
 use cairn_protocol::ObjectKind;
@@ -97,13 +98,52 @@ struct MenuModel {
     tooltip: String,
     registry_error: Option<String>,
     roots: Vec<RootLine>,
-    problems: usize,
-    conflicts: usize,
+    problems: Listing<String>,
+    conflicts: Listing<ConflictLine>,
+    deleted: Listing<String>,
     /// A release that is out and not installed here.
     update: Option<String>,
     recent: Vec<RecentLine>,
     /// A daemon is running, so an empty `recent` means nothing has synced since it started.
     any_up: bool,
+}
+
+/// As many of each list as Recent activity shows; the window has the rest.
+const MENU_MAX: usize = MAX_RECENT;
+
+/// A list the menu shows as Recent activity is shown, in a submenu that hovering opens.
+#[derive(Clone, Debug, PartialEq)]
+struct Listing<T> {
+    /// At most [`MENU_MAX`], newest first where they have a time.
+    lines: Vec<T>,
+    /// How many more there are than shown.
+    more: usize,
+    /// A root's that could not be listed, and why: no daemon to ask, its daemon still asked, its error.
+    notes: Vec<String>,
+}
+
+impl<T> Listing<T> {
+    fn of(mut all: Vec<T>, notes: Vec<String>) -> Self {
+        let more = all.len().saturating_sub(MENU_MAX);
+        all.truncate(MENU_MAX);
+        Listing {
+            lines: all,
+            more,
+            notes,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.lines.len() + self.more
+    }
+}
+
+/// An open conflict in the menu: a click shows its copy in its folder.
+#[derive(Clone, Debug, PartialEq)]
+struct ConflictLine {
+    text: String,
+    root_id: String,
+    seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,8 +199,9 @@ fn menu_model(s: &State) -> MenuModel {
         light,
         tooltip,
         registry_error: s.registry_error.clone(),
-        problems: s.roots.iter().map(|r| model::problems(r).len()).sum(),
-        conflicts: s.roots.iter().filter_map(model::open_conflicts).sum(),
+        problems: problem_lines(s),
+        conflicts: conflict_lines(s),
+        deleted: deleted_lines(s),
         roots,
         update: crate::update::status()
             .ok()
@@ -210,6 +251,139 @@ fn recent_lines(s: &State) -> Vec<RecentLine> {
     all.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     all.truncate(MAX_RECENT);
     all.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Each root's problems, as the window says them, under the root's name when there are several.
+fn problem_lines(s: &State) -> Listing<String> {
+    let many = s.roots.len() > 1;
+    let all = s
+        .roots
+        .iter()
+        .flat_map(|r| {
+            model::problems(r).into_iter().map(move |p| {
+                if many {
+                    format!("{}: {}", model::name(r), p.what)
+                } else {
+                    p.what
+                }
+            })
+        })
+        .collect();
+    Listing::of(all, Vec::new())
+}
+
+/// A root's last answer to what the hub asks its daemon for, or what to say for it instead.
+fn answered<'a, T>(
+    r: &RootView,
+    kept: &'a Option<(i64, Result<Vec<T>, String>)>,
+    many: bool,
+    asking: &str,
+) -> Result<&'a [T], String> {
+    let say = |text: String| {
+        if many {
+            format!("{}: {text}", model::name(r))
+        } else {
+            let mut c = text.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        }
+    };
+    if !matches!(r.link, Link::Up(_)) {
+        return Err(say("no daemon is running to ask".into()));
+    }
+    match kept {
+        None => Err(say(asking.into())),
+        Some((_, Err(e))) => Err(say(format!("cannot list them: {e}"))),
+        Some((_, Ok(list))) => Ok(list),
+    }
+}
+
+/// Every root's open conflicts, newest first.
+fn conflict_lines(s: &State) -> Listing<ConflictLine> {
+    let many = s.roots.len() > 1;
+    let (mut all, mut notes) = (Vec::new(), Vec::new());
+    for r in &s.roots {
+        match answered(r, &r.conflicts, many, "asking its daemon…") {
+            Err(note) => notes.push(note),
+            Ok(open) => {
+                for c in open {
+                    let shown = if many {
+                        format!("{}/{}", model::name(r), c.copy_display)
+                    } else {
+                        c.copy_display.clone()
+                    };
+                    all.push((
+                        c.time,
+                        ConflictLine {
+                            text: format!(
+                                "{}  {}  ·  from {}",
+                                model::when(c.time),
+                                model::clip_middle(&shown, 64),
+                                c.device_name
+                            ),
+                            root_id: r.entry.root_id.clone(),
+                            seq: c.seq,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    all.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    Listing::of(all.into_iter().map(|(_, l)| l).collect(), notes)
+}
+
+/// What every root's daemon lists as deleted in the last [`DEFAULT_DELETED_DAYS`] days, newest first.
+fn deleted_lines(s: &State) -> Listing<String> {
+    let many = s.roots.len() > 1;
+    let (mut all, mut notes) = (Vec::new(), Vec::new());
+    for r in &s.roots {
+        let asking = "asking its daemon, which reads the server's history…";
+        match answered(r, &r.deleted, many, asking) {
+            Err(note) => notes.push(note),
+            Ok(items) => {
+                for i in items {
+                    let path = match i.kind {
+                        ObjectKind::Dir => format!("{}/", i.path),
+                        _ => i.path.clone(),
+                    };
+                    let shown = if many {
+                        format!("{}/{path}", model::name(r))
+                    } else {
+                        path
+                    };
+                    all.push((
+                        i.time,
+                        format!(
+                            "{}  {}  ·  {}, by {}",
+                            model::when(i.time),
+                            model::clip_middle(&shown, 64),
+                            deleted_size(i),
+                            i.device_name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // Stable, so each daemon's own order stands within a second.
+    all.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    Listing::of(all.into_iter().map(|(_, l)| l).collect(), notes)
+}
+
+/// "4.2 MiB", or for a folder "12 files, 4.2 MiB".
+fn deleted_size(item: &DeletedItem) -> String {
+    match item.kind {
+        ObjectKind::Dir => format!(
+            "{} file{}, {}",
+            item.files,
+            if item.files == 1 { "" } else { "s" },
+            local_api::bytes(item.bytes)
+        ),
+        ObjectKind::Symlink => "a symlink".into(),
+        ObjectKind::File => local_api::bytes(item.bytes),
+    }
 }
 
 /// Where the change left it, relative to its root: a move is shown by its new name.
@@ -367,9 +541,42 @@ fn recent_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<Submenu<
     Ok(sub)
 }
 
-/// The menu, and where its Recent activity is in it: Settings nearest the icon, then Recent activity and
-/// the rest a person deals with, then each root's actions, then what each root is doing, laid out by
-/// `model::from_icon`; Quit last.
+/// A list's submenu, as Recent activity's: what could not be listed, its lines, then an item that opens
+/// its tab in the window, where each is dealt with.
+fn list_menu<T>(
+    app: &AppHandle,
+    title: &str,
+    tab: &str,
+    empty: &str,
+    list: &Listing<T>,
+    line: impl Fn(&T) -> tauri::Result<Kind>,
+) -> tauri::Result<Submenu<Wry>> {
+    let sub = Submenu::with_id(app, format!("menu:{tab}"), title, true)?;
+    for n in &list.notes {
+        sub.append(&item(app, "note", n, false)?)?;
+    }
+    if list.lines.is_empty() && list.notes.is_empty() {
+        sub.append(&item(app, "note", empty, false)?)?;
+    }
+    for l in &list.lines {
+        sub.append(&line(l)?)?;
+    }
+    if list.more > 0 {
+        sub.append(&item(
+            app,
+            "note",
+            &format!("And {} more", list.more),
+            false,
+        )?)?;
+    }
+    sub.append(&PredefinedMenuItem::separator(app)?)?;
+    sub.append(&item(app, tab, "Open in the window…", true)?)?;
+    Ok(sub)
+}
+
+/// The menu, and where its Recent activity is in it: Settings nearest the icon, then Recent activity,
+/// Recently deleted, Problems and Conflicts, each a submenu that hovering opens, then each root's
+/// actions, then what each root is doing, laid out by `model::from_icon`; Quit last.
 fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry>, usize)> {
     let count = |word: &str, n: usize| {
         if n == 0 {
@@ -387,11 +594,42 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
             true,
         )?);
     }
+    let deleted_empty = format!("Nothing deleted in the last {DEFAULT_DELETED_DAYS} days");
+    // A click on a problem or on something deleted opens its tab, where it is dealt with or brought
+    // back; on a conflict, it shows the copy, as one on a change shows the change.
     let deal = vec![
         Kind::Submenu(recent_menu(app, m, n)?),
-        item(app, "problems", &count("Problems", m.problems), true)?,
-        item(app, "conflicts", &count("Conflicts", m.conflicts), true)?,
-        item(app, "deleted", "Recently deleted…", true)?,
+        Kind::Submenu(list_menu(
+            app,
+            "Recently deleted",
+            "deleted",
+            &deleted_empty,
+            &m.deleted,
+            |l| item(app, "deleted", l, true),
+        )?),
+        Kind::Submenu(list_menu(
+            app,
+            &count("Problems", m.problems.count()),
+            "problems",
+            "No problems",
+            &m.problems,
+            |l| item(app, "problems", l, true),
+        )?),
+        Kind::Submenu(list_menu(
+            app,
+            &count("Conflicts", m.conflicts.count()),
+            "conflicts",
+            "No conflict waits for you",
+            &m.conflicts,
+            |l| {
+                item(
+                    app,
+                    format!("conflict:{}:{}", l.root_id, l.seq),
+                    &l.text,
+                    true,
+                )
+            },
+        )?),
     ];
     let actions = match m.roots.as_slice() {
         [] => Vec::new(),
@@ -450,6 +688,21 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
     match what.as_str() {
         "quit" => app.exit(0),
         "problems" | "conflicts" | "deleted" | "settings" => show_window(app, &what),
+        "conflict" => {
+            let Some((root_id, seq)) = root
+                .rsplit_once(':')
+                .and_then(|(r, s)| Some((r.to_string(), s.parse().ok()?)))
+            else {
+                return;
+            };
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = actions::show_conflict(hub(), &root_id, seq) {
+                    hub().notice(e);
+                    show_window(&app, "conflicts");
+                }
+            });
+        }
         "recent" => {
             let line = root
                 .split_once(':')
@@ -825,9 +1078,6 @@ struct UiDeleted {
     size: String,
 }
 
-/// A daemon reads the server's history to answer, all of it the first time: as long as that takes.
-const DELETED_WAIT: Duration = Duration::from_secs(600);
-
 #[tauri::command]
 async fn deleted(root_id: String, days: u32) -> Result<UiDeletedList, String> {
     blocking(move || {
@@ -837,6 +1087,9 @@ async fn deleted(root_id: String, days: u32) -> Result<UiDeletedList, String> {
             DELETED_WAIT,
         ) {
             Ok(Reply::Deleted { head, items }) => {
+                if days == DEFAULT_DELETED_DAYS {
+                    hub().keep_deleted(&root_id, Ok(items.clone()));
+                }
                 let at = model::now_secs();
                 Ok(UiDeletedList {
                     at,
@@ -846,16 +1099,7 @@ async fn deleted(root_id: String, days: u32) -> Result<UiDeletedList, String> {
                         .into_iter()
                         .map(|item| UiDeleted {
                             when: model::when(item.time),
-                            size: match item.kind {
-                                ObjectKind::Dir => format!(
-                                    "{} file{}, {}",
-                                    item.files,
-                                    if item.files == 1 { "" } else { "s" },
-                                    local_api::bytes(item.bytes)
-                                ),
-                                ObjectKind::Symlink => "a symlink".into(),
-                                ObjectKind::File => local_api::bytes(item.bytes),
-                            },
+                            size: deleted_size(&item),
                             item,
                         })
                         .collect(),
@@ -875,6 +1119,7 @@ async fn undelete(root_id: String, ids: Vec<String>) -> Result<String, String> {
     blocking(
         move || match link::ask(&root_id, Request::Undelete { ids }, DELETED_WAIT) {
             Ok(Reply::Undeleted { items, already, .. }) => {
+                hub().deleted_changed(&root_id);
                 let mut lines = Vec::new();
                 if items.len() > 3 {
                     lines.push(format!("Brought back {} items.", items.len()));
@@ -1004,4 +1249,168 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     window
         .close()
         .map_err(|e| format!("cannot close the window: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::LinkError;
+    use cairn_protocol::local::{DaemonStatus, OpenConflict, RootEntry};
+
+    fn root(name: &str, link: Link) -> RootView {
+        let entry = RootEntry {
+            path: PathBuf::from(format!("/nowhere/{name}")),
+            root_id: format!("id-{name}"),
+            server: String::new(),
+            added: 0,
+        };
+        RootView::detached(entry, link, None)
+    }
+
+    fn up() -> Link {
+        Link::Up(Box::default())
+    }
+
+    fn gone(t: i64, path: &str, kind: ObjectKind) -> DeletedItem {
+        DeletedItem {
+            id: format!("{t:032x}"),
+            seq: 1,
+            time: t,
+            device_name: "laptop".into(),
+            path: path.into(),
+            kind,
+            bytes: 2048,
+            files: 3,
+            folder_gone: false,
+        }
+    }
+
+    fn conflict(seq: u64, t: i64, copy: &str) -> OpenConflict {
+        OpenConflict {
+            seq,
+            time: t,
+            device_name: "laptop".into(),
+            copy: None,
+            original: None,
+            copy_display: copy.into(),
+            original_display: None,
+        }
+    }
+
+    fn state(roots: Vec<RootView>) -> State {
+        State {
+            roots,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn what_was_deleted_is_listed_newest_first_across_roots() {
+        let mut a = root("a", up());
+        a.deleted = Some((
+            0,
+            Ok(vec![
+                gone(30, "docs", ObjectKind::Dir),
+                gone(10, "x.txt", ObjectKind::File),
+            ]),
+        ));
+        let mut b = root("b", up());
+        b.deleted = Some((0, Ok(vec![gone(20, "y.txt", ObjectKind::File)])));
+        let l = deleted_lines(&state(vec![a, b]));
+        let paths: Vec<&str> = l
+            .lines
+            .iter()
+            .map(|t| t.split("  ").nth(1).unwrap())
+            .collect();
+        assert_eq!(paths, ["a/docs/", "b/y.txt", "a/x.txt"]);
+        assert!(
+            l.lines[0].ends_with("·  3 files, 2.0 KiB, by laptop"),
+            "{}",
+            l.lines[0]
+        );
+        assert!(
+            l.lines[1].ends_with("·  2.0 KiB, by laptop"),
+            "{}",
+            l.lines[1]
+        );
+        assert_eq!((l.more, l.notes.len()), (0, 0));
+    }
+
+    #[test]
+    fn a_root_not_listed_says_why_by_its_name_when_there_are_several() {
+        let asking = root("a", up());
+        let mut failed = root("b", up());
+        failed.deleted = Some((0, Err("the server did not answer".into())));
+        let stopped = root(
+            "c",
+            Link::Down {
+                since: 0,
+                why: LinkError::NotRunning("stopped".into()),
+            },
+        );
+        let l = deleted_lines(&state(vec![asking.clone(), failed, stopped]));
+        assert!(l.lines.is_empty());
+        assert_eq!(
+            l.notes,
+            [
+                "a: asking its daemon, which reads the server's history…",
+                "b: cannot list them: the server did not answer",
+                "c: no daemon is running to ask",
+            ]
+        );
+        assert_eq!(
+            conflict_lines(&state(vec![asking])).notes,
+            ["Asking its daemon…"]
+        );
+    }
+
+    #[test]
+    fn a_long_list_shows_as_many_as_recent_activity_and_counts_the_rest() {
+        let mut a = root("a", up());
+        a.conflicts = Some((
+            0,
+            Ok((0..MENU_MAX as u64 + 5)
+                .map(|i| conflict(i, i as i64, &format!("c{i}.txt")))
+                .collect()),
+        ));
+        let l = conflict_lines(&state(vec![a]));
+        assert_eq!(
+            (l.lines.len(), l.more, l.count()),
+            (MENU_MAX, 5, MENU_MAX + 5)
+        );
+        let newest = &l.lines[0];
+        assert_eq!(
+            (newest.root_id.as_str(), newest.seq),
+            ("id-a", MENU_MAX as u64 + 4)
+        );
+        assert!(newest
+            .text
+            .contains(&format!("  c{}.txt  ·  from laptop", MENU_MAX + 4)));
+    }
+
+    #[test]
+    fn problems_are_listed_by_their_roots_name_when_there_are_several() {
+        let paused = |name| {
+            root(
+                name,
+                Link::Up(Box::new(DaemonStatus {
+                    paused_since: Some(0),
+                    ..DaemonStatus::default()
+                })),
+            )
+        };
+        let one = problem_lines(&state(vec![paused("a")]));
+        assert!(
+            one.lines[0].starts_with("Paused by you since "),
+            "{:?}",
+            one.lines
+        );
+        let two = problem_lines(&state(vec![paused("a"), paused("b")]));
+        assert_eq!(two.count(), 2);
+        assert!(
+            two.lines[1].starts_with("b: Paused by you since "),
+            "{:?}",
+            two.lines
+        );
+    }
 }

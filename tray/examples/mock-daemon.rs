@@ -8,9 +8,11 @@
 //! second, as a real daemon's on a big tree.
 
 use cairn_protocol::local::{
-    control_address, registry_path, Activity, Change, DaemonStatus, Direction, LocalAddress,
-    NotApplied, OpenConflict, Phase, Progress, Registry, Reply, Request, RootEntry, Waiting,
+    control_address, registry_path, Activity, Change, DaemonStatus, DeletedItem, Direction,
+    LocalAddress, NotApplied, OpenConflict, Phase, Progress, Registry, Reply, Request, RootEntry,
+    Waiting,
 };
+use cairn_protocol::ObjectKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -248,14 +250,34 @@ fn answer(stream: impl std::io::Read + Write, shared: &Shared) {
         ),
         // A mock has no updater: the tray's button only has to be taken.
         Request::UpdateNow => send(out, &Reply::Done),
-        // Nor a server's history.
+        // Nor a server's history: what it made up as removed is what it lists as deleted.
         Request::Deleted { .. } => {
-            let head = shared.status.lock().unwrap().1.head;
+            let st = shared.status.lock().unwrap().1.clone();
+            let items = st
+                .recent
+                .iter()
+                .filter(|a| a.change == Change::Removed)
+                .enumerate()
+                .map(|(i, a)| DeletedItem {
+                    id: format!("{:032x}", i + 1),
+                    seq: st.head,
+                    time: a.time,
+                    device_name: match a.direction {
+                        Direction::Up => "this mock".into(),
+                        Direction::Down => "mock-device".into(),
+                    },
+                    path: a.path.clone(),
+                    kind: ObjectKind::File,
+                    bytes: 1234,
+                    files: 0,
+                    folder_gone: false,
+                })
+                .collect();
             send(
                 out,
                 &Reply::Deleted {
-                    head,
-                    items: Vec::new(),
+                    head: st.head,
+                    items,
                 },
             )
         }
@@ -263,6 +285,18 @@ fn answer(stream: impl std::io::Read + Write, shared: &Shared) {
             out,
             &Reply::Error {
                 text: "a mock daemon has nothing deleted to bring back".into(),
+            },
+        ),
+        Request::SignInLink => send(
+            out,
+            &Reply::Error {
+                text: "a mock daemon has no server to sign in to".into(),
+            },
+        ),
+        Request::Badges { .. } | Request::WatchBadges => send(
+            out,
+            &Reply::Error {
+                text: "a mock daemon keeps no badges".into(),
             },
         ),
     }

@@ -9,6 +9,13 @@
   of under 64 KiB came 4 to 5 times as fast, both disks at work. A device's first sync is bound by this. What
   is read ahead is bounded (16 MiB, or 64 chunks, beyond the next to be sent), and a download still ends at
   the first chunk missing or damaged in the order asked, as before.
+- The tray's menu lists Recently deleted, Problems and Conflicts in submenus, as it lists Recent activity, so
+  pointing at one shows them, every root's and up to 100, without opening the window; Recently deleted comes
+  next to Recent activity, before Problems. A click on a problem or on something deleted opens its tab in the
+  window, and one on a conflict shows its copy in its folder; each ends with "Open in the window…". The tray
+  asks each daemon for both lists once it answers, and again when its activity shows a conflict made or its
+  copy dealt with, or a delete (at most once a minute), where it asked for conflicts only when one was made and
+  for what was deleted only when its tab was opened.
 
 **Fixed:**
 

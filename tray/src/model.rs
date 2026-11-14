@@ -346,13 +346,6 @@ pub fn change_word(c: Change) -> &'static str {
     }
 }
 
-pub fn open_conflicts(view: &RootView) -> Option<usize> {
-    match &view.conflicts {
-        Some((_, Ok(list))) => Some(list.len()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,14 +363,14 @@ mod tests {
         assert_eq!(when_at(at(3, 9, 5), day(6), Clock::H12), "3 Nov 9:05 AM");
     }
 
-    /// Settings is nearest the icon and Recent activity next to it, on a menu that drops from the top of
-    /// the screen as on one raised from the bottom.
+    /// Settings is nearest the icon, Recent activity next to it and Recently deleted next to that, on a
+    /// menu that drops from the top of the screen as on one raised from the bottom.
     #[test]
     fn the_menu_keeps_what_matters_by_its_icon() {
         let given = || {
             [
                 vec!["Settings", "update"],
-                vec!["Recent", "Problems", "Conflicts", "Deleted"],
+                vec!["Recent", "Deleted", "Problems", "Conflicts"],
                 vec!["Sync now", "Pause"],
                 vec!["root: synced"],
             ]
@@ -389,9 +382,9 @@ mod tests {
                 "Settings",
                 "update",
                 "Recent",
+                "Deleted",
                 "Problems",
                 "Conflicts",
-                "Deleted",
                 "Sync now",
                 "Pause",
                 "root: synced"
@@ -403,9 +396,9 @@ mod tests {
                 "root: synced",
                 "Sync now",
                 "Pause",
-                "Deleted",
                 "Conflicts",
                 "Problems",
+                "Deleted",
                 "Recent",
                 "update",
                 "Settings"

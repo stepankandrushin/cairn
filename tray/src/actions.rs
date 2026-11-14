@@ -502,6 +502,27 @@ pub fn conflict(
     }
 }
 
+/// A click on a conflict in the menu: shows its copy in its folder, or the version it competes with if
+/// only that is here, as the list the hub keeps has them, so that it waits for no journal to be
+/// replayed; acting on it in the window asks again first.
+pub fn show_conflict(hub: &Hub, root_id: &str, seq: u64) -> Result<(), String> {
+    let r = hub
+        .root(root_id)
+        .ok_or("that root is no longer in the registry")?;
+    let c = match &r.conflicts {
+        Some((_, Ok(open))) => open.iter().find(|c| c.seq == seq),
+        _ => None,
+    }
+    .ok_or("that conflict is no longer listed: it was dealt with meanwhile")?;
+    let at = c.copy.as_deref().or(c.original.as_deref()).ok_or_else(|| {
+        format!(
+            "neither the copy, {}, nor the version it competes with is on this device: deal with it on one that has it",
+            c.copy_display
+        )
+    })?;
+    show(&r.entry.path, &inside(&r.entry.path, at)?)
+}
+
 /// Starting at login: a LaunchAgent on macOS, the Run key on Windows, an autostart entry on Linux.
 pub mod login {
     #[cfg(target_os = "macos")]

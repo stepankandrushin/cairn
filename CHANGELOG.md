@@ -26,6 +26,13 @@
 
 **Fixed:**
 
+- On Windows no item of the tray's menu did anything about an hour after the tray started, while a root
+  synced: a click on Settings, Sync now, Pause or even Quit closed the menu and nothing followed. The menu
+  is made anew whenever a root's state changes, and the library that makes it (muda, as Tauri 2 has it)
+  numbers each item it ever makes from one counter, but finds the item clicked by the low 16 bits of the id
+  Windows hands back, so once the count passed 65535 it found none. The tray now finds those itself, from
+  the whole id Windows gives, and hands the click on as before; an earlier click, which muda still finds, is
+  left to it. Restarting the tray brought the menu back for the next hour.
 - The tray's Conflicts tab could stay at "Asking its daemon…" and then say "the daemon did not answer within
   60 s", on a root that had ever had a conflict, all of them long dealt with: to list the open ones the
   daemon replayed the server's whole journal, 13 s for a large root's on a fast machine and more than a minute

@@ -29,6 +29,8 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
+/// For a click that reaches the tray by `native` rather than by Tauri.
+static APP: OnceLock<AppHandle> = OnceLock::new();
 
 fn hub() -> &'static Arc<Hub> {
     HUB.get().expect("the hub starts before the window")
@@ -60,7 +62,8 @@ pub fn run(hub: Arc<Hub>, open: Option<String>) -> Result<(), String> {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             // Before the tray, on the thread its menu runs on. Without it the menu still works, but may
             // be set anew while open, and a right click copies nothing.
-            if let Err(e) = native::watch(right_click) {
+            let _ = APP.set(app.handle().clone());
+            if let Err(e) = native::watch(right_click, command) {
                 crate::log(&e);
             }
             let tray = TrayIconBuilder::with_id("cairn")
@@ -458,6 +461,7 @@ fn refresh(app: AppHandle, tray: TrayIcon) {
                 Ok((menu, recent_at)) => match t.set_menu(Some(menu.clone())) {
                     Ok(()) => {
                         native::recent_menu(&menu, recent_at);
+                        native::commands(&menu);
                         let mut shown = RECENT.lock().unwrap_or_else(|e| e.into_inner());
                         shown.push((n, model.recent.clone()));
                         let extra = shown.len().saturating_sub(2);
@@ -770,6 +774,15 @@ fn build_menu(app: &AppHandle, m: &MenuModel, n: u64) -> tauri::Result<(Menu<Wry
         }
     }
     Ok((menu, recent_at))
+}
+
+/// A click on an item that muda could not match to it, which Windows told `native` of: taken as
+/// Tauri hands on the others, on its event loop once the menu has closed.
+fn command(id: MenuId) {
+    if let Some(app) = APP.get() {
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || on_menu(&a, MenuEvent { id }));
+    }
 }
 
 fn on_menu(app: &AppHandle, event: MenuEvent) {

@@ -1,7 +1,8 @@
 //! What the tray's menu needs from each system that Tauri does not give: whether a person has it open,
 //! so that it is not set anew under them; a right click on an item of its Recent activity, which
-//! copies that item's path where a click shows it; and its icons as each system has them, SF Symbols
-//! on macOS, and on Windows the light or dark of its menus, which the glyphs drawn for it follow.
+//! copies that item's path where a click shows it; its icons as each system has them, SF Symbols
+//! on macOS, and on Windows the light or dark of its menus, which the glyphs drawn for it follow; and
+//! on Windows the clicks that muda can no longer match to their item (`commands`).
 //!
 //! Setting a menu anew while it is open closes it on Windows, as the one shown is destroyed, and on
 //! macOS leaves its items pointing at what was freed; the hub's state changes every few seconds while
@@ -31,18 +32,19 @@ fn opened(open: bool) {
     OPENED.store(at, Ordering::SeqCst);
 }
 
-pub use imp::{dark_menus, mark, recent_menu, take_secondary, unmark, watch};
+pub use imp::{commands, dark_menus, mark, recent_menu, take_secondary, unmark, watch};
 
 #[cfg(windows)]
 mod imp {
-    use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::OnceLock;
-    use tauri::menu::{ContextMenu, Menu};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use tauri::menu::{ContextMenu, Menu, MenuId, MenuItemKind};
     use tauri::Wry;
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, EndMenu, GetSubMenu, SetWindowsHookExW, CWPSTRUCT, WH_CALLWNDPROC,
+        CallNextHookEx, EndMenu, GetMenuItemCount, GetMenuItemID, GetSubMenu, SetWindowsHookExW,
+        CWPSTRUCT, HMENU, MSG, PM_REMOVE, WH_CALLWNDPROC, WH_GETMESSAGE, WM_COMMAND,
         WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_MENURBUTTONUP,
     };
 
@@ -50,25 +52,39 @@ mod imp {
     static RECENT: AtomicIsize = AtomicIsize::new(0);
     static ON_RIGHT_CLICK: OnceLock<fn(usize)> = OnceLock::new();
 
+    /// The items of the tray's menu that muda cannot match to a click, by their id. Windows names the
+    /// item clicked by a WM_COMMAND whose wParam is its whole id, and muda 0.20 reads only the low 16
+    /// bits of it (all a command from a control or an accelerator has) and looks those up among ids
+    /// from a counter that only goes up, one for every item it has ever made: as the menu is made
+    /// anew whenever a root's state changes, about a hundred items each time, its ids passed 65535
+    /// within about an hour of the tray's start, and from then on no click was matched, and none did
+    /// anything. muda 0.21 keeps them under 16 bits; Tauri 2 still uses 0.20.
+    static PAST_16_BITS: Mutex<Vec<(u32, MenuId)>> = Mutex::new(Vec::new());
+    static ON_COMMAND: OnceLock<fn(MenuId)> = OnceLock::new();
+    /// The window the menu was last opened for, tray-icon's, which its clicks are sent to.
+    static OWNER: AtomicIsize = AtomicIsize::new(0);
+    /// Said once: a menu whose items and Windows' do not line up is passed over.
+    static UNLIKE_SAID: AtomicBool = AtomicBool::new(false);
+
     /// On the thread that owns the tray's window, which is the one the menu runs on. Windows tells that
     /// window, by messages sent to it, when a menu opens and closes and when the right button is let go
-    /// over an item: a hook on the thread sees them before tray-icon's window does.
-    pub fn watch(on_right_click: fn(usize)) -> Result<(), String> {
+    /// over an item, and by one sent or posted to it which item was clicked: hooks on the thread see
+    /// them before tray-icon's window does.
+    pub fn watch(on_right_click: fn(usize), on_command: fn(MenuId)) -> Result<(), String> {
         let _ = ON_RIGHT_CLICK.set(on_right_click);
-        // SAFETY: a hook on this thread alone, whose procedure is this program's and lives as long.
-        let hook = unsafe {
-            SetWindowsHookExW(
-                WH_CALLWNDPROC,
-                Some(sent),
-                std::ptr::null_mut(),
-                GetCurrentThreadId(),
-            )
-        };
-        if hook.is_null() {
-            return Err(format!(
-                "cannot watch the menu: {}",
-                std::io::Error::last_os_error()
-            ));
+        let _ = ON_COMMAND.set(on_command);
+        type Proc = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
+        for (kind, proc) in [(WH_CALLWNDPROC, sent as Proc), (WH_GETMESSAGE, got)] {
+            // SAFETY: a hook on this thread alone, whose procedure is this program's and lives as long.
+            let hook = unsafe {
+                SetWindowsHookExW(kind, Some(proc), std::ptr::null_mut(), GetCurrentThreadId())
+            };
+            if hook.is_null() {
+                return Err(format!(
+                    "cannot watch the menu: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
         Ok(())
     }
@@ -79,8 +95,15 @@ mod imp {
             // SAFETY: for WH_CALLWNDPROC, lparam points at a CWPSTRUCT for the length of the call.
             let m = unsafe { &*(lparam as *const CWPSTRUCT) };
             match m.message {
-                WM_ENTERMENULOOP => super::opened(true),
+                WM_ENTERMENULOOP => {
+                    // wParam is TRUE for a menu TrackPopupMenu shows, as tray-icon's is.
+                    if m.wParam != 0 {
+                        OWNER.store(m.hwnd as isize, Ordering::SeqCst);
+                    }
+                    super::opened(true)
+                }
                 WM_EXITMENULOOP => super::opened(false),
+                WM_COMMAND => command(m.hwnd as isize, m.wParam, m.lParam),
                 // wParam is the item's place in the menu that lParam names.
                 WM_MENURBUTTONUP if m.lParam != 0 && m.lParam == RECENT.load(Ordering::SeqCst) => {
                     if let Some(f) = ON_RIGHT_CLICK.get() {
@@ -94,6 +117,88 @@ mod imp {
         }
         // SAFETY: passes the message on unchanged, as every hook must.
         unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+
+    unsafe extern "system" fn got(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // HC_ACTION, for a message being taken off the queue (PM_REMOVE), so that each is seen once.
+        if code == 0 && wparam & PM_REMOVE as WPARAM != 0 {
+            // SAFETY: for WH_GETMESSAGE, lparam points at the MSG for the length of the call.
+            let m = unsafe { &*(lparam as *const MSG) };
+            if m.message == WM_COMMAND {
+                command(m.hwnd as isize, m.wParam, m.lParam);
+            }
+        }
+        // SAFETY: passes the message on unchanged, as every hook must.
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+
+    /// A click on an item of the tray's menu that muda will not match: passed on, as muda passes
+    /// those it does. One it does match is not among `PAST_16_BITS`, so none is passed on twice.
+    fn command(hwnd: isize, wparam: WPARAM, lparam: LPARAM) {
+        // A menu's: no control in lParam, and sent to the window the menu opened for.
+        if lparam != 0 || hwnd == 0 || hwnd != OWNER.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(clicked) = u32::try_from(wparam) else {
+            return;
+        };
+        let id = PAST_16_BITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(n, _)| *n == clicked)
+            .map(|(_, id)| id.clone());
+        if let (Some(id), Some(f)) = (id, ON_COMMAND.get()) {
+            f(id);
+        }
+    }
+
+    /// Once `menu` is the tray's: which of its items, its submenus' too, muda will not match when
+    /// clicked, read from the ids Windows has for them, place by place beside Tauri's items.
+    pub fn commands(menu: &Menu<Wry>) {
+        let mut past = Vec::new();
+        match (menu.hpopupmenu(), menu.items()) {
+            (Ok(h), Ok(items)) => past_16_bits(h as HMENU, &items, &mut past),
+            (Err(e), _) | (_, Err(e)) => crate::log(&format!(
+                "cannot read the menu's items, so once their ids pass 16 bits a click on one does nothing: {e}"
+            )),
+        }
+        *PAST_16_BITS.lock().unwrap_or_else(|e| e.into_inner()) = past;
+    }
+
+    fn past_16_bits(h: HMENU, items: &[MenuItemKind<Wry>], past: &mut Vec<(u32, MenuId)>) {
+        // SAFETY: a handle the menu owns, which outlives the call.
+        let count = unsafe { GetMenuItemCount(h) };
+        // Matched by place, so a menu whose places differ is left out rather than matched wrong.
+        if usize::try_from(count).ok() != Some(items.len()) {
+            if !UNLIKE_SAID.swap(true, Ordering::SeqCst) {
+                crate::log(&format!(
+                    "the menu has {} items and Windows {count}, so once their ids pass 16 bits a click there does nothing",
+                    items.len()
+                ));
+            }
+            return;
+        }
+        for (at, item) in (0i32..).zip(items) {
+            match item {
+                MenuItemKind::Submenu(s) => {
+                    // SAFETY: as above; muda puts a submenu's own handle at its place.
+                    let sub = unsafe { GetSubMenu(h, at) };
+                    if let (false, Ok(items)) = (sub.is_null(), s.items()) {
+                        past_16_bits(sub, &items, past);
+                    }
+                }
+                MenuItemKind::Predefined(_) => {}
+                _ => {
+                    // SAFETY: as above.
+                    let id = unsafe { GetMenuItemID(h, at) };
+                    // u32::MAX: no id, as for a submenu.
+                    if id > 0xFFFF && id != u32::MAX {
+                        past.push((id, item.id().clone()));
+                    }
+                }
+            }
+        }
     }
 
     /// Once `menu` is the tray's: muda puts a submenu's own handle into its parent's, at `at`.
@@ -160,7 +265,7 @@ mod imp {
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::Mutex;
-    use tauri::menu::Menu;
+    use tauri::menu::{Menu, MenuId};
     use tauri::Wry;
 
     /// Menus being tracked, the open submenus among them should macOS say so of each.
@@ -223,7 +328,7 @@ mod imp {
 
     /// On the main thread. Tauri hands a chosen item on later, by its event loop, when the event that
     /// chose it is gone, so how it was clicked is read as macOS says the menu is about to act.
-    pub fn watch(_on_right_click: fn(usize)) -> Result<(), String> {
+    pub fn watch(_on_right_click: fn(usize), _on_command: fn(MenuId)) -> Result<(), String> {
         let mtm = MainThreadMarker::new().ok_or("the menu is watched from the main thread")?;
         let center = NSNotificationCenter::defaultCenter();
         // Each item is given its symbol as muda adds it, while the menu is built; and again, should
@@ -288,6 +393,9 @@ mod imp {
 
     pub fn recent_menu(_menu: &Menu<Wry>, _at: usize) {}
 
+    /// macOS hands every click to its item itself.
+    pub fn commands(_menu: &Menu<Wry>) {}
+
     /// macOS draws its symbols in the menu's own colours, and the lights read on either.
     pub fn dark_menus() -> bool {
         false
@@ -301,14 +409,16 @@ mod imp {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
-    use tauri::menu::Menu;
+    use tauri::menu::{Menu, MenuId};
     use tauri::Wry;
 
-    pub fn watch(_on_right_click: fn(usize)) -> Result<(), String> {
+    pub fn watch(_on_right_click: fn(usize), _on_command: fn(MenuId)) -> Result<(), String> {
         Ok(())
     }
 
     pub fn recent_menu(_menu: &Menu<Wry>, _at: usize) {}
+
+    pub fn commands(_menu: &Menu<Wry>) {}
 
     pub fn take_secondary() -> bool {
         false

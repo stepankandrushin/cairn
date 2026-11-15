@@ -6,8 +6,11 @@
 #                 with CAIRN_TEST_SERVER and CAIRN_TEST_TOKEN set, its UI test run against that server,
 #                 the photos access granted first; the screenshots are in build/ios-test.xcresult;
 #   --device      an archive, exported for the devices registered to the team: build/ios/Cairn.ipa;
-#   --testflight  an archive uploaded to App Store Connect, for TestFlight: outward-facing, and needing
-#                 the app's record there, so only when the owner asks;
+#   --testflight  an archive uploaded to App Store Connect, for TestFlight: outward-facing, so only when
+#                 the owner asks. It needs the app's record there, which xcodebuild cannot make ("App
+#                 record … not found"): the first time, open build/ios/Cairn.xcarchive in Xcode's
+#                 Organizer and Distribute App, which offers to make it (its name must be free on the App
+#                 Store, and the team's agreements in force);
 #   --bindings    the library and bindings alone, for Xcode.
 #
 # Signing is automatic, by the team in ios/Config/Local.xcconfig (CAIRN_IOS_TEAM), which git leaves out

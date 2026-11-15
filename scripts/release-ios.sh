@@ -8,9 +8,10 @@
 #   --device      an archive, exported for the devices registered to the team: build/ios/Cairn.ipa;
 #   --testflight  an archive uploaded to App Store Connect, for TestFlight: outward-facing, so only when
 #                 the owner asks. It needs the app's record there, which xcodebuild cannot make ("App
-#                 record … not found"): the first time, open build/ios/Cairn.xcarchive in Xcode's
-#                 Organizer and Distribute App, which offers to make it (its name must be free on the App
-#                 Store, and the team's agreements in force);
+#                 record … not found"): make it once, in App Store Connect (Apps, New App, bundle ID
+#                 storage.cairn.ios) or from Xcode's Organizer (Distribute App on build/ios/Cairn.xcarchive);
+#                 either needs a name free on the App Store and the team's agreements in force. A TestFlight
+#                 group with automatic distribution then gets each build once Apple has processed it;
 #   --bindings    the library and bindings alone, for Xcode.
 #
 # Signing is automatic, by the team in ios/Config/Local.xcconfig (CAIRN_IOS_TEAM), which git leaves out

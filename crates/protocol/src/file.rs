@@ -288,6 +288,9 @@ mod tests {
         };
         let s = query_string(&q);
         assert!(!s.contains(' ') && !s.contains('\''), "{s}");
-        assert!(s.contains("path=Photos%2FThe%20phone%27s%20photos%2F"), "{s}");
+        assert!(
+            s.contains("path=Photos%2FThe%20phone%27s%20photos%2F"),
+            "{s}"
+        );
     }
 }

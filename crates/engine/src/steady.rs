@@ -98,9 +98,9 @@ pub(crate) fn build() -> &'static str {
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| {
         // Linux names the file that is running even after it has been replaced.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let exe = Some(std::path::PathBuf::from("/proc/self/exe"));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let exe = std::env::current_exe().ok();
         let seen = exe.and_then(|p| std::fs::metadata(p).ok()).map(|m| {
             #[cfg(unix)]

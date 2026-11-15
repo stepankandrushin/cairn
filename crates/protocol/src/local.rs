@@ -576,7 +576,7 @@ pub enum LocalAddress {
 }
 
 pub fn control_address(root_id: &str) -> Option<LocalAddress> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         Some(LocalAddress::Abstract(format!("cairn-daemon-{root_id}")))
     }
@@ -593,7 +593,12 @@ pub fn control_address(root_id: &str) -> Option<LocalAddress> {
             r"\\.\pipe\cairn-daemon-{root_id}"
         )))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         let _ = root_id;
         None

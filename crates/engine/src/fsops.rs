@@ -6,12 +6,12 @@
 //! outside the tree.
 
 use cairn_protocol::{Name, Timestamp};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::AsRawFd;
 pub use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 pub use rustix::fs::FileType;
 use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags, Timespec, Timestamps};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{Statx, StatxFlags, CWD};
 use rustix::io::Errno;
 use std::ffi::OsStr;
@@ -52,7 +52,7 @@ pub fn os_name_bytes(name: &OsStr) -> Option<Vec<u8>> {
 }
 
 /// `stat` of an open descriptor.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     Ok(from_statx(fs::statx(
         fd,
@@ -238,7 +238,7 @@ pub struct Stat {
     pub mnt_id: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn stamp(t: rustix::fs::StatxTimestamp) -> Timestamp {
     Timestamp {
         sec: t.tv_sec,
@@ -246,7 +246,7 @@ fn stamp(t: rustix::fs::StatxTimestamp) -> Timestamp {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn from_statx(s: Statx) -> Stat {
     Stat {
         file_type: fs::FileType::from_raw_mode(u32::from(s.stx_mode)),
@@ -264,7 +264,7 @@ fn from_statx(s: Statx) -> Stat {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const STATX_WANT: StatxFlags = StatxFlags::BASIC_STATS
     .union(StatxFlags::BTIME)
     .union(StatxFlags::MNT_ID);
@@ -293,7 +293,7 @@ fn from_stat(s: fs::Stat) -> Stat {
 
 /// `true` when this error says an xattr is not there.
 pub fn is_no_xattr(e: &io::Error) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let absent = Errno::NODATA;
     #[cfg(target_vendor = "apple")]
     let absent = Errno::NOATTR;
@@ -326,7 +326,7 @@ pub fn is_exists(e: &io::Error) -> bool {
 /// none has. `None` where that cannot be asked: a file of another user's, a filesystem whose leases
 /// mean something else (NFS refuses one for every file it holds no delegation for), or not Linux.
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "android"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub fn open_for_writing(fd: BorrowedFd<'_>) -> Option<bool> {
@@ -375,7 +375,7 @@ pub fn open_for_writing(fd: BorrowedFd<'_>) -> Option<bool> {
 }
 
 #[cfg(not(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "android"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 pub fn open_for_writing(_: BorrowedFd<'_>) -> Option<bool> {
@@ -385,7 +385,7 @@ pub fn open_for_writing(_: BorrowedFd<'_>) -> Option<bool> {
 /// Writes to files this process has just written, seen through inotify: a record can vouch for a file
 /// nothing was done to without making anyone wait, as a watch holds nothing back. Only on filesystems
 /// whose every write goes through this kernel, which a watch then sees.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub struct WriteWatch {
     fd: OwnedFd,
     /// Watches that saw a write, a change of metadata or a writer's close since they were added.
@@ -394,7 +394,7 @@ pub struct WriteWatch {
     overflowed: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl WriteWatch {
     pub fn new() -> Option<Self> {
         use rustix::fs::inotify::{self, CreateFlags};
@@ -501,10 +501,10 @@ impl WriteWatch {
 }
 
 /// No watch to be had here: every placed file is read again by the next scan.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub struct WriteWatch;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl WriteWatch {
     pub fn new() -> Option<Self> {
         None
@@ -611,7 +611,7 @@ impl Dir {
         if path.is_empty() {
             return self.stat_self();
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             /// The kernel, or a filter in front of it, does not take `openat2`: the walk from here.
@@ -662,7 +662,7 @@ impl Dir {
         self.open_dir(name)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn stat_self(&self) -> io::Result<Stat> {
         Ok(from_statx(fs::statx(
             &self.0,
@@ -677,7 +677,7 @@ impl Dir {
         Ok(from_stat(fs::fstat(&self.0)?))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn stat(&self, name: &[u8]) -> io::Result<Stat> {
         Ok(from_statx(fs::statx(
             &self.0,
@@ -756,7 +756,7 @@ impl Dir {
     /// of its chunks: what it reads is let go of with `read_once_done`.
     pub fn open_read_once(&self, name: &[u8]) -> io::Result<OwnedFd> {
         let fd = self.open_read(name)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let _ = fs::fadvise(&fd, 0, None, fs::Advice::Sequential);
         Ok(fd)
     }
@@ -841,7 +841,7 @@ impl Dir {
     /// The path that addresses one entry through this descriptor, for the calls that only take a
     /// path. The kernel resolves the descriptor's magic link to this very directory; the entry's
     /// last component is then looked up by the `l*` call without following a symlink.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn proc_entry(&self, name: &[u8]) -> io::Result<PathBuf> {
         let mut path = PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()));
         path.push(os(name));
@@ -932,7 +932,7 @@ impl Dir {
 
     /// `chmod` of the entry itself. A descriptor opened with `O_PATH | O_NOFOLLOW` pins the inode,
     /// and its magic link reaches that inode and nothing else. Refuses symlinks.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn chmod(&self, name: &[u8], mode: u32) -> io::Result<()> {
         let fd = fs::openat(
             &self.0,
@@ -970,7 +970,7 @@ impl Dir {
     pub fn set_mtime(&self, name: &[u8], mtime: Timestamp) -> io::Result<()> {
         // With the access time as it is, and not left out: the mtime alone reads to inotify as a write
         // (IN_MODIFY), and a run that watches a file for writes would take its own change for one.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let last_access = match fs::statx(
             &self.0,
             os(name),
@@ -986,7 +986,7 @@ impl Dir {
                 tv_nsec: fs::UTIME_OMIT,
             },
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let last_access = Timespec {
             tv_sec: 0,
             tv_nsec: fs::UTIME_OMIT,
@@ -1023,11 +1023,11 @@ impl Dir {
 /// again and again, the state above all, whose every step then waits on the disk. Pages still to be
 /// written, or mapped by a program, stay.
 pub fn read_once_done(fd: BorrowedFd<'_>, offset: u64, len: u64) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(len) = std::num::NonZeroU64::new(len) {
         let _ = fs::fadvise(fd, offset, Some(len), fs::Advice::DontNeed);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = (fd, offset, len);
 }
 

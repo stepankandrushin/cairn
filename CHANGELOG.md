@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+**Added:**
+
+- An Android app (android/, built from source with `scripts/release-android.sh`), for Android 11 and later, on
+  the iPhone's core: the camera's photos and videos, or all of them, backed up to a folder and path of the
+  server as they were taken, their location kept, named as the camera named them or as Nextcloud's iOS app
+  did, found by MediaStore's generation numbers and sent by WorkManager soon after they are taken, on Wi-Fi
+  only unless chosen otherwise; the server's folders browsed live, with thumbnails, a file downloaded only when
+  opened and a video streamed; and each chosen folder in the system's Files picker, which downloads on demand
+  and adds new files and folders, each queued like a photo before it is sent.
+- crates/mobile builds for Android (a shared library, and its start for Android's certificate checks), and the
+  engine, a client library there, builds for Android as on Linux.
+
 ## 0.1.28 (2026-11-15)
 
 **Added:**

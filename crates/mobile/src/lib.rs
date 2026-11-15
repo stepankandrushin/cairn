@@ -1,4 +1,4 @@
-//! The core of Cairn's phone apps, called from Swift (and later Kotlin) through uniffi.
+//! The core of Cairn's phone apps, called from Swift and Kotlin through uniffi.
 //!
 //! A phone keeps no replica of a folder: a namespace can hold hundreds of thousands of objects, and an
 //! app extension has little memory. It lists a folder when it is opened, downloads a file when it is
@@ -6,10 +6,12 @@
 //! new files and folders alone: a photo sent in one request (`PUT /file`), which the server stores and
 //! commits as this device, and a folder made by a commit of its own.
 //!
-//! Every call blocks; Swift calls them off the main thread.
+//! Every call blocks; Swift and Kotlin call them off the main thread.
 
 uniffi::setup_scaffolding!();
 
+#[cfg(target_os = "android")]
+mod android;
 pub mod folder;
 pub mod fp;
 pub mod naming;
@@ -85,7 +87,7 @@ pub(crate) fn bad(reason: impl Into<String>) -> CairnError {
     }
 }
 
-/// An ID from Swift's text: the hex the server writes.
+/// An ID from the app's text: the hex the server writes.
 pub(crate) fn object_of(s: &str) -> Result<ObjectId> {
     if s == "root" {
         return Ok(ObjectId::ROOT);

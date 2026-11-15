@@ -1178,7 +1178,7 @@ mod tests {
         }
         assert!(transient_io(&io::Error::from_raw_os_error(ENOBUFS)));
         // As the kernel numbers them, and as std reads each number.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         for errno in [105, 12, 104, 103, 32, 110, 111, 100, 101, 113] {
             assert!(
                 transient_io(&io::Error::from_raw_os_error(errno)),

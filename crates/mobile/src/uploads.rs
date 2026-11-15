@@ -55,12 +55,13 @@ CREATE TABLE IF NOT EXISTS skipped (
 );
 ";
 
-/// One resource of a photo library asset: its photo, its Live Photo's video, a RAW beside a JPEG.
+/// One resource of a photo library asset: its photo, its Live Photo's video, a RAW beside a JPEG; on
+/// Android a MediaStore item, or a file added from the Files picker.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AssetResource {
-    /// The asset's local identifier.
+    /// The asset's local identifier; on Android `<volume>:<id>` of MediaStore, or `added:<id>`.
     pub asset: String,
-    /// The resource's type, as PhotoKit numbers it.
+    /// The resource's type, as PhotoKit numbers it; on Android MediaStore's media type, 0 for a file.
     pub kind: i32,
     /// Which of the asset's resources of that type.
     pub idx: u32,

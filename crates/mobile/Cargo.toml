@@ -9,7 +9,8 @@ publish.workspace = true
 
 [lib]
 name = "cairn_mobile"
-crate-type = ["lib", "staticlib"]
+# staticlib for iOS, cdylib for Android.
+crate-type = ["lib", "staticlib", "cdylib"]
 
 [[bin]]
 name = "uniffi-bindgen"
@@ -28,6 +29,11 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uniffi = { version = "0.32", features = ["cli"] }
+
+# Android's certificate verifier calls into the JVM, given it once at the app's start (android.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
+rustls-platform-verifier = "0.7"
 
 [features]
 failpoints = ["cairn-engine/failpoints", "cairn-failpoint/enabled"]

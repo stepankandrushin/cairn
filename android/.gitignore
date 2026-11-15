@@ -1,0 +1,8 @@
+# What Gradle and scripts/release-android.sh make: the build, the core's library for each ABI and its
+# Kotlin bindings (src/generated), and this machine's SDK path.
+.gradle/
+build/
+app/build/
+app/src/generated/
+local.properties
+.kotlin/

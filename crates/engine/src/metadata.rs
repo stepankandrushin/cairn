@@ -7,7 +7,7 @@ use crate::fsops::{Dir, Stat};
 use cairn_protocol::{Bytes, Metadata, ObjectKind, Owner, RecordKey};
 
 /// Where this platform's xattrs go in a record. Another platform's stay stored and untouched here.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use cairn_protocol::NS_LINUX_XATTR as NS_XATTR;
 #[cfg(target_vendor = "apple")]
 use cairn_protocol::NS_MACOS_XATTR as NS_XATTR;
@@ -56,7 +56,7 @@ pub struct ApplyPolicy {
 fn yes() -> bool {
     true
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn default_xattr_allow() -> Vec<String> {
     [
         "user.",
@@ -66,7 +66,7 @@ fn default_xattr_allow() -> Vec<String> {
     .map(String::from)
     .to_vec()
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn default_xattr_deny() -> Vec<String> {
     vec!["security.selinux".into()]
 }
@@ -105,7 +105,7 @@ const MACHINE_LOCAL_XATTRS: [&str; 5] = [
 #[cfg(target_vendor = "apple")]
 const MAX_XATTR_STORED: usize = 1 << 20;
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
 fn stored_xattr(_: &[u8]) -> bool {
     true
 }
@@ -131,7 +131,7 @@ impl ApplyPolicy {
     /// Everything this platform can apply, for an explicit restore. `security.selinux` stays out:
     /// labels belong to the destination's policy.
     pub fn exact() -> Self {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let xattr_allow = ["user.", "system.posix_acl_", "security.", "trusted."]
             .map(String::from)
             .to_vec();
@@ -762,7 +762,7 @@ mod tests {
         assert!(stored_xattr(b"com.apple.FinderInfo"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn the_default_policy_withholds_what_needs_an_explicit_choice() {
         let p = ApplyPolicy::default();

@@ -12,7 +12,8 @@ access, ahead of milestone 5, came in 0.1.12; the web interface, ahead of milest
 history, recently deleted, members, shares with users and public links, signing in from a device), came in
 0.1.14; Explorer's badges, each entry's state on its icon on Windows, in 0.1.25; an iPhone app, ahead of
 milestone 8 (photo and video backup, browsing with downloads on demand, the Files app read and add only), built
-from source, its core crates/mobile in CI and its Swift not. The architecture, the decisions and their reasons,
+from source, its core crates/mobile in CI and its Swift not; and, not yet released, an Android app, the same on
+the same core, its Kotlin outside CI. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md: read it before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3's code and failure tests are in; what
 it still needs is its exit criterion, weeks on real trees with no silent loss, a run begun in November 2026
@@ -31,7 +32,7 @@ on the owner's own trees and machines.
   `cairn status --all` show, so a scratch root made without it shows up to the person whose machine it is.
 - **The filesystem is the hard part, so it comes first**: follow PLAN.md's milestone order, and do not
   start the UI or another platform while the Linux engine's exit criteria are unmet. macOS and
-  Windows, the tray on them, Explorer's badges, updates, accounts, the web interface and the iPhone app are
+  Windows, the tray on them, Explorer's badges, updates, accounts, the web interface and the phone apps are
   the exceptions, at the owner's asking.
 - **All of it speaks one protocol**: the server, the CLI, the daemon and the web UI share the Rust
   types in the protocol crate, so a client can never quietly strip a field it does not understand.
@@ -65,5 +66,8 @@ on the owner's own trees and machines.
 - ios/ — the iPhone app and its Files and Photos upload extensions, outside CI, on crates/mobile (uniffi);
   `bash scripts/release-ios.sh --sim` on a Mac builds it and, given a server, runs its UI test in the simulator.
   The team that signs and the server Photos uploads to are in the untracked ios/Config/Local.xcconfig.
+- android/ — the Android app (Kotlin, Compose) and its Files picker provider, outside CI, on crates/mobile
+  (uniffi); `bash scripts/release-android.sh` builds a signed APK on Linux, `--emulator` installs it there. The
+  key that signs it is the maintainer's (agents/maintainer.md): every APK an installed copy updates to needs it.
 - agents/maintainer.md — remotes, publishing and releases; before any of those. It and history/ exist only
   in the maintainer's checkout.

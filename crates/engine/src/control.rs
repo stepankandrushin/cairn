@@ -348,9 +348,9 @@ pub fn status_of(path: &Path, root_id: &str) -> Option<DaemonStatus> {
     if let Ok(Reply::Status(s)) = ask(root_id, &Request::Status, ASK_WAIT) {
         return Some(*s);
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     return crate::daemon::running_status(path);
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         let _ = path;
         None
@@ -371,7 +371,7 @@ impl Conn for UnixStream {
 }
 
 /// The user at the other end of a Unix socket.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     Ok(rustix::net::sockopt::socket_peercred(s)?.uid.as_raw())
 }
@@ -423,7 +423,7 @@ fn is_transient(e: &io::Error) -> bool {
 }
 
 /// Linux: the daemon's lock is a listening socket already, in the abstract namespace; it serves too.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn listen(lock: &UnixListener, _root_id: &str) -> io::Result<Listener> {
     Ok(Listener(lock.try_clone()?))
 }
@@ -447,8 +447,11 @@ pub fn listen(_lock: &std::fs::File, root_id: &str) -> io::Result<Listener> {
 #[cfg(unix)]
 fn connect(address: &LocalAddress) -> io::Result<Box<dyn ClientConn>> {
     let s = match address {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         LocalAddress::Abstract(name) => {
+            #[cfg(target_os = "android")]
+            use std::os::android::net::SocketAddrExt;
+            #[cfg(target_os = "linux")]
             use std::os::linux::net::SocketAddrExt;
             UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name)?)?
         }

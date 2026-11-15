@@ -6,9 +6,9 @@ every version; clients sync a real filesystem. Files only: no groupware, no app 
 
 **Status: 0.1.28, early.** Clients for Linux (x86_64 and aarch64), macOS and Windows, with only Linux in CI, and on Windows each file's state on its icon in Explorer; the server on Linux;
 users with their own folders and shared ones, read-only or not; since 0.1.14, a web interface in the server,
-which a device opens signed in, with shares of any file or folder and public links; and an iPhone app, built
-from source and not yet in the App Store, that backs up photos and videos and opens the server's files on
-demand. It has
+which a device opens signed in, with shares of any file or folder and public links; and phone apps for
+iPhone and Android, built from source and in neither store yet, that back up photos and videos and open the
+server's files on demand. It has
 been through a harsh failure harness and now syncs real trees, but for days, not yet weeks, so keep another
 copy of anything you put through it. See
 [CHANGELOG.md](CHANGELOG.md) for what is and is not there, and [PLAN.md](PLAN.md) for where it is going.
@@ -230,6 +230,32 @@ and the app sending the same photo, still makes one file, and a name taken by ot
 registered to the team, signed by the team in `ios/Config/Local.xcconfig`. Photos' upload extension sends only
 to the server named there (`CAIRN_UPLOAD_URL_BASE`) and does not run in the simulator.
 
+## The Android app
+
+android/ is the app, for Android 11 and later, on the same Rust core as the iPhone's (crates/mobile, its Kotlin
+bindings made by uniffi). Sign in as on the iPhone, with a token made for the phone (`cairn-server token add
+alice --label android`).
+
+- **Photos:** each photo and video of the camera's (DCIM), or every one on the phone, goes to the folder and path
+  chosen as it was taken, its location kept (the app asks for it, as Android takes it out of a photo otherwise).
+  By default each keeps the camera's name, `20240512_114915.jpg`, as Nextcloud's Android app kept them;
+  optionally in a folder for each year and month. New ones are found by MediaStore's generation numbers, which
+  also catch a photo a camera writes hidden and shows later, and sent a little after they are taken, and what
+  waits every hour, on Wi-Fi only unless chosen otherwise, and while charging if chosen; Upload now sends at once
+  on any network, shown as a notification, and goes on with the app closed. A photo deleted from the phone stays
+  on the server. What could not be sent is listed with the server's reason, and Retry.
+- **Browse:** as on the iPhone: the server's folders as they are now, thumbnails, a file downloaded only when
+  opened into a cache the system empties as it needs room, and a video streamed.
+- **Files:** each folder chosen in Settings is a place in the system's Files picker, where a file is downloaded
+  when it is opened. New files and folders can be added there, and from any app that saves through it: a new
+  file is kept in the app and queued like a photo, so it is sent whatever happens to the app or the network.
+  Renaming, moving, deleting and writing over a file are not offered yet.
+
+The uploads are the iPhone's: one request each, its IDs chosen and kept before it is sent. `bash
+scripts/release-android.sh` builds a signed APK in build/android (`--emulator` installs it on the emulator,
+`--debug` builds one signed by the machine's debug key); it needs the Android SDK and NDK, `cargo-ndk`, and
+`rustup target add aarch64-linux-android x86_64-linux-android`.
+
 ## The daemon
 
 ```sh
@@ -412,7 +438,8 @@ bash scripts/ci.sh --quick      # the same in about a minute, less the tests tha
 bash scripts/release.sh         # static binaries and checksums in dist/, after a smoke test over TLS
 ```
 
-`bash scripts/release-ios.sh --sim`, on a Mac with Xcode, builds the iPhone app (above).
+`bash scripts/release-ios.sh --sim`, on a Mac with Xcode, builds the iPhone app (above). `bash scripts/release-android.sh`, with the
+Android SDK and NDK, builds the Android app.
 
 release.sh builds the client for x86_64 and aarch64 and the server for x86_64, each static (musl). The aarch64
 client is cross-built by cargo-zigbuild (`cargo install cargo-zigbuild --locked`, zig on the PATH, `rustup target

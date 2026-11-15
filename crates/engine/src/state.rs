@@ -506,7 +506,7 @@ pub fn warm(path: &Path) -> u64 {
             continue;
         };
         // Twice the read-ahead; the other systems see a sequential reader for themselves.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Sequential);
         loop {
             match file.read(&mut piece) {
@@ -521,7 +521,7 @@ pub fn warm(path: &Path) -> u64 {
 }
 
 /// This machine's memory, in bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn memory() -> Option<u64> {
     let info = rustix::system::sysinfo();
     Some(info.totalram as u64 * u64::from(info.mem_unit.max(1)))
@@ -555,7 +555,12 @@ fn memory() -> Option<u64> {
     (ok && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
 }
 
-#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
 fn memory() -> Option<u64> {
     None
 }
@@ -2576,7 +2581,7 @@ mod tests {
 
     /// What this thread has written, through any file: SQLite writes from the thread that calls it, so
     /// tests running beside this one do not count.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn written_by_this_thread() -> u64 {
         let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
         io.lines()
@@ -2590,7 +2595,7 @@ mod tests {
     /// With the statement journals that every statement on a table with triggers keeps in temporary
     /// files, and rows in the order given into a page cache of 2 MiB, which sent a page to the WAL again
     /// each time it was dirtied again, this wrote 29 times what it left (3.6 GB for 125 MB).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_transaction_over_every_row_writes_about_the_state_once() {
         let (dir, mut state) = fresh();

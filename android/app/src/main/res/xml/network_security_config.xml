@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- In place of rustls-platform-verifier's own, which forbids plain HTTP but to the revocation lists it
+     fetches: a server given as http:// (on a home network, say) is the user's choice, and the core refuses
+     one beyond loopback unless so given. A certificate authority the user installed on the phone is
+     trusted beside the system's, for a server with a certificate of its own. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

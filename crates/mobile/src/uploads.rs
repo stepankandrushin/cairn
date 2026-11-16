@@ -491,6 +491,19 @@ impl Store {
         self.one(&c, id)
     }
 
+    /// An upload not to be sent after all, as when its photo's folder is no longer backed up:
+    /// forgotten if it never went or the server refused it (planned, failed, skipped), so that its
+    /// name is free again and planning it later queues it anew. One sent, whose answer may still be
+    /// on its way, and one done stay: forgotten, the same photo planned again would go under other
+    /// IDs, a second file. Answers whether it was forgotten.
+    pub fn forget(&self, id: i64) -> Result<bool> {
+        let n = self.db()?.execute(
+            "DELETE FROM upload WHERE id = ?1 AND state IN ('planned', 'failed', 'skipped')",
+            [id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// An upload sent by the app itself, its bytes read from `file`, a copy the app made of the
     /// resource: the same request the Photos system would send. Answered with where it stands.
     pub fn upload_now(
@@ -709,6 +722,46 @@ mod tests {
             .unwrap();
         assert_eq!(a[0].path, "phone/iPhone/23-08-13 16-50-14 0003.heic");
         assert_eq!(b[0].path, "phone/iPhone/23-08-13 16-50-14 0003 (2).heic");
+    }
+
+    #[test]
+    fn only_what_never_went_or_was_refused_is_forgotten() {
+        let (_d, s) = store();
+        let t = 1_691_920_214;
+        let planned = s
+            .plan(
+                dest(),
+                vec![
+                    res("A", 1, "IMG_0003.HEIC", t),
+                    res("B", 1, "IMG_0004.HEIC", t),
+                    res("C", 1, "IMG_0005.HEIC", t),
+                    res("D", 1, "IMG_0006.HEIC", t),
+                ],
+            )
+            .unwrap();
+        let (a, b, c, d) = (&planned[0], &planned[1], &planned[2], &planned[3]);
+        s.mark_sent(b.id, None).unwrap();
+        s.mark_sent(c.id, None).unwrap();
+        s.finish(c.id, 409, vec![]).unwrap();
+        s.skip(d.id, "deleted".into()).unwrap();
+
+        assert!(s.forget(a.id).unwrap());
+        // Sent, its answer not in: it may be on the server under its IDs, so it stays and goes again.
+        assert!(!s.forget(b.id).unwrap());
+        assert_eq!(s.upload(b.id).unwrap().state, UploadState::Sent);
+        assert!(s.forget(c.id).unwrap());
+        assert!(s.forget(d.id).unwrap());
+        assert!(!s.forget(a.id).unwrap());
+        let st = s.stats().unwrap();
+        assert_eq!((st.planned, st.sent, st.failed, st.skipped), (0, 1, 0, 0));
+
+        // Planned again, it is a new upload with new IDs, under its own name, which is free again.
+        let again = s
+            .plan(dest(), vec![res("A", 1, "IMG_0003.HEIC", t)])
+            .unwrap();
+        assert_ne!(again[0].id, a.id);
+        assert_ne!(again[0].object, a.object);
+        assert_eq!(again[0].path, a.path);
     }
 
     #[test]

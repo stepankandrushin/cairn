@@ -1,5 +1,6 @@
-// Backup of the phone's photos and videos: where they go and what they are called, which and when, how
-// far it is, and what was not sent and why, each with Retry.
+// Backup of the phone's photos and videos: where they go and what they are called, which (the camera's,
+// screenshots, other apps' folders, each a switch) and when, how far it is, and what was not sent and
+// why, each with Retry.
 
 package storage.cairn.android
 
@@ -44,6 +45,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -53,6 +55,7 @@ import java.util.Locale
 
 @Composable
 fun PhotosScreen() {
+    LaunchedEffect(Unit) { Model.loadMediaFolders() }
     Screen("Photos") {
         if (Model.backup.enabled) BackupStatus() else BackupSetup()
     }
@@ -72,14 +75,66 @@ fun Choice(text: String, selected: Boolean, tag: String? = null, onClick: () -> 
 }
 
 @Composable
-fun Toggle(text: String, on: Boolean, tag: String? = null, onChange: (Boolean) -> Unit) {
+fun Toggle(text: String, on: Boolean, tag: String? = null, detail: String? = null, onChange: (Boolean) -> Unit) {
     Row(
         Modifier.fillMaxWidth().clickable { onChange(!on) }.padding(horizontal = 16.dp, vertical = 6.dp)
             .let { if (tag != null) it.testTag(tag) else it },
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(text, Modifier.weight(1f))
+        Column(Modifier.weight(1f)) {
+            Text(text)
+            if (detail != null) {
+                Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Spacer(Modifier.width(12.dp))
         Switch(checked = on, onCheckedChange = onChange)
+    }
+}
+
+/**
+ * Which photos and videos, each kind a switch: the camera's, on until turned off; screenshots and
+ * screen recordings, and each other app's folder, off until turned on. The folders are the phone's
+ * own, so they show once Cairn may see its photos.
+ */
+@Composable
+fun Which(b: Backup, onChange: (Backup) -> Unit) {
+    val context = LocalContext.current
+    val see = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { Model.loadMediaFolders() }
+    val allowed = MediaLibrary.authorized(context)
+    val found = Model.mediaFolders
+    fun count(of: List<MediaFolder>) = of.sumOf { it.count }
+    val camera = found.filter { it.kind == MediaFolder.Kind.CAMERA }
+    val screens = found.filter { it.kind == MediaFolder.Kind.SCREENSHOTS }
+    val others = found.filter { it.kind == MediaFolder.Kind.OTHER }.sortedBy { it.title.lowercase() }
+    Header("Which")
+    Toggle("Camera", b.camera, "camera", if (allowed) "DCIM · ${count(camera)}" else "DCIM") { onChange(b.copy(camera = it)) }
+    Toggle(
+        "Screenshots and screen recordings", b.screenshots, "screenshots",
+        when {
+            screens.isNotEmpty() -> screens.joinToString(", ") { it.path.trimEnd('/') } + " · ${count(screens)}"
+            allowed -> "None on the phone yet"
+            else -> null
+        },
+    ) { onChange(b.copy(screenshots = it)) }
+    for (f in others) {
+        Toggle(f.title, f.path in b.folders, detail = "${f.path.trimEnd('/')} · ${f.count}") { on ->
+            onChange(b.copy(folders = if (on) b.folders + f.path else b.folders - f.path))
+        }
+    }
+    // One chosen that holds nothing now stays, so that it can be turned off.
+    for (p in b.folders.filter { p -> others.none { it.path == p } }) {
+        Toggle(MediaFolder(p, 0).title, true, detail = "${p.trimEnd('/')} · none now") { onChange(b.copy(folders = b.folders - p)) }
+    }
+    when {
+        !allowed -> {
+            TextButton(onClick = { see.launch(MediaLibrary.permissions) }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                Text("Choose other apps' folders")
+            }
+            Footnote("WhatsApp's, Telegram's and other apps' folders of photos and videos show here once Cairn may see them.")
+        }
+        others.isEmpty() -> Footnote("No other app keeps photos or videos on the phone yet: the folders apps make later show here, off.")
+        else -> Footnote("Other apps' folders, off until turned on: those apps make later show here too.")
     }
 }
 
@@ -123,9 +178,7 @@ fun BackupSetup() {
             Choice("Date and time first, as Nextcloud's iPhone app named them", !b.originalNames) { b = b.copy(originalNames = false) }
             Toggle("A folder for each year and month", b.subfolders) { b = b.copy(subfolders = it) }
             Footnote(example(b))
-            Header("Which")
-            Choice("The camera's (DCIM)", b.cameraOnly) { b = b.copy(cameraOnly = true) }
-            Choice("Every photo and video on the phone", !b.cameraOnly) { b = b.copy(cameraOnly = false) }
+            Which(b) { b = it }
             HorizontalDivider(Modifier.padding(vertical = 4.dp, horizontal = 16.dp))
             Choice("New photos and videos, from now on", !b.everything, "fromNow") { b = b.copy(everything = false) }
             Choice("Those already on the phone too", b.everything, "everything") { b = b.copy(everything = true) }
@@ -141,7 +194,7 @@ fun BackupSetup() {
                         if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
                         ask.launch(perms.toTypedArray())
                     },
-                    enabled = !busy && b.folder.isNotEmpty() && b.path.isNotBlank(),
+                    enabled = !busy && b.folder.isNotEmpty() && b.path.isNotBlank() && b.choosesAny,
                     modifier = Modifier.testTag("startBackup"),
                 ) { Text("Turn on backup") }
                 if (busy) {
@@ -173,7 +226,7 @@ fun BackupStatus() {
     var refreshing by remember { mutableStateOf(false) }
     val b = Model.backup
     val s = Model.stats
-    PullToRefreshBox(isRefreshing = refreshing, onRefresh = { Model.refresh() }) {
+    PullToRefreshBox(isRefreshing = refreshing, onRefresh = { Model.refresh(); Model.loadMediaFolders() }) {
         LazyColumn(Modifier.fillMaxWidth()) {
             item {
                 Labeled("Folder", "${Model.title(b.folder)}/${b.path}")
@@ -196,6 +249,13 @@ fun BackupStatus() {
                 Header("When")
                 Toggle("Only on Wi-Fi", b.wifiOnly) { Model.saveBackup(b.copy(wifiOnly = it)) }
                 Toggle("Only while charging", b.chargingOnly) { Model.saveBackup(b.copy(chargingOnly = it)) }
+                Which(b) { Model.saveWhich(it) }
+                Footnote(
+                    (if (b.everything) "Turned on, a folder's photos and videos already on the phone are sent too"
+                    else "Turned on, a folder's photos and videos taken since backup was turned on are sent") +
+                        "; turned off, what waits from it is not. What was sent stays on the server." +
+                        (if (b.choosesAny) "" else " Nothing is chosen, so nothing new is sent."),
+                )
             }
             if (Model.failed.isNotEmpty()) {
                 item { Header("Not sent") }

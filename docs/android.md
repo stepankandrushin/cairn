@@ -75,8 +75,8 @@ Then **Sign in**.
 After signing in, the **Photos** tab sets up the backup.
 
 <table>
-<tr><td width="50%"><img src="android/photos-setup.webp" alt="Photos: Folder photos, Path in it Photos/alice-phone, Names, A folder for each year and month, Which" width="320"></td>
-<td><img src="android/photos-setup-2.webp" alt="Which: the camera's (DCIM) or every photo and video; new ones from now on or those already on the phone too; When: Only on Wi-Fi, Only while charging; Turn on backup" width="320"></td></tr>
+<tr><td width="50%"><img src="android/photos-setup.webp" alt="Photos: Folder photos, Path in it Photos/alice-phone, Names, A folder for each year and month, Which: Camera on, Screenshots and screen recordings off" width="320"></td>
+<td><img src="android/photos-setup-2.webp" alt="Which, continued: Telegram and WhatsApp Images, each off; new ones from now on or those already on the phone too; When: Only on Wi-Fi, Only while charging; Turn on backup" width="320"></td></tr>
 </table>
 
 - **Folder** and **Path in it:** where on the server they go. The folder is one of yours that you can write
@@ -84,14 +84,22 @@ After signing in, the **Photos** tab sets up the backup.
 - **Names:** as the camera named them, `20240512_114915.jpg`, as Nextcloud's Android app kept them; or date
   and time first, as Nextcloud's iPhone app named them, so that a folder it filled goes on as it was.
   Optionally, a folder for each year and month. The line under them shows an example.
-- **Which:** the camera's (DCIM) or every photo and video on the phone; the new ones from now on, or those
-  already on the phone too.
+- **Which:** a switch for each kind, each with where it is on the phone and how many it holds:
+  - **Camera:** on until turned off. It covers DCIM and its folders, but not screenshots.
+  - **Screenshots and screen recordings:** off until turned on. This means every folder named Screenshots,
+    ScreenRecorder, ScreenRecords or Screen recordings, wherever the phone keeps it.
+  - **Other apps' folders:** WhatsApp's, Telegram's, a browser's downloads, and so on. Each folder that holds
+    photos or videos has its own switch, off until turned on. A folder an app makes later shows up here,
+    off. Until Cairn may see the photos, **Choose other apps' folders** asks for that access.
+
+  Then choose between the new ones from now on, or those already on the phone too.
 - **When:** in the background only on Wi-Fi (the default), and only while charging if chosen.
 
 <table>
 <tr><td width="50%">
 
-**Turn on backup** asks to send notifications, which Upload now uses, and for access to photos and videos.
+**Turn on backup** asks to send notifications, which Upload now uses, and for access to photos and videos
+(unless Choose other apps' folders already asked).
 Choose **Allow all**: limited access shows the app only the photos you pick. With it the app may also read
 where each photo was taken, which Android takes out of a photo otherwise.
 
@@ -103,10 +111,15 @@ and what waits every hour. **Upload now** sends at once on any network, shown as
 with the app closed. What could not be sent is listed with the server's reason, and **Retry**. A name the
 server already has for other bytes gets `(2)`.
 
+**When** and **Which** can be changed here while backup is on:
+- **Switching a folder on** sends what is already in it, or only what was taken since backup was turned on,
+  as chosen at the start.
+- **Switching a folder off** stops what was waiting from it. What was sent stays on the server.
+
 Originals are sent as they are, where they were taken included. A photo deleted from the phone stays on the
 server, and **Turn off backup** keeps what was sent.
 
-</td><td><img src="android/photos-status.webp" alt="Photos: Folder photos/Photos/alice-phone, Sent 4, Waiting 0, Upload now, When, Last sent: four photos" width="320"></td></tr>
+</td><td><img src="android/photos-status.webp" alt="Photos: Folder photos/Photos/alice-phone, Sent 4, Waiting 0, Upload now, When, Which: Camera on, Screenshots and screen recordings off" width="320"></td></tr>
 </table>
 
 ## Browse the server

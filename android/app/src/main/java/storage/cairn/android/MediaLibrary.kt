@@ -1,7 +1,8 @@
 // What of the phone's photos and videos is backed up: each found through MediaStore, first what was
 // there (all of it, or what was taken since backup was turned on), then what each volume's generation
 // number says changed since the last look, and queued in the core's database, once each, before
-// anything is sent.
+// anything is sent. Only those in the folders chosen (Backup.wants): every row is looked at, so that
+// a folder chosen later is found by going through them again from the start.
 //
 // A changed row, not only an added one: a camera writes a photo as pending, which no other app sees,
 // and publishes it later, when its generation_added is still the one it had while hidden; publishing
@@ -23,6 +24,7 @@ import org.json.JSONObject
 import uniffi.cairn_mobile.AssetResource
 import uniffi.cairn_mobile.Store
 import uniffi.cairn_mobile.Upload
+import uniffi.cairn_mobile.UploadState
 import java.util.TimeZone
 
 object MediaLibrary {
@@ -32,6 +34,7 @@ object MediaLibrary {
 
     private const val TAG = "Cairn"
     private const val STATE_KEY = "media.volumes"
+    private const val RESTART_KEY = "media.restart"
     private const val BATCH = 500
 
     /** What backup asks for: the photos and videos, and their location as taken, not redacted. */
@@ -71,13 +74,18 @@ object MediaLibrary {
         store.setText(STATE_KEY, o.toString())
     }
 
-    /** Forgets where the looking was, as when backup is turned on again. */
+    /**
+     * The next look starts over, as when backup is turned on again or a folder is chosen: noted, and
+     * done by `queueNew` as it begins, since one going on would save over a state forgotten here. Call
+     * it after saving the backup it is for, so that the look which takes it up reads that one.
+     */
     fun restart(store: Store) {
-        store.setText(STATE_KEY, null)
+        store.setText(RESTART_KEY, "1")
     }
 
     private val projection = arrayOf(
         MediaStore.MediaColumns._ID,
+        MediaStore.MediaColumns.RELATIVE_PATH,
         MediaStore.MediaColumns.DISPLAY_NAME,
         MediaStore.Files.FileColumns.MEDIA_TYPE,
         MediaStore.MediaColumns.DATE_TAKEN,
@@ -92,6 +100,10 @@ object MediaLibrary {
      * volume's generation before anything else, so that nothing added while it goes through is missed.
      */
     fun queueNew(context: Context, store: Store): Boolean {
+        if (store.getText(RESTART_KEY) != null) {
+            store.setText(STATE_KEY, null)
+            store.setText(RESTART_KEY, null)
+        }
         val backup = Backup.load(store)
         if (!backup.enabled || !authorized(context)) return false
         val state = loadState(store)
@@ -110,10 +122,6 @@ object MediaLibrary {
             val uri = MediaStore.Files.getContentUri(volume)
             val base = mutableListOf("${MediaStore.Files.FileColumns.MEDIA_TYPE} IN ($KIND_IMAGE, $KIND_VIDEO)")
             val args = mutableListOf<String>()
-            if (backup.cameraOnly) {
-                base += "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-                args += "${android.os.Environment.DIRECTORY_DCIM}/%"
-            }
 
             if (v.cursor >= 0) {
                 // What was there before: everything, or what was taken from `since` on, by ID.
@@ -122,11 +130,11 @@ object MediaLibrary {
                 sel += "${MediaStore.MediaColumns._ID} > ?"
                 selArgs += v.cursor.toString()
                 if (!backup.everything) {
-                    sel += "COALESCE(NULLIF(${MediaStore.MediaColumns.DATE_TAKEN}, 0), ${MediaStore.MediaColumns.DATE_MODIFIED} * 1000) >= ?"
+                    sel += "COALESCE(NULLIF(${MediaStore.MediaColumns.DATE_TAKEN}, 0), ${MediaStore.MediaColumns.DATE_MODIFIED} * 1000) >= CAST(? AS INTEGER)"
                     selArgs += (backup.since * 1000).toString()
                 }
-                val (batch, last, n) = query(context.contentResolver, uri, volume, sel, selArgs, "${MediaStore.MediaColumns._ID} ASC", BATCH)
-                Log.i(TAG, "$volume: $n there before, after ID ${v.cursor}")
+                val (batch, last, n) = query(context.contentResolver, uri, volume, sel, selArgs, "${MediaStore.MediaColumns._ID} ASC", BATCH, backup::wants)
+                Log.i(TAG, "$volume: $n there before, after ID ${v.cursor}, ${batch.size} of them chosen")
                 if (batch.isNotEmpty()) store.plan(backup.destination, batch)
                 v = if (n >= BATCH) {
                     more = true
@@ -148,11 +156,11 @@ object MediaLibrary {
             selArgs += v.generation.toString()
             if (!backup.everything) {
                 sel += "(${MediaStore.MediaColumns.GENERATION_ADDED} > ? OR " +
-                    "COALESCE(NULLIF(${MediaStore.MediaColumns.DATE_TAKEN}, 0), ${MediaStore.MediaColumns.DATE_MODIFIED} * 1000) >= ?)"
+                    "COALESCE(NULLIF(${MediaStore.MediaColumns.DATE_TAKEN}, 0), ${MediaStore.MediaColumns.DATE_MODIFIED} * 1000) >= CAST(? AS INTEGER))"
                 selArgs += v.first.toString()
                 selArgs += (backup.since * 1000).toString()
             }
-            val (batch, last, _) = query(context.contentResolver, uri, volume, sel, selArgs, "${MediaStore.MediaColumns.GENERATION_MODIFIED} ASC", 0)
+            val (batch, last, _) = query(context.contentResolver, uri, volume, sel, selArgs, "${MediaStore.MediaColumns.GENERATION_MODIFIED} ASC", 0, backup::wants)
             if (batch.isNotEmpty()) Log.i(TAG, "$volume: ${batch.size} changed after generation ${v.generation}")
             for (chunk in batch.chunked(BATCH)) store.plan(backup.destination, chunk)
             if (last.second > v.generation) {
@@ -163,10 +171,13 @@ object MediaLibrary {
         return more
     }
 
-    /** The resources a query finds, the last ID and the highest generation in it, and how many rows it had. */
+    /**
+     * The resources a query finds in the folders `wants` takes, and of every row it had, the last ID,
+     * the highest generation and how many.
+     */
     private fun query(
         resolver: ContentResolver, uri: Uri, volume: String, sel: List<String>, args: List<String>,
-        order: String, limit: Int,
+        order: String, limit: Int, wants: (String) -> Boolean,
     ): Triple<List<AssetResource>, Pair<Long, Long>, Int> {
         val q = Bundle().apply {
             putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel.joinToString(" AND "))
@@ -186,11 +197,13 @@ object MediaLibrary {
             val modified = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
             val added = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
             val gen = c.getColumnIndexOrThrow(MediaStore.MediaColumns.GENERATION_MODIFIED)
+            val dir = c.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
             while (c.moveToNext()) {
                 rows++
                 val i = c.getLong(id)
                 lastId = maxOf(lastId, i)
                 maxGen = maxOf(maxGen, c.getLong(gen))
+                if (!wants(c.getString(dir) ?: "")) continue
                 val ms = when {
                     !c.isNull(taken) && c.getLong(taken) > 0 -> c.getLong(taken)
                     !c.isNull(modified) && c.getLong(modified) > 0 -> c.getLong(modified) * 1000
@@ -225,7 +238,62 @@ object MediaLibrary {
         return ContentUris.withAppendedId(base, n)
     }
 
-    /** Whether the item is still on the phone. */
-    fun exists(context: Context, uri: Uri): Boolean =
-        context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)?.use { it.count > 0 } ?: false
+    /** The folder the item is in (MediaStore's relative path), or null once it is no longer on the phone. */
+    fun folderOf(context: Context, uri: Uri): String? =
+        context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.RELATIVE_PATH), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) ?: "" else null
+        }
+
+    /** Each folder on the phone that holds photos or videos, with how many, by its path. */
+    fun folders(context: Context): List<MediaFolder> {
+        if (!authorized(context)) return emptyList()
+        val counts = sortedMapOf<String, Int>(String.CASE_INSENSITIVE_ORDER)
+        for (volume in MediaStore.getExternalVolumeNames(context)) {
+            context.contentResolver.query(
+                MediaStore.Files.getContentUri(volume), arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN ($KIND_IMAGE, $KIND_VIDEO)", null, null,
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val p = c.getString(0) ?: continue
+                    counts[p] = (counts[p] ?: 0) + 1
+                }
+            }
+        }
+        return counts.map { (p, n) -> MediaFolder(p, n) }
+    }
+
+    /**
+     * What waits to be sent, or was not sent, from a folder no longer chosen, forgotten (Store.forget):
+     * one already sent, its answer not in, goes on. Answers how many were forgotten.
+     */
+    fun forgetUnwanted(context: Context, store: Store, backup: Backup): Int {
+        val waiting = (store.pending(UInt.MAX_VALUE) + store.failed(UInt.MAX_VALUE))
+            .filter { it.state != UploadState.SENT && it.state != UploadState.DONE && !Added.isAdded(it) }
+        var n = 0
+        // Each volume's items looked up in MediaStore 500 at a time.
+        val byVolume = waiting.groupBy { it.asset.substringBefore(':') }
+        for ((volume, ups) in byVolume) {
+            for (chunk in ups.chunked(BATCH)) {
+                val ids = chunk.mapNotNull { it.asset.substringAfter(':').toLongOrNull() }
+                val dirs = mutableMapOf<Long, String>()
+                runCatching {
+                    context.contentResolver.query(
+                        MediaStore.Files.getContentUri(volume),
+                        arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH),
+                        "${MediaStore.MediaColumns._ID} IN (${ids.joinToString(",") { "?" }})",
+                        ids.map { it.toString() }.toTypedArray(), null,
+                    )?.use { c ->
+                        while (c.moveToNext()) dirs[c.getLong(0)] = c.getString(1) ?: ""
+                    }
+                }.onFailure { Log.w(TAG, "$volume: folders of what waits not read: $it") }
+                for (u in chunk) {
+                    // One no longer on the phone is left as it is: sending it says so.
+                    val dir = dirs[u.asset.substringAfter(':').toLongOrNull()] ?: continue
+                    if (!backup.wants(dir) && store.forget(u.id)) n++
+                }
+            }
+        }
+        if (n > 0) Log.i(TAG, "$n waiting from folders no longer chosen, forgotten")
+        return n
+    }
 }

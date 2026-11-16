@@ -237,8 +237,10 @@ bindings made by uniffi). Sign in as on the iPhone, with a token made for the ph
 alice --label android`). [docs/android.md](docs/android.md) is its manual: installing the APK, signing in and
 each screen, with screenshots.
 
-- **Photos:** each photo and video of the camera's (DCIM), or every one on the phone, goes to the folder and path
-  chosen as it was taken, its location kept (the app asks for it, as Android takes it out of a photo otherwise).
+- **Photos:** each photo and video of the folders switched on goes to the folder and path chosen as it was
+  taken. The camera's (DCIM) is on by default. Screenshots and screen recordings are off until switched on,
+  and so is each other app's folder (WhatsApp's, Telegram's, …); the switches can change while backup runs.
+  Each keeps its location (the app asks for it, as Android takes it out of a photo otherwise).
   By default each keeps the camera's name, `20240512_114915.jpg`, as Nextcloud's Android app kept them;
   optionally in a folder for each year and month. New ones are found by MediaStore's generation numbers, which
   also catch a photo a camera writes hidden and shows later, and sent a little after they are taken, and what

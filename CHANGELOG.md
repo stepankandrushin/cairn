@@ -5,8 +5,9 @@
 **Added:**
 
 - An Android app (android/, built from source with `scripts/release-android.sh`), for Android 11 and later, on
-  the iPhone's core: the camera's photos and videos, or all of them, backed up to a folder and path of the
-  server as they were taken, their location kept, named as the camera named them or as Nextcloud's iOS app
+  the iPhone's core: photos and videos backed up to a folder and path of the server as they were taken, from
+  the folders switched on (the camera's by default; screenshots and screen recordings, and each other app's
+  folder, off until switched on, and changeable while backup runs), their location kept, named as the camera named them or as Nextcloud's iOS app
   did, found by MediaStore's generation numbers and sent by WorkManager soon after they are taken, on Wi-Fi
   only unless chosen otherwise; the server's folders browsed live, with thumbnails, a file downloaded only when
   opened and a video streamed; and each chosen folder in the system's Files picker, which downloads on demand

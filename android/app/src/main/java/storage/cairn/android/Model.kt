@@ -36,6 +36,7 @@ object Model {
     var message by mutableStateOf<String?>(null)
     var uploading by mutableStateOf(false)
     var uploadNote by mutableStateOf<String?>(null)
+    var mediaFolders by mutableStateOf<List<MediaFolder>>(emptyList())
 
     private var started = false
 
@@ -49,7 +50,8 @@ object Model {
         folders = Folders.load(store)
         filesFolders = FilesFolders.load(store)
         scope.launch { Uploader.changed.collect { refresh() } }
-        scope.launch { Uploader.uploading.collect { uploading = it } }
+        // A run ended: new photos may have come, so the folders' counts are looked at again.
+        scope.launch { Uploader.uploading.collect { uploading = it; if (!it) loadMediaFolders() } }
         scope.launch { Uploader.note.collect { uploadNote = it } }
     }
 
@@ -137,10 +139,22 @@ object Model {
     fun opened() {
         if (!started) return
         refresh()
+        loadMediaFolders()
         if (account == null || !backup.enabled) return
         Background.schedule(app)
-        val metered = app.getSystemService(ConnectivityManager::class.java).isActiveNetworkMetered
-        if (!backup.wifiOnly || !metered) scope.launch { Uploader.run(app) }
+        if (mayRun()) scope.launch { Uploader.run(app) }
+    }
+
+    /** Whether backup may send now, on this network. */
+    private fun mayRun(): Boolean =
+        !backup.wifiOnly || !app.getSystemService(ConnectivityManager::class.java).isActiveNetworkMetered
+
+    /** The phone's folders of photos and videos, for Which: none until Cairn may see them. */
+    fun loadMediaFolders() {
+        if (!started) return
+        scope.launch {
+            mediaFolders = withContext(Dispatchers.IO) { runCatching { MediaLibrary.folders(app) }.getOrDefault(emptyList()) }
+        }
     }
 
     // Backup
@@ -154,8 +168,8 @@ object Model {
         val now = b.copy(enabled = true, since = System.currentTimeMillis() / 1000)
         withContext(Dispatchers.IO) {
             val store = store()
-            MediaLibrary.restart(store)
             now.save(store)
+            MediaLibrary.restart(store)
         }
         backup = now
         Background.schedule(app, replace = true)
@@ -167,6 +181,27 @@ object Model {
         backup = b
         b.save(store())
         Background.schedule(app, replace = true)
+    }
+
+    /**
+     * Which folders, changed while backup is on. One chosen now has what is in it looked for from the
+     * start, those already on the phone or those taken since backup began, as was chosen then; what
+     * waits from one no longer chosen is not sent. What was sent stays.
+     */
+    fun saveWhich(b: Backup) {
+        val was = backup
+        backup = b
+        val store = store()
+        b.save(store)
+        if (!b.enabled) return
+        val wider = was.widenedTo(b)
+        val narrower = b.widenedTo(was)
+        if (wider) MediaLibrary.restart(store)
+        scope.launch {
+            if (narrower) withContext(Dispatchers.IO) { runCatching { MediaLibrary.forgetUnwanted(app, store, Backup.load(store)) } }
+            // Looked for at once, so that Waiting says what is to go; sent if the network allows.
+            if (wider) Uploader.run(app, send = mayRun()) else refresh()
+        }
     }
 
     fun stopBackup() {

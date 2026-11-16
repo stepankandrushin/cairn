@@ -59,18 +59,20 @@ object Uploader {
 
     /**
      * Queues what is new and sends what is queued, until done or `stop` says so; one run at a time, a
-     * second waiting for the first. `progress` is told how many of how many.
+     * second waiting for the first. `progress` is told how many of how many. Without `send`, it only
+     * queues.
      */
     suspend fun run(
         context: Context,
         stop: () -> Boolean = { false },
+        send: Boolean = true,
         progress: ((Int, Int) -> Unit)? = null,
     ) = withContext(Dispatchers.IO) {
         mutex.withLock {
             stopping = false
             uploading.value = true
             try {
-                body(context.applicationContext, { stopping || stop() }, progress)
+                body(context.applicationContext, { stopping || stop() }, progress, send)
             } catch (e: Exception) {
                 note.value = describe(e)
             } finally {
@@ -80,7 +82,7 @@ object Uploader {
         }
     }
 
-    private fun body(context: Context, stop: () -> Boolean, progress: ((Int, Int) -> Unit)? = null) {
+    private fun body(context: Context, stop: () -> Boolean, progress: ((Int, Int) -> Unit)?, sends: Boolean) {
         val store = Cairn.store(context)
         val account = Account.load(store) ?: return
         Added.sweep(context, store)
@@ -92,6 +94,10 @@ object Uploader {
                 if (stop()) return
             }
             changed.value++
+        }
+        if (!sends) {
+            note.value = null
+            return
         }
         val session = account.session(store)
         val folders = mutableMapOf<String, Folder>()
@@ -136,10 +142,13 @@ object Uploader {
                 store.skip(u.id, "it is not a photo or video of this phone")
                 return true
             }
-            if (!MediaLibrary.exists(context, uri)) {
+            val from = MediaLibrary.folderOf(context, uri)
+            if (from == null) {
                 store.skip(u.id, "it was deleted from the phone before it was sent")
                 return true
             }
+            // Its folder no longer chosen since it was queued: not sent, unless it went once already.
+            if (!Backup.load(store).wants(from) && store.forget(u.id)) return true
             val dir = File(context.cacheDir, "upload").apply { mkdirs() }
             copy = File(dir, "${u.id}-${UUID.randomUUID()}")
             try {

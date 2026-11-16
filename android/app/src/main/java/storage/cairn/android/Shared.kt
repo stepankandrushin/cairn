@@ -156,8 +156,12 @@ data class Backup(
     /** Everything already on the phone too, or only what is taken from `since` on. */
     val everything: Boolean = false,
     val since: Long = System.currentTimeMillis() / 1000,
-    /** Only the camera's (DCIM), or every photo and video on the phone. */
-    val cameraOnly: Boolean = true,
+    /** The camera's: DCIM and its folders, but for screenshots. */
+    val camera: Boolean = true,
+    /** Screenshots and screen recordings, wherever the phone keeps them. */
+    val screenshots: Boolean = false,
+    /** Other apps' folders backed up, each by its MediaStore relative path (`Pictures/Telegram/`). */
+    val folders: List<String> = emptyList(),
     /** In the background, only on a network that is not metered. */
     val wifiOnly: Boolean = true,
     /** In the background, only while charging. */
@@ -166,11 +170,27 @@ data class Backup(
     val destination: Destination
         get() = Destination(folder, path, if (originalNames) NameStyle.ORIGINAL else NameStyle.NEXTCLOUD, subfolders)
 
+    /** Whether anything at all is chosen. */
+    val choosesAny: Boolean
+        get() = camera || screenshots || folders.isNotEmpty()
+
+    /** Whether a photo or video in the folder `relativePath` (MediaStore's, `DCIM/Camera/`) is backed up. */
+    fun wants(relativePath: String): Boolean = when (MediaFolder.kindOf(relativePath)) {
+        MediaFolder.Kind.SCREENSHOTS -> screenshots
+        MediaFolder.Kind.CAMERA -> camera
+        MediaFolder.Kind.OTHER -> relativePath in folders
+    }
+
+    /** Whether `to` backs up something this does not, which only a look from the start finds. */
+    fun widenedTo(to: Backup): Boolean =
+        (to.camera && !camera) || (to.screenshots && !screenshots) || (to.folders - folders.toSet()).isNotEmpty()
+
     fun save(store: Store) {
         val o = JSONObject()
             .put("enabled", enabled).put("folder", folder).put("path", path)
             .put("originalNames", originalNames).put("subfolders", subfolders)
-            .put("everything", everything).put("since", since).put("cameraOnly", cameraOnly)
+            .put("everything", everything).put("since", since)
+            .put("camera", camera).put("screenshots", screenshots).put("folders", JSONArray(folders))
             .put("wifiOnly", wifiOnly).put("chargingOnly", chargingOnly)
         store.setText(KEY, o.toString())
     }
@@ -181,14 +201,44 @@ data class Backup(
         fun load(store: Store): Backup = runCatching {
             val o = JSONObject(store.getText(KEY) ?: return Backup())
             val d = Backup()
+            val folders = o.optJSONArray("folders")?.let { a -> List(a.length()) { a.getString(it) } } ?: d.folders
             Backup(
                 o.optBoolean("enabled", d.enabled), o.optString("folder", d.folder),
                 o.optString("path", d.path), o.optBoolean("originalNames", d.originalNames),
                 o.optBoolean("subfolders", d.subfolders), o.optBoolean("everything", d.everything),
-                o.optLong("since", d.since), o.optBoolean("cameraOnly", d.cameraOnly),
+                o.optLong("since", d.since), o.optBoolean("camera", d.camera),
+                o.optBoolean("screenshots", d.screenshots), folders,
                 o.optBoolean("wifiOnly", d.wifiOnly), o.optBoolean("chargingOnly", d.chargingOnly),
             )
         }.getOrDefault(Backup())
+    }
+}
+
+/**
+ * A folder of the phone's that holds photos or videos, by MediaStore's relative path, and how many:
+ * the camera's (DCIM, but for its screenshots), screenshots and screen recordings (a folder of one of
+ * their names, wherever it is: Pictures/Screenshots on most phones, DCIM/Screenshots on Samsung's), or
+ * another app's, each chosen by itself.
+ */
+data class MediaFolder(val path: String, val count: Int) {
+    enum class Kind { CAMERA, SCREENSHOTS, OTHER }
+
+    val kind: Kind get() = kindOf(path)
+
+    /** Its last name, `Telegram` of `Pictures/Telegram/`. */
+    val title: String get() = path.trimEnd('/').substringAfterLast('/').ifEmpty { path }
+
+    companion object {
+        private val SCREENS = listOf("Screenshots", "ScreenRecorder", "ScreenRecords", "Screen recordings")
+
+        fun kindOf(relativePath: String): Kind {
+            val names = relativePath.split('/')
+            return when {
+                names.any { n -> SCREENS.any { it.equals(n, ignoreCase = true) } } -> Kind.SCREENSHOTS
+                names.first().equals("DCIM", ignoreCase = true) -> Kind.CAMERA
+                else -> Kind.OTHER
+            }
+        }
     }
 }
 

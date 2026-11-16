@@ -46,6 +46,8 @@ on the owner's own trees and machines.
 
 - PLAN.md — the design and build order; before any design or code work.
 - docs/protocol.md, docs/format.md — the wire and on-disk formats; before changing either.
+- docs/android.md — the Android app's manual, its screenshots in docs/android/, also published as
+  cairn.storage/android/: when the app's screens change, retake them as that site's shots/README.md says.
 - scripts/ci.sh — the checks and every test, on the real disk in /var/tmp, since tmpfs hid a bug, under
   cargo-nextest (`cargo install cargo-nextest --locked`), the long sweeps split into parts by `shards!`
   (crates/harness/tests/common). `--quick` must pass before a commit: all but the 58 tests and sweeps over

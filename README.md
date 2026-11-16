@@ -234,7 +234,8 @@ to the server named there (`CAIRN_UPLOAD_URL_BASE`) and does not run in the simu
 
 android/ is the app, for Android 11 and later, on the same Rust core as the iPhone's (crates/mobile, its Kotlin
 bindings made by uniffi). Sign in as on the iPhone, with a token made for the phone (`cairn-server token add
-alice --label android`).
+alice --label android`). [docs/android.md](docs/android.md) is its manual: installing the APK, signing in and
+each screen, with screenshots.
 
 - **Photos:** each photo and video of the camera's (DCIM), or every one on the phone, goes to the folder and path
   chosen as it was taken, its location kept (the app asks for it, as Android takes it out of a photo otherwise).

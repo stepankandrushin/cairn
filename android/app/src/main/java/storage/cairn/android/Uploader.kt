@@ -1,4 +1,4 @@
-// The uploads: while the app is open, when new photos are taken, now and then in the background on the
+// The uploads: while the app is open, when new photos are taken and every hour in the background, on the
 // network and power chosen, and at Upload now, which shows a notification and goes on with the app
 // closed. Each photo or video is copied out of MediaStore as it was taken, its location kept, and sent
 // with the request planned for it before it was first sent, so that one sent twice is one file.
@@ -9,6 +9,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
@@ -88,11 +91,13 @@ object Uploader {
         Added.sweep(context, store)
         val backup = Backup.load(store)
         if (backup.enabled) {
+            HeldBack.looking(context)
             note.value = "Looking for new photos"
             while (MediaLibrary.queueNew(context, store)) {
                 changed.value++
                 if (stop()) return
             }
+            HeldBack.looked(store, store.stats().let { it.planned + it.sent } > 0uL)
             changed.value++
         }
         if (!sends) {
@@ -262,12 +267,19 @@ object Added {
     }
 }
 
-/** What WorkManager runs: a run of the uploader, shown as a notification when asked for by Upload now. */
+/**
+ * What WorkManager runs: a run of the uploader, shown as a notification when asked for by Upload now. Its
+ * start is kept, so that the app can say when the phone did not let it run in the background.
+ */
 class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
+        HeldBack.began(applicationContext)
         val now = inputData.getBoolean(NOW, false)
         if (now) runCatching { setForeground(info(0, 0)) }
-        Uploader.run(applicationContext, stop = { isStopped }) { done, total ->
+        // The hourly run starts on any network and power, so that its start says what the phone allows;
+        // off those chosen it only looks for new photos.
+        val send = Background.HOURLY !in tags || Background.allowed(applicationContext)
+        Uploader.run(applicationContext, stop = { isStopped }, send = send) { done, total ->
             if (now) setForegroundAsync(info(done, total))
         }
         if (Background.NEW_MEDIA in tags) Background.rearm(applicationContext) else Background.schedule(applicationContext)
@@ -298,6 +310,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
 object Background {
     const val CHANNEL = "backup"
     private const val PERIODIC = "backup"
+    const val HOURLY = "backup-hourly"
     const val NEW_MEDIA = "backup-new-media"
     private const val NOW = "upload-now"
     private const val ADDED = "send-added"
@@ -307,14 +320,10 @@ object Background {
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "Backup", NotificationManager.IMPORTANCE_LOW))
     }
 
-    private fun constraints(b: Backup) = Constraints.Builder()
-        .setRequiredNetworkType(if (b.wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED)
-        .setRequiresCharging(b.chargingOnly)
-        .build()
-
     /**
-     * While backup is on: a run every hour, and one a little after new photos or videos appear, each
-     * on the network and power chosen; `replace` when the choice changed.
+     * While backup is on: a run every hour, whatever the network and power, which sends only on those
+     * chosen, and one a little after new photos or videos appear, on those chosen; `replace` when the
+     * choice changed.
      */
     fun schedule(context: Context, replace: Boolean = false) {
         val wm = WorkManager.getInstance(context)
@@ -326,7 +335,7 @@ object Background {
         }
         wm.enqueueUniquePeriodicWork(
             PERIODIC, ExistingPeriodicWorkPolicy.UPDATE,
-            PeriodicWorkRequestBuilder<BackupWorker>(1, TimeUnit.HOURS).setConstraints(constraints(b)).build(),
+            PeriodicWorkRequestBuilder<BackupWorker>(1, TimeUnit.HOURS).addTag(HOURLY).build(),
         )
         enqueueNewMedia(context, b, if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP)
     }
@@ -350,6 +359,16 @@ object Background {
             NEW_MEDIA, policy,
             OneTimeWorkRequestBuilder<BackupWorker>().setConstraints(media).addTag(NEW_MEDIA).build(),
         )
+    }
+
+    /** Whether the network and power now are those chosen for the background. */
+    fun allowed(context: Context): Boolean {
+        val b = Backup.load(Cairn.store(context))
+        val net = context.getSystemService(ConnectivityManager::class.java)
+        val caps = net.getNetworkCapabilities(net.activeNetwork) ?: return false
+        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+        if (b.wifiOnly && net.isActiveNetworkMetered) return false
+        return !b.chargingOnly || context.getSystemService(BatteryManager::class.java).isCharging
     }
 
     /** Upload now: on any network, shown as a notification, and on with the app closed. */

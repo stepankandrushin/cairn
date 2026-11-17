@@ -123,8 +123,33 @@ server already has for other bytes gets `(2)`
 Originals are sent as they are, where they were taken included. A photo deleted from the phone stays on the
 server, and **Turn off backup** keeps what was sent.
 
-</td><td><img src="android/photos-status.webp" alt="Photos: Folder photos/Photos/alice-phone, Sent 4, Waiting 0, Upload now, When, Which: Camera on, Screenshots and screen recordings off" width="320"></td></tr>
+</td><td><img src="android/photos-status.webp" alt="Photos: Folder photos/Photos/alice-phone, Sent 4, Waiting 0, Last background run, Upload now, When, Which: Camera on, Screenshots and screen recordings off" width="320"></td></tr>
 </table>
+
+## Phones that stop apps in the background
+
+<table>
+<tr><td width="50%">
+
+Android puts off what an app does in the background to save battery, for hours once the app has not been
+opened for a while. So **Turn on backup** then asks to leave Cairn out of battery optimization, or, as other
+phones put it, to let it always run in the background: choose **Ignore** or **Allow**. Until it may, the
+Photos tab says so, with **Allow in the background**.
+
+</td><td><img src="android/photos-battery.webp" alt="Ignore battery optimizations? Allow the app Cairn to stay connected in the background? This may consume more battery power. Cancel, Ignore" width="320"></td></tr>
+</table>
+
+Some phones go further: Honor, Huawei, Xiaomi, OPPO, OnePlus, realme, vivo and Samsung freeze an app that
+has not been opened lately or keep it from starting by itself, and new photos then wait until Cairn is
+opened. The Photos tab shows when backup last ran in the background. When something waited and the phone had
+not let it run there for two hours while the app was closed, it says so, with a button to the phone's own
+setting, or to the app's info where the phone's is not known: *This phone has not let Cairn run in the
+background since 13:17* The note stays until Cairn has run in the background again.
+
+On an Honor phone (MagicOS) the setting is **Settings › Battery › App launch**: find Cairn and turn off
+**Manage automatically**, then in the box that opens leave **Auto-launch**, **Secondary launch** and **Run in
+background** on. Set it when backup is turned on, rather than waiting for the note: the phone does
+not say when it holds an app back. [dontkillmyapp.com](https://dontkillmyapp.com/) gives each maker's steps.
 
 ## Browse the server
 

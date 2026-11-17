@@ -1,11 +1,14 @@
 // Backup of the phone's photos and videos: where they go and what they are called, which (the camera's,
-// screenshots, other apps' folders, each a switch) and when, how far it is, and what was not sent and
-// why, each with Retry.
+// screenshots, other apps' folders, each a switch) and when, how far it is, whether the phone lets it run
+// in the background, and what was not sent and why, each with Retry.
 
 package storage.cairn.android
 
 import android.Manifest
+import android.content.Context
 import android.os.Build
+import android.text.format.DateFormat
+import android.text.format.DateUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -140,6 +143,7 @@ fun Which(b: Backup, onChange: (Backup) -> Unit) {
 
 @Composable
 fun BackupSetup() {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var b by remember { mutableStateOf(Model.backup) }
     var busy by remember { mutableStateOf(false) }
@@ -151,6 +155,7 @@ fun BackupSetup() {
             busy = true
             try {
                 Model.startBackup(b)
+                if (!HeldBack.exempt(context)) HeldBack.askExempt(context)
             } catch (e: Exception) {
                 Model.message = describe(e)
             } finally {
@@ -220,6 +225,44 @@ private fun example(b: Backup): String {
     return "For example: " + parts.filter { it.isNotEmpty() }.joinToString("/")
 }
 
+/**
+ * When a run last started in the background; and, while the phone holds the app back there, what it
+ * would allow: Android's battery optimization left off, and the setting of its maker's own.
+ */
+@Composable
+fun InTheBackground() {
+    val context = LocalContext.current
+    val since = Model.heldSince
+    Model.lastBegan?.let { Labeled("Last background run", at(context, it), Modifier.testTag("lastBackgroundRun")) }
+    if (since != null) {
+        Text(
+            "This phone has not let Cairn run in the background since ${at(context, since)}, so new photos wait until the app is opened.",
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).testTag("heldBack"),
+        )
+    }
+    if (!Model.exempt) {
+        Footnote("To save battery, Android puts off what an app does in the background, for hours once it has not been opened for a while.")
+        TextButton(onClick = { HeldBack.askExempt(context) }, modifier = Modifier.padding(horizontal = 8.dp).testTag("allowBackground")) {
+            Text("Allow in the background")
+        }
+    }
+    if (since != null) {
+        val screen = remember { HeldBack.screen(context) }
+        Footnote(screen.hint)
+        OutlinedButton(onClick = { screen.open(context) }, modifier = Modifier.padding(horizontal = 16.dp).testTag("openHeldBack")) {
+            Text("Open ${screen.name}")
+        }
+    }
+}
+
+/** A time today, or a day and time before. */
+private fun at(context: Context, ms: Long): String {
+    val time = DateFormat.getTimeFormat(context).format(Date(ms))
+    if (DateUtils.isToday(ms)) return time
+    return DateUtils.formatDateTime(context, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH) + ", " + time
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BackupStatus() {
@@ -233,6 +276,7 @@ fun BackupStatus() {
                 Labeled("Sent", "${s.done}", Modifier.testTag("sentCount"))
                 Labeled("Waiting", "${s.planned + s.sent}", Modifier.testTag("waitingCount"))
                 if (s.failed + s.skipped > 0uL) Labeled("Not sent", "${s.failed + s.skipped}")
+                InTheBackground()
                 Model.uploadNote?.let { Footnote(it) }
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Button(onClick = { Model.uploadNow() }, modifier = Modifier.testTag("uploadNow")) { Text("Upload now") }

@@ -256,7 +256,10 @@ screenshots.
   also catch a photo a camera writes hidden and shows later, and sent a little after they are taken, and what
   waits every hour, on Wi-Fi only unless chosen otherwise, and while charging if chosen; Upload now sends at once
   on any network, shown as a notification, and goes on with the app closed. A photo deleted from the phone stays
-  on the server. What could not be sent is listed with the server's reason, and Retry.
+  on the server. What could not be sent is listed with the server's reason, and Retry. The app asks to be left
+  out of battery optimization, shows when it last ran in the background, and says so when the phone kept it
+  from running there while something waited, as Honor's App launch and other makers' managers do, with a button
+  to the phone's own setting.
 - **Browse:** as on the iPhone: the server's folders as they are now, thumbnails, a file downloaded only when
   opened into a cache the system empties as it needs room, and a video streamed.
 - **Files:** each folder chosen in Settings is a place in the system's Files picker, where a file is downloaded

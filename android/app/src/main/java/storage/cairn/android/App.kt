@@ -86,9 +86,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        Model.shown()
+    }
+
     override fun onResume() {
         super.onResume()
         Model.opened()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Model.left()
     }
 }
 

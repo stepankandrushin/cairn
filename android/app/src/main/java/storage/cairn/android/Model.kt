@@ -37,6 +37,10 @@ object Model {
     var uploading by mutableStateOf(false)
     var uploadNote by mutableStateOf<String?>(null)
     var mediaFolders by mutableStateOf<List<MediaFolder>>(emptyList())
+    /** Left out of battery optimization; when a run last started in the background; since when the phone has held it back. */
+    var exempt by mutableStateOf(true)
+    var lastBegan by mutableStateOf<Long?>(null)
+    var heldSince by mutableStateOf<Long?>(null)
 
     private var started = false
 
@@ -122,7 +126,7 @@ object Model {
             val got = withContext(Dispatchers.IO) {
                 runCatching {
                     val s = store()
-                    listOf(s.stats(), s.failed(200u), s.recent(30u), s.skipped())
+                    listOf(s.stats(), s.failed(200u), s.recent(30u), s.skipped(), HeldBack.lastBegan(s), HeldBack.since(s))
                 }.getOrNull()
             } ?: return@launch
             @Suppress("UNCHECKED_CAST")
@@ -131,18 +135,34 @@ object Model {
                 failed = got[1] as List<Upload>
                 recent = got[2] as List<Upload>
                 skipped = got[3] as List<SkippedEntry>
+                lastBegan = got[4] as Long?
+                heldSince = got[5] as Long?
             }
         }
     }
 
-    /** The app came to the screen: what waits is sent while it is open, on the network chosen. */
+    /** The app is on the screen, from before it is drawn: a run that starts now is not in the background. */
+    fun shown() {
+        if (started) HeldBack.shown(app)
+    }
+
+    /** The app left the screen. */
+    fun left() {
+        if (started) HeldBack.left(app)
+    }
+
+    /**
+     * The app came to the screen: what is new is queued, so that Waiting says what is to go and whether
+     * the phone held the app back meanwhile (HeldBack), and what waits is sent, on the network chosen.
+     */
     fun opened() {
         if (!started) return
+        exempt = HeldBack.exempt(app)
         refresh()
         loadMediaFolders()
         if (account == null || !backup.enabled) return
         Background.schedule(app)
-        if (mayRun()) scope.launch { Uploader.run(app) }
+        scope.launch { Uploader.run(app, send = mayRun()) }
     }
 
     /** Whether backup may send now, on this network. */
@@ -170,6 +190,7 @@ object Model {
             val store = store()
             now.save(store)
             MediaLibrary.restart(store)
+            HeldBack.forget(store)
         }
         backup = now
         Background.schedule(app, replace = true)
@@ -207,6 +228,7 @@ object Model {
     fun stopBackup() {
         val b = backup.copy(enabled = false)
         b.save(store())
+        HeldBack.forget(store())
         backup = b
         Uploader.stop()
         Background.schedule(app)

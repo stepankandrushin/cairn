@@ -54,6 +54,20 @@ fn in_parallel<B: Send, R: Send>(
 ) -> Result<()> {
     // Four keep up with the reading, and each thread's allocator holds what it parsed last.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 4));
+    in_parallel_on(threads, read, work, sink)
+}
+
+/// `in_parallel` on so many threads, with at most two batches for each read and not yet sunk, parsed
+/// or not. The sink takes them in order, so while one thread is held up, as a machine busy with
+/// something else holds threads up, what the others parse waits for it: the reading waits too, or the
+/// rest of the state would pile up behind that one batch.
+fn in_parallel_on<B: Send, R: Send>(
+    threads: usize,
+    read: Reader<'_, B>,
+    work: &(dyn Fn(B) -> Result<R> + Sync),
+    sink: &mut dyn FnMut(R) -> Result<()>,
+) -> Result<()> {
+    let most = 2 * threads;
     let (to_work, from_read) = std::sync::mpsc::sync_channel::<(usize, B)>(threads);
     let (to_sink, done) = std::sync::mpsc::channel::<(usize, Result<R>)>();
     let from_read = std::sync::Mutex::new(from_read);
@@ -66,8 +80,19 @@ fn in_parallel<B: Send, R: Send>(
                 let Ok((i, batch)) = next else {
                     return;
                 };
-                if to_sink.send((i, work(batch))).is_err() {
-                    return;
+                // A panic is first its batch's error, as the reading may be waiting for that very
+                // batch, and then the panic it is.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(batch))) {
+                    Ok(r) => {
+                        if to_sink.send((i, r)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(panic) => {
+                        let lost = anyhow::anyhow!("a thread parsing the state panicked");
+                        let _ = to_sink.send((i, Err(lost)));
+                        std::panic::resume_unwind(panic);
+                    }
                 }
             });
         }
@@ -90,7 +115,16 @@ fn in_parallel<B: Send, R: Send>(
             while let Ok((i, r)) = done.try_recv() {
                 waiting.insert(i, r);
             }
-            drain(&mut waiting, &mut next_out)
+            drain(&mut waiting, &mut next_out)?;
+            // Room for the next batch, which is held from when it is read.
+            while n >= next_out + most {
+                let (i, r) = done
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("the rebuild's workers stopped"))?;
+                waiting.insert(i, r);
+                drain(&mut waiting, &mut next_out)?;
+            }
+            Ok(())
         });
         drop(to_work);
         // Every worker ends once the batches sent are done, whatever happened here.
@@ -848,4 +882,80 @@ pub fn paths_of(root: &Root, ids: &[ObjectId]) -> Result<HashMap<ObjectId, Strin
         out.insert(*id, path.unwrap_or_else(|| format!("the object {id}")));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// The first batch held up, as a busy machine holds a thread up, while the other threads go
+    /// through the rest: what was read and not yet sunk stays within two batches a thread, and the
+    /// sink still has every batch in order. Before, all 200 were read while the first waited.
+    #[test]
+    fn a_thread_held_up_holds_the_reading_back_not_the_rest_of_the_state_in_memory() {
+        const THREADS: usize = 4;
+        const BATCHES: usize = 200;
+        let (read_so_far, sunk, most) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let work = |i: usize| -> Result<usize> {
+            if i == 0 {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Ok(i)
+        };
+        in_parallel_on(
+            THREADS,
+            &mut |send| {
+                for i in 0..BATCHES {
+                    read_so_far.set(i + 1);
+                    most.set(most.get().max(read_so_far.get() - sunk.get()));
+                    send(i)?;
+                }
+                Ok(())
+            },
+            &work,
+            &mut |i| {
+                assert_eq!(i, sunk.get(), "out of order");
+                sunk.set(i + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sunk.get(), BATCHES);
+        assert!(
+            most.get() <= 2 * THREADS,
+            "{} batches read and not sunk at once",
+            most.get()
+        );
+    }
+
+    /// A thread that panics on the batch the reading waits for: the panic comes out, where it would
+    /// otherwise wait for that batch for ever.
+    #[test]
+    fn a_thread_that_panics_on_the_batch_waited_for_is_a_panic_not_a_hang() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let work = |i: usize| -> Result<usize> {
+                if i == 0 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    panic!("planted on the first batch");
+                }
+                Ok(i)
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                in_parallel_on(
+                    4,
+                    &mut |send| (0..200).try_for_each(&mut *send),
+                    &work,
+                    &mut |_| Ok(()),
+                )
+            }));
+            let _ = tx.send(r.is_err());
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("in_parallel is still waiting for the batch whose thread panicked");
+        assert!(panicked, "the panic came out as nothing");
+    }
 }

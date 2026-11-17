@@ -680,7 +680,11 @@ fn a_sync_holds_a_few_hundred_bytes_for_each_entry_of_the_tree() {
 /// no second decision, no second copy of the tree. Peak memory of a daemon whose sync is the check, on a
 /// tree of thousands, against one whose sync is not, each with one edit to take: within a fifth more,
 /// and a few megabytes whatever the tree's size, for the threads that parse the state, where a second
-/// decision beside the round would hold some 20 KB an entry, a quarter of a gigabyte here.
+/// decision beside the round would hold some 20 KB an entry, a quarter of a gigabyte here. Each daemon's
+/// malloc keeps one arena, as a release's has (musl's): glibc's gives each thread one of its own, which
+/// keeps the most that thread's results ever held while waiting to be let go, so the more a busy machine
+/// keeps the sink from them, the more each arena holds. That was the check 3 MB higher beside the
+/// builds of a release, whatever the check itself held.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_periodic_check_holds_little_more_than_the_round() {
@@ -691,7 +695,11 @@ fn the_periodic_check_holds_little_more_than_the_round() {
     for d in [&a, &b, &a] {
         d.synced();
     }
-    let release = [("CAIRN_FP_INCR_ORACLE", "0"), ("CAIRN_FP_FAST_ORACLE", "0")];
+    let release = [
+        ("CAIRN_FP_INCR_ORACLE", "0"),
+        ("CAIRN_FP_FAST_ORACLE", "0"),
+        ("MALLOC_ARENA_MAX", "1"),
+    ];
     let peak = |full_sync: &str, edit: &str, done: &str| -> u64 {
         a.write(edit, "edited");
         let d = Daemon::start_env(

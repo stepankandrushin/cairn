@@ -248,7 +248,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cairn-cli"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "cairn-engine",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-engine"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-explorer"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "cairn-engine",
  "cairn-protocol",
@@ -295,11 +295,11 @@ dependencies = [
 
 [[package]]
 name = "cairn-failpoint"
-version = "0.1.28"
+version = "0.1.29"
 
 [[package]]
 name = "cairn-harness"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-mobile"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-protocol"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-release"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-server"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "axum",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-store"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "cairn-failpoint",

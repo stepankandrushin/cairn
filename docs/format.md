@@ -114,6 +114,19 @@ names with them, so a renamed namespace answers to its name now alone; from 4 to
 while a renamed namespace keeps its chunks under another name than its own, where schema 4 would not look:
 renamed back to its first name, and each device synced once so that it has taken that name up, it goes.
 
+Schema 6 adds, in one transaction, so a kill or a full disk leaves schema 5 or 6 whole:
+- `users.password` a user's password as an argon2id hash in its PHC string, NULL for none;
+- `tokens.kind` `device` for a token a person handed a device, every token from before included;
+  `browser` for one a password's sign-in made for one browser; `paired` for one a device took with a
+  pairing code. `tokens.used` the hour it was last used, NULL for never since;
+- `retention` each folder's policy, no row keeping everything; `pruned` each revision retention gave up and
+  when, whose content a collection may then take; `gc_runs` each collection, its cutoff and how far it got.
+
+From 6 to 5 `downgrade` drops them all, passwords, kinds and policies with them, and the revisions retention
+gave up are history again, their content whole. It refuses once a collection that went on to delete has a
+cutoff after a revision was given up, as that revision's chunks may be gone and a binary of schema 5 would
+report them missing; `--forget-pruned` goes back all the same and says how many.
+
 A data directory with no namespace, as `cairn-server init` makes it, gets its first, `cloud` managed by the
 first user; one from before keeps its `default` A namespace a user adds `POST /v1/folders` is made in one
 transaction with that user's `manage` grant and their own name for it, if they gave one. A rename, by the

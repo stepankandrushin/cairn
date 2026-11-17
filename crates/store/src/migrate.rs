@@ -275,20 +275,104 @@ pub(crate) fn to_5(conn: &mut Connection) -> Result<()> {
     }
 }
 
+/// Moves a database of schema 5 to 6 in one transaction: three columns and three tables more, empty
+/// but for each token's kind, `device`, so a kill or a full disk leaves it at 5 or 6 whole.
+pub(crate) fn to_6(conn: &mut Connection) -> Result<()> {
+    let moved = (|| -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        hit("server.migrate6.begun");
+        tx.execute_batch(crate::sqlite::MIGRATION_6)?;
+        tx.pragma_update(None, "user_version", 6)?;
+        hit("server.migrate6.commit");
+        check("server.migrate6.write")?;
+        tx.commit()?;
+        Ok(())
+    })();
+    match moved {
+        Ok(()) => Ok(()),
+        Err(e) if crate::is_disk_full(&e) => bail!(
+            "moving this database from schema 5 to 6 ran out of room on the disk that holds it ({e:#}). It stays at schema 5: make room, or go on with the binary from before"
+        ),
+        Err(e) => Err(e.context("move the database from schema 5 to 6; it stays at schema 5")),
+    }
+}
+
 /// Moves the database one schema back, with no server on it, which the caller sees to by holding
-/// the data directory's lock: from 5 to 4, which a binary of schema 4 reads, or from 4 to 3.
-pub fn back_one(file: &Path) -> Result<String> {
+/// the data directory's lock: from 6 to 5, from 5 to 4, which a binary of schema 4 reads, or from 4
+/// to 3. `forget_pruned` lets 6 go back to 5 when a collection has taken retention's revisions' content,
+/// which a binary of schema 5 would take for damage.
+pub fn back_one(file: &Path, forget_pruned: bool) -> Result<String> {
     let version: usize = {
         let conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
         conn.pragma_query_value(None, "user_version", |r| r.get(0))?
     };
     match version {
+        6 => from_6(file, forget_pruned),
         5 => from_5(file),
         4 => to_3(file),
         v => bail!(
-            "this database has schema {v}: only one of schema 5 is moved back to 4, or of 4 to 3"
+            "this database has schema {v}: only one of schema 6 is moved back to 5, of 5 to 4, or of 4 to 3"
         ),
     }
+}
+
+fn open_to_move(file: &Path) -> Result<Connection> {
+    let conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
+}
+
+/// Schema 6 back to 5, in one transaction: its three tables and three columns dropped, and with them
+/// users' passwords, each token's kind and last use, folders' retention policies, and which revisions
+/// retention gave up, which, their content still whole, are history again. Refused once a collection has
+/// taken the content of a revision retention gave up, as a binary of schema 5 would take those chunks for
+/// missing ones, unless `forget_pruned`.
+fn from_6(file: &Path, forget_pruned: bool) -> Result<String> {
+    let mut conn = open_to_move(file)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: usize = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version != 6 {
+        bail!("this database has schema {version}: only one of schema 6 is moved back to 5");
+    }
+    // A revision given up before a run's cutoff, where that run went on to delete, may have lost chunks.
+    let taken: i64 = tx.query_row(
+        "SELECT count(*) FROM pruned p WHERE p.at < (SELECT max(cutoff) FROM gc_runs g WHERE g.ns = p.ns AND g.state IN ('deleting', 'done', 'interrupted'))",
+        [],
+        |r| r.get(0),
+    )?;
+    if taken > 0 && !forget_pruned {
+        bail!(
+            "the database stays at schema 6: a collection may have taken the content of {taken} revisions this folder's retention gave up, which a binary of schema 5 would take for damage, its fsck reporting their chunks missing and its history offering them. With --forget-pruned it goes back all the same"
+        );
+    }
+    let count = |sql: &str| -> Result<i64> { Ok(tx.query_row(sql, [], |r| r.get(0))?) };
+    let passwords = count("SELECT count(*) FROM users WHERE password IS NOT NULL")?;
+    let policies = count("SELECT count(*) FROM retention")?;
+    let pruned = count("SELECT count(*) FROM pruned")?;
+    hit("server.downgrade6.begun");
+    tx.execute_batch(
+        "DROP TABLE gc_runs; DROP TABLE pruned; DROP TABLE retention;
+         ALTER TABLE tokens DROP COLUMN used; ALTER TABLE tokens DROP COLUMN kind;
+         ALTER TABLE users DROP COLUMN password;",
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    hit("server.downgrade6.commit");
+    check("server.downgrade6.write")?;
+    tx.commit()
+        .context("move the database back to schema 5; it stays at schema 6")?;
+    checkpoint(&conn)?;
+    Ok(format!(
+        "moved {} back to schema 5, which a binary of schema 5 reads: {passwords} users' passwords, {policies} folders' retention policies and the marks on {pruned} revisions retention gave up gone with it{}. This binary moves it to 6 again when it opens it",
+        file.display(),
+        if taken > 0 {
+            format!(", {taken} of them perhaps without their content, which that binary's fsck reports as missing chunks")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 /// Schema 5 back to 4, in one transaction: its two tables and `namespaces.dir` dropped, and with them
@@ -296,11 +380,7 @@ pub fn back_one(file: &Path) -> Result<String> {
 /// while a renamed folder keeps its chunks under another name than its own, where a binary of schema 4
 /// would not look for them.
 fn from_5(file: &Path) -> Result<String> {
-    let mut conn = Connection::open(file).with_context(|| format!("open {}", file.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let mut conn = open_to_move(file)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: usize = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 5 {
@@ -960,11 +1040,13 @@ mod tests {
         let dir = scratch();
         let db = dir.join("meta.sqlite");
         drop(SqliteStore::open(&db).unwrap());
+        from_6(&db, false).unwrap();
         from_5(&db).unwrap();
         let four = rows(&db);
         let mut s = SqliteStore::open(&db).unwrap();
         s.rename_namespace(FIRST_FOLDER, "files").unwrap();
         drop(s);
+        from_6(&db, false).unwrap();
         let err = format!("{:#}", from_5(&db).unwrap_err());
         assert!(
             err.contains("stays at schema 5")
@@ -978,6 +1060,7 @@ mod tests {
         let mut s = SqliteStore::open(&db).unwrap();
         s.rename_namespace("files", FIRST_FOLDER).unwrap();
         drop(s);
+        from_6(&db, false).unwrap();
         let said = from_5(&db).unwrap();
         assert!(said.contains("the former names files for cloud"), "{said}");
         assert_eq!(version(&db), 4);
@@ -985,8 +1068,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// From the schema this binary writes back to 3, as `cairn-server downgrade` run twice.
+    /// From the schema this binary writes back to 3, as `cairn-server downgrade` run until it is.
     fn down_to_3(db: &Path) {
+        if version(db) == 6 {
+            from_6(db, false).unwrap();
+        }
         if version(db) == 5 {
             from_5(db).unwrap();
         }
@@ -1008,7 +1094,7 @@ mod tests {
         let dir = scratch();
         let db = dir.join("meta.sqlite");
         let objects = rich(&db);
-        assert_eq!(version(&db), 5);
+        assert_eq!(version(&db), 6);
         let want = reads(&db, &objects);
         assert!(want.contains("from_the_future"), "{want}");
 
@@ -1046,7 +1132,7 @@ mod tests {
 
         // The binary of schema 4 moves it when it opens it, and reads it as before.
         assert_eq!(reads(&db, &objects), want);
-        assert_eq!(version(&db), 5);
+        assert_eq!(version(&db), 6);
         let four = rows(&db);
         let journal = four.iter().find(|(t, _)| t == "journal").unwrap();
         assert!(journal.1.iter().all(|r| r.contains("Blob(")), "{journal:?}");

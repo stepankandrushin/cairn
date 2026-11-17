@@ -153,17 +153,17 @@ impl Repo {
         }
     }
 
-    /// Moves the data directory's database one schema back, from 5 to 4 or from 4 to 3, which a binary
-    /// of that schema reads, with the directory's lock held so that no server has it meanwhile; what it
-    /// did.
-    pub fn downgrade(root: impl Into<PathBuf>) -> Result<String> {
+    /// Moves the data directory's database one schema back, from 6 to 5, 5 to 4 or 4 to 3, which a
+    /// binary of that schema reads, with the directory's lock held so that no server has it meanwhile;
+    /// what it did. `forget_pruned` as `migrate::back_one`'s.
+    pub fn downgrade(root: impl Into<PathBuf>, forget_pruned: bool) -> Result<String> {
         let root = root.into();
         let db = root.join("meta.sqlite");
         if !db.exists() {
             anyhow::bail!("{} is no data directory", root.display());
         }
         let _lock = lock(&root)?;
-        crate::migrate::back_one(&db)
+        crate::migrate::back_one(&db, forget_pruned)
     }
 
     fn meta(&self) -> std::sync::MutexGuard<'_, Box<dyn MetaStore>> {

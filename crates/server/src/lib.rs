@@ -797,12 +797,15 @@ enum Command {
         #[arg(long)]
         data: PathBuf,
     },
-    /// Move the database back to schema 3, which a binary from before schema 4 reads (0.1.14 and
-    /// earlier), with the server stopped: the way back to one. This one moves it to 4 again when it
-    /// opens it.
+    /// Move the database one schema back, which a binary of that schema reads, with the server stopped:
+    /// the way back to one. Each run moves it one schema; this binary moves it up again when it opens it.
     Downgrade {
         #[arg(long)]
         data: PathBuf,
+        /// From schema 6, even once a collection has taken the content of revisions retention gave up,
+        /// which a binary of schema 5 then reports as missing chunks.
+        #[arg(long)]
+        forget_pruned: bool,
     },
 }
 
@@ -1002,8 +1005,11 @@ fn run_inner() -> Result<std::process::ExitCode> {
                 .build()?
                 .block_on(serve(data, listen, behind_tls_proxy, link_url))?;
         }
-        Command::Downgrade { data } => {
-            println!("{}", Repo::downgrade(&data)?);
+        Command::Downgrade {
+            data,
+            forget_pruned,
+        } => {
+            println!("{}", Repo::downgrade(&data, forget_pruned)?);
         }
         Command::Fsck { data } => {
             let repo = Repo::open(&data)?;

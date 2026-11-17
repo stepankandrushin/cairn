@@ -130,6 +130,7 @@ fn a_folder_renamed_under_its_devices_loses_nothing_and_they_follow_it() {
 
     // Back to schema 4 only once its chunks are under its own name again.
     server.kill();
+    run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     let run = run_server(&["downgrade", "--data", &data], &[]);
     assert!(
         !run.ok() && run.stderr.contains("stays at schema 5") && run.stderr.contains("rename"),
@@ -148,11 +149,12 @@ fn a_folder_renamed_under_its_devices_loses_nothing_and_they_follow_it() {
         assert_eq!(configured(d), "cloud");
     }
     server.kill();
+    run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     let run = run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     assert!(run.stdout.contains("back to schema 4"), "{}", run.text());
     server.restart();
-    a.write("d1/back", "at schema 5 again");
+    a.write("d1/back", "at schema 6 again");
     converge(&[&a, &b, &c]);
-    assert_eq!(c.read("d1/back"), b"at schema 5 again");
+    assert_eq!(c.read("d1/back"), b"at schema 6 again");
     assert!(server.fsck().contains("clean"));
 }

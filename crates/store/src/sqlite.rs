@@ -90,11 +90,36 @@ CREATE TABLE folder_names (
 CREATE INDEX folder_names_user ON folder_names (user);
 "#;
 
+/// Schema 6's, after 5: a user's password, as an argon2id hash in its PHC string (NULL: none); a token's
+/// kind, `device` for one a person handed a device, `browser` for one a password's sign-in made for a
+/// browser, `paired` for one a device took with a pairing code, and the time it was last used, to the
+/// hour; each folder's retention policy (no row: keep everything); the revisions retention gave up
+/// (`at` when), whose content a collection then takes; and each collection run.
+pub(crate) const MIGRATION_6: &str = r#"
+ALTER TABLE users ADD COLUMN password TEXT;
+ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'device';
+ALTER TABLE tokens ADD COLUMN used INTEGER;
+CREATE TABLE retention (
+    ns INTEGER PRIMARY KEY REFERENCES namespaces (id),
+    keep TEXT NOT NULL, trash INTEGER NOT NULL, set_by TEXT NOT NULL, set_at INTEGER NOT NULL
+);
+CREATE TABLE pruned (
+    ns INTEGER NOT NULL REFERENCES namespaces (id), revision BLOB NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (ns, revision)
+) WITHOUT ROWID;
+CREATE TABLE gc_runs (
+    id INTEGER PRIMARY KEY, ns INTEGER NOT NULL REFERENCES namespaces (id),
+    started INTEGER NOT NULL, cutoff INTEGER NOT NULL, state TEXT NOT NULL,
+    chunks INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, ended INTEGER
+);
+CREATE INDEX gc_runs_ns ON gc_runs (ns, started);
+"#;
+
 /// The schema this binary writes: `PRAGMA user_version` once every migration has run. Schema 4 keeps
 /// each revision's body once, in `revisions`, and bodies and operations as binary records
-/// (`crate::codec`), with what is sent made from them as the JSON it always was; schema 5 adds
-/// [`MIGRATION_5`]'s tables.
-pub const SCHEMA: usize = MIGRATIONS.len() + 2;
+/// (`crate::codec`), with what is sent made from them as the JSON it always was; schemas 5 and 6 add
+/// [`MIGRATION_5`]'s and [`MIGRATION_6`]'s.
+pub const SCHEMA: usize = MIGRATIONS.len() + 3;
 
 /// The user a data directory's one token from before accounts becomes, managing every namespace.
 pub const FIRST_USER: &str = "admin";
@@ -359,6 +384,9 @@ impl SqliteStore {
         }
         if version < 5 {
             crate::migrate::to_5(&mut conn)?;
+        }
+        if version < 6 {
+            crate::migrate::to_6(&mut conn)?;
         }
         let mut store = Self { conn };
         if no_namespace(&store.conn)? {

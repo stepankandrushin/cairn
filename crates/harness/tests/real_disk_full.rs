@@ -705,7 +705,8 @@ fn inner_server_move_on_a_full_disk() {
     b.synced();
     server.kill();
     let data = server.data.to_str().unwrap().to_string();
-    // From schema 5 to 4, then to 3.
+    // From schema 6 to 5, to 4, then to 3.
+    run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     run_server(&["downgrade", "--data", &data], &[]).expect_ok();
     let db = server.data.join("meta.sqlite");
@@ -763,7 +764,7 @@ fn inner_server_move_on_a_full_disk() {
     // Room again.
     std::fs::remove_file(&ballast).unwrap();
     server.restart();
-    assert_eq!(schema(&db), 5);
+    assert_eq!(schema(&db), 6);
     a.write("d0/after", "after the move");
     b.write("d1/f1", "edited on b");
     converge(&[&a, &b]);

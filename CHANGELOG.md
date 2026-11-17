@@ -10,6 +10,12 @@
 - A web item carries its file's manifest hash, the one a client makes of the same bytes, so a phone after a
   reinstall skips what it sent before without sending it again.
 
+**Changed:**
+
+- The server's database moves to schema 6 when a server opens it, in one transaction: room for users'
+  passwords, each token's kind and last use, and each folder's retention and collections. `cairn-server
+  downgrade` moves it back one schema each time it runs, and says what goes with it.
+
 **Fixed:**
 
 - The server looks a commit's operation ID up before it checks the commit's chunks, so a commit it took whose

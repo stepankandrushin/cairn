@@ -20,6 +20,8 @@
 - `PUT /file` changes a file already there given `base` the revision the client saw, keeping everything of it
   but its mtime; changed since by another, the bytes go beside it as a conflict copy, never in its place, and
   a file deleted since comes back where it was. So a phone's Files app can change files in one request.
+- Thumbnails at `GET B/thumb/{object}` made on the first ask from JPEG, PNG, WebP and GIF, turned as their
+  EXIF says, and kept; for HEIC and video a client sends its own, which every size is made from.
 
 **Changed:**
 

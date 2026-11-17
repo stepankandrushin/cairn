@@ -13,6 +13,7 @@ const FEATURES: &[&str] = &[
     "pairing",
     "passwords",
     "file_update",
+    "thumbs",
 ];
 
 fn token(server: &Server) -> String {
@@ -541,4 +542,163 @@ fn a_password_signs_one_browser_in_and_each_is_signed_out_alone() {
     assert_eq!(sign_in(&server, "alice", "a third long one").code, 401);
     let me = get(&server, "/v1/me", Auth::Bearer(&alice)).ok().json();
     assert!(me.get("password").is_none(), "{me}");
+}
+
+/// A picture of `w` by `h`, as `format`.
+fn picture(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut out, format)
+        .unwrap();
+    out.into_inner()
+}
+
+/// A JPEG whose EXIF says it is to be turned a quarter clockwise to be seen, as a camera held upright
+/// writes one.
+fn turned_jpeg(w: u32, h: u32) -> Vec<u8> {
+    let plain = picture(w, h, image::ImageFormat::Jpeg);
+    let mut exif = b"Exif\0\0MM\x00\x2a\x00\x00\x00\x08\x00\x01".to_vec();
+    exif.extend_from_slice(b"\x01\x12\x00\x03\x00\x00\x00\x01\x00\x06\x00\x00");
+    exif.extend_from_slice(b"\x00\x00\x00\x00");
+    let mut out = plain[..2].to_vec();
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(&exif);
+    out.extend_from_slice(&plain[2..]);
+    out
+}
+
+#[track_caller]
+fn dimensions(answer: &Answer) -> (u32, u32) {
+    assert_eq!(answer.code, 200, "{}", answer.text());
+    assert_eq!(answer.header("content-type").as_deref(), Some("image/jpeg"));
+    let img = image::load_from_memory_with_format(&answer.body, image::ImageFormat::Jpeg).unwrap();
+    (img.width(), img.height())
+}
+
+/// A picture's thumbnail is a JPEG no larger than asked, turned as its EXIF says, made once and kept; a
+/// file the server does not decode has none until a client sends its own, which every size is made from;
+/// and a public link reads them but sends none.
+#[test]
+fn a_thumbnail_is_made_of_a_picture_or_sent_by_a_client_and_kept() {
+    let sb = Sandbox::fast("api-thumbs");
+    let server = Server::start(sb.path("data"));
+    let a = Device::new(&sb, &server, "a");
+    a.write("wide.png", picture(2000, 1000, image::ImageFormat::Png));
+    a.write("upright.jpg", turned_jpeg(200, 100));
+    a.write("notes.txt", "no picture at all");
+    a.write("IMG_0001.HEIC", "bytes the server does not decode");
+    a.synced();
+    let t = token(&server);
+    let root = get(
+        &server,
+        &format!("/v1/ns/cloud/dir/{ROOT}"),
+        Auth::Bearer(&t),
+    )
+    .ok()
+    .json();
+    let id = |name: &str| entry(&root, name)["object"].as_str().unwrap().to_string();
+    let thumb = |object: &str, size: u32| {
+        get(
+            &server,
+            &format!("/v1/ns/cloud/thumb/{object}?size={size}"),
+            Auth::Bearer(&t),
+        )
+    };
+
+    assert_eq!(dimensions(&thumb(&id("wide.png"), 128)), (128, 64));
+    assert_eq!(dimensions(&thumb(&id("wide.png"), 1024)), (1024, 512));
+    assert_eq!(
+        dimensions(&thumb(&id("upright.jpg"), 128)),
+        (64, 128),
+        "turned"
+    );
+    // Not larger than the picture itself.
+    assert_eq!(dimensions(&thumb(&id("upright.jpg"), 512)), (100, 200));
+    for name in ["notes.txt", "IMG_0001.HEIC"] {
+        let none = thumb(&id(name), 256);
+        assert_eq!(none.code, 404, "{name}: {}", none.text());
+        assert_eq!(none.text(), "no thumbnail");
+    }
+    assert_eq!(thumb(&id("wide.png"), 300).code, 400);
+
+    // Kept: by its revision, for good, and asked again by its tag, not sent again.
+    let entry_rev = entry(&root, "wide.png")["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fixed = get(
+        &server,
+        &format!(
+            "/v1/ns/cloud/thumb/{}?size=128&revision={entry_rev}",
+            id("wide.png")
+        ),
+        Auth::Bearer(&t),
+    );
+    assert!(fixed.header("cache-control").unwrap().contains("immutable"));
+    let etag = thumb(&id("wide.png"), 128).header("etag").unwrap();
+    let again = request(
+        &server,
+        "GET",
+        &format!("/v1/ns/cloud/thumb/{}?size=128", id("wide.png")),
+        Auth::Bearer(&t),
+        &[("If-None-Match", &etag)],
+        b"",
+    );
+    assert_eq!(again.code, 304, "{}", again.text());
+
+    // A client's own, for what the server does not decode.
+    let heic = id("IMG_0001.HEIC");
+    let put_thumb = |bytes: &[u8]| {
+        request(
+            &server,
+            "PUT",
+            &format!("/v1/ns/cloud/thumb/{heic}"),
+            Auth::Bearer(&t),
+            &[("Content-Type", "image/jpeg")],
+            bytes,
+        )
+    };
+    assert_eq!(put_thumb(b"not a jpeg").code, 400);
+    assert_eq!(
+        put_thumb(&picture(2000, 100, image::ImageFormat::Jpeg)).code,
+        400
+    );
+    assert_eq!(
+        put_thumb(&picture(512, 384, image::ImageFormat::Png)).code,
+        400
+    );
+    let sent = put_thumb(&picture(512, 384, image::ImageFormat::Jpeg));
+    assert_eq!(sent.code, 204, "{}", sent.text());
+    assert_eq!(dimensions(&thumb(&heic, 256)), (256, 192));
+    assert_eq!(dimensions(&thumb(&heic, 1024)), (512, 384));
+
+    // By a public link: read, never sent.
+    let link = post(
+        &server,
+        "/v1/ns/cloud/shares",
+        Auth::Bearer(&t),
+        json!({"object": ROOT}),
+    )
+    .ok()
+    .json();
+    let link = link["link"].as_str().unwrap().to_string();
+    let by_link = get(
+        &server,
+        &format!("/v1/links/{link}/thumb/{}?size=128", id("wide.png")),
+        Auth::None,
+    );
+    assert_eq!(dimensions(&by_link), (128, 64));
+    let refused = request(
+        &server,
+        "PUT",
+        &format!("/v1/links/{link}/thumb/{heic}"),
+        Auth::None,
+        &[],
+        &picture(64, 64, image::ImageFormat::Jpeg),
+    );
+    assert_eq!(refused.code, 403, "{}", refused.text());
 }

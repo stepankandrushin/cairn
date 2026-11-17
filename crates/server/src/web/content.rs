@@ -80,7 +80,7 @@ impl Write for ChannelWriter {
     }
 }
 
-fn manifest_of(store: &FsChunkStore, hash: &Hash) -> Result<Manifest> {
+pub(super) fn manifest_of(store: &FsChunkStore, hash: &Hash) -> Result<Manifest> {
     let bytes = store
         .get(hash)?
         .ok_or_else(|| anyhow!("manifest {hash} is not on the server"))?;
@@ -88,7 +88,7 @@ fn manifest_of(store: &FsChunkStore, hash: &Hash) -> Result<Manifest> {
 }
 
 /// Bytes `[from, to)` of a file, holes as zeros, each chunk read and checked as it comes.
-fn write_range(
+pub(super) fn write_range(
     store: &FsChunkStore,
     manifest: &Manifest,
     from: u64,
@@ -249,15 +249,15 @@ pub(super) fn disposition(how: &str, name: &str) -> HeaderValue {
 }
 
 /// What a request for a file's bytes is answered from.
-struct FileAt {
-    name: String,
-    revision: RevisionId,
-    manifest: Hash,
-    size: u64,
-    store: Arc<FsChunkStore>,
+pub(super) struct FileAt {
+    pub(super) name: String,
+    pub(super) revision: RevisionId,
+    pub(super) manifest: Hash,
+    pub(super) size: u64,
+    pub(super) store: Arc<FsChunkStore>,
 }
 
-fn file_at(
+pub(super) fn file_at(
     app: &App,
     view: &View,
     object: ObjectId,

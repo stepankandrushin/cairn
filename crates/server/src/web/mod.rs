@@ -23,6 +23,7 @@ pub(crate) mod deleted;
 pub(crate) mod edit;
 pub(crate) mod session;
 mod shares;
+pub(crate) mod thumbs;
 pub(crate) mod upload;
 mod zip;
 
@@ -501,6 +502,12 @@ fn tree_routes() -> Router<Arc<App>> {
         .route("/content/{object}", get(content::content))
         .route("/zip/{object}", get(content::zip))
         .route("/history/{object}", get(history))
+        .route(
+            "/thumb/{object}",
+            get(thumbs::get)
+                .put(thumbs::put)
+                .layer(DefaultBodyLimit::max(thumbs::MAX_CLIENT_BYTES + 1)),
+        )
         .route("/mkdir", post(edit::mkdir))
         .route("/move", post(edit::move_entry))
         .route("/delete", post(edit::delete))

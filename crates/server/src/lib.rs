@@ -52,6 +52,8 @@ struct App {
     touched: tokens::Touched,
     /// The pairing codes waiting to be taken.
     pairing: pairing::Codes,
+    /// Thumbnails, made on the first ask and kept.
+    thumbs: web::thumbs::Thumbs,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -286,6 +288,7 @@ fn features() -> Vec<String> {
         f::PAIRING,
         f::PASSWORDS,
         f::FILE_UPDATE,
+        f::THUMBS,
     ]
     .into_iter()
     .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
@@ -960,6 +963,7 @@ async fn serve(
         naming: std::sync::Mutex::new(()),
         touched: tokens::Touched::default(),
         pairing: pairing::Codes::default(),
+        thumbs: web::thumbs::Thumbs::open(&data)?,
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();

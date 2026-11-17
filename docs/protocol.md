@@ -131,6 +131,7 @@ every client must speak. A server before features sends none.
 | `pairing` | A signed-in device makes a code another device trades for a token of its own [Pairing](#pairing) |
 | `passwords` | A user signs in to the web with a password [Passwords](#passwords) |
 | `file_update` | `PUT /file` changes a file already there, given the revision the client saw [One-request uploads](#one-request-uploads) |
+| `thumbs` | `B/thumb/{object}` thumbnails, and a client's own sent there [Thumbnails](#thumbnails) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -321,6 +322,8 @@ the object is brought back or that user given `manage` again.
 | `GET B/content/{object}?revision=R&download=1` | | The file's bytes, at `R` (a revision of that object) or its head; one `Range: bytes=` range is answered 206 `download=1` asks for `Content-Disposition: attachment` |
 | `GET B/zip/{object}` | | A folder and everything in it as a zip, stored uncompressed, streamed. Symbolic links are left out |
 | `GET B/history/{object}` | | `{revisions}` newest first, each `{revision, seq, time, user?, device_name, kind, size?, mode, mtime}` Not by link |
+| `GET B/thumb/{object}?revision=R&size=S` | | A JPEG of a picture, `S` 128 256 512 or 1024 pixels on its longer side, 256 if not given, never larger than the picture. 404 `no thumbnail` for what has none [Thumbnails](#thumbnails) |
+| `PUT B/thumb/{object}?revision=R` | a JPEG | 204 the client's own thumbnail of a file the server does not decode. Needs `write` [Thumbnails](#thumbnails) |
 | `POST B/mkdir` | `{parent, name}` | `{object, seq}` Needs `write` |
 | `POST B/move` | `{object, from, to}` | `{seq}` - `from` and `to` are links `{parent, name}` a rename is a move in one folder. Needs `write` |
 | `POST B/delete` | `{object, link, base?}` | `{seq, objects}` - a folder goes with everything in it, deepest first, in one commit. With `base` refused unless the object's head is still that revision. Needs `write` |
@@ -381,6 +384,17 @@ database reads the files anyway.
 A user's share reaches no further than what it names: the sync protocol's endpoints answer 404 to a user who
 has only shares in a folder, as they reveal the whole tree. Syncing a share as a root of its own waits for
 mounting one into another root's tree PLAN.md "Sharing and access".
+
+## Thumbnails
+
+A picture's thumbnail is made on its first ask, a JPEG of quality 80 turned as its EXIF says, and kept by its
+file's manifest under the data directory's `thumbs/` so every revision and copy of the same bytes shares
+it. The server decodes JPEG, PNG, WebP and GIF of up to 64 MiB itself, by their first bytes and never their
+name, at most two at once; for anything else, HEIC and video among them, the client that has the file and a
+system that decodes it sends its own, a JPEG of at most 512 KB and 1024 pixels on its longer side, which every
+size is then made from. Anything with neither answers 404 `no thumbnail` and a client shows what it would
+without one. With `revision` the answer is kept by a browser for good, `immutable` without it `no-cache` with
+an `ETag` that `If-None-Match` is answered 304 by. A public link reads thumbnails and sends none.
 
 ## Local API
 

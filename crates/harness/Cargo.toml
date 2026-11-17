@@ -34,6 +34,7 @@ rand.workspace = true
 ring = "0.17"
 serde_json.workspace = true
 rusqlite.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

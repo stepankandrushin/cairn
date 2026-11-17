@@ -14,6 +14,9 @@ data/
   web/uploads/<id>       a web upload's bytes as they arrive, until stored; emptied at startup
   web/session.key        what browsers' sessions are signed with, 0600, made at the first start: removed, a
                          new one is made at the next, and every browser signs in again
+  thumbs/<chunk dir>/ab/abcdef...-<size>.jpg
+                         a picture's thumbnail by its manifest, made on the first ask; `-client.jpg` one a
+                         client sent, which the sizes are made from. A cache: removed, it is made again
 ```
 
 Nothing is renamed or linked between `ns/` and the rest, so `ns/` may be a mount of another filesystem:

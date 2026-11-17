@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.31 2026-11-17
+
+**Added:**
+
+- The Android app says when the phone keeps backup from running in the background, as some phones do without
+  a word. Turn on backup asks to leave the app out of battery optimization, and while it is not the Photos tab
+  says so, with **Allow in the background**. The tab shows when backup last ran in the background, and when
+  something waited and the phone had not let it run there for two hours while the app was closed, it says so
+  in red, with a button to the phone maker's own setting (App launch on Honor and Huawei, Autostart on Xiaomi
+  and vivo, OPPO's startup manager, App Auto-Launch on OnePlus, Samsung's battery settings) or else to the
+  app's info.
+
+**Changed:**
+
+- The Android app's hourly run starts on any network and power, and off the ones chosen only looks for new
+  photos, so that the phone alone can keep it from running; a new photo still goes once they are back.
+
 ## 0.1.30 2026-11-17
 
 **Added:**

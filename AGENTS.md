@@ -5,7 +5,7 @@ versioned history, and clients that sync a real filesystem without losing anythi
 modes, owners, xattrs, hard links, sparse files, filename bytes). Files only: no groupware, no app
 platform.
 
-**Status: 0.1.29 released on cairn.storage and GitHub, milestones 0 to 2 done, and the harness runs in CI.**
+**Status: 0.1.30 released on cairn.storage and GitHub, milestones 0 to 2 done, and the harness runs in CI.**
 Linux, on x86_64 and since 0.1.26 aarch64 a one-shot CLI and a daemon; the same on macOS and Windows with a tray, ahead of milestone 7 and not in
 CI; each installed copy updates itself from signed releases, from cairn.storage, or GitHub when it does not answer. Users, tokens and per-folder read, write and manage
 access, ahead of milestone 5 came in 0.1.12 the web interface, ahead of milestone 6 (browsing, uploads,
@@ -13,7 +13,10 @@ history, recently deleted, members, shares with users and public links, signing 
 0.1.14 Explorer's badges, each entry's state on its icon on Windows, in 0.1.25 an iPhone app, ahead of
 milestone 8 (photo and video backup, browsing with downloads on demand, the Files app read and add only), built
 from source, its core crates/mobile in CI and its Swift not; and, since 0.1.29 an Android app, the same on
-the same core, its APK among each release's files, its Kotlin outside CI. The architecture, the decisions and their reasons,
+the same core, its APK among each release's files, its Kotlin outside CI. In 0.1.30 the server took ahead of
+the clients what they will ask of it, each named in its features: each user's tokens, pairing by a code and
+passwords for the web; thumbnails, a file changed in one request and resumable uploads; and each folder's
+retention and a collection ahead of milestone 4 at the owner's asking. The architecture, the decisions and their reasons,
 and the build order are in PLAN.md - read before writing code, and when work changes a decision,
 rewrite that line of the plan rather than appending to it. Milestone 3 code and failure tests are in; what
 it still needs is its exit criterion, weeks on real trees with no silent loss, a run begun in November 2026

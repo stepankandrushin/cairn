@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.1.29 (2026-11-17)
+## 0.1.29 2026-11-17
 
 **Added:**
 
-- An Android app (android/, built from source with `scripts/release-android.sh`), for Android 11 and later, on
+- An Android app android/ built from source with `scripts/release-android.sh` for Android 11 and later, on
   the iPhone's core: photos and videos backed up to a folder and path of the server as they were taken, from
   the folders switched on (the camera's by default; screenshots and screen recordings, and each other app's
   folder, off until switched on, and changeable while backup runs), their location kept, named as the camera named them or as Nextcloud's iOS app
@@ -12,23 +12,23 @@
   only unless chosen otherwise; the server's folders browsed live, with thumbnails, a file downloaded only when
   opened and a video streamed; and each chosen folder in the system's Files picker, which downloads on demand
   and adds new files and folders, each queued like a photo before it is sent. Its APK,
-  `cairn-<v>-android.apk`, is among the release's files on cairn.storage and GitHub, signed by the project's
+  `cairn-<v>-android.apk` is among the release's files on cairn.storage and GitHub, signed by the project's
   key; the app does not update itself, so a later one is installed over it.
 - crates/mobile builds for Android (a shared library, and its start for Android's certificate checks), and the
   engine, a client library there, builds for Android as on Linux.
 
-## 0.1.28 (2026-11-15)
+## 0.1.28 2026-11-15
 
 **Added:**
 
-- An iPhone app (ios/, built from source with `scripts/release-ios.sh`): photos and videos backed up to a folder
+- An iPhone app ios/ built from source with `scripts/release-ios.sh` - photos and videos backed up to a folder
   and path of the server, originals as they are, named as Nextcloud's iOS app named them or as on the phone,
   sent by the system in the background and by the app; the server's folders browsed live, with thumbnails, a
   file downloaded only when opened; and the Files app, which shows a folder, downloads on demand and adds new
-  files and folders. Its core, crates/mobile, is Rust through uniffi, ready for Android.
-- `PUT /v1/ns/{ns}/file`: a new file in one request, stored as it arrives and committed as the device that sent
+  files and folders. Its core, crates/mobile is Rust through uniffi, ready for Android.
+- `PUT /v1/ns/{ns}/file` a new file in one request, stored as it arrives and committed as the device that sent
   it, missing folders on its path made with it, a name taken by other bytes refused or numbered, and a retry of
-  a request whose answer was lost the same commit (docs/protocol.md, "One-request uploads").
+  a request whose answer was lost the same commit docs/protocol.md "One-request uploads".
 
 - The web interface's preview steps through the folder's files, in the order the list shows them: → or Space
   to the next, ← or Shift+Space to the one before, or the arrows at the preview's foot, beside "3 of 12". The
@@ -41,26 +41,26 @@
   the check went where it only said it had asked: "Checking for a new version…" until the updater has finished,
   then, in green, "✓ Up to date: 0.1.x is the latest" once the tray and every daemon run it, or what it
   installed and that the tray and the daemons restart into it, or, in red, why it could not. The updater now
-  writes when each run ended (`tried` in `update-state.json`), so a check that fails just as the one before
+  writes when each run ended `tried` in `update-state.json` so a check that fails just as the one before
   did is seen to have ended too.
 
 **Fixed:**
 
 - On macOS 27 the tray's menu showed none of its icons, the symbols by its items and the coloured dot by each
   root's status, which macOS 26 and Windows show: macOS 27 hides a menu item's image unless the item asks for
-  it to be shown (`preferredImageVisibility`), and each item with an image now asks.
+  it to be shown `preferredImageVisibility` and each item with an image now asks.
 
-## 0.1.27 (2026-11-14)
+## 0.1.27 2026-11-14
 
 **Changed:**
 
 - The server reads a download's chunks 32 at once, handing them on in the order asked, where it read one
   after the other: a store on hard disks reorders what it has queued, and on a mirror of two, cold chunks
   of under 64 KiB came 4 to 5 times as fast, both disks at work. A device's first sync is bound by this. What
-  is read ahead is bounded (16 MiB, or 64 chunks, beyond the next to be sent), and a download still ends at
+  is read ahead is bounded 16 MiB, or 64 chunks, beyond the next to be sent, and a download still ends at
   the first chunk missing or damaged in the order asked, as before.
 - The tray's menu lists Recently deleted, Problems and Conflicts in submenus, as it lists Recent activity, so
-  pointing at one shows them, every root's and up to 100, without opening the window; Recently deleted comes
+  pointing at one shows them, every root's and up to 100 without opening the window; Recently deleted comes
   next to Recent activity, before Problems. A click on a problem or on something deleted opens its tab in the
   window, and one on a conflict shows its copy in its folder; each ends with "Open in the window…". The tray
   asks each daemon for both lists once it answers, and again when its activity shows a conflict made or its
@@ -88,7 +88,7 @@
   daemon replayed the server's whole journal, 13 s for a large root's on a fast machine and more than a minute
   on a Mac. It now reads them from its base, the server's tree at its last sync, brought up to the head by
   the journal since, with the one commit that made each copy still there, and answers in a few hundredths of
-  a second; `cairn conflicts` does the same, and `--all`, which says where each copy dealt with was made,
+  a second; `cairn conflicts` does the same, and `--all` which says where each copy dealt with was made,
   still reads the whole journal.
 - A daemon wrote each status to `.cairn/daemon.json` a moment before its local API had it: a program that
   found a status in the file and then asked the daemon, through `cairn status` or the tray, could be told the
@@ -99,41 +99,41 @@
   macOS, where it sat at the bottom next to Settings; each root's actions and status lines now read up from
   the icon too, Sync now nearest it.
 
-## 0.1.26 (2026-11-13)
+## 0.1.26 2026-11-13
 
 **Added:**
 
-- Linux on ARM64: `cairn-<v>-linux-aarch64`, the client (the CLI and daemon), static as the x86_64 one, which
+- Linux on ARM64 - `cairn-<v>-linux-aarch64` the client (the CLI and daemon), static as the x86_64 one, which
   installed copies on aarch64 update to. The server stays x86_64 alone. The release builds it on x86_64 with
-  cargo-zigbuild, zig as its C compiler and linker, and runs its checks and the smoke test under qemu-aarch64,
+  cargo-zigbuild, zig as its C compiler and linker, and runs its checks and the smoke test under qemu-aarch64
   against the x86_64 server.
 
-## 0.1.25 (2026-11-13)
+## 0.1.25 2026-11-13
 
 **Added:**
 
 - On Windows, Explorer shows each entry of a root with a badge on its icon, as Nextcloud's client does: a green
   check once synced, blue arrows while a change here waits or a sync moves it, a red cross on what is not
-  synced, with the reason in `cairn status`, and a yellow mark on each folder above one, on a file whose metadata
+  synced, with the reason in `cairn status` and a yellow mark on each folder above one, on a file whose metadata
   this filesystem refused, and on a paused root. What this device excludes has none. `cairn explorer on` turns
   them on, once, asking for an administrator to list the handlers for Explorer, and Explorer shows them once it
   starts again; `cairn explorer status` says whether they are on and where they come among Explorer's overlay
-  handlers, of which it shows the first 11; `cairn explorer off` takes them away. cairn.exe carries the handler,
+  handlers, of which it shows the first 11 `cairn explorer off` takes them away. cairn.exe carries the handler,
   and a daemon on a newer version moves the badges to its own. A root shows them once its daemon runs this
   version.
 - The daemon's badges are on the local API for any program to show: `badges { folder }` and `watch_badges`
-  (docs/protocol.md, "Badges").
+  docs/protocol.md "Badges".
 
-## 0.1.24 (2026-11-13)
+## 0.1.24 2026-11-13
 
 **Changed:**
 
 - On macOS the bundles have new identifiers, named for the project's domain, cairn.storage: Cairn.app is
-  `storage.cairn`, where it was `com.cairn.sync`, and Cairn Tray.app `storage.cairn.tray`, where it was
-  `com.cairn.tray`. macOS keeps its permissions by them, so a Mac that updates from 0.1.23 or before asks once
+  `storage.cairn` where it was `com.cairn.sync` and Cairn Tray.app `storage.cairn.tray` where it was
+  `com.cairn.tray` macOS keeps its permissions by them, so a Mac that updates from 0.1.23 or before asks once
   more, "Allow "Cairn" to find devices on local networks?", if its daemon reaches a server on the same local
   network; until it is answered nothing syncs there, though nothing is lost. The tray set to start at login moves
-  itself to its new agent, `storage.cairn.tray`, as it starts, and removes `com.cairn.tray.plist`. A daemon's
+  itself to its new agent, `storage.cairn.tray` as it starts, and removes `com.cairn.tray.plist` A daemon's
   agent written from README.md names the old identifier, and goes on starting the daemon, but Login Items may no
   longer show it as Cairn: `launchctl bootout` it, write it anew as README.md has it, with
   `AssociatedBundleIdentifiers` `storage.cairn` and the label `storage.cairn.daemon.<root>` (the word `daemon`
@@ -142,52 +142,52 @@
   `~/Library/WebKit/com.cairn.tray` and `~/Library/Caches/com.cairn.tray` on macOS,
   `%LOCALAPPDATA%\com.cairn.tray` on Windows.
 - On Linux the client and the server are files of their own, as each goes on a different machine:
-  `cairn-<v>-linux-x86_64`, cairn, the CLI and daemon, which installed copies update to as before, and
-  `cairn-<v>-linux-x86_64-server`, cairn-server, each the program alone, where `cairn-<v>-linux-x86_64.tar.gz`
+  `cairn-<v>-linux-x86_64` cairn, the CLI and daemon, which installed copies update to as before, and
+  `cairn-<v>-linux-x86_64-server` cairn-server, each the program alone, where `cairn-<v>-linux-x86_64.tar.gz`
   held both.
 
-## 0.1.23 (2026-11-13)
+## 0.1.23 2026-11-13
 
 **Changed:**
 
 - Each program is shown by its own name, the same on every platform. Cairn, the main program, the CLI and
-  daemon, is `cairn` (`cairn.exe` on Windows) as before, and macOS and Windows now show it as "Cairn", where they
-  showed "Cairn Sync": on macOS its bundle is Cairn.app, where it was Cairn Sync.app, and so Login Items and Local
+  daemon, is `cairn` `cairn.exe` on Windows as before, and macOS and Windows now show it as "Cairn", where they
+  showed "Cairn Sync": on macOS its bundle is Cairn.app where it was Cairn Sync.app and so Login Items and Local
   Network name it; on Windows its version information, which Task Manager shows, says Cairn. Cairn Tray, the
   tray, which nothing needs, is `cairn-tray` and shown as "Cairn Tray", where it was "Cairn": on macOS its bundle
-  is Cairn Tray.app, where it was Cairn.app, and the name is in its Windows version information, its window's
+  is Cairn Tray.app where it was Cairn.app and the name is in its Windows version information, its window's
   title, its menu's Quit, the Run key's value on Windows and the autostart entry on Linux. The bundle
   identifiers, and with them each permission macOS keeps, are unchanged.
 - The release's files name the tray alone: `cairn-<v>-linux-x86_64` (cairn alone), `cairn-<v>-linux-x86_64.tar.gz`
-  (cairn and cairn-server), `cairn-<v>-macos-universal.app.tar.gz` (Cairn.app) and `-tray.app.tar.gz` (Cairn
-  Tray.app), `cairn-<v>-windows-x86_64.exe` (cairn.exe) and `-tray.exe` (cairn-tray.exe), where cairn's ended in
-  `-sync`.
+  (cairn and cairn-server), `cairn-<v>-macos-universal.app.tar.gz` Cairn.app and `-tray.app.tar.gz` (Cairn
+  Tray.app), `cairn-<v>-windows-x86_64.exe` cairn.exe and `-tray.exe` cairn-tray.exe where cairn's ended in
+  `-sync`
 - A copy of 0.1.21 updates itself to it and keeps its paths. On Windows the tray goes on starting at login by
-  the Run key's old value, `Cairn`, which it takes for its own and removes once it is set either way. On macOS
-  the new bundles go in under the old names, Cairn Sync.app and Cairn.app, which Finder and Login Items may still
-  show. To rename them: `launchctl bootout` both agents (`com.cairn.tray`, and the daemon's), rename Cairn.app to
-  Cairn Tray.app, then Cairn Sync.app to Cairn.app, point `~/.local/bin/cairn` and the daemon's agent at
-  `Cairn.app/Contents/MacOS/cairn`, run `cairn-tray --login on` from the renamed tray, and `launchctl bootstrap`
+  the Run key's old value, `Cairn` which it takes for its own and removes once it is set either way. On macOS
+  the new bundles go in under the old names, Cairn Sync.app and Cairn.app which Finder and Login Items may still
+  show. To rename them: `launchctl bootout` both agents `com.cairn.tray` and the daemon's, rename Cairn.app to
+  Cairn Tray.app then Cairn Sync.app to Cairn.app point `~/.local/bin/cairn` and the daemon's agent at
+  `Cairn.app/Contents/MacOS/cairn` run `cairn-tray --login on` from the renamed tray, and `launchctl bootstrap`
   the daemon's agent.
 
-## 0.1.22 (2026-11-13)
+## 0.1.22 2026-11-13
 
-Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
+Not published: it renamed the CLI `cairn-sync` which 0.1.23 takes back.
 
-## 0.1.21 (2026-11-13)
+## 0.1.21 2026-11-13
 
 **Changed:**
 
 - The release's files are named by platform, then program, so a release page that sorts by name groups each
   platform's together, and each program has one name everywhere: `cairn-<v>-linux-x86_64-sync` (cairn alone),
   `cairn-<v>-linux-x86_64.tar.gz` (cairn and cairn-server), `cairn-<v>-macos-universal-sync.app.tar.gz` (Cairn
-  Sync.app) and `-tray.app.tar.gz` (Cairn.app), `cairn-<v>-windows-x86_64-sync.exe` (cairn.exe) and
-  `-tray.exe` (cairn-tray.exe). One file, `cairn-<v>.sha256`, holds every file's SHA-256, in place of a
-  `.sha256` beside each: `sha256sum -c --ignore-missing cairn-<v>.sha256`. Installed copies update from the new
-  names as before, as each finds its file by program and platform in update.json; installed, the programs keep
+  Sync.app) and `-tray.app.tar.gz` Cairn.app `cairn-<v>-windows-x86_64-sync.exe` cairn.exe and
+  `-tray.exe` cairn-tray.exe One file, `cairn-<v>.sha256` holds every file's SHA-256 in place of a
+  `.sha256` beside each: `sha256sum -c --ignore-missing cairn-<v>.sha256` Installed copies update from the new
+  names as before, as each finds its file by program and platform in update.json installed, the programs keep
   their names. Releases before keep theirs.
 
-## 0.1.20 (2026-11-13)
+## 0.1.20 2026-11-13
 
 **Changed:**
 
@@ -199,14 +199,14 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   keeps whole only what the ledger does not account for: of the rest, the object each is, some 30 bytes an
   entry, where it held a node of about 800 bytes for every entry, those a daemon's sync takes from the ledger
   without listing them too. The ledger is held as the state stores it, about 150 bytes an entry instead of
-  300, and asked rather than copied into a map of every row by inode. A sync with nothing to do asks the
+  300 and asked rather than copied into a map of every row by inode. A sync with nothing to do asks the
   ledger too, instead of reading every row. What a round takes in of what was sorted away is made again from
   its ledger entry and row, and checked against what the ledger says was read. A sync takes as long as it
-  did, but for the first after an update, which walks the tree once more (22 s there, 18 before). A harness
+  did, but for the first after an update, which walks the tree once more 22 s there, 18 before. A harness
   build keeps every node whole beside what was sorted, and fails a sync unless the rows the walk was given,
   the check and a rebuild come out the same from either.
 
-## 0.1.19 (2026-11-12)
+## 0.1.19 2026-11-12
 
 **Changed:**
 
@@ -214,23 +214,23 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   new files are written up to 64 at a time and, where a flush waits on the disk, flushed together, so a
   journaling filesystem commits them in a few flushes rather than one each. Each is still whole and durable
   before it appears at its name, checked against what is there in its own turn, and placed in the same order as
-  before. A first sync of 50,000 small files on two NVMe drives in RAID1 took 32 s, where it took 261.
+  before. A first sync of 50,000 small files on two NVMe drives in RAID1 took 32 s, where it took 261
 
-## 0.1.18 (2026-11-12)
+## 0.1.18 2026-11-12
 
 **Added:**
 
 - Folders added and renamed in the web interface. The + beside Folders in the sidebar adds a folder of the
   user's own, which they manage and nobody else reaches until given access: what they call it, and its name
-  on the server, made of that (`Family photos` as `family-photos`) until they change it. Each folder has a page
+  on the server, made of that `Family photos` as `family-photos` until they change it. Each folder has a page
   of its settings, opened from Folder settings under it in the sidebar or from its level beside its name, which
   until now did nothing when clicked: its name on the server, which a manager renames there, the user's own
   name for it, their access, and the command that syncs it on a computer.
 - A folder renamed while the server serves, by a manager of it, in one transaction, its chunks left where
   they are: what was begun by the former name as it was renamed goes on in the same folder, a commit or a web
-  upload in flight lands in it, and the former name goes on reaching it as after `cairn-server folder rename`,
+  upload in flight lands in it, and the former name goes on reaching it as after `cairn-server folder rename`
   which stays for the server stopped. The API is `POST /v1/folders` and `POST /v1/ns/{ns}/rename`
-  (docs/protocol.md); a name that is or was another folder's is refused, saying nothing of that folder.
+  docs/protocol.md a name that is or was another folder's is refused, saying nothing of that folder.
 - A light and a dark theme in the web interface, switched by a button at the right end of the top bar (on the
   sign-in page and a public link's page too) and chosen in Settings, Theme, which also goes back to following
   the device. Kept in that browser; until something is chosen it is light or dark as the device is, as before.
@@ -238,16 +238,16 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 **Changed:**
 
 - Updates come from cairn.storage, where each release's files are, with its downloads page
-  (https://cairn.storage/download/), and from GitHub's latest release only when that does not answer. `cairn
+  https://cairn.storage/download/ and from GitHub's latest release only when that does not answer. `cairn
   update` says which feed answered, and what the one before it said when it did not, so a fallback never hides
   a feed that is down. Several feeds, comma-separated, are asked in order wherever one is named: a build's
-  `CAIRN_UPDATE_FEED`, `update-settings.json`'s `feed`, `--feed`. A release's `update.json` names its files
+  `CAIRN_UPDATE_FEED` `update-settings.json`'s `feed` `--feed` A release's `update.json` names its files
   beside it, so the one signed file serves from either; copies of 0.1.17 and before, which ask GitHub alone,
   take this release there.
 - In the web's file list and on Shared with me, a click anywhere in the name's cell opens the item: its icon and
   the space around and beside the name too, where only the name itself did.
 
-## 0.1.17 (2026-11-11)
+## 0.1.17 2026-11-11
 
 **Added:**
 
@@ -257,23 +257,23 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   A device offers the name of the directory it syncs the folder into, as `cairn init` joins and each time its
   daemon starts, which the server keeps only while the user has none: a folder synced into `~/Sync` shows as
   "Sync" until they choose another.
-- `cairn-server folder rename <from> <to>`, with the server stopped: one transaction, the folder's chunks left
+- `cairn-server folder rename <from> <to>` with the server stopped: one transaction, the folder's chunks left
   where they are, so nothing is moved or copied; its former name goes on reaching it, so every device, link
   and bookmark made with it goes on working. Each device takes the new name up at its next sync, and no other
   folder may take the former name; `folder list` shows it.
 
 **Changed:**
 
-- A new server's first folder is `cloud`, where it was `default`; a server from before keeps its `default`
+- A new server's first folder is `cloud` where it was `default` a server from before keeps its `default`
   and gets no second one. `cairn init` without `--folder` syncs the one folder the token reaches, whatever its
-  name, and with several names them and asks which, where it took `default`.
-- The server's database is schema 5: a renamed folder's former names, each user's own names for folders, and
+  name, and with several names them and asks which, where it took `default`
+- The server database is schema 5 - a renamed folder's former names, each user's own names for folders, and
   where a renamed folder keeps its chunks. A server moves a database of schema 4 to it when it starts, in one
   transaction, so a kill or a full disk leaves 4 or 5 whole. A server of schema 4 refuses it; `cairn-server
-  downgrade --data <dir>`, with the server stopped, now moves it back one schema each time it runs: to 4,
-  dropping what schema 5 added, once no folder is renamed away from its first name, then to 3.
+  downgrade --data <dir>`, with the server stopped, now moves it back one schema each time it runs: to 4
+  dropping what schema 5 added, once no folder is renamed away from its first name, then to 3
 
-- The web interface writes times on a 24-hour clock and dates as year-month-day (`2026-11-11 09:50`), where it
+- The web interface writes times on a 24-hour clock and dates as year-month-day `2026-11-11 09:50` where it
   followed the browser's locale. Its new Settings page, at the top of every page, chooses a 12-hour clock or
   another date order; the choice is kept in that browser.
 - The web's sidebar gives a folder's Recently deleted, Members, and Shares and links an icon each, and Shared
@@ -287,7 +287,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   the page narrows, the Was in and By columns, then Size and Deleted, move to lines under the name, and a
   path breaks after a `/` rather than inside a word.
 
-## 0.1.16 (2026-11-11)
+## 0.1.16 2026-11-11
 
 **Fixed:**
 
@@ -296,21 +296,21 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   changes nothing, so it now counts as no change, grouped or one to each file; the sync takes only what
   did change, and `cairn log` shows the note as before.
 
-## 0.1.15 (2026-11-11)
+## 0.1.15 2026-11-11
 
 **Changed:**
 
 - The server keeps each revision's body once, as a binary record, where it kept it twice as JSON: in the
-  commit and again in the table of revisions. Its database is schema 4, about a quarter of the size (a real
+  commit and again in the table of revisions. Its database is schema 4 about a quarter of the size (a real
   one, 1.3 GB, became 361 MB), and reading it is a little faster. What it sends is the same, byte for byte.
   A server of this release moves a database of schema 3 when it starts, in one transaction, after checking
-  for room, and gives the freed space back; `cairn-server downgrade` moves it back to schema 3, for a server
+  for room, and gives the freed space back; `cairn-server downgrade` moves it back to schema 3 for a server
   from before.
 - `cairn-server fsck` also checks that each revision is named by the commit that made it.
 - A commit's notes of one text, the losers of a merge, go as one note naming each object, where they went
   as one to each: a device joining on another umask wrote the same "mode: kept 664 from the server; this
   device had 644" for every file. `cairn log` says how many each names. A client sends them so only to a
-  server of this release, which says it takes them (`/info`'s `note_groups`); to an older one, a note to
+  server of this release, which says it takes them `/info`'s `note_groups` to an older one, a note to
   each object as before. A client from before reads one as a note of its first object.
 
 **Fixed:**
@@ -318,7 +318,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - The web's Recently deleted opens at once and lists all of the last 30 days, from an index the server
   keeps in memory, rather than reading the journal back on each request, which took minutes on a busy disk.
 
-## 0.1.14 (2026-11-10)
+## 0.1.14 2026-11-10
 
 **Added:**
 
@@ -336,32 +336,32 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - Signing in from a device, with nothing to type: the tray's Open in browser, and `cairn web` in a synced
   folder, open the web interface signed in as that device, by a ticket that works once within two minutes.
   The browser keeps a session the server signed, never the token, and removing the token signs it out.
-- Endpoints for all of it, which any client may use (docs/protocol.md, "Web"), and schema 3 on the server,
+- Endpoints for all of it, which any client may use docs/protocol.md "Web", and schema 3 on the server,
   which adds the table of shares.
 
-## 0.1.13 (2026-11-09)
+## 0.1.13 2026-11-09
 
 **Fixed:**
 
-- The tray's "Open in browser" opened a page saying only `missing or wrong token`, which read as a client
+- The tray's "Open in browser" opened a page saying only `missing or wrong token` which read as a client
   that had lost its token. The server's address now answers a browser with a page saying it is a Cairn
   server, that there is no web interface yet, and where the files and their history are; it names no
   version, user or folder. Everything else on the server still needs a token.
 
-## 0.1.12 (2026-11-09)
+## 0.1.12 2026-11-09
 
 **Added:**
 
 - Users. A server holds users, each with tokens of its own, one per device at best, and folders, each its own
   tree, history and set of chunks. A user reaches only the folders given to it, at one of three levels:
-  `read`, `write`, or `manage`, which is write and also saying who else has access. A folder a user has no
+  `read` `write` or `manage` which is write and also saying who else has access. A folder a user has no
   access to answers as one that does not exist. The server's administrator manages all of it with
-  `cairn-server user`, `token`, `folder`, `grant` and `revoke`, while the server runs or not; a folder's
-  managers share it with `cairn access grant` and `revoke`, never leaving it without a manager. `cairn
+  `cairn-server user` `token` `folder` `grant` and `revoke` while the server runs or not; a folder's
+  managers share it with `cairn access grant` and `revoke` never leaving it without a manager. `cairn
   folders` lists what a token reaches, `cairn init --folder` makes a root of one, and `cairn log` says which
   user made each commit.
 - Read-only folders. Everything in one comes down, and nothing made on the reader's devices goes up or is lost
-  there: an edit, a new file or a rename stays as it is, listed by every sync as `read-only`, until it is
+  there: an edit, a new file or a rename stays as it is, listed by every sync as `read-only` until it is
   moved out of the root or the user may write, when it goes up like any change; something deleted there comes
   back from the server; where the server changes something also changed there, both stay, the server's at the
   name. Such a sync completes as any other and costs no more, and the daemon does not try it again for
@@ -373,10 +373,10 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   file once it has been upgraded: the first start of this release makes that token the user `admin`'s,
   managing every folder there is, so every device using it goes on as before. Clients from before this
   release work with it unchanged, and are refused uploads to a folder they may only read, with the reason.
-- `cairn-server init` makes the user `admin` with the folder `default`, and refuses a directory that already
+- `cairn-server init` makes the user `admin` with the folder `default` and refuses a directory that already
   holds a server's data.
 
-## 0.1.11 (2026-11-09)
+## 0.1.11 2026-11-09
 
 **Changed:**
 
@@ -400,7 +400,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   seconds; on Windows that destroyed the menu on screen, which then shrank to an empty 6 by 6 pixel box. The
   menu is no longer touched while open, and is brought up to date as it closes.
 
-## 0.1.10 (2026-11-08)
+## 0.1.10 2026-11-08
 
 **Fixed:**
 
@@ -408,7 +408,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   1.9 GB on a tree of 568k entries, shown as Cairn Sync in Activity Monitor, with about 1 MB of it in use. The
   system's allocator keeps the blocks of 64 KiB and more that a program frees, for later, and the call the daemon
   made at each sync's end to give memory back frees none of them there. The daemon now starts itself again, in the
-  same process, with that cache off (`MallocLargeCache=0`), and holds about 15 MB between syncs on that tree. A
+  same process, with that cache off `MallocLargeCache=0` and holds about 15 MB between syncs on that tree. A
   daemon started with the variable set already, to any value, is left as it is.
 - On Windows an idle daemon could hold a few hundred megabytes it no longer used, shown as Cairn Sync in Task
   Manager: 441 MB between syncs of a file or two on a tree of 568k entries. Once a big sync (the first after a
@@ -422,22 +422,22 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   the syncs freed, and the allocator of the Linux build has no call to make it. Each path is now one run of bytes
   in one buffer, and a walk that finds a path as it was makes nothing; the watcher's marks of where something
   happened are one block each too. On a tree of that one's 65k folders, with a reconcile every 2 minutes: 25 MB
-  between syncs where it held 54 to 60 MB, with 16 MB in use where it had 24.
+  between syncs where it held 54 to 60 MB, with 16 MB in use where it had 24
 - On Linux each update a daemon restarted into, in the same process, kept the version before's inotify watches:
   a whole tree's more at each update, counted against the kernel's limit on watches until the daemon stopped,
   and enough updates would reach it, after which every sync lists the whole tree. Every descriptor the daemon
   holds is now closed when it restarts.
 
-## 0.1.9 (2026-11-08)
+## 0.1.9 2026-11-08
 
 **Added:**
 
-- Recently deleted, in the tray and as `cairn deleted` and `cairn undelete`: what is deleted and still deleted, from
+- Recently deleted, in the tray and as `cairn deleted` and `cairn undelete` what is deleted and still deleted, from
   the server's history, newest first, with when, by which device, its size, and for a folder how many files went
   with it, listed once. Restore brings it back on every device as it was when deleted, a folder with what was
   deleted in it, replacing nothing: where its name has been taken since, it comes back beside it under a restored
   copy's name. It is one commit, so a kill leaves nothing or all of it. The tray's tab has a search, a choice of
-  7, 30 or 90 days, ticks and Restore selected, and draws 200 at a time. It is where a file an antivirus removed
+  7 30 or 90 days, ticks and Restore selected, and draws 200 at a time. It is where a file an antivirus removed
   is found too, as that is a delete to every device, and it needs nothing of any antivirus. On a tree of 2.66
   million journal operations, the list takes 8 s and 234 MB, where `cairn history` takes 20 s and 1.7 GB; a
   daemon keeps its index for 10 minutes, so what follows takes only what is new.
@@ -446,7 +446,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 
 - On Windows a file with a long name, 77 bytes or more, could stay at an old version for good, and could not be
   deleted there either, failing every sync with "destination cannot represent this (The filename, directory
-  name, or volume label syntax is incorrect. (os error 123))". The temporary name it is moved aside under carries
+  name, or volume label syntax is incorrect. os error 123)". The temporary name it is moved aside under carries
   the start of its own name, cut to fit, and where the cut fell just after a dot or a space Windows refused it.
   The cut now never ends in one. Each attempt also left its download beside the file, a leftover that sends the
   next sync through the whole tree to settle it rather than only what changed: on a large tree on a hard disk,
@@ -455,7 +455,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   to read on one device or to write on another: an access list, another program holding it, a program that guards
   files, a failing disk. Reads were held already; now a refused write says "waiting for permission" with the
   system's own words instead of "destination cannot represent this", Windows' codes for a file blocked or removed
-  as a threat (225, 226) and for a policy, a lock or a failing disk are told by kind, with the hint on Windows
+  as a threat 225 226 and for a policy, a lock or a failing disk are told by kind, with the hint on Windows
   that another program or security software may block it, and `cairn status` lists what the daemon's last sync
   skipped. A refused file no longer holds every other change back for up to a minute in the daemon: it is tried
   again on the backoff, and clears by itself once let in. A tree most of which is refused pauses, as one most of
@@ -471,32 +471,32 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   cache had dropped the file, every page was a seek: a Windows PC whose tree is on a hard disk read it 4 KiB at a
   time, 166 reads a second. A sync now reads the state's file through once as it starts, in the file's order and
   in pieces of a MiB, so the disk goes at its sequential rate and what follows finds it cached. On Linux, with a
-  state of 40,000 files joined and rewritten four times (256 MB) dropped from the cache, a sync after a rule changed read it
+  state of 40,000 files joined and rewritten four times 256 MB dropped from the cache, a sync after a rule changed read it
   in 244 reads in one sequential run before loading, where loading had taken 5,311 reads at 4,329 places and its
-  first round another 14,541 at 7,461; a sync with nothing to do, 10,616 at 6,605. A state over a quarter of the
+  first round another 14,541 at 7,461 a sync with nothing to do, 10,616 at 6,605 A state over a quarter of the
   machine's memory, which the cache would not keep, is read as before.
 - The state of a sync root never shrank. A join, or any sync that rewrites or deletes much, leaves its file
   mostly free pages, which SQLite reuses but never gives back: on the devices of a tree of 558,000 entries the
   state stood at 1.6 to 2.7 GB, over half of it free, and each sync's read of it went through all of it. Once a
   sync that leaves over half of the file free has been reported, the state is now rewritten without them,
   every table in key order, which only the daemon's log mentions. On copies of two of those states, 2.34
-  GB came to 0.98 GB in 3.5 s (Linux, NVMe) and 2.65 GB to 1.08 GB in 7.7 s (an M1's SSD), with 70 to 85 MB more
+  GB came to 0.98 GB in 3.5 s (Linux, NVMe) and 2.65 GB to 1.08 GB in 7.7 s (an M1 SSD), with 70 to 85 MB more
   memory and about twice what the state holds of room for the moment. Where a disk lacks that room it is put
   off, and the log says so once; a kill or a full disk partway through leaves the state as it was.
 - The state held each file's details two and three times over, as JSON text: the base node and the row each in
   a table of its own, the row repeating the node's content, metadata and entries, and repeating its own metadata
-  as `scan` and `applied`, with every hash and ID in hex and every name in base64. A row and its node now share
+  as `scan` and `applied` with every hash and ID in hex and every name in base64 A row and its node now share
   one SQL row as binary records, the row written against the node, so it holds only what differs from it
   (usually the device and inode alone), and manifests are stored as their fields, their canonical JSON made
   again when one is read and checked against its hash. The first build of this layout to open a state moves it,
   in one transaction, after checking the disk has room; the next sync rebuilds the ledger and compacts the file.
   On copies of two states of a tree of 568,000 entries, what their nodes, rows and manifests took went from 1.0
-  GiB to 144 MiB in a move of 3.4 s (Linux, NVMe), and from 1.2 GiB to 188 MiB in 7.7 s (an M1's SSD), every
+  GiB to 144 MiB in a move of 3.4 s (Linux, NVMe), and from 1.2 GiB to 188 MiB in 7.7 s (an M1 SSD), every
   record decoding to what it was; compacted, the files came to 131 and 174 MiB before the ledger, from 2.34 and
   2.65 GB. A kill or a full disk during the move leaves the state as it was, and a disk short of room stops the
   sync until there is room. An older build refuses a state this one has moved.
 - On Windows, Task Manager showed the daemon as a bare `cairn.exe` with the generic program icon and no
-  description, beside the tray's "Cairn": the gap macOS had until 0.1.8. Windows takes a program's name and icon
+  description, beside the tray's "Cairn": the gap macOS had until 0.1.8 Windows takes a program's name and icon
   from its file, and `cairn.exe` had neither. It now carries the daemon's icon, the cairn inside two sync arrows
   that Cairn Sync.app has, and version information naming it "Cairn Sync", product "Cairn", at the release's
   version, so Task Manager and the file's Properties show it so. The commands are the same program and show the
@@ -542,12 +542,12 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - A long sync looked like a hung one. A Mac's daemon took in a folder its rules had left out until then, 73,498
   files and about 700 GB already there, and read each to hash it: one thread busy for 54 minutes, nothing in the
   log from the line before to the one after, and `cairn status` saying "synced", the last sync's outcome, with no
-  word that one was running. While a sync runs, `cairn status`, `cairn status --all` and the tray now say so and
+  word that one was running. While a sync runs, `cairn status` `cairn status --all` and the tray now say so and
   what it is doing: its phase (loading the state, the server's journal, looking at the tree, working out what to
   do, applying, uploading, committing, recording), how far it has got there (entries looked at of about how many,
   steps applied, chunks uploaded, commits sent), the files and bytes it has read to hash them and the file it is
   reading, the bytes downloaded and uploaded of how many, how long it has run and when anything in it last moved.
-  The local API's status carries the same as `progress`, sent again every 2 s. A sync still running a minute after
+  The local API's status carries the same as `progress` sent again every 2 s. A sync still running a minute after
   it began says it in the daemon's log, and again every 5 minutes; one in which nothing has moved for 10 minutes
   says so there, once, and again when it moves; and the line at a sync's end says what it read to hash and how
   long it took, now also for a sync that changed nothing but took a minute.
@@ -564,21 +564,21 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   update now` installs at once and waits for the daemons; `cairn update auto|notify|off` sets how (the tray's
   Settings tab too, with an Update now button and the menu saying when one is available); `cairn update rollback`
   goes back. Only a release signed with the project's own Ed25519 key is installed, each file checked by its size
-  and SHA-256, and on macOS a bundle signed by the team of the one it replaces. The new program must run and say
+  and SHA-256 and on macOS a bundle signed by the team of the one it replaces. The new program must run and say
   its version before it is put in place, by a rename, with the one before kept; a kill or a full disk at any step
   leaves a whole program, and a version on which a daemon keeps dying before it syncs is taken back by itself. A
   release on a newer protocol waits until the server speaks it; the server is never updated by itself. A build of
   one's own updates from nobody's releases unless it names a feed and keys of its own. `cairn-release` makes the
-  key and signs a release's `update.json`; scripts/release-macos.sh, release-windows.ps1 and release-update.sh
+  key and signs a release's `update.json` scripts/release-macos.sh release-windows.ps1 and release-update.sh
   build, sign and describe the macOS and Windows halves. This release is the last to be installed by hand.
-- On macOS the daemon can run from its own app bundle, Cairn Sync.app, which `tray/macos/bundle.sh` makes around the
+- On macOS the daemon can run from its own app bundle, Cairn Sync.app which `tray/macos/bundle.sh` makes around the
   `cairn` binary, so that System Settings shows it as Cairn Sync with its icon, in Login Items and in the privacy
   lists, where it was a bare `cairn` with the generic executable's tile; the Local Network prompt names it and says
   why it asks. README.md has the launchd agent for it. The tray's agent now names Cairn.app
-  (`AssociatedBundleIdentifiers`), so Login Items shows Cairn rather than `cairn-tray`.
+  `AssociatedBundleIdentifiers` so Login Items shows Cairn rather than `cairn-tray`
 - New icons for both, a cairn of three stones, the daemon's inside two sync arrows, drawn on macOS's icon grid and
   compiled into an asset catalog when Xcode is installed, as macOS 26 and later draw a plain icon on a gray tile at
-  small sizes. `bundle.sh` signs with `CAIRN_SIGN`, an Apple-issued certificate, with which Login Items ties each
+  small sizes. `bundle.sh` signs with `CAIRN_SIGN` an Apple-issued certificate, with which Login Items ties each
   agent to its app and macOS keeps the Local Network answer from one build to the next.
 
 **Fixed:**
@@ -602,7 +602,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   server's and never did, and the devices kept different times. It is now the next round's to take up.
 - A device whose sync rounds take longer than another device takes to commit never came to agree: a round that
   applied anything had to be confirmed by another, which found a newer commit to apply, until after 12 rounds the
-  sync gave up, "the tree kept changing", exit 3, having agreed on nothing, so the next sync looked at the whole
+  sync gave up, "the tree kept changing", exit 3 having agreed on nothing, so the next sync looked at the whole
   tree again. A Windows device on an HDD joining 468k entries beside one committing every 30 s or so ended so
   twice, and a Mac's daemon went round for an hour. The round that confirms an apply now reads no new commits,
   so the sync agrees as of the sequence it applied and leaves what came after to the next: such a join beside a
@@ -610,14 +610,14 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - The check at the end of every walk, which catches an entry moved from a folder not yet listed into one already
   listed, reopened each folder from the root, a level at a time. On Linux it now opens each in one `openat2` that
   refuses any symlink on the way, and compares the inode as well as the times: on a tree of 27,550 folders a walk's
-  opens, dups and closes fall from 325,476 to 165,374.
+  opens, dups and closes fall from 325,476 to 165,374
 - A daemon's every sync walked the whole tree, the ones that take what changed alone too: a stat of every entry
   and a listing of every folder, then a second pass that reopened each folder from the root, 15 to 30 s a round
   on a Mac with 472k entries and 46 to 83 s on a Windows HDD, so rounds rarely fitted between another device's
   commits. The watcher now marks the folder each event was in, and a daemon's round on what changed alone lists
   those, the folders of whatever the state marks as written since or the journal names, and the folders above
   them, and takes everything else from the last agreement. Beside a device committing every 2 s, a daemon on a
-  tree of 227,551 entries now lists 3 folders in each sync's 2 rounds, some 260 stats where it made 620,000, and
+  tree of 227,551 entries now lists 3 folders in each sync's 2 rounds, some 260 stats where it made 620,000 and
   keeps up, 28 syncs for 33 commits at 1.1 s of CPU each where it managed 16 at 2.3 s; slowed to 1.5 s a round
   beside a commit a second, it agrees every time, where it gave up after 12 rounds. Whatever the watcher may have
   missed, an overflowed queue, dropped events, a watch that ended, a rules file saved, sends the next sync to the
@@ -626,9 +626,9 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   waits for those. The daemon's "synced to" line now says how many rounds the sync took, how long its scans took, and
   how many folders it listed.
 - The tray's window showed times on the webview's locale clock, so `04:52 PM` in Recent activity on a Mac set to
-  24 hours whose locale has 12, beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
-  window, its menu and `--probe`, is now written in one place, on a 24-hour clock unless a person chooses 12 in the
-  window's new Settings tab (also the menu's Settings…, or `--open settings`). The choice is kept in `tray.json`
+  24 hours whose locale has 12 beside `synced at 16:52` from the tray itself. Every time the tray shows, in its
+  window, its menu and `--probe` is now written in one place, on a 24-hour clock unless a person chooses 12 in the
+  window's new Settings tab also the menu's Settings…, or `--open settings` The choice is kept in `tray.json`
   beside the registry of roots.
 
 ## 0.1.5
@@ -642,12 +642,12 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   failed after 98 minutes on "No buffer space available (os error 55)", a moment's shortage of socket memory, and a
   second run finished it. A request the network fails in a way that says nothing about the request (no socket
   buffers or memory, a connection reset, aborted, refused, timed out or closed before the whole answer came, as a
-  server restarting closes it, a name that could not be looked up, a network or host out of reach, or 502, 503 or
-  504 from a proxy) is now tried again: after 0.5, 1, 2, 4, 8, 16 and 30 s in a sync, after 0.5, 1 and 2 s in any
+  server restarting closes it, a name that could not be looked up, a network or host out of reach, or 502 503 or
+  504 from a proxy) is now tried again: after 0.5 1 2 4 8 16 and 30 s in a sync, after 0.5 1 and 2 s in any
   other command, and for about three minutes at most however slow each try. The command says each try on its error
   output, the daemon's log says a request's first new try and how it ended, and the sync's summary counts them;
-  past that the sync fails as before, and the next one delivers what it queued. A refusal (4xx), the server's disk
-  full (507), an answer that makes no sense, or a server that has not answered in ten minutes is never tried again.
+  past that the sync fails as before, and the next one delivers what it queued. A refusal 4xx the server's disk
+  full 507 an answer that makes no sense, or a server that has not answered in ten minutes is never tried again.
 - On macOS, and on Linux in a build against glibc, the daemon held what a sync had used, up to that sync's peak, for
   the pause after it and 30 s more: gigabytes for about a minute after a big tree's sync. It now gives it back as the
   sync ends. The Linux release binaries did not hold it: musl gives freed memory back by itself.
@@ -665,7 +665,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - A file rewritten in place had a sync look at every other name in its folder too, so that 1,000 rewrites in big
   folders looked at 137,000 entries and held 3.4 GB. A rewrite takes no name, so a sync now looks at the file and
   the folders above it, unless the file changed on both sides: those 1,000 now look at 3,300 entries and hold
-  1.1 GB, and one edit 83 entries where it looked at 9,159.
+  1.1 GB, and one edit 83 entries where it looked at 9,159
 
 **Known limits:**
 
@@ -690,8 +690,8 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   watch, on the folder above the root, now notices at once, and the root's watch moves to what is at its path.
 - A file that came down was flushed to disk twice, after its data and again after its metadata, and each flush
   has the disk empty its cache. It is now flushed once, after both, still before the rename that puts it in place.
-  A first download places a small file on an HDD under Windows in about 20 ms where it took 29, and on a busy
-  Linux disk array in about 18 ms where it took 31: most of what is left is that one flush.
+  A first download places a small file on an HDD under Windows in about 20 ms where it took 29 and on a busy
+  Linux disk array in about 18 ms where it took 31 - most of what is left is that one flush
 - A sync that carried a change still went the whole way, twice, at a cost that grew with the tree and not with
   the change: on 840,000 entries about a minute and up to 8.6 GB a round. A round now decides only about what
   changed, here or on the server, and what is next to it: the other names in its folders, the folders above it,
@@ -708,7 +708,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   brought back into view by this device's own record of it, and went the way the server's had, deleted by that
   move as anything moved into an excluded path is, but for what had been edited in it, which went up. What was
   kept out was recorded for an inode that no longer existed, and `cairn status` listed it at a path that had gone.
-  It now stays here, out of view and listed where it is, until `cairn include --merge`, and the same for a file.
+  It now stays here, out of view and listed where it is, until `cairn include --merge` and the same for a file.
   Where another device has added to the folder meanwhile, each sync says the copy here is in the way of the
   server's and to move it or `cairn include --merge` it, which merges it as new. A file with another name here
   cannot stay out without taking that name with it, and comes back in.
@@ -730,7 +730,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 **Fixed:**
 
 - A folder removed on one device while something in it was edited on another comes back to the first. Stopped
-  before its last pass, by a kill or a full disk, it stayed private (mode 0700) there for good, with no change
+  before its last pass, by a kill or a full disk, it stayed private mode 0700 there for good, with no change
   shown: that device took 0700 for a mode it keeps. The server and the other devices had the right mode. It now
   gets it on the next sync.
 - A folder that arrived and was stopped before its last pass, by a kill or a full disk, also stayed at 0700 for
@@ -749,7 +749,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   and neither the scan nor what the merge was given once it is done with them. The daemon gives that memory back
   to the system once it has been idle half a minute past its pause, instead of keeping it until the next sync.
 - The daemon's watcher held every subfolder waiting its turn open, and in a folder of thousands of them ran out
-  of open files at the usual soft limit of 1,024: the rest went unwatched, and the daemon fell back to a full sync
+  of open files at the usual soft limit of 1,024 the rest went unwatched, and the daemon fell back to a full sync
   every 5 minutes. It now holds one folder for each level down, the daemon takes the hard limit on open files at
   start, and it names the first folders it could not watch, and why.
 - A device that applied a change synced once more for its own writes, and one whose sync took in commits after
@@ -760,7 +760,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   the merge, not the data it moved, and 30 seconds at the most, so that a change written as a sync ends waits at
   most about that and one sync.
 - Every sync downloaded the whole commit at its cursor to check that the server still has its history, megabytes
-  after a big one. `GET /changes` takes `ops=false`, which answers an entry without its operations; an older server
+  after a big one. `GET /changes` takes `ops=false` which answers an entry without its operations; an older server
   sends them anyway.
 - A device's first sync of a big tree took a night or more: on a SATA disk, for a tree of 842,000 entries and
   53 GB, about 5.6 hours to upload and 6 hours to download, 11 over a 15 ms path, with twice the tree's size free.
@@ -778,7 +778,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   and a download that would not fit is refused before anything moves, saying what it needs and what is free. On
   Linux a placed file is watched until a later write would show, and its record needs no read unless the watch saw
   something done to it; nothing waits on the watch, so a save of a file that has just arrived is never held up.
-- A new device read the whole journal in one answer of `GET /changes`, hundreds of megabytes and twice that of the
+- A new device read the whole journal in one answer of `GET /changes` hundreds of megabytes and twice that of the
   server's memory. An answer now stops at about 16 MiB, always with one entry; every client asks again from where
   it ended.
 
@@ -797,17 +797,17 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 
 - `cairn daemon` keeps a root in sync: an inotify watcher, a long-poll change feed that passes through a
   reverse proxy, and a full sync every hour as the safety net. It reports through its output, `cairn status`
-  and `.cairn/daemon.json`. A kill at any moment is an ordinary crash, and it pauses and resumes around a
+  and `.cairn/daemon.json` A kill at any moment is an ordinary crash, and it pauses and resumes around a
   missing mount without holding the disk busy. This has not yet run on real trees for any length of time.
-- `GET /changes` takes `wait`. A client of this version works with an older server, which only makes it poll.
-- Ignore rules: `.cairn/ignore`, in `.gitignore` syntax, one device's own. There are still no ignored names by
+- `GET /changes` takes `wait` A client of this version works with an older server, which only makes it poll.
+- Ignore rules: `.cairn/ignore` in `.gitignore` syntax, one device's own. There are still no ignored names by
   default, and a project's `.gitignore` means nothing.
-- Selective sync: `cairn exclude <path>` and `cairn include <path>`. An excluded folder stays excluded through a
+- Selective sync: `cairn exclude <path>` and `cairn include <path>` An excluded folder stays excluded through a
   rename, and `--remove-local` also removes the copy here, except what differs from the server.
   What a rule covers stays out when a sync moves its folder to where the rule would not match; your own `mv` is
   your choice, as in git.
 - The local API: each daemon answers on a socket only its user can open, for `cairn status` and a tray. It
-  pushes its status, now with its last 100 changes, takes look now, pause and resume (`cairn pause`, `cairn
+  pushes its status, now with its last 100 changes, takes look now, pause and resume (`cairn pause` `cairn
   resume`; a pause outlives a restart), and lists open conflicts with their paths here. `cairn status --all`
   shows every root of this user on this machine, from a list `cairn init` and each daemon add to, a root that
   has gone included, until `cairn forget` takes it off; `--json` gives either as JSON, and `cairn ask` sends
@@ -817,7 +817,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - A Windows client: NTFS by handle, no link followed, names Windows refuses left out and reported. Windows holds no
   symlinks, owners or xattrs: what it does not hold is kept on the server as it was, and a file's read-only
   attribute is its write bits. The failure harness runs there too, though not in CI.
-- A tray for macOS and Windows, in tray/, a workspace of its own: each daemon's state, its problems and conflicts,
+- A tray for macOS and Windows, in tray/ a workspace of its own: each daemon's state, its problems and conflicts,
   pause and resume, and Forget for a root that is gone. It reads the local API and believes only a daemon of its
   own user.
 
@@ -860,7 +860,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
   went up as a change, for everyone, and a policy changed before the next sync, `setid` turned on, took a setuid bit
   off the server's record. The filesystem is now asked beside the file, under the policy the run applied by.
 - After a kill, a chmod made in that moment never went up if the disk had no room for one more entry, and a dry run,
-  so `cairn status`, said there was nothing to do. The sync now stops and says the disk is full, and the dry run
+  so `cairn status` said there was nothing to do. The sync now stops and says the disk is full, and the dry run
   asks as the sync does.
 - An edit to another name of a hard-linked file, in the moment a sync moved that name to the new version, split
   the file in two for everyone: that name became a new file holding the edit, with no conflict copy. The names now
@@ -885,7 +885,7 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 - A device joining with separate equal copies of a file the server holds under several names made a conflict copy
   of each extra name, for everyone. They are now links of the one file here.
 - A conflict copy made because a new file here had a name the server already used, as happens at a join, was missing
-  from `cairn conflicts`. It is listed now, like any other.
+  from `cairn conflicts` It is listed now, like any other.
 - On a filesystem that takes one name for another (APFS: a decomposed name and its composed form, or two cases),
   something new at a name the server had in the other form went up as a second name, a folder with everything in
   it, and every device that keeps names as bytes then held both. It now waits, reported with both names, until it
@@ -903,9 +903,9 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 
 **Fixed:**
 
-- A device could stop finishing syncs for good on a filesystem that reuses inode numbers, such as ext4.
+- A device could stop finishing syncs for good on a filesystem that reuses inode numbers, such as ext4
   If a new file took the inode number of a file deleted in the same sync, every `cairn sync` ended with
-  "the tree kept changing for 12 rounds" and exit code 3, even on an idle tree. Nothing was lost, and
+  "the tree kept changing for 12 rounds" and exit code 3 even on an idle tree. Nothing was lost, and
   updating is enough: the next sync completes.
 - With the same reuse, a file that moved and then became unreadable could fail to be held back, and read
   as deleted elsewhere. History kept it.
@@ -915,12 +915,12 @@ Not published: it renamed the CLI `cairn-sync`, which 0.1.23 takes back.
 
 The first release: milestones 0 to 2 of [PLAN.md](PLAN.md), for Linux, with a one-shot CLI. **This is
 early software.** It has been tested hard but has run on no one's real data for any length of time, so
-keep another copy of anything you put through it. Formats may change before 1.0.
+keep another copy of anything you put through it. Formats may change before 1.0
 
 **There now:**
 
-- `cairn-server`: one static binary with SQLite and a local chunk store; `init`, `serve`, `fsck`.
-- `cairn`: `init`, `sync`, `status`, `log`, `history`, `restore`, `export`, `conflicts`.
+- `cairn-server` - one static binary with SQLite and a local chunk store; `init` `serve` `fsck`
+- `cairn` - `init` `sync` `status` `log` `history` `restore` `export` `conflicts`
 - Full Linux metadata: all 12 mode bits, owners by number and name, nanosecond mtime, btime stored,
   xattrs, POSIX ACLs, capabilities, symlinks verbatim, hard links, sparse files, and names as bytes.
 - Content-defined chunks, so only what changed moves. Versions share chunks.
@@ -932,11 +932,11 @@ keep another copy of anything you put through it. Formats may change before 1.0.
 
 **Not there yet:**
 
-- Sync runs when you run it. The daemon, watcher and change feed are milestone 3.
-- One user: a single token and namespace. Sharing and OIDC are milestone 5.
+- Sync runs when you run it. The daemon, watcher and change feed are milestone 3
+- One user: a single token and namespace. Sharing and OIDC are milestone 5
 - No TLS in the server: put a reverse proxy in front of it beyond loopback.
-- No retention or garbage collection: the server only grows. Milestone 4.
-- Linux only. No Zstd, no S3, no PostgreSQL, no ignore rules, no selective sync, no web UI.
+- No retention or garbage collection: the server only grows. Milestone 4
+- Linux only. No Zstd, no S3 no PostgreSQL, no ignore rules, no selective sync, no web UI.
 
 **Known limits:**
 
@@ -948,7 +948,7 @@ keep another copy of anything you put through it. Formats may change before 1.0.
 - When a conflict is resolved after a crash or a refused commit, some edits made on top of a pushed
   version become conflict copies rather than plain edits. Both versions survive; it is noise, not loss.
 - A device rejoining with existing files keeps the server's metadata for identical content. What it
-  replaces is written to the activity log (`cairn log`), values included.
+  replaces is written to the activity log `cairn log` values included.
 - Files changed in the last 250 ms wait before being read, to avoid catching a save halfway. A writer
   that pauses longer than that in the middle of a file can still be captured mid-save. A later sync
   picks up the finished file, and the partial version stays in history.

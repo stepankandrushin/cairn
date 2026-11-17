@@ -9,17 +9,17 @@ Other phones word the system's screens a little differently.
 
 ## What you need
 
-- **The server's address**, such as `https://cairn.example.com`.
+- **The server's address**, such as `https://cairn.example.com`
 - **A token for this phone**, which whoever runs the server makes for your user, one per device:
-  `cairn-server token add alice --label android --data <data dir>`. A lost phone's token is then taken back
-  alone, by `cairn-server token remove <id>`, with the ID from `cairn-server token list`.
-- **The APK**, `cairn-<version>-android.apk`, one for every phone, among the files of each release from
+  `cairn-server token add alice --label android --data <data dir>` A lost phone's token is then taken back
+  alone, by `cairn-server token remove <id>` with the ID from `cairn-server token list`
+- **The APK**, `cairn-<version>-android.apk` one for every phone, among the files of each release from
   0.1.29 on: on [cairn.storage/download](https://cairn.storage/download/), the latest release's page, and
   [GitHub's latest release](https://github.com/stepankandrushin/cairn/releases/latest). Each is signed by the
   project's key, whose certificate's SHA-256 is
-  `dc981e26f3084defacb05268103e31ba30eb7cd6c01734ae9f19742f56009006`; `apksigner verify --print-certs` on the
+  `dc981e26f3084defacb05268103e31ba30eb7cd6c01734ae9f19742f56009006` `apksigner verify --print-certs` on the
   APK shows it. Android installs an update only when the same key signed it, so an APK built from the source
-  (`bash scripts/release-android.sh`, see the README's "The Android app") is signed by your own key, and every
+  `bash scripts/release-android.sh` see the README's "The Android app" is signed by your own key, and every
   later one must then be your own build too.
 
 ## Install
@@ -30,29 +30,29 @@ debugging turned on, `adb install cairn-<version>-android.apk` installs it inste
 <table>
 <tr><td width="50%">
 
-**1.** A browser asks first whether to keep it: **Download anyway**, then open the download.
+**1** A browser asks first whether to keep it: **Download anyway**, then open the download.
 
 </td><td><img src="android/install-download.webp" alt="Chrome: File might be harmful. Do you want to download Cairn.apk anyway? Cancel, Download anyway" width="320"></td></tr>
 <tr><td>
 
-**2.** Android installs apps only from sources you have allowed. The first time, it says so: tap **Settings**.
+**2** Android installs apps only from sources you have allowed. The first time, it says so: tap **Settings**.
 If the phone asks which app should open the file, choose **Package installer**.
 
 </td><td><img src="android/install-allow-chrome.webp" alt="Chrome: your phone currently isn't allowed to install unknown apps from this source. Cancel, Settings" width="320"></td></tr>
 <tr><td>
 
-**3.** Turn on **Allow app installs** for that app. The installer comes back: tap **Install**.
+**3** Turn on **Allow app installs** for that app. The installer comes back: tap **Install**.
 
 </td><td><img src="android/install-allow-toggle.webp" alt="Install apps from external sources: Chrome, Allow app installs on; over it, Cairn: Do you want to install this app? Cancel, Install" width="320"></td></tr>
 <tr><td>
 
-**4.** Google Play Protect has not seen the app before and recommends a scan. **Scan app** sends the app to
+**4** Google Play Protect has not seen the app before and recommends a scan. **Scan app** sends the app to
 Google first; **Install without scanning** installs it as it is.
 
 </td><td><img src="android/install-play-protect.webp" alt="Google Play Protect: App scan recommended for Cairn. Install without scanning, Scan app, Don't install app" width="320"></td></tr>
 <tr><td>
 
-**5.** **Open** starts the app. Afterwards you can turn **Allow app installs** off again for the browser
+**5** **Open** starts the app. Afterwards you can turn **Allow app installs** off again for the browser
 (Settings › Apps › Special app access › Install unknown apps); turn it back on for the next update.
 
 </td><td><img src="android/install-done.webp" alt="Cairn: App installed. Done, Open" width="320"></td></tr>
@@ -63,8 +63,8 @@ Google first; **Install without scanning** installs it as it is.
 <table>
 <tr><td width="50%">
 
-- **Server:** the address, `https://` and all. A server reached over plain `http://`, on a home network say,
-  works only when the address is typed with `http://`.
+- **Server:** the address, `https://` and all. A server reached over plain `http://` on a home network say,
+  works only when the address is typed with `http://`
 - **Token:** type it, or copy it and tap **Paste token**.
 - **This device's name:** shown in each file's history, and the name of its photos' folder. It starts as the
   phone's model.
@@ -84,8 +84,8 @@ After signing in, the **Photos** tab sets up the backup.
 </table>
 
 - **Folder** and **Path in it:** where on the server they go. The folder is one of yours that you can write
-  to, and the path starts as `Photos/<this device's name>`.
-- **Names:** as the camera named them, `20240512_114915.jpg`, as Nextcloud's Android app kept them; or date
+  to, and the path starts as `Photos/<this device's name>`
+- **Names:** as the camera named them, `20240512_114915.jpg` as Nextcloud's Android app kept them; or date
   and time first, as Nextcloud's iPhone app named them, so that a folder it filled goes on as it was.
   Optionally, a folder for each year and month. The line under them shows an example.
 - **Which:** a switch for each kind, each with where it is on the phone and how many it holds:
@@ -113,7 +113,7 @@ where each photo was taken, which Android takes out of a photo otherwise.
 From then on the tab shows what was sent and what waits. New photos are sent a little after they are taken,
 and what waits every hour. **Upload now** sends at once on any network, shown as a notification, and goes on
 with the app closed. What could not be sent is listed with the server's reason, and **Retry**. A name the
-server already has for other bytes gets `(2)`.
+server already has for other bytes gets `(2)`
 
 **When** and **Which** can be changed here while backup is on:
 - **Switching a folder on** sends what is already in it, or only what was taken since backup was turned on,

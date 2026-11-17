@@ -4,8 +4,8 @@ Self-hosted file sync with versioned history that keeps everything about your fi
 owners, xattrs, ACLs, capabilities, hard links, sparse files, and filename bytes. A central server keeps
 every version; clients sync a real filesystem. Files only: no groupware, no app platform.
 
-**Status: 0.1.29, early.** Clients for Linux (x86_64 and aarch64), macOS and Windows, with only Linux in CI, and on Windows each file's state on its icon in Explorer; the server on Linux;
-users with their own folders and shared ones, read-only or not; since 0.1.14, a web interface in the server,
+**Status: 0.1.29 early.** Clients for Linux x86_64 and aarch64 macOS and Windows, with only Linux in CI, and on Windows each file's state on its icon in Explorer; the server on Linux;
+users with their own folders and shared ones, read-only or not; since 0.1.14 a web interface in the server,
 which a device opens signed in, with shares of any file or folder and public links; and phone apps for
 iPhone and Android, in neither store yet, the iPhone's built from source and since 0.1.29 Android's APK among
 the downloads, that back up photos and videos and open the server's files on demand. It has
@@ -84,7 +84,7 @@ versions.
 
 ## Promises
 
-These outrank features and speed, and each has failure tests in `crates/harness`:
+These outrank features and speed, and each has failure tests in `crates/harness`
 
 1. A commit acknowledged by the server is durable, and its chunks were durable first.
 2. A device never erases what it cannot represent.
@@ -97,7 +97,7 @@ These outrank features and speed, and each has failure tests in `crates/harness`
 
 ## Try it
 
-Each release's files are at [cairn.storage/download](https://cairn.storage/download/), each with its SHA-256,
+Each release's files are at [cairn.storage/download](https://cairn.storage/download/), each with its SHA-256
 and the same in [GitHub's releases](https://github.com/stepankandrushin/cairn/releases). Or build it (Build and
 test, below).
 
@@ -122,17 +122,17 @@ cairn undelete <ID>                              # bring it back as it was, besi
 ```
 
 Beyond one machine, put a TLS-terminating reverse proxy in front, start the server with
-`--behind-tls-proxy`, and use an `https://` URL. A read timeout above 25 seconds lets changes arrive at once
+`--behind-tls-proxy` and use an `https://` URL. A read timeout above 25 seconds lets changes arrive at once
 (nginx's default of 60 is fine); with a shorter one the daemon asks more often.
 
 ## Users and folders
 
 A server holds folders, each with its own tree, history and set of chunks, and users, each with tokens of its
-own, one per device at best. A user reaches only the folders given to it, at one of three levels: `read`,
-`write`, or `manage`, which is write and also saying who else has access. To anyone else a folder answers as
-one that does not exist. `cairn-server init` makes the user `admin`, who manages the folder `cloud`, with
+own, one per device at best. A user reaches only the folders given to it, at one of three levels: `read`
+`write` or `manage` which is write and also saying who else has access. To anyone else a folder answers as
+one that does not exist. `cairn-server init` makes the user `admin` who manages the folder `cloud` with
 its token in the data directory's `token` file; a server from before accounts gives that file's token the
-same, managing every folder it has, the first of them `default`. `cairn init` without `--folder` syncs the
+same, managing every folder it has, the first of them `default` `cairn init` without `--folder` syncs the
 one folder its token reaches, and with several asks which.
 
 A folder's name is what devices, links and commands use. Each user may also call it something of their
@@ -165,7 +165,7 @@ cairn access grant carol write                   # a manager shares it; nobody e
 ```
 
 A folder a user may only read comes down whole, and nothing made on that user's devices goes up or is lost
-there: an edit, a new file, a rename stay as they are, listed by every sync as `read-only`; something deleted
+there: an edit, a new file, a rename stay as they are, listed by every sync as `read-only` something deleted
 there comes back from the server; where the server changes something also changed there, both stay, the
 server's at the name. Moved out of the root, a change is kept and the server's version comes back; once the
 user may write, what was held back goes up like any change. `cairn log` says which user made each commit.
@@ -183,11 +183,11 @@ may expire. A change made there is a commit like any device's, refused rather th
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
 a user is seen in the web interface, not synced yet. The + beside Folders adds a folder of one's own. It is
 light or dark as the device is, and the sun or moon at the right end of its top bar switches it. Times are on
-a 24-hour clock, as `2026-11-11 09:50`; its Settings choose the theme, a 12-hour clock or another order of the
+a 24-hour clock, as `2026-11-11 09:50` its Settings choose the theme, a 12-hour clock or another order of the
 date, kept in that browser, and the user's own name for each folder, kept on the server. The endpoints are in
-docs/protocol.md, "Web".
+docs/protocol.md "Web".
 
-A public link needs only `/s/`, `/web/` and `/v1/links/`. Where the server's address is open to some addresses
+A public link needs only `/s/` `/web/` and `/v1/links/` Where the server's address is open to some addresses
 alone, a second door in the proxy, open to anyone, can pass just those, and `cairn-server serve --link-url
 https://files.example:8443` makes every link name it:
 
@@ -207,13 +207,13 @@ server {
 ## The iPhone app
 
 ios/ is the app, for iOS 26.4 and later, on a Rust core shared with what will be the Android one
-(crates/mobile). Sign in with the server's address, a token made for the phone (`cairn-server token add alice
+crates/mobile Sign in with the server's address, a token made for the phone (`cairn-server token add alice
 --label iphone`), and a name for the device.
 
 - **Photos:** each photo and video goes to the folder and path chosen, as it was taken: HEIC, MOV and RAW
   originals, a Live Photo's video beside its photo, none converted. By default each is named as Nextcloud's iOS
-  app named them, `24-05-12 11-49-15 0003.heic`, so that a folder it filled goes on as it was; or as on the phone,
-  `IMG_0003.HEIC`; optionally in a folder for each year and month. The system sends them in the background
+  app named them, `24-05-12 11-49-15 0003.heic` so that a folder it filled goes on as it was; or as on the phone,
+  `IMG_0003.HEIC` optionally in a folder for each year and month. The system sends them in the background
   through Photos' upload extension, also while the app is closed, on its own schedule; the app sends what waits
   while it is open, overnight on power, and at Upload now, which goes on in the background. A photo deleted from
   the phone stays on the server. What could not be sent is listed with the server's reason, and Retry.
@@ -223,16 +223,16 @@ ios/ is the app, for iOS 26.4 and later, on a Rust core shared with what will be
   opened and kept only if Keep Downloaded is chosen. New files and folders can be added there, as can anything
   shared into it from another app; renaming, moving, deleting and editing in place are not offered yet.
 
-A photo is sent as one request, `PUT /v1/ns/{ns}/file` (docs/protocol.md, "One-request uploads"), whose IDs the
+A photo is sent as one request, `PUT /v1/ns/{ns}/file` docs/protocol.md "One-request uploads", whose IDs the
 phone chooses and keeps before it is sent: a phone or a server killed at any step, an answer lost, or the system
-and the app sending the same photo, still makes one file, and a name taken by other bytes gets `(2)`.
+and the app sending the same photo, still makes one file, and a name taken by other bytes gets `(2)`
 `bash scripts/release-ios.sh --sim` builds it for the simulator on a Mac with Xcode, `--device` for the phones
-registered to the team, signed by the team in `ios/Config/Local.xcconfig`. Photos' upload extension sends only
-to the server named there (`CAIRN_UPLOAD_URL_BASE`) and does not run in the simulator.
+registered to the team, signed by the team in `ios/Config/Local.xcconfig` Photos' upload extension sends only
+to the server named there `CAIRN_UPLOAD_URL_BASE` and does not run in the simulator.
 
 ## The Android app
 
-android/ is the app, for Android 11 and later, on the same Rust core as the iPhone's (crates/mobile, its Kotlin
+android/ is the app, for Android 11 and later, on the same Rust core as the iPhone's (crates/mobile its Kotlin
 bindings made by uniffi). Sign in as on the iPhone, with a token made for the phone (`cairn-server token add
 alice --label android`). Each release since 0.1.29 has its APK, `cairn-<v>-android.apk`, signed by the
 project's key, among its files on [cairn.storage/download](https://cairn.storage/download/) and GitHub.
@@ -243,7 +243,7 @@ screenshots.
   taken. The camera's (DCIM) is on by default. Screenshots and screen recordings are off until switched on,
   and so is each other app's folder (WhatsApp's, Telegram's, …); the switches can change while backup runs.
   Each keeps its location (the app asks for it, as Android takes it out of a photo otherwise).
-  By default each keeps the camera's name, `20240512_114915.jpg`, as Nextcloud's Android app kept them;
+  By default each keeps the camera's name, `20240512_114915.jpg` as Nextcloud's Android app kept them;
   optionally in a folder for each year and month. New ones are found by MediaStore's generation numbers, which
   also catch a photo a camera writes hidden and shows later, and sent a little after they are taken, and what
   waits every hour, on Wi-Fi only unless chosen otherwise, and while charging if chosen; Upload now sends at once
@@ -258,9 +258,9 @@ screenshots.
 
 The uploads are the iPhone's: one request each, its IDs chosen and kept before it is sent. `bash
 scripts/release-android.sh` builds a signed APK in build/android, and the same as `dist/cairn-<v>-android.apk`
-for a release (`--emulator` installs it on the emulator, `--debug` builds one signed by the machine's debug key);
-it needs the Android SDK and NDK, `cargo-ndk`, and `rustup target add aarch64-linux-android
-x86_64-linux-android`. Android installs an update only over an app signed by the same key, so a phone with
+for a release `--emulator` installs it on the emulator, `--debug` builds one signed by the machine's debug key;
+it needs the Android SDK and NDK, `cargo-ndk` and `rustup target add aarch64-linux-android
+x86_64-linux-android` Android installs an update only over an app signed by the same key, so a phone with
 the released APK takes only released ones, and one with an APK of your own key only yours.
 
 ## The daemon
@@ -273,14 +273,14 @@ cairn forget ~/Old               # take one that has gone off that list (--even-
 cairn pause                      # no sync starts until `cairn resume`, through restarts too
 ```
 
-It syncs when something changes here or on the server, and every hour regardless (`--reconcile-secs`), since
-events can be lost. A sync takes what changed alone; once a day (`--full-sync-secs`) one decides everything the
+It syncs when something changes here or on the server, and every hour regardless `--reconcile-secs` since
+events can be lost. A sync takes what changed alone; once a day `--full-sync-secs` one decides everything the
 full way as well and takes that answer, and says in its output if the two differed, which would be a bug to
 report. Its output says what it did and what it could not do, each thing once, and `cairn status`
 keeps what this filesystem refused (a mode on a file another user owns, say) until it is put right. A paused or
-failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log`, `history`, `export`
+failing root keeps being retried, and `cairn sync` beside it works as usual; `cairn log` `history` `export`
 and `conflicts` only ask the server, so they answer during a sync too. It answers `cairn status` and the
-tray on a local socket only your user can open (`--json` gives the same objects; docs/protocol.md). As a
+tray on a local socket only your user can open `--json` gives the same objects; docs/protocol.md As a
 systemd user unit:
 
 ```ini
@@ -292,11 +292,11 @@ Restart=always
 WantedBy=default.target
 ```
 
-On a big tree, the kernel's limit on watches may need raising (`fs.inotify.max_user_watches`); the daemon says
+On a big tree, the kernel's limit on watches may need raising `fs.inotify.max_user_watches` the daemon says
 so if it does, and until then those folders wait for the hourly sync.
 
 On Windows, Microsoft Defender's real-time protection scans the files the client opens, and on a tree of many
-small files that can be most of a first sync's time: one on a hard disk was read at under 2 MB/s, with Defender
+small files that can be most of a first sync's time: one on a hard disk was read at under 2 MB/s with Defender
 using about a hundred times the client's CPU. A process exclusion, set once from an administrator's PowerShell,
 spares it:
 
@@ -308,7 +308,7 @@ Its cost: what the client writes into the tree is scanned only when another prog
 lists the exclusions, and `Remove-MpPreference -ExclusionProcess <path>` takes one back.
 
 On Windows, Explorer can show each entry's state on its icon: a green check once synced, blue arrows while a
-change here waits or a sync moves it, a red cross on what is not synced (`cairn status` says why), and a yellow
+change here waits or a sync moves it, a red cross on what is not synced `cairn status` says why, and a yellow
 mark on each folder above one, on a file whose metadata the filesystem refused, and on a paused root. What you
 exclude has none. The daemon decides each badge; Explorer only asks it.
 
@@ -323,12 +323,12 @@ on a newer version moves them to its own handler, which Explorer takes up the sa
 first 11 overlay handlers by name, which other sync programs compete for: Cairn's come before OneDrive's, and
 `cairn explorer status` lists them all.
 
-On macOS, run the daemon from its app bundle, Cairn.app, so that System Settings shows it as Cairn with
-its icon, in Login Items and in the privacy lists, rather than as a bare `cairn`. From tray/, `bash macos/bundle.sh
+On macOS, run the daemon from its app bundle, Cairn.app so that System Settings shows it as Cairn with
+its icon, in Login Items and in the privacy lists, rather than as a bare `cairn` From tray/ `bash macos/bundle.sh
 ../target/release/cairn "$HOME/Applications/Cairn.app"` makes it around the binary (with Xcode installed,
 its icon is compiled for macOS 26 and later, which otherwise draw it on a gray tile at small sizes). Link
 `~/.local/bin/cairn` to `Contents/MacOS/cairn` inside it, and start the daemon with a launchd user agent that
-names the bundle's identifier, `storage.cairn`: one agent per root, each with a label of its own, as
+names the bundle's identifier, storage.cairn - one agent per root, each with a label of its own, as
 `~/Library/LaunchAgents/storage.cairn.daemon.home.plist` for a root called home (`daemon` in it keeps a root
 called tray off the tray's agent, `storage.cairn.tray`):
 
@@ -354,9 +354,9 @@ called tray off the tray's agent, `storage.cairn.tray`):
 
 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/storage.cairn.daemon.home.plist` starts it. The tray's
 Cairn Tray.app is made the same way
-(`bash macos/bundle.sh target/release/cairn-tray "$HOME/Applications/Cairn Tray.app"`), and
-`cairn-tray --login on` writes its agent, `storage.cairn.tray`. Sign both with a certificate Apple issued: `CAIRN_SIGN` for bundle.sh,
-one of `security find-identity -v -p codesigning`. Login Items ties an agent to its app only for such a
+`bash macos/bundle.sh target/release/cairn-tray "$HOME/Applications/Cairn Tray.app"` and
+`cairn-tray --login on` writes its agent, `storage.cairn.tray` Sign both with a certificate Apple issued: `CAIRN_SIGN` for bundle.sh
+one of `security find-identity -v -p codesigning` Login Items ties an agent to its app only for such a
 signature, and macOS keeps the Local Network answer below for the same certificate and identifier from one
 build to the next, where an ad-hoc build is a new program at each upgrade and asks again. A signed bundle put
 where an ad-hoc one was can be left under the certificate's team name in Login Items: load the agent once from
@@ -371,12 +371,12 @@ router, not on the Mac's own network, needs no permission.
 ## Updates
 
 A release build keeps itself up to date. Each daemon asks about once an hour for the latest release, at
-cairn.storage, or at GitHub's latest release when that does not answer (`cairn update` says which did), and when
+cairn.storage, or at GitHub's latest release when that does not answer `cairn update` says which did, and when
 there is a newer release it downloads it beside the installed program, checks it, puts it in place and restarts into
 it between syncs; the tray installed beside `cairn` is updated with it and restarts too. No permission is asked
 again: macOS keeps them for the same bundle identifier signed by the same team, which every release has, and
 Windows by the path, which does not change. Only the update from 0.1.23 or before asks once more on macOS, for
-Local Network, as 0.1.24 changed the identifiers (CHANGELOG.md says what else to change then).
+Local Network, as 0.1.24 changed the identifiers CHANGELOG.md says what else to change then.
 
 ```sh
 cairn update                     # what is installed, how updates are set, what the feed offered last
@@ -388,23 +388,23 @@ cairn update rollback            # back to the version before, which is then not
 
 The tray's Settings tab has the same choice and a Check for updates button, which says it is checking and then
 whether everything here is up to date, what it installed, or why it could not. What it installs is only ever what the
-release's own key signed: every file's size and SHA-256 are in a signed `update.json`, and on macOS the new bundle
+release's own key signed: every file's size and SHA-256 are in a signed `update.json` and on macOS the new bundle
 must also be signed by the team of the one it replaces. A kill or a full disk at any step leaves the old program
-or the new one in place, whole; the one before is kept beside it in `.cairn-update`, and a version on which a
+or the new one in place, whole; the one before is kept beside it in `.cairn-update` and a version on which a
 daemon keeps dying before it gets through a sync is taken back by itself. A release on a newer protocol waits until
 the server speaks it, so upgrade the server first: it is never updated by itself. Where the program's folder is
 not yours to write, as for a `/usr/local/bin` owned by root, `cairn update` says so, and `sudo cairn update now`
 installs it; the daemons restart into it.
 
 A build of your own names no feed and is never updated by anyone's releases. To update it from releases of your
-own, build with `CAIRN_UPDATE_FEED` (the URL of your `update.json`, or several comma-separated, asked in order) and
+own, build with `CAIRN_UPDATE_FEED` (the URL of your `update.json` or several comma-separated, asked in order) and
 `CAIRN_UPDATE_KEYS` (your public keys), or
-name them in `update-settings.json` beside the registry of roots (`feed`, `keys`); `cairn-release` (crates/release)
+name them in `update-settings.json` beside the registry of roots `feed` `keys` `cairn-release` crates/release
 makes the key and signs the file, and docs/protocol.md has its format.
 
 ## Leaving things out
 
-Nothing is left out unless you say so. Rules go in `.cairn/ignore`, in `.gitignore` syntax, for this device
+Nothing is left out unless you say so. Rules go in `.cairn/ignore` in `.gitignore` syntax, for this device
 only:
 
 ```gitignore
@@ -432,8 +432,8 @@ status` lists what is left out.
 `cairn sync` exits 0 when both sides agree (anything excluded is listed), 2 when it paused and is waiting
 for you, 3 when another run is needed, and 1 on an error. In every case nothing is lost.
 
-By default a client applies modes, `user.*` xattrs and POSIX ACLs. Owners (`--owners`), setuid and setgid
-(`--setid`) and capabilities (`--capabilities`) need an explicit choice at `cairn init`; whatever a client
+By default a client applies modes, `user.*` xattrs and POSIX ACLs. Owners `--owners` setuid and setgid
+`--setid` and capabilities `--capabilities` need an explicit choice at `cairn init` whatever a client
 does not apply stays stored for those that do. `cairn export --exact` applies all of it, given privileges.
 
 ## Build and test
@@ -445,22 +445,22 @@ bash scripts/ci.sh --quick      # the same in about a minute, less the tests tha
 bash scripts/release.sh         # static binaries and checksums in dist/, after a smoke test over TLS
 ```
 
-`bash scripts/release-ios.sh --sim`, on a Mac with Xcode, builds the iPhone app (above). `bash scripts/release-android.sh`, with the
+`bash scripts/release-ios.sh --sim` on a Mac with Xcode, builds the iPhone app (above). `bash scripts/release-android.sh` with the
 Android SDK and NDK, builds the Android app.
 
-release.sh builds the client for x86_64 and aarch64 and the server for x86_64, each static (musl). The aarch64
-client is cross-built by cargo-zigbuild (`cargo install cargo-zigbuild --locked`, zig on the PATH, `rustup target
+release.sh builds the client for x86_64 and aarch64 and the server for x86_64 each static (musl). The aarch64
+client is cross-built by cargo-zigbuild (`cargo install cargo-zigbuild --locked` zig on the PATH, `rustup target
 add aarch64-unknown-linux-musl`), and its checks and smoke test run under qemu-aarch64 (the qemu-user package).
 
-Both run the tests under cargo-nextest (`cargo install cargo-nextest --locked`), each test a process of its own
+Both run the tests under cargo-nextest `cargo install cargo-nextest --locked` each test a process of its own
 and every long sweep split into parts that run at once; the full run is as long as the disk takes over its
-fsyncs, about 11 minutes on two NVMe drives in RAID1, whose every journal commit waits on two cache flushes.
+fsyncs, about 11 minutes on two NVMe drives in RAID1 whose every journal commit waits on two cache flushes.
 `CAIRN_SEEDS=500 cargo nextest run -p cairn-harness --test random` runs more random seeds, and `CAIRN_SEED=n`
 reproduces one.
 
 On Windows, a cairn.exe that carries Explorer's handler is built after it, as scripts/release-windows.ps1 does:
-`cargo build --profile explorer -p cairn-explorer`, then the build of cairn-cli with `CAIRN_EXPLORER_DLL` set to
-`target\explorer\cairn_explorer.dll`. `cairn explorer on --dll <that file>` takes one without rebuilding.
+`cargo build --profile explorer -p cairn-explorer` then the build of cairn-cli with `CAIRN_EXPLORER_DLL` set to
+`target\explorer\cairn_explorer.dll` `cairn explorer on --dll <that file>` takes one without rebuilding.
 
 ## Docs
 
@@ -470,6 +470,6 @@ On Windows, a cairn.exe that carries Explorer's handler is built after it, as sc
 
 ## License
 
-The server and storage (`cairn-server`, `cairn-store`, and the test harness) are
+The server and storage `cairn-server` `cairn-store` and the test harness are
 [AGPL-3.0-only](LICENSE-AGPL). The protocol, engine, client, mobile and failpoint crates, and the iPhone
 app, are [Apache-2.0](LICENSE-APACHE), so any client can embed them.

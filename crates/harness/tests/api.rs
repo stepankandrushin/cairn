@@ -6,7 +6,7 @@ use common::*;
 use serde_json::{json, Value};
 
 /// Every feature this build's server names.
-const FEATURES: &[&str] = &["note_groups", "item_hash", "tokens", "pairing"];
+const FEATURES: &[&str] = &["note_groups", "item_hash", "tokens", "pairing", "passwords"];
 
 fn token(server: &Server) -> String {
     std::fs::read_to_string(&server.token_file)
@@ -365,4 +365,173 @@ fn a_pairing_code_makes_one_token_of_the_users_once_and_in_time() {
         claim(&server, made["code"].as_str().unwrap(), None).code,
         401
     );
+}
+
+/// `cairn-server user password` with what it reads on stdin.
+fn set_password(server: &Server, user: &str, password: Option<&str>) -> Run {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new(SERVER);
+    cmd.args(["user", "password", user]);
+    if password.is_none() {
+        cmd.arg("--clear");
+    }
+    let mut child = cmd
+        .arg("--data")
+        .arg(&server.data)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(p) = password {
+        writeln!(child.stdin.take().unwrap(), "{p}").unwrap();
+    }
+    Run::from(child.wait_with_output().unwrap())
+}
+
+fn sign_in(server: &Server, user: &str, password: &str) -> Answer {
+    request(
+        server,
+        "POST",
+        "/v1/session",
+        Auth::None,
+        &[
+            ("Content-Type", "application/json"),
+            (
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            ),
+        ],
+        json!({"user": user, "password": password})
+            .to_string()
+            .as_bytes(),
+    )
+}
+
+fn session_of(signed: &Answer) -> String {
+    let cookie = signed
+        .header("set-cookie")
+        .expect("a sign-in sets the cookie");
+    let value = cookie
+        .strip_prefix("cairn=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(!value.is_empty(), "{cookie}");
+    value.to_string()
+}
+
+fn browsers(server: &Server, token: &str) -> usize {
+    let list = get(server, "/v1/tokens", Auth::Bearer(token)).ok().json();
+    list["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["kind"] == "browser")
+        .count()
+}
+
+/// A user with a password signs a browser in with it, which makes a token for that browser alone: listed
+/// with what the browser is, taken back by signing out or alone, and every one of them by a change of the
+/// password. A wrong password and a user with none, or no such user, answer alike.
+#[test]
+fn a_password_signs_one_browser_in_and_each_is_signed_out_alone() {
+    let sb = Sandbox::fast("api-password");
+    let server = Server::start(sb.path("data"));
+    let alice = read_token(&server.user("alice"));
+    server.user("bob");
+    let refused = sign_in(&server, "alice", "no password yet at all");
+    assert_eq!(refused.code, 401, "{}", refused.text());
+
+    let short = set_password(&server, "alice", Some("short"));
+    assert!(
+        !short.ok() && short.stderr.contains("at least 10"),
+        "{}",
+        short.text()
+    );
+    set_password(&server, "alice", Some("correct horse battery")).expect_ok();
+    let me = get(&server, "/v1/me", Auth::Bearer(&alice)).ok().json();
+    assert_eq!(me["password"], true, "{me}");
+
+    let wrong = sign_in(&server, "alice", "correct horse battery!");
+    let nobody = sign_in(&server, "carol", "correct horse battery");
+    let none = sign_in(&server, "bob", "correct horse battery");
+    for refused in [&wrong, &nobody, &none] {
+        assert_eq!(refused.code, 401, "{}", refused.text());
+        assert_eq!(refused.text(), "wrong user or password");
+        assert!(refused.header("set-cookie").is_none());
+    }
+
+    let signed = sign_in(&server, "alice", "correct horse battery");
+    assert_eq!(signed.code, 204, "{}", signed.text());
+    let one = session_of(&signed);
+    let me = get(&server, "/v1/me", Auth::Cookie(&one, false))
+        .ok()
+        .json();
+    assert_eq!(me["user"], "alice");
+    assert_eq!(me["token"]["kind"], "browser", "{me}");
+    assert_eq!(me["token"]["label"], "Firefox on Linux", "{me}");
+    let two = session_of(&sign_in(&server, "alice", "correct horse battery"));
+    assert_eq!(browsers(&server, &alice), 2);
+
+    // Signed out, its token goes with it, and the other browser stays in.
+    let out = request(
+        &server,
+        "DELETE",
+        "/v1/session",
+        Auth::Cookie(&one, false),
+        &[],
+        b"",
+    );
+    assert_eq!(out.code, 204, "{}", out.text());
+    assert_eq!(get(&server, "/v1/me", Auth::Cookie(&one, false)).code, 401);
+    get(&server, "/v1/me", Auth::Cookie(&two, false)).ok();
+    assert_eq!(browsers(&server, &alice), 1);
+
+    // Changed by the user, who gives the one they have; then every browser it signed in is out.
+    let change = |auth: Auth, body: Value| {
+        request(
+            &server,
+            "PUT",
+            "/v1/me/password",
+            auth,
+            &[("Content-Type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+    };
+    let no = change(Auth::Bearer(&alice), json!({"new": "another long one"}));
+    assert_eq!(no.code, 403, "{}", no.text());
+    let no = change(
+        Auth::Bearer(&alice),
+        json!({"current": "correct horse battery", "new": "short"}),
+    );
+    assert_eq!(no.code, 400, "{}", no.text());
+    let yes = change(
+        Auth::Bearer(&alice),
+        json!({"current": "correct horse battery", "new": "another long one"}),
+    );
+    assert_eq!(yes.code, 204, "{}", yes.text());
+    assert_eq!(get(&server, "/v1/me", Auth::Cookie(&two, false)).code, 401);
+    assert_eq!(browsers(&server, &alice), 0);
+    assert_eq!(sign_in(&server, "alice", "correct horse battery").code, 401);
+    let three = session_of(&sign_in(&server, "alice", "another long one"));
+
+    // A browser's own change keeps it in.
+    let kept = change(
+        Auth::Cookie(&three, true),
+        json!({"current": "another long one", "new": "a third long one"}),
+    );
+    assert_eq!(kept.code, 204, "{}", kept.text());
+    get(&server, "/v1/me", Auth::Cookie(&three, false)).ok();
+
+    // Taken away by the administrator: no sign-in by it, and no browser it signed in.
+    set_password(&server, "alice", None).expect_ok();
+    assert_eq!(
+        get(&server, "/v1/me", Auth::Cookie(&three, false)).code,
+        401
+    );
+    assert_eq!(sign_in(&server, "alice", "a third long one").code, 401);
+    let me = get(&server, "/v1/me", Auth::Bearer(&alice)).ok().json();
+    assert!(me.get("password").is_none(), "{me}");
 }

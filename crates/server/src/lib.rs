@@ -23,6 +23,7 @@ use std::sync::Arc;
 mod admin;
 mod file;
 mod pairing;
+mod passwords;
 mod tokens;
 mod web;
 
@@ -278,11 +279,17 @@ fn features() -> Vec<String> {
     if cairn_failpoint::unsupported("server.features") {
         return Vec::new();
     }
-    [f::NOTE_GROUPS, f::ITEM_HASH, f::TOKENS, f::PAIRING]
-        .into_iter()
-        .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
-        .map(String::from)
-        .collect()
+    [
+        f::NOTE_GROUPS,
+        f::ITEM_HASH,
+        f::TOKENS,
+        f::PAIRING,
+        f::PASSWORDS,
+    ]
+    .into_iter()
+    .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
+    .map(String::from)
+    .collect()
 }
 
 /// The caller's own name for the namespace, which only they see, in place of its name: set, or with
@@ -741,6 +748,7 @@ fn router(app: Arc<App>) -> Router {
             axum::routing::patch(tokens::relabel).delete(tokens::remove),
         )
         .route("/v1/pair", post(pairing::issue))
+        .route("/v1/me/password", put(passwords::change))
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .merge(web::user_routes(&app))

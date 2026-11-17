@@ -225,7 +225,7 @@ pub struct Run {
 }
 
 impl Run {
-    fn from(out: Output) -> Self {
+    pub fn from(out: Output) -> Self {
         Self {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

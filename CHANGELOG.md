@@ -14,6 +14,9 @@
   a kind, `device` `browser` or `paired` and the hour it was last used, which `cairn-server token list` shows.
 - Pairing: a signed-in device or the web asks `POST /v1/pair` for a code, with its link and QR code, and a
   new device trades it at `POST /v1/pair/claim` for a token of its own, within ten minutes and once.
+- Passwords for the web: `cairn-server user password` sets one, a user changes their own at `PUT
+  /v1/me/password` and a sign-in by one makes a token for that browser alone, which signing out takes back.
+  A password changed signs out every browser it signed in.
 
 **Changed:**
 

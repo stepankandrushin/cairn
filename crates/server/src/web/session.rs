@@ -1,5 +1,5 @@
-//! Signing a browser in, by a token typed once or by a ticket a program with a token asked for. Either
-//! sets the same cookie: a session the server signed with a key of its own, naming the token's hash and
+//! Signing a browser in, by a token typed once, by a ticket a program with a token asked for, or by a
+//! user's name and password, which make a token for that browser alone. Each sets the same cookie: a session the server signed with a key of its own, naming the token's hash and
 //! when it ends. The token is never in the browser, and removing it signs out every browser it signed in.
 
 use crate::{blocking, now, ApiResult, App, Caller};
@@ -151,8 +151,16 @@ fn refused(why: &str) -> Response {
 /// browser's downloads and previews are signed in too.
 pub(crate) async fn sign_in(
     State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<w::SignIn>,
 ) -> ApiResult<Response> {
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if req.user.is_some() || req.password.is_some() {
+        return by_password(app, req, agent).await;
+    }
     let token = match (req.token.as_deref().map(str::trim), req.ticket.as_deref()) {
         (Some(token), None) => {
             if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -176,23 +184,113 @@ pub(crate) async fn sign_in(
     if user.is_none() {
         return Ok(refused("missing or wrong token"));
     }
+    Ok(signed_in(&app, &token))
+}
+
+/// The answer that sets a browser's session as this token's.
+fn signed_in(app: &App, token: &Hash) -> Response {
     let expires = now() as u64 + w::SESSION_SECS;
-    Ok((
+    (
         StatusCode::NO_CONTENT,
         [(
             header::SET_COOKIE,
-            session_cookie(&app.sessions.cookie(&token, expires), w::SESSION_SECS),
+            session_cookie(&app.sessions.cookie(token, expires), w::SESSION_SECS),
         )],
     )
-        .into_response())
+        .into_response()
 }
 
-pub(crate) async fn sign_out() -> Response {
-    (
+/// A user's name and password: a token of kind `browser` made for this browser alone, labelled with
+/// what the browser says it is, and the session its. A wrong name or password is one answer, as long.
+async fn by_password(app: Arc<App>, req: w::SignIn, agent: Option<String>) -> ApiResult<Response> {
+    let (Some(user), Some(password)) = (req.user, req.password) else {
+        return Ok(refused("sign in with a user and a password, both of them"));
+    };
+    if req.token.is_some() || req.ticket.is_some() {
+        return Ok(refused(
+            "sign in with a token, a ticket or a password, one of them",
+        ));
+    }
+    let ok = blocking({
+        let (app, user) = (app.clone(), user.clone());
+        move || {
+            let phc = app.repo.with_meta(|m| m.password(&user))?;
+            Ok(crate::passwords::verify(phc.as_deref(), &password))
+        }
+    })
+    .await?;
+    if !ok {
+        return Ok(refused("wrong user or password"));
+    }
+    let label = browser_label(agent.as_deref());
+    let made = crate::tokens::issue(
+        app.clone(),
+        user,
+        label,
+        cairn_protocol::wire::TokenKind::Browser,
+    )
+    .await?;
+    Ok(signed_in(&app, &cairn_store::token_hash(&made.token)))
+}
+
+/// What a browser's token is labelled: the browser and system its `User-Agent` names, as far as that
+/// says, or "browser".
+fn browser_label(agent: Option<&str>) -> String {
+    let Some(agent) = agent else {
+        return "browser".into();
+    };
+    let browser = ["Edg/", "Firefox/", "Chrome/", "Safari/"]
+        .into_iter()
+        .find(|b| agent.contains(b))
+        .map(|b| match b {
+            "Edg/" => "Edge",
+            "Firefox/" => "Firefox",
+            "Chrome/" => "Chrome",
+            _ => "Safari",
+        });
+    let system = [
+        ("iPhone", "iPhone"),
+        ("iPad", "iPad"),
+        ("Android", "Android"),
+        ("Mac OS X", "macOS"),
+        ("Windows", "Windows"),
+        ("Linux", "Linux"),
+    ]
+    .into_iter()
+    .find(|(k, _)| agent.contains(k))
+    .map(|(_, v)| v);
+    match (browser, system) {
+        (Some(b), Some(s)) => format!("{b} on {s}"),
+        (Some(b), None) => b.to_string(),
+        (None, Some(s)) => format!("browser on {s}"),
+        (None, None) => "browser".into(),
+    }
+}
+
+/// `DELETE /v1/session`: the cookie cleared; and a session a password made, its token taken back, so
+/// that nothing it opened stays open anywhere.
+pub(crate) async fn sign_out(State(app): State<Arc<App>>, req: Request) -> ApiResult<Response> {
+    if let Some(hash) = cookie_value(&req).and_then(|c| app.sessions.verify(&c)) {
+        blocking({
+            let app = app.clone();
+            move || {
+                let browser =
+                    app.repo.with_meta(|m| m.tokens())?.into_iter().find(|t| {
+                        t.hash == hash && t.kind == cairn_protocol::wire::TokenKind::Browser
+                    });
+                if let Some(t) = browser {
+                    app.repo.with_meta(|m| m.remove_token(&t.hash))?;
+                }
+                Ok(())
+            }
+        })
+        .await?;
+    }
+    Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session_cookie("", 0))],
     )
-        .into_response()
+        .into_response())
 }
 
 /// `POST /v1/session/ticket`, with a token: a ticket that signs a browser in once as that token.

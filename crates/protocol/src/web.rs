@@ -35,6 +35,12 @@ pub struct SignIn {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
+    /// With `password` a user's name and password (`feature::PASSWORDS`), which make a token for this
+    /// browser alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 /// `POST /v1/session/ticket`: what signs a browser in once, as the token that asked, within

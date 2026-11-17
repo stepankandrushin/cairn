@@ -29,6 +29,17 @@ pub enum UserCommand {
         #[arg(long)]
         data: PathBuf,
     },
+    /// Set a user's password for signing in to the web, read from stdin: typed twice without being
+    /// shown, or the first line of what is piped in. Every browser a password of theirs signed in is
+    /// signed out.
+    Password {
+        name: String,
+        /// Take the password away instead: the user signs in with a token or from a device alone.
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        data: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -207,6 +218,28 @@ pub fn user(what: UserCommand) -> Result<()> {
             let repo = open(&data)?;
             repo.with_meta(|m| m.remove_user(&name))?;
             println!("user {name} removed, with its tokens and access");
+        }
+        UserCommand::Password { name, clear, data } => {
+            let password = if clear {
+                None
+            } else {
+                let p = crate::passwords::read_from_stdin()?;
+                cairn_protocol::wire::check_password(&p).map_err(anyhow::Error::msg)?;
+                Some(p)
+            };
+            let repo = open(&data)?;
+            if !repo
+                .with_meta(|m| m.users())?
+                .iter()
+                .any(|u| u.name == name)
+            {
+                bail!("no user {name:?}");
+            }
+            let out = crate::passwords::set(&repo, &name, password.as_deref(), None)?;
+            let what = if clear { "taken away" } else { "set" };
+            println!(
+                "the password of user {name} {what}; {out} browser(s) it signed in signed out"
+            );
         }
     }
     Ok(())

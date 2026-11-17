@@ -928,7 +928,7 @@ impl Client {
         let token = self.auth.strip_prefix("Bearer ").unwrap_or(&self.auth);
         let body = serde_json::to_vec(&cairn_protocol::web::SignIn {
             token: Some(token.to_string()),
-            ticket: None,
+            ..Default::default()
         })?;
         let resp = self
             .agent

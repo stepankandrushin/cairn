@@ -154,6 +154,7 @@ cairn-server token add bob --label laptop --token-file bob-laptop.token --data ~
 cairn-server user list --data ~/cairn-data
 cairn-server revoke team bob --data ~/cairn-data
 cairn-server token list --data ~/cairn-data; cairn-server token remove <ID> --data ~/cairn-data
+cairn-server user password alice --data ~/cairn-data   # for the web, typed twice; --clear takes it away
 cairn-server folder list --data ~/cairn-data     # each folder, its head, former names and who has access
 cairn-server folder rename team crew --data ~/cairn-data   # with the server stopped; or in the web
 

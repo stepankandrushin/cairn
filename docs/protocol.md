@@ -81,6 +81,23 @@ user's token is not there, 404 alike. `/v1/me` names the request's own token as 
 and says `password: true` when the user has one to sign in to the web with. A server keeps a token's last use
 to the hour, written by the first request of each hour.
 
+## Passwords
+
+A user may have a password, to sign a browser in on a computer that syncs nothing. The server keeps it as an
+argon2id hash. `POST /v1/session` with `{user, password}` makes a token of kind `browser` for that browser
+alone, labelled with the browser and system its `User-Agent` names, and the session is that token's: so each
+browser signed in by a password is listed in `/v1/tokens` and signed out alone, and `DELETE /v1/session` takes
+its token back. A wrong password, a user with none and no such user answer alike, 401 `wrong user or
+password` in the same time.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `PUT /v1/me/password` | `{current?, new?}` | 204 the caller's password set to `new` or with `new` absent taken away. A user who has one gives it as `current` else 403; one who forgot it has the administrator set another. 400 a password under 10 characters, over 1024 bytes, or only spaces |
+
+A password set, changed or taken away signs out every browser a password of that user's signed in, but the
+one that changed it. The administrator sets one with `cairn-server user password <user>` which reads it from
+stdin, typed twice unseen or piped, and takes it away with `--clear`.
+
 ## Pairing
 
 A device signs in without anyone pasting a token: one of the user's signed-in devices, or the web, asks for a
@@ -112,6 +129,7 @@ every client must speak. A server before features sends none.
 | `item_hash` | A web `item` carries a file's manifest hash [Web](#web) |
 | `tokens` | A user's own tokens through `/v1/tokens` and `token` in `/v1/me` [Tokens](#tokens) |
 | `pairing` | A signed-in device makes a code another device trades for a token of its own [Pairing](#pairing) |
+| `passwords` | A user signs in to the web with a password [Passwords](#passwords) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -255,11 +273,12 @@ The web interface is a thin client of the endpoints below, which any client may 
 scripts are in the server binary, at `GET /` and `/web/…` and the same page at `GET /s/{link}` opens a
 public link. They name no version, user or folder, and answer without a token. In `cairn_protocol::web`
 
-**Signing in.** `POST /v1/session` with `{token}` or `{ticket}` answers 204 and sets the cookie `cairn`
+**Signing in.** `POST /v1/session` with `{token}` `{ticket}` or `{user, password}` [Passwords](#passwords) answers 204 and sets the cookie `cairn`
 `HttpOnly; Secure; SameSite=Strict` for 30 days; a wrong token or a ticket used or late is 401 The cookie is a
 session, `<token hash>.<end>.<mac>` the BLAKE3 of the token that signed in, the second it ends, and a keyed
 BLAKE3 of both under the server's key, `web/session.key` It never holds the token, it outlives a restart, and
-removing the token signs out every browser it signed in. `DELETE /v1/session` clears it. A ticket comes from
+removing the token signs out every browser it signed in. `DELETE /v1/session` clears it, and takes back the
+token a password made for that browser. A ticket comes from
 `POST /v1/session/ticket` with a token, `{ticket, expires_in}` - 32 random bytes as base64url in memory only,
 taken once within 120 s. A program with a token the tray's Open in browser, `cairn web` opens
 `<server>/#/signin/<ticket>/f/<folder>/root` the ticket is in the fragment, which no browser sends, and the page

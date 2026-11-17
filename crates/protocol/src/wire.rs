@@ -204,6 +204,30 @@ pub struct NewToken {
     pub token: String,
 }
 
+/// `PUT /v1/me/password`: a new password, or with `new` absent none; `current` the one the user has now,
+/// if they have one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewPassword {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<String>,
+}
+
+/// A password a user may have: 10 to 1024 bytes, and not only spaces.
+pub fn check_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < 10 {
+        return Err("a password is at least 10 characters".into());
+    }
+    if password.len() > 1024 {
+        return Err("a password is at most 1024 bytes".into());
+    }
+    if password.trim().is_empty() {
+        return Err("a password is more than spaces".into());
+    }
+    Ok(())
+}
+
 /// How long a pairing code waits to be taken, in seconds.
 pub const PAIR_SECS: u64 = 600;
 

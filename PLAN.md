@@ -401,9 +401,8 @@ one for the web in memory, replayed when it starts and kept up after each commit
 
 Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
 Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.
-Before it lands, the server must look a commit's operation ID up before it checks the commit's chunks, which
-today it does after: a retry of a commit it took, whose chunks were collected since, would be refused rather
-than answered.
+The server looks a commit's operation ID up before it checks the commit's chunks, so a retry of a commit it
+took, whose chunks were collected since, is answered as it was rather than refused.
 
 ## Sharing and access
 

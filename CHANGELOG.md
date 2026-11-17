@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Fixed:**
+
+- The server looks a commit's operation ID up before it checks the commit's chunks, so a commit it took whose
+  answer was lost is answered as it was when it is sent again, even once its chunks are gone, as a collector
+  may take them in between.
+
 ## 0.1.29 2026-11-17
 
 **Added:**

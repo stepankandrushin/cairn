@@ -91,10 +91,11 @@ CommitResponse { result: "committed", seq } | { result: "rejected", reject }
 ```
 
 A commit is all or nothing, and durable when `committed` is answered. Retrying an `op_id` that committed
-returns the first `seq` and changes nothing, so a lost response is harmless. A rejected commit changed
-nothing; the client merges again and sends a new one.
+returns the first `seq` and changes nothing, whatever has become of its chunks since, as the `op_id` is
+looked up first: so a lost response is harmless. A rejected commit changed nothing; the client merges
+again and sends a new one.
 
-Before the operations are looked at, the server checks that every manifest a revision names, and every
+Then, before the operations are looked at, the server checks that every manifest a revision names, and every
 chunk those manifests name, is already stored with the right length. So a chunk is durable before
 any commit can refer to it.
 

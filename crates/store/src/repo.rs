@@ -227,7 +227,16 @@ impl Repo {
         time: i64,
         user: Option<&str>,
     ) -> Result<CommitResponse> {
+        // A commit taken before is answered as it was, whatever has become of its chunks since: a
+        // retry after a lost answer must not be refused for chunks collected in the meantime.
+        if let Some(seq) = self.meta().committed(ns, &req.op_id)? {
+            return Ok(CommitResponse::Committed { seq });
+        }
         if let Some(reject) = self.check_content(ns, req)? {
+            // A copy of the same commit, sent at once, may have been taken while this one was looked at.
+            if let Some(seq) = self.meta().committed(ns, &req.op_id)? {
+                return Ok(CommitResponse::Committed { seq });
+            }
             return Ok(CommitResponse::Rejected { reject });
         }
         let outcome = self.meta().commit(ns, req, time, user)?;

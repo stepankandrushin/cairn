@@ -377,3 +377,82 @@ fn a_server_restarted_before_it_answers_is_asked_again() {
     assert_eq!(b.read("f"), a.read("f"));
     server.fsck();
 }
+
+/// Every chunk file the server holds, by its path under the data directory.
+fn chunk_files(server: &Server) -> std::collections::BTreeSet<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.map(Result::unwrap) {
+            let path = e.path();
+            if e.file_type().unwrap().is_dir() {
+                walk(&path, out);
+            } else if path.components().any(|c| c.as_os_str() == "chunks") {
+                out.insert(path);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(&server.data.join("ns"), &mut out);
+    out
+}
+
+/// A commit the server took, whose answer never came, is answered as it was when it is sent again,
+/// even once the chunks it named are gone, as a collector may take them in between: looked up by its
+/// operation ID before its chunks are.
+#[test]
+fn a_commit_taken_whose_chunks_went_since_still_gets_the_first_answer() {
+    let (sb, mut server, a, b) = pair("net-gone");
+    a.synced();
+    let gate = sb.path("gate");
+    std::fs::create_dir(&gate).unwrap();
+    server.set_env(vec![(
+        "CAIRN_FP_PAUSE".into(),
+        format!("server.commit.before_ack:{}", gate.display()),
+    )]);
+    server.restart();
+    let held = chunk_files(&server);
+    a.write(
+        "f",
+        "committed, then its chunks taken away before the answer",
+    );
+    let before = journal(&server);
+    let syncing = {
+        let a = a.clone();
+        std::thread::spawn(move || a.sync_env(&[("CAIRN_FP_TUNE", "client.retry_ms=250")]))
+    };
+    let start = std::time::Instant::now();
+    while !gate.join("reached").exists() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "the commit never came"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    server.kill();
+    let aside = sb.path("aside");
+    std::fs::create_dir(&aside).unwrap();
+    let gone: Vec<_> = chunk_files(&server).difference(&held).cloned().collect();
+    assert!(!gone.is_empty(), "the commit stored no chunk");
+    for (i, path) in gone.iter().enumerate() {
+        std::fs::rename(path, aside.join(i.to_string())).unwrap();
+    }
+    server.set_env(Vec::new());
+    server.restart();
+    let run = syncing.join().unwrap();
+    assert!(run.ok(), "{}", run.text());
+    assert!(!run.stdout.contains("refused a commit"), "{}", run.text());
+    assert!(run.stdout.contains("1 commits pushed"), "{}", run.text());
+    assert_eq!(journal(&server).len(), before.len() + 1, "{}", run.text());
+    assert!(outbox(&a).is_empty());
+    // Put back, as nothing but this test removes a chunk a head names.
+    server.kill();
+    for (i, path) in gone.iter().enumerate() {
+        std::fs::rename(aside.join(i.to_string()), path).unwrap();
+    }
+    server.restart();
+    b.synced();
+    assert_eq!(b.read("f"), a.read("f"));
+    server.fsck();
+}

@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
-use cairn_protocol::{Hash, Link, Name, ObjectId, ObjectKind, OpReject, RevisionBody, RevisionId};
+use cairn_protocol::{
+    Hash, Link, Name, ObjectId, ObjectKind, OpId, OpReject, RevisionBody, RevisionId,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommitOutcome {
@@ -121,6 +123,8 @@ pub trait MetaStore: Send {
         name: Option<&str>,
         if_none: bool,
     ) -> Result<Option<String>>;
+    /// The sequence number of the commit with this operation ID, if the namespace took it.
+    fn committed(&mut self, ns: &str, op_id: &OpId) -> Result<Option<u64>>;
     /// All or nothing. Durable when this returns `Committed`. `user` is whose token sent it, kept in
     /// the journal with it.
     fn commit(

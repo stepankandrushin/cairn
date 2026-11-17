@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
 use cairn_protocol::{
-    check_and_apply, Content, Hash, Link, Metadata, Name, ObjectId, ObjectKind, Op, OpReject,
+    check_and_apply, Content, Hash, Link, Metadata, Name, ObjectId, ObjectKind, Op, OpId, OpReject,
     RevisionBody, RevisionId, TreeStore,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -950,6 +950,19 @@ impl MetaStore for SqliteStore {
             });
         }
         Ok(out)
+    }
+
+    fn committed(&mut self, ns: &str, op_id: &OpId) -> Result<Option<u64>> {
+        let ns_id = self.ns_id(ns)?;
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM journal WHERE ns = ?1 AND op_id = ?2",
+                params![ns_id, op_id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(seq.map(|s| s as u64))
     }
 
     fn commit(

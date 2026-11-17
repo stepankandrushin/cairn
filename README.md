@@ -174,19 +174,25 @@ user may write, what was held back goes up like any change. `cairn log` says whi
 ## The web interface
 
 The server's address opens it in a browser. From a computer that syncs, the tray's Open in browser, or `cairn
-web` in a synced folder, opens it signed in as that device, with nothing to type; elsewhere, sign in with a
+web` in a synced folder, opens it signed in as that device, with nothing to type; elsewhere, sign in with the
+user's name and password, which `cairn-server user password alice --data ~/cairn-data` sets, or with a
 token, which `cairn-server token add alice --label browser --data ~/cairn-data` makes. Each folder is there to browse, with uploads of files and folders,
 downloads of a file or of a folder as a zip, previews stepped through by the arrow keys, a file's history with any revision restored, what was
 deleted brought back, who has access, a page of its settings, and, for a folder's managers, its rename and
 shares of any file or folder in it: with
 another user of the server, to read or to write, or by a public link that needs no account, reads only and
-may expire. A change made there is a commit like any device's, refused rather than forced when something
+may expire. A picture or video shows its thumbnail in place of its icon where the server made one, or a phone
+sent one, a HEIC's among them, and a picture's preview shows the larger one while the file itself loads.
+A change made there is a commit like any device's, refused rather than forced when something
 changed since it was looked at, and a file replaced there keeps its mode, owners and attributes. A share with
 a user is seen in the web interface, not synced yet. The + beside Folders adds a folder of one's own. It is
 light or dark as the device is, and the sun or moon at the right end of its top bar switches it. Times are on
 a 24-hour clock, as `2026-11-11 09:50` its Settings choose the theme, a 12-hour clock or another order of the
-date, kept in that browser, and the user's own name for each folder, kept on the server. The endpoints are in
-docs/protocol.md "Web".
+date, kept in that browser, and the user's own name for each folder, kept on the server. Settings also set,
+change or remove the user's password, which signs out every other browser it signed in, and list every device
+and browser signed in as them, each by a token of its own, to rename or sign out alone, this browser with
+them; Add a device there shows a QR code and a code, which a new device trades within ten minutes for a token
+of its own, with nothing to paste. The endpoints are in docs/protocol.md "Web".
 
 A public link needs only `/s/` `/web/` and `/v1/links/` Where the server's address is open to some addresses
 alone, a second door in the proxy, open to anyone, can pass just those, and `cairn-server serve --link-url

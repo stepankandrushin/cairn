@@ -253,7 +253,13 @@ pre.command {
 .signin-form { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .signin-form input { width: 100%; height: 38px; }
 .signin-form .btn { margin-top: 6px; height: 38px; }
+.signin-form .form-error { margin: 0; }
+.signin-note { margin: 0 0 12px; }
+.signin-or { display: flex; align-items: center; gap: 10px; margin: 4px 0 12px; color: var(--muted); font-size: 12.5px; }
+.signin-or::before, .signin-or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .signin-card code { overflow-wrap: anywhere; }
+/* A card taller than a phone's screen starts at its top: the theme button keeps a row of its own. */
+@media (max-width: 480px) { .signin { padding: 52px 12px 24px; } }
 
 /* Browser */
 
@@ -308,6 +314,21 @@ table.list tr.current td { background: color-mix(in srgb, var(--accent) 7%, tran
 /* The name's link covers its whole cell, the icon and the space around the name too. */
 td.link-cell { position: relative; }
 td.link-cell .name-link::after { content: ""; position: absolute; inset: 0; }
+/* A picture's or video's thumbnail in place of its icon; where any row has one, every icon takes as much
+   room, so the names line up. */
+.thumb {
+  width: 32px; height: 32px; flex: none; display: block;
+  object-fit: cover; border-radius: 4px; background: var(--hover);
+}
+table.with-thumbs .name-cell { min-height: 32px; }
+table.with-thumbs .name-cell > .icon { margin: 0 7px; }
+/* On a phone the name keeps the room it had beside an icon. */
+@container main (max-width: 480px) {
+  .thumb { width: 24px; height: 24px; }
+  table.with-thumbs .name-cell { min-height: 24px; gap: 8px; }
+  table.with-thumbs .name-cell > .icon { margin: 0 3px; }
+  table.files .col-size { width: 80px; }
+}
 .target { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 .row-actions { text-align: right; white-space: nowrap; }
 .row-actions .btn + .btn { margin-left: 6px; }
@@ -414,7 +435,54 @@ dialog.dlg::backdrop { background: rgba(10, 12, 14, 0.5); }
 .share-row .link-input { flex: 1; min-width: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
 .share-meta { color: var(--muted); font-size: 12.5px; }
 
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 10px; }
+.panel .panel-head h2 { margin: 0; }
+
 .settings { max-width: 620px; }
+.password-form { margin-top: 12px; gap: 10px; }
+.password-form .text-input { max-width: 340px; }
+.password-form .form-row { margin: 4px 0 0; }
+.password-form .form-error { margin: 0; }
+.password-form + .hint { margin: 12px 0 0; }
+
+/* Devices. The name keeps its room: on a narrow page the columns beside it go, and what they said is told
+   on a line under the name instead. The widths are of .main, with or without the sidebar. */
+table.devices { margin-top: 4px; }
+table.devices th { position: static; }
+table.devices .name-stack { min-width: 0; }
+table.devices .dev-name { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+table.devices .dev-name .badge { margin-left: 0; }
+table.devices .col-kind, table.devices .col-added, table.devices .col-used { width: 1%; white-space: nowrap; color: var(--muted); }
+.badge.current { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
+.dev-meta { display: none; color: var(--muted); font-size: 12.5px; }
+.dev-meta > span { display: none; white-space: nowrap; }
+.dev-meta > span + span::before { content: "·"; margin: 0 6px; }
+.rename-row { margin: 0; gap: 6px; }
+.rename-row > .grow { flex: 1 1 8em; width: 8em; min-width: 6em; }
+@container main (max-width: 640px) {
+  table.devices .col-kind, table.devices .col-added { display: none; }
+  .dev-meta { display: block; }
+  .dev-meta > .m-kind, .dev-meta > .m-added { display: inline; }
+}
+@container main (max-width: 460px) {
+  table.devices .col-used { display: none; }
+  .dev-meta > .m-used { display: block; }
+  .dev-meta > .m-used::before { content: none; }
+}
+
+/* Adding a device: the QR code, dark on light in either theme, as a camera reads it, and the code large. */
+.pair { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; }
+.pair > p { margin: 0; }
+.pair-qr {
+  display: block; max-width: 100%; height: auto;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+}
+.pair-code {
+  font: 600 clamp(20px, 7vw, 30px)/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.08em; user-select: all; overflow-wrap: anywhere;
+}
+.pair-left { font-variant-numeric: tabular-nums; }
+.pair .muted { max-width: 34em; }
 .choice { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-weight: 400; cursor: pointer; }
 .choice-label { min-width: 8em; }
 

@@ -25,6 +25,12 @@
 - Resumable uploads: `PUT /file` speaks the IETF's resumable uploads draft in interop versions 3 5 and 6 as
   the phones' systems do, a 104 telling where an upload can go on from, so a large video cut off sends only
   what is left. The server answers on its own accept loop, which can send that 104.
+- The web interface signs in with a user's name and password beside a token, and says so where a server
+  takes none. Its Settings set, change or remove the password, and list every device and browser signed in
+  as the user, each renamed in place or signed out alone, this browser too; Add a device shows a pairing code
+  and its QR code with the time it has left. A folder shows a thumbnail in place of each picture's and
+  video's icon where there is one, loaded as it scrolls near, and a picture's preview shows the larger one
+  while the file itself loads, a HEIC's in place of the file no browser shows.
 
 **Changed:**
 

@@ -192,18 +192,45 @@ const EXT_TYPE = new Map();
 for (const [type, list] of Object.entries(TYPES)) for (const ext of list.split(' ')) EXT_TYPE.set(ext, type);
 const TEXT_NAMES = new Set(['makefile', 'dockerfile', 'readme', 'license', 'copying', 'changelog', 'authors']);
 
-/** What a file is, by its name: what kind of preview it gets and its icon's colour. */
-function typeOf(display) {
+/** A name's extension, lower case, or ''. */
+function extOf(display) {
   const lower = display.toLowerCase();
   const dot = lower.lastIndexOf('.');
-  const ext = dot >= 0 ? lower.slice(dot + 1) : '';
-  return EXT_TYPE.get(ext) || (TEXT_NAMES.has(lower) ? 'text' : 'other');
+  return dot >= 0 ? lower.slice(dot + 1) : '';
+}
+
+/** What a file is, by its name: what kind of preview it gets and its icon's colour. */
+function typeOf(display) {
+  return EXT_TYPE.get(extOf(display)) || (TEXT_NAMES.has(display.toLowerCase()) ? 'text' : 'other');
 }
 
 function fileIcon(item, cls = '') {
   if (item.kind === 'dir') return icon('folder', `t-folder ${cls}`);
   if (item.kind === 'symlink') return icon('link', `t-link ${cls}`);
   return icon('file', `t-${typeOf(item.display)} ${cls}`);
+}
+
+// Thumbnails (docs/protocol.md "Thumbnails"): asked for of the files whose names say picture or video. The
+// server makes one of a picture it decodes and keeps one a phone sent of the rest; of anything else it
+// answers 404, and the icon stays.
+const THUMB_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'mov', 'mp4', 'm4v']);
+
+/** Whether a view's server makes thumbnails. A public link has no `/v1/me` to ask, so it tries, and a 404 leaves the icon. */
+const thumbsIn = (view) => (view.kind === 'link' ? true : hasFeature('thumbs'));
+const mayHaveThumb = (view, item) => item.kind === 'file' && thumbsIn(view) && THUMB_EXTS.has(extOf(item.display));
+
+function thumbUrl(view, item, size) {
+  const q = new URLSearchParams({ size: String(size) });
+  if (item.revision) q.set('revision', item.revision);
+  return `${view.base}/thumb/${enc(item.object)}?${q}`;
+}
+
+/** A listed file's thumbnail, loaded once it scrolls near, where it may have one; else, or on a 404, its icon. */
+function rowIcon(view, item) {
+  if (!mayHaveThumb(view, item)) return fileIcon(item);
+  const img = h('img', { class: 'thumb', src: thumbUrl(view, item, 128), alt: '', loading: 'lazy', decoding: 'async', width: 32, height: 32 });
+  img.addEventListener('error', () => img.replaceWith(fileIcon(item)));
+  return img;
 }
 
 function loading() {
@@ -373,8 +400,12 @@ const api = {
   get: async (p) => ownTopName(p, await request('GET', p)),
   post: (p, json) => request('POST', p, json === undefined ? {} : { json }),
   put: (p, json) => request('PUT', p, { json }),
+  patch: (p, json) => request('PATCH', p, { json }),
   del: (p) => request('DELETE', p),
 };
+
+/** Whether the server says it does this, one of the names in `features` (docs/protocol.md "Features"). */
+const hasFeature = (name) => !!(state.me && Array.isArray(state.me.features) && state.me.features.includes(name));
 
 async function getUsers() {
   const r = await api.get('/v1/users');
@@ -591,6 +622,27 @@ function brand(link = true) {
     h('img', { src: '/web/icon.svg', alt: '' }), 'Cairn');
 }
 
+/** `POST /v1/session` with a token, a ticket, or a user and password: the server's answer, whatever it is. */
+async function postSession(body) {
+  try {
+    return await fetch('/v1/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Cairn-Web': '1' },
+      body: JSON.stringify(body),
+      credentials: 'same-origin',
+    });
+  } catch (e) {
+    throw new ApiError(0, `The server could not be reached (${e.message}).`);
+  }
+}
+
+// What a server before passwords says to a sign-in by one, taking it for neither a token nor a ticket.
+const NO_PASSWORDS = /token or a ticket, one of them/;
+
+/**
+ * Both ways in, as nothing says yet which the server takes: a user and password, which a server before
+ * passwords answers it does not take, and a token.
+ */
 function showSignIn(message) {
   closeMenu();
   state.me = null;
@@ -598,46 +650,64 @@ function showSignIn(message) {
   state.openFolder = null;
   shell = null;
   document.title = 'Cairn';
-  const input = h('input', { type: 'password', id: 'token', name: 'token', autocomplete: 'current-password', required: true, spellcheck: 'false', autocapitalize: 'off' });
-  const err = h('p', { class: 'form-error', role: 'alert', hidden: !message, text: message || '' });
-  const button = h('button', { class: 'btn primary wide', type: 'submit' }, 'Sign in');
-  const form = h('form', {
+  const note = h('p', { class: 'form-error signin-note', role: 'alert', hidden: !message, text: message || '' });
+  // One form's submit: what went wrong is said under it, and once signed in the page starts.
+  const submitting = (button, err, run) => async (ev) => {
+    ev.preventDefault();
+    button.disabled = true;
+    err.hidden = true;
+    note.hidden = true;
+    try {
+      await run();
+      await start();
+    } catch (e) {
+      err.textContent = e.message;
+      err.hidden = false;
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  const user = h('input', { type: 'text', id: 'user', name: 'username', autocomplete: 'username', required: true, spellcheck: 'false', autocapitalize: 'off' });
+  const password = h('input', { type: 'password', id: 'password', name: 'password', autocomplete: 'current-password', required: true });
+  const passwordErr = h('p', { class: 'form-error', role: 'alert', hidden: true });
+  const passwordButton = h('button', { class: 'btn primary wide', type: 'submit' }, 'Sign in');
+  const passwordForm = h('form', {
     class: 'signin-form',
-    onsubmit: async (ev) => {
-      ev.preventDefault();
-      button.disabled = true;
-      err.hidden = true;
-      try {
-        let r;
-        try {
-          r = await fetch('/v1/session', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Cairn-Web': '1' },
-            body: JSON.stringify({ token: input.value.trim() }),
-            credentials: 'same-origin',
-          });
-        } catch (e) {
-          throw new ApiError(0, `The server could not be reached (${e.message}).`);
-        }
-        if (r.status === 401) throw new UserError('That token is not one this server knows.');
-        if (!r.ok) throw new ApiError(r.status, (await r.text()).trim());
-        input.value = '';
-        await start();
-      } catch (e) {
-        err.textContent = e.message;
-        err.hidden = false;
-      } finally {
-        button.disabled = false;
+    onsubmit: submitting(passwordButton, passwordErr, async () => {
+      const r = await postSession({ user: user.value.trim(), password: password.value });
+      if (r.ok) { password.value = ''; return; }
+      const text = (await r.text().catch(() => '')).trim();
+      if ([400, 404, 405].includes(r.status) || (r.status === 401 && NO_PASSWORDS.test(text))) {
+        throw new UserError('This server does not take passwords: sign in with a token instead.');
       }
-    },
-  }, h('label', { for: 'token', text: 'Token' }), input, err, button);
+      throw new UserError(text ? said(new Error(text)) : `The server answered ${r.status}.`);
+    }),
+  }, h('label', { for: 'user', text: 'User' }), user, h('label', { for: 'password', text: 'Password' }), password, passwordErr, passwordButton);
+
+  const token = h('input', { type: 'password', id: 'token', name: 'token', autocomplete: 'off', required: true, spellcheck: 'false', autocapitalize: 'off' });
+  const tokenErr = h('p', { class: 'form-error', role: 'alert', hidden: true });
+  const tokenButton = h('button', { class: 'btn wide', type: 'submit' }, 'Sign in with the token');
+  const tokenForm = h('form', {
+    class: 'signin-form',
+    onsubmit: submitting(tokenButton, tokenErr, async () => {
+      const r = await postSession({ token: token.value.trim() });
+      if (r.status === 401) throw new UserError('That token is not one this server knows.');
+      if (!r.ok) throw new ApiError(r.status, (await r.text()).trim());
+      token.value = '';
+    }),
+  }, h('label', { for: 'token', text: 'Token' }), token, tokenErr, tokenButton);
+
   $app().replaceChildren(h('div', { class: 'signin' }, themeButton('signin-theme'), h('div', { class: 'signin-card' },
     brand(false),
     h('h1', { text: 'Sign in' }),
-    form,
+    note,
+    passwordForm,
+    h('div', { class: 'signin-or', text: 'or with a token' }),
+    tokenForm,
     h('p', { class: 'hint' }, 'Opened from Cairn on a computer that syncs (its Open in browser, or ', h('code', { text: 'cairn web' }), ' in a synced folder), this page signs in by itself.'),
-    h('p', { class: 'hint' }, 'Or sign in with a token: ', h('code', { text: 'cairn-server token add <user> --label browser' }), ' on the server makes one.'))));
-  input.focus();
+    h('p', { class: 'hint' }, 'A password is set here in Settings once signed in, or by the administrator with ', h('code', { text: 'cairn-server user password <user>' }), '. A token is made with ', h('code', { text: 'cairn-server token add <user> --label browser' }), ' on the server.'))));
+  user.focus();
 }
 
 function signedOut() {
@@ -720,17 +790,12 @@ async function signInByTicket() {
   history.replaceState(null, '', location.pathname + (m[2] ? `#${m[2]}` : ''));
   state.signingIn = true;
   try {
-    const r = await fetch('/v1/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Cairn-Web': '1' },
-      body: JSON.stringify({ ticket: m[1] }),
-      credentials: 'same-origin',
-    });
+    const r = await postSession({ ticket: m[1] });
     if (r.ok) return null;
     const text = (await r.text()).trim();
     return text ? text.charAt(0).toUpperCase() + text.slice(1) + '.' : `The server answered ${r.status}.`;
   } catch (e) {
-    return `The server could not be reached (${e.message}).`;
+    return e.message;
   } finally {
     state.signingIn = false;
   }
@@ -894,7 +959,8 @@ function browser(view, listing) {
     },
   });
   ctx.headers = {};
-  const table = h('table', { class: 'files' },
+  // Where any row may show a thumbnail, every icon takes a thumbnail's room, so the names line up.
+  const table = h('table', { class: `files${ctx.entries.some((e) => mayHaveThumb(view, e)) ? ' with-thumbs' : ''}` },
     h('thead', {}, h('tr', {},
       h('th', { class: 'col-check' }, ctx.all),
       sortHeader(ctx, 'name', 'Name', 'col-name'),
@@ -993,7 +1059,7 @@ function row(ctx, e) {
       },
     })),
     h('td', { class: 'col-name link-cell' }, h('div', { class: 'name-cell' },
-      fileIcon(e),
+      rowIcon(ctx.view, e),
       name,
       e.kind === 'symlink' && h('span', { class: 'target', text: `→ ${e.target_display ?? ''}` }))),
     h('td', { class: 'col-size', text: e.kind === 'file' ? humanSize(e.size) : '' }),
@@ -1184,17 +1250,37 @@ function previewEl(view, item) {
   const none = (text) => h('div', { class: 'pv-none', text });
   if (item.kind !== 'file') return none(item.kind === 'symlink' ? `A link to ${item.target_display ?? ''}` : 'No preview.');
   const url = contentUrl(view, item.object, { revision: item.revision });
+  const thumb = mayHaveThumb(view, item);
   switch (typeOf(item.display)) {
     case 'image': {
-      const img = h('img', { class: 'pv-img', src: url, alt: item.display });
-      img.addEventListener('error', () => img.replaceWith(none('This image cannot be shown here: download it to open it.')));
-      return img;
+      const unshown = () => none('This image cannot be shown here: download it to open it.');
+      const full = h('img', { class: 'pv-img', src: url, alt: item.display });
+      if (!thumb) {
+        full.addEventListener('error', () => full.replaceWith(unshown()));
+        return full;
+      }
+      // Its 1024-pixel thumbnail while the file itself loads, which then takes its place; the thumbnail
+      // stays if only the file fails, and neither loaded says so.
+      const low = h('img', { class: 'pv-img', src: thumbUrl(view, item, 1024), alt: item.display });
+      let failed = 0;
+      const fail = () => { if (++failed === 2 && low.isConnected) low.replaceWith(unshown()); };
+      low.addEventListener('error', () => { low.hidden = true; fail(); });
+      full.addEventListener('load', () => { if (low.isConnected) low.replaceWith(full); });
+      full.addEventListener('error', fail);
+      return low;
     }
-    case 'video': return h('video', { class: 'pv-media', src: url, controls: true, preload: 'metadata' });
+    case 'video': return h('video', { class: 'pv-media', src: url, controls: true, preload: 'metadata', poster: thumb ? thumbUrl(view, item, 1024) : undefined });
     case 'audio': return h('audio', { class: 'pv-audio', src: url, controls: true, preload: 'metadata' });
     case 'pdf': return h('iframe', { class: 'pv-pdf', src: url, title: item.display });
     case 'text': return textPreview(url, item.size);
-    default: return none('No preview for this kind of file: download it to open it.');
+    default: {
+      const nothing = () => none('No preview for this kind of file: download it to open it.');
+      if (!thumb) return nothing();
+      // A picture a browser does not show, HEIC among them, as the thumbnail its phone sent.
+      const img = h('img', { class: 'pv-img', src: thumbUrl(view, item, 1024), alt: item.display });
+      img.addEventListener('error', () => img.replaceWith(nothing()));
+      return img;
+    }
   }
 }
 
@@ -2342,11 +2428,292 @@ function folderNames() {
     rows.length ? rows : h('p', { class: 'empty', text: 'No folder is yours yet.' }));
 }
 
+/** Why a new password cannot be one, or null: what the server refuses too. */
+function passwordProblem(p) {
+  if ([...p].length < 10) return 'A password is at least 10 characters.';
+  if (utf8.encode(p).length > 1024) return 'A password is at most 1024 bytes.';
+  if (!p.trim()) return 'A password is more than spaces.';
+  return null;
+}
+
+/**
+ * The user's password for signing in to this page: set where there is none, else changed or removed, each
+ * with the one there is now. Any of them signs out every other browser a password of theirs signed in.
+ */
+function passwordPanel() {
+  const panel = h('div', { class: 'panel' });
+  const paint = () => {
+    const has = !!state.me.password;
+    const input = (autocomplete) => h('input', { type: 'password', class: 'text-input', autocomplete });
+    const field = (text, el, hint) => h('label', { class: 'field' }, h('span', { text }), el, hint && h('span', { class: 'hint', text: hint }));
+    const current = input('current-password');
+    const fresh = input('new-password');
+    const again = input('new-password');
+    const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
+    const fail = (text, at) => { err.textContent = text; err.hidden = false; if (at) at.focus(); };
+    const send = async (body, done) => {
+      try {
+        await api.put('/v1/me/password', body);
+      } catch (e) {
+        if (e.status === 403) fail('That is not your password now.', current);
+        else if (e.status !== 401) fail(said(e));
+        return;
+      }
+      state.me = await api.get('/v1/me');
+      paint();
+      toast(done);
+    };
+    const save = h('button', { class: 'btn primary', type: 'submit' }, has ? 'Change password' : 'Set password');
+    const submit = act(async (ev) => {
+      ev.preventDefault();
+      err.hidden = true;
+      if (has && !current.value) { fail('Give the password you have now first.', current); return; }
+      const problem = passwordProblem(fresh.value);
+      if (problem) { fail(problem, fresh); return; }
+      if (fresh.value !== again.value) { fail('The two new passwords are not the same.', again); return; }
+      save.disabled = true;
+      try {
+        await send(has ? { current: current.value, new: fresh.value } : { new: fresh.value },
+          has ? 'Your password is changed.' : `Your password is set: sign in with it as ${state.me.user} on any browser.`);
+      } finally {
+        save.disabled = false;
+      }
+    });
+    const remove = has && h('button', {
+      class: 'btn danger',
+      type: 'button',
+      onclick: act(async () => {
+        err.hidden = true;
+        if (!current.value) { fail('Give the password you have now to remove it.', current); return; }
+        const ok = await confirmDialog('Remove your password',
+          'From then on you sign in to this page with a token, or from Cairn on a computer that syncs. Every other browser your password signed in is signed out.',
+          { ok: 'Remove', danger: true });
+        if (ok) await send({ current: current.value }, 'Your password is removed.');
+      }),
+    }, 'Remove password');
+    panel.replaceChildren(
+      h('h2', { text: 'Password' }),
+      h('p', { class: 'muted', text: has
+        ? `You sign in to this page on any browser as ${state.me.user} with your password.`
+        : `You have none. With one, you sign in to this page on any browser as ${state.me.user}, with nothing to paste.` }),
+      h('form', { class: 'stack password-form', onsubmit: submit },
+        // For a password manager, which keeps a password by its user.
+        h('input', { type: 'text', autocomplete: 'username', value: state.me.user, hidden: true, readOnly: true, tabindex: '-1', 'aria-hidden': 'true' }),
+        has && field('Current password', current),
+        field(has ? 'New password' : 'Password', fresh, 'At least 10 characters.'),
+        field(has ? 'New password again' : 'Password again', again),
+        err,
+        h('div', { class: 'form-row' }, save, remove)),
+      h('p', { class: 'hint', text: has
+        ? 'Changing or removing it signs out every other browser your password signed in; this one stays. If you forget it, the administrator sets another.'
+        : 'Setting it signs out no device or browser.' }));
+  };
+  paint();
+  return panel;
+}
+
+const KIND_WORDS = { device: 'Device', browser: 'Browser', paired: 'Paired device' };
+
+/** Why a label cannot be a token's, or null: what the server refuses too. */
+function labelProblem(label) {
+  if (!label.trim()) return 'A name cannot be empty.';
+  if ([...label].length > 100) return 'A name is at most 100 characters.';
+  if (/\p{Cc}/u.test(label)) return 'A name cannot hold a control character.';
+  return null;
+}
+
+/**
+ * Each device and browser signed in as the user, by a token of its own, which is signed out alone: a lost
+ * phone or an old browser, from any other. And a code that signs a new device in, where the server makes
+ * them. `{el, repaint}` repaint showing the times as Settings now says.
+ */
+function devicesPanel() {
+  const tokens = hasFeature('tokens');
+  const pairing = hasFeature('pairing');
+  if (!tokens && !pairing) return null;
+  const list = h('div', {}, tokens && loading());
+  let shown = null;
+  const repaint = () => { if (shown) list.replaceChildren(devicesTable(shown, load)); };
+  const load = async () => {
+    if (!tokens) return;
+    try {
+      const r = await api.get('/v1/tokens');
+      shown = (r && r.tokens) || [];
+      repaint();
+    } catch (e) {
+      if (e.status !== 401) list.replaceChildren(errorBox(e));
+    }
+  };
+  load();
+  const el = h('div', { class: 'panel' },
+    h('div', { class: 'panel-head' },
+      h('h2', { text: 'Devices' }),
+      pairing && h('button', { class: 'btn primary', onclick: act(() => addDevice(load)) }, icon('plus'), 'Add a device')),
+    h('p', { class: 'muted', text: tokens
+      ? 'Every device and browser signed in as you, each by a token of its own. Signed out here, one can no longer reach your folders, and every other goes on.'
+      : 'A phone or computer signs in as you by a code shown here, with nothing to paste.' }),
+    list);
+  return { el, repaint };
+}
+
+function devicesTable(tokens, reload) {
+  if (!tokens.length) return h('p', { class: 'empty', text: 'No device or browser is signed in as you.' });
+  return h('table', { class: 'list devices' },
+    h('thead', {}, h('tr', {},
+      h('th', { class: 'col-name', text: 'Name' }),
+      h('th', { class: 'col-kind', text: 'Kind' }),
+      h('th', { class: 'col-added', text: 'Added' }),
+      h('th', { class: 'col-used', text: 'Last used' }),
+      h('th', { class: 'col-menu' }, h('span', { class: 'hidden-input', text: 'Actions' })))),
+    h('tbody', {}, tokens.map((t) => deviceRow(t, reload))));
+}
+
+/** The current token is this browser's own when a password signed it in, else the device's it signed in as. */
+const thisOne = (t) => (t.kind === 'browser' ? 'this browser' : 'this device');
+
+function deviceRow(t, reload) {
+  const kind = KIND_WORDS[t.kind] || t.kind;
+  const used = t.used ? fmtTime(t.used) : '—';
+  // The columns a narrow page leaves out are told under the name instead (app.css, "Devices").
+  const box = h('div', { class: 'name-stack' },
+    h('div', { class: 'dev-name' },
+      h('span', { class: 'name-text', text: t.label }),
+      t.current && h('span', { class: 'badge current', text: thisOne(t) })),
+    h('div', { class: 'dev-meta' },
+      h('span', { class: 'm-kind', text: kind }),
+      h('span', { class: 'm-added', text: `added ${fmtDate(t.created)}` }),
+      h('span', { class: 'm-used', text: `last used ${used}` })));
+  return h('tr', { class: t.current ? 'current' : '' },
+    h('td', { class: 'col-name' }, box),
+    h('td', { class: 'col-kind', text: kind }),
+    h('td', { class: 'col-added', text: fmtDate(t.created), title: fmtTime(t.created) }),
+    h('td', { class: 'col-used', text: used }),
+    h('td', { class: 'col-menu' }, h('button', {
+      class: 'icon-btn',
+      'aria-label': `Actions for ${t.label}`,
+      'aria-haspopup': 'menu',
+      onclick: (ev) => popupMenu(ev.currentTarget, [
+        ['Rename…', () => renameToken(t, box, reload)],
+        ['Sign out…', () => signOutToken(t, reload), 'danger'],
+      ]),
+    }, icon('more'))));
+}
+
+/** The label, made a field in its place: Enter or Save keeps it, Escape or Cancel puts it back. */
+function renameToken(t, box, reload) {
+  const before = [...box.childNodes];
+  const cancel = () => box.replaceChildren(...before);
+  const input = h('input', { type: 'text', class: 'grow', value: t.label, spellcheck: 'false', autocomplete: 'off', 'aria-label': `New name for ${t.label}` });
+  const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
+  const save = h('button', { class: 'btn small primary', type: 'submit' }, 'Save');
+  input.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); cancel(); } });
+  box.replaceChildren(h('form', {
+    class: 'form-row rename-row',
+    onsubmit: act(async (ev) => {
+      ev.preventDefault();
+      const label = input.value.trim();
+      if (label === t.label) { cancel(); return; }
+      const problem = labelProblem(label);
+      if (problem) { err.textContent = problem; err.hidden = false; return; }
+      save.disabled = true;
+      try {
+        const now = await api.patch(`/v1/tokens/${enc(t.id)}`, { label });
+        if (t.current && state.me.token) state.me.token.label = now.label;
+        toast(`Renamed to “${now.label}”.`);
+        await reload();
+      } catch (e) {
+        if (e.status === 401) return;
+        err.textContent = said(e);
+        err.hidden = false;
+      } finally {
+        save.disabled = false;
+      }
+    }),
+  }, input, save, h('button', { class: 'btn small', type: 'button', onclick: cancel }, 'Cancel')), err);
+  input.focus();
+  input.select();
+}
+
+/** One token taken back, after asking: this browser's own ends this session, and the page signs in again. */
+async function signOutToken(t, reload) {
+  let message;
+  if (t.current && t.kind === 'browser') message = 'This browser is signed out at once.';
+  else if (t.current) message = `This browser is signed in as “${t.label}”, by its token: signing it out signs this browser out at once, and whatever else has that token can no longer sync until it is given a new one.`;
+  else if (t.kind === 'browser') message = `“${t.label}” is signed out at its next request.`;
+  else message = `“${t.label}” can no longer reach your folders from its next request, until it signs in again with a new token or code. What it holds stays on it.`;
+  if (t.current && uploads.busy()) message += ' Uploads still running here stop, and what has not finished is not kept.';
+  const ok = await confirmDialog(t.current ? `Sign out ${thisOne(t)}` : `Sign out “${t.label}”`, message, { ok: 'Sign out', danger: true });
+  if (!ok) return;
+  await api.del(`/v1/tokens/${enc(t.id)}`);
+  if (t.current) uploads.forget();
+  if (!t.current) {
+    toast(`“${t.label}” is signed out.`);
+    await reload();
+    return;
+  }
+  // The cookie names a token that is gone now: cleared, and the next to sign in starts at their own folders.
+  await fetch('/v1/session', { method: 'DELETE', headers: { 'X-Cairn-Web': '1' }, credentials: 'same-origin' }).catch(() => {});
+  history.replaceState(null, '', location.pathname);
+  showSignIn('This browser is signed out.');
+}
+
+/** The server's QR code, an SVG it made, shown as an image: nothing in an image runs, or reaches the page. */
+function qrImage(svg) {
+  if (typeof svg !== 'string' || !/^\s*(<\?xml[^>]*>\s*)?<svg[\s>]/.test(svg)) return null;
+  return h('img', { class: 'pair-qr', src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`, alt: 'QR code of the pairing link' });
+}
+
+/**
+ * A pairing code (docs/protocol.md "Pairing"): its QR code and its letters, while it waits, ten minutes,
+ * for a new device to trade it for a token of its own. The list is read again once the dialog closes.
+ */
+function addDevice(onClose) {
+  const box = h('div', { class: 'pair' }, loading());
+  let timer = null;
+  const d = dialog({
+    title: 'Add a device',
+    body: box,
+    actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Done')],
+    onClose: () => { clearInterval(timer); if (onClose) onClose(); },
+  });
+  const issue = async () => {
+    clearInterval(timer);
+    box.replaceChildren(loading());
+    let p;
+    try {
+      p = await api.post('/v1/pair', { origin: location.origin });
+    } catch (e) {
+      if (e.status !== 401) box.replaceChildren(errorBox(e));
+      return;
+    }
+    if (!d.dlg.open) return;
+    const until = Date.now() + (p.expires_in || 600) * 1000;
+    const left = h('strong', { class: 'pair-left' });
+    const tick = () => {
+      const s = Math.ceil((until - Date.now()) / 1000);
+      if (s > 0) { left.textContent = `${Math.floor(s / 60)}:${pad2(s % 60)}`; return; }
+      clearInterval(timer);
+      box.replaceChildren(
+        h('p', { text: 'This code has run out: no device can sign in with it now.' }),
+        h('button', { class: 'btn primary', type: 'button', onclick: act(issue) }, 'Show a new code'));
+    };
+    box.replaceChildren(
+      qrImage(p.qr_svg),
+      h('p', { class: 'pair-code', text: p.code }),
+      h('p', { class: 'pair-time', 'aria-live': 'off' }, 'It runs out in ', left, ' and signs in one device, once.'),
+      h('p', { class: 'muted', text: 'Cairn on an iPhone or Android phone scans this QR code with its camera, or has the code typed in. The device signs in as you, with a token of its own, listed here as a paired device.' }));
+    tick();
+    timer = setInterval(tick, 1000);
+  };
+  issue().catch(report);
+}
+
 function renderSettings(gen) {
   // A day past the 12th, so that the order of each date shows.
   const sample = new Date(new Date().getFullYear(), 2, 25, 16, 52);
   const now = h('strong');
   const showNow = () => { now.textContent = fmtTime(Date.now() / 1000); };
+  const devices = devicesPanel();
   const group = (title, key, values, label, about) => h('div', { class: 'panel', role: 'radiogroup', 'aria-label': title },
     h('h2', { text: title }),
     values.map((v) => h('label', { class: 'choice' },
@@ -2356,7 +2723,7 @@ function renderSettings(gen) {
         value: v,
         checked: state.settings[key] === v,
         onchange: act(() => {
-          try { saveSetting(key, v); } finally { showNow(); applyTheme(); }
+          try { saveSetting(key, v); } finally { showNow(); applyTheme(); if (devices) devices.repaint(); }
         }),
       }),
       h('span', { class: 'choice-label', text: label(v) }),
@@ -2365,6 +2732,8 @@ function renderSettings(gen) {
   show(gen, h('section', { class: 'settings' },
     h('div', { class: 'screen-head' }, h('h1', { text: 'Settings' })),
     folderNames(),
+    hasFeature('passwords') && passwordPanel(),
+    devices && devices.el,
     h('p', { class: 'muted', text: 'How this page looks and shows times. Kept in this browser, for whoever signs in on it.' }),
     group('Theme', 'theme', THEMES, (v) => THEME_WORDS[v][0], (v) => THEME_WORDS[v][1]),
     group('Clock', 'clock', CLOCKS, (v) => (v === '12h' ? '12-hour' : '24-hour'), (v) => clockText(sample, v)),

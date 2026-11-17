@@ -12,6 +12,8 @@
 - Each user lists, makes, relabels and takes back their own tokens through `/v1/tokens` and `/v1/me` names
   the token a request came with, so a lost phone is signed out from any of the user's devices. Each token has
   a kind, `device` `browser` or `paired` and the hour it was last used, which `cairn-server token list` shows.
+- Pairing: a signed-in device or the web asks `POST /v1/pair` for a code, with its link and QR code, and a
+  new device trades it at `POST /v1/pair/claim` for a token of its own, within ten minutes and once.
 
 **Changed:**
 

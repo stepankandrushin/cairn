@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 mod admin;
 mod file;
+mod pairing;
 mod tokens;
 mod web;
 
@@ -48,6 +49,8 @@ struct App {
     naming: std::sync::Mutex<()>,
     /// The hour each token was last said to be used in.
     touched: tokens::Touched,
+    /// The pairing codes waiting to be taken.
+    pairing: pairing::Codes,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -275,7 +278,7 @@ fn features() -> Vec<String> {
     if cairn_failpoint::unsupported("server.features") {
         return Vec::new();
     }
-    [f::NOTE_GROUPS, f::ITEM_HASH, f::TOKENS]
+    [f::NOTE_GROUPS, f::ITEM_HASH, f::TOKENS, f::PAIRING]
         .into_iter()
         .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
         .map(String::from)
@@ -737,6 +740,7 @@ fn router(app: Arc<App>) -> Router {
             "/v1/tokens/{id}",
             axum::routing::patch(tokens::relabel).delete(tokens::remove),
         )
+        .route("/v1/pair", post(pairing::issue))
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .merge(web::user_routes(&app))
@@ -744,6 +748,10 @@ fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), authorize))
         // After the layer, so outside it: what answers without a token.
         .merge(web::public_routes(&app))
+        .route(
+            "/v1/pair/claim",
+            post(pairing::claim).with_state(app.clone()),
+        )
         .layer(middleware::map_response(web::no_referrer));
     // Around all of it, as one fallback that every request reaches before a route is chosen in it.
     Router::new()
@@ -942,6 +950,7 @@ async fn serve(
         former: std::sync::RwLock::new(former),
         naming: std::sync::Mutex::new(()),
         touched: tokens::Touched::default(),
+        pairing: pairing::Codes::default(),
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();

@@ -81,6 +81,23 @@ user's token is not there, 404 alike. `/v1/me` names the request's own token as 
 and says `password: true` when the user has one to sign in to the web with. A server keeps a token's last use
 to the hour, written by the first request of each hour.
 
+## Pairing
+
+A device signs in without anyone pasting a token: one of the user's signed-in devices, or the web, asks for a
+code and shows it, as text and as a QR code; the new device trades it for a token of its own, of kind
+`paired` which the user can take back alone [Tokens](#tokens).
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `POST /v1/pair` | `{label?, origin?}` | `{code, expires_in, uri?, qr_svg?}` signed in: `code` as a person reads it, `ABCD-EFGH-JKMN` waiting 600 seconds; given the server's address as the caller reaches it, `uri` the link a phone's camera opens, `cairn://pair?server=<origin>&code=<code>` and `qr_svg` its QR code. `label` names the device to come, until it names itself |
+| `POST /v1/pair/claim` | `{code, label?}` | 201 `{user, id, token}` with no token: a token of the code's user, shown this once. 401 a code mistyped, used, or past its time |
+
+A code is twelve letters of Crockford's base 32, 60 random bits, taken once: any try with it ends it, in time
+or not. A claim reads it as a person types it, dashes and spaces left out, any case, O as 0 and I or L as
+1. Codes are kept in memory only, so a restart forgets those waiting; at most 256 wait at once, past which
+`POST /v1/pair` answers 503. A wrong code answers 401 as a wrong token does, so whatever bans an address
+for wrong tokens bans it for wrong codes too.
+
 ## Features
 
 What a server does beyond what every server of this protocol does, it names in `features` in `/info` and
@@ -94,6 +111,7 @@ every client must speak. A server before features sends none.
 | `note_groups` | A note may name more objects than one [Committing](#committing) also `note_groups: true` for clients before features |
 | `item_hash` | A web `item` carries a file's manifest hash [Web](#web) |
 | `tokens` | A user's own tokens through `/v1/tokens` and `token` in `/v1/me` [Tokens](#tokens) |
+| `pairing` | A signed-in device makes a code another device trades for a token of its own [Pairing](#pairing) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.

@@ -6,7 +6,7 @@ use common::*;
 use serde_json::{json, Value};
 
 /// Every feature this build's server names.
-const FEATURES: &[&str] = &["note_groups", "item_hash", "tokens"];
+const FEATURES: &[&str] = &["note_groups", "item_hash", "tokens", "pairing"];
 
 fn token(server: &Server) -> String {
     std::fs::read_to_string(&server.token_file)
@@ -249,4 +249,120 @@ fn a_user_manages_their_own_tokens_and_no_one_elses() {
     let mine = format!("/v1/tokens/{first}");
     assert_eq!(delete(&server, &mine, Auth::Bearer(&alice)).code, 204);
     assert_eq!(get(&server, "/v1/me", Auth::Bearer(&alice)).code, 401);
+}
+
+fn claim(server: &Server, code: &str, label: Option<&str>) -> Answer {
+    let mut body = json!({"code": code});
+    if let Some(l) = label {
+        body["label"] = json!(l);
+    }
+    post(server, "/v1/pair/claim", Auth::None, body)
+}
+
+/// A signed-in device makes a code, with its link and QR code; another device, with no token, trades it
+/// once for a token of its own of the same user's, which is listed as paired and works at once. A code
+/// mistyped, used, or past its time trades for nothing.
+#[test]
+fn a_pairing_code_makes_one_token_of_the_users_once_and_in_time() {
+    let sb = Sandbox::fast("api-pair");
+    let mut server = Server::start(sb.path("data"));
+    let alice = read_token(&server.user("alice"));
+    let made = post(
+        &server,
+        "/v1/pair",
+        Auth::Bearer(&alice),
+        json!({"label": "phone", "origin": "https://cairn.example:8443/"}),
+    )
+    .ok()
+    .json();
+    let code = made["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 14, "{made}");
+    assert_eq!(&code[4..5], "-", "{made}");
+    let bare: String = code.chars().filter(|c| *c != '-').collect();
+    assert_eq!(
+        made["uri"],
+        format!("cairn://pair?server=https%3A%2F%2Fcairn.example%3A8443&code={bare}").as_str(),
+        "{made}"
+    );
+    assert!(made["qr_svg"].as_str().unwrap().contains("<svg"), "{made}");
+    assert_eq!(made["expires_in"], 600);
+
+    // Typed as a person types it: lower case, spaced.
+    let typed = format!("{} {}", bare[..6].to_lowercase(), &bare[6..]);
+    let paired = claim(&server, &typed, Some("iPhone"));
+    assert_eq!(paired.code, 201, "{}", paired.text());
+    let paired = paired.json();
+    assert_eq!(paired["user"], "alice", "{paired}");
+    let phone = paired["token"].as_str().unwrap().to_string();
+    let me = get(&server, "/v1/me", Auth::Bearer(&phone)).ok().json();
+    assert_eq!(me["user"], "alice");
+    assert_eq!(me["token"]["kind"], "paired", "{me}");
+    assert_eq!(me["token"]["label"], "iPhone", "{me}");
+    assert_eq!(me["token"]["id"], paired["id"], "{me}");
+
+    // Once only, and nothing for a wrong code.
+    for (what, code) in [
+        ("again", bare.as_str()),
+        ("wrong", "0000-0000-0000"),
+        ("not a code", "hello"),
+    ] {
+        let refused = claim(&server, code, None);
+        assert_eq!(refused.code, 401, "{what}: {}", refused.text());
+    }
+
+    // The label the code was made with, when the device gives none; and a bad origin refused.
+    let made = post(
+        &server,
+        "/v1/pair",
+        Auth::Bearer(&alice),
+        json!({"label": "tablet"}),
+    )
+    .ok()
+    .json();
+    assert!(
+        made.get("uri").is_none() && made.get("qr_svg").is_none(),
+        "{made}"
+    );
+    let paired = claim(&server, made["code"].as_str().unwrap(), None).json();
+    let me = get(
+        &server,
+        "/v1/me",
+        Auth::Bearer(paired["token"].as_str().unwrap()),
+    )
+    .ok()
+    .json();
+    assert_eq!(me["token"]["label"], "tablet", "{me}");
+    for bad in ["ftp://x", "https://", "https://a/b", "https://a b"] {
+        let refused = post(
+            &server,
+            "/v1/pair",
+            Auth::Bearer(&alice),
+            json!({"origin": bad}),
+        );
+        assert_eq!(refused.code, 400, "{bad}: {}", refused.text());
+    }
+    // Only signed in.
+    assert_eq!(post(&server, "/v1/pair", Auth::None, json!({})).code, 401);
+    let list = get(&server, "/v1/tokens", Auth::Bearer(&alice)).ok().json();
+    let mut kinds: Vec<_> = list["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["kind"].as_str().unwrap().to_string())
+        .collect();
+    // Oldest first, and made within the same second here.
+    kinds.sort();
+    assert_eq!(kinds, ["device", "paired", "paired"], "{list}");
+
+    // Past its time, it trades for nothing.
+    server.set_env(vec![("CAIRN_FP_TUNE".into(), "server.pair_secs=1".into())]);
+    server.restart();
+    let made = post(&server, "/v1/pair", Auth::Bearer(&alice), json!({}))
+        .ok()
+        .json();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(
+        claim(&server, made["code"].as_str().unwrap(), None).code,
+        401
+    );
 }

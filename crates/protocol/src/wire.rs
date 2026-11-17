@@ -204,6 +204,110 @@ pub struct NewToken {
     pub token: String,
 }
 
+/// How long a pairing code waits to be taken, in seconds.
+pub const PAIR_SECS: u64 = 600;
+
+/// The letters a pairing code is made of: Crockford's base 32, which leaves out I, L, O and U, so that
+/// nothing a person reads off a screen is taken for another.
+pub const PAIR_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// `POST /v1/pair`, signed in: a code another device trades for a token of the same user's. `label` names
+/// the device to come, until it names itself; `origin` the server's address as the caller reaches it,
+/// for the answer's link and QR code.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// The answer to `POST /v1/pair`: the code as a person reads it, in three groups of four, how long it
+/// waits, and given an origin, the link a phone's camera opens and its QR code as SVG.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pairing {
+    pub code: String,
+    pub expires_in: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qr_svg: Option<String>,
+}
+
+/// `POST /v1/pair/claim`, with no token: the code, and the label the new device gives itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairClaim {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The answer to a claim: whose the new token is, its ID, and the token, shown this once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paired {
+    pub user: String,
+    pub id: String,
+    pub token: String,
+}
+
+/// A pairing code as typed: its twelve letters, upper case, with any dashes and spaces left out and the
+/// letters a person takes for digits read as those digits; `None` if it is not one.
+pub fn pair_code(typed: &str) -> Option<String> {
+    let mut out = String::with_capacity(12);
+    for c in typed.chars() {
+        let c = match c.to_ascii_uppercase() {
+            '-' | ' ' => continue,
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        };
+        if !c.is_ascii() || !PAIR_ALPHABET.contains(&(c as u8)) {
+            return None;
+        }
+        out.push(c);
+    }
+    (out.len() == 12).then_some(out)
+}
+
+/// A pairing code as a person reads it: `ABCD-EFGH-JKMN`
+pub fn pair_display(code: &str) -> String {
+    let b = code.as_bytes();
+    let group = |r: std::ops::Range<usize>| String::from_utf8_lossy(&b[r]).into_owned();
+    format!("{}-{}-{}", group(0..4), group(4..8), group(8..12))
+}
+
+/// The link a phone opens to pair with a server: `cairn://pair?server=<origin>&code=<code>`
+pub fn pair_uri(origin: &str, code: &str) -> String {
+    let mut server = String::new();
+    for b in origin.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            server.push(b as char);
+        } else {
+            server.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("cairn://pair?server={server}&code={code}")
+}
+
+/// A server's address as a pairing link names it: `http` or `https`, a host and perhaps a port, and
+/// nothing after them but a slash.
+pub fn check_origin(origin: &str) -> Result<(), String> {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .ok_or_else(|| format!("{origin:?} is not an http or https address"))?;
+    let host = rest.strip_suffix('/').unwrap_or(rest);
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-.:[]".contains(&b))
+    {
+        return Err(format!("{origin:?} is not a server's address"));
+    }
+    Ok(())
+}
+
 /// A token's label: what a person knows it by, at most 100 characters and no control characters, and
 /// not empty.
 pub fn check_token_label(label: &str) -> Result<(), String> {

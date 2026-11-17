@@ -21,9 +21,11 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 mod admin;
+mod conn;
 mod file;
 mod pairing;
 mod passwords;
+mod resumable;
 mod tokens;
 mod web;
 
@@ -54,6 +56,8 @@ struct App {
     pairing: pairing::Codes,
     /// Thumbnails, made on the first ask and kept.
     thumbs: web::thumbs::Thumbs,
+    /// The uploads to `PUT /file` that may be resumed.
+    resumable: resumable::Resumable,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -289,6 +293,7 @@ fn features() -> Vec<String> {
         f::PASSWORDS,
         f::FILE_UPDATE,
         f::THUMBS,
+        f::RESUMABLE,
     ]
     .into_iter()
     .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
@@ -740,6 +745,12 @@ fn router(app: Arc<App>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
         // A streamed body, of any size: outside the limit above.
         .route("/file", put(file::put).options(file::options))
+        .route(
+            "/file/uploads/{id}",
+            axum::routing::head(resumable::offset_of)
+                .patch(resumable::append)
+                .delete(resumable::cancel),
+        )
         .merge(web::namespace_routes())
         .route_layer(middleware::from_fn_with_state(app.clone(), check_namespace))
         .with_state(app.clone());
@@ -964,6 +975,7 @@ async fn serve(
         touched: tokens::Touched::default(),
         pairing: pairing::Codes::default(),
         thumbs: web::thumbs::Thumbs::open(&data)?,
+        resumable: resumable::Resumable::open(&data)?,
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();
@@ -972,6 +984,7 @@ async fn serve(
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             let app = sweeper.clone();
             let _ = tokio::task::spawn_blocking(move || app.uploads.sweep()).await;
+            sweeper.resumable.sweep().await;
         }
     });
     // What is deleted, replayed from every namespace's journal now rather than when someone first
@@ -1000,9 +1013,7 @@ async fn serve(
         .with_context(|| format!("bind {listen}"))?;
     println!("listening on {}", listener.local_addr()?);
     std::io::stdout().flush()?;
-    axum::serve(listener, router(app.clone()))
-        .with_graceful_shutdown(shutdown_signal(app))
-        .await?;
+    conn::serve(listener, router(app.clone()), shutdown_signal(app)).await;
     Ok(())
 }
 

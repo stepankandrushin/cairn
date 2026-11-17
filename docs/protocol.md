@@ -132,6 +132,7 @@ every client must speak. A server before features sends none.
 | `passwords` | A user signs in to the web with a password [Passwords](#passwords) |
 | `file_update` | `PUT /file` changes a file already there, given the revision the client saw [One-request uploads](#one-request-uploads) |
 | `thumbs` | `B/thumb/{object}` thumbnails, and a client's own sent there [Thumbnails](#thumbnails) |
+| `resumable` | `PUT /file` resumable as the IETF's resumable uploads draft says [Resumable uploads](#resumable-uploads) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -220,7 +221,7 @@ The answer, 201 for a file made and 200 for one that was there, is `{object, rev
 existed?}`, and the same in headers: `X-Cairn-Object`, `X-Cairn-Revision`, `X-Cairn-Seq`,
 `X-Cairn-Name` base64 of the name's bytes and `X-Cairn-Existed: 1` A refusal says why in its body
 and in `X-Cairn-Error` printable ASCII with any other byte as `%XX` 507 is a full disk; a body that
-stops short of its length commits nothing. `OPTIONS` answers 501 - uploads are not resumable yet
+stops short of its length commits nothing. `OPTIONS` answers 501 but to a resumable upload's client [Resumable uploads](#resumable-uploads)
 
 **A change in one request.** With `base` the revision of a file the client saw, and `object` that file, the
 bytes change it [Features](#features) `file_update` with no `path`: the file stays where it is. While its head
@@ -233,6 +234,32 @@ itself if it was not changed before its delete, else as a copy there, either nam
 name was taken; and 409 if the folder it was in is gone too. The same bytes as its head answer that file, 200
 `existed` with no commit. A retry is answered as the first was, the copy's too, as its `op_id` is the
 revision.
+
+## Resumable uploads
+
+`PUT /file` is resumable as the IETF's draft "Resumable Uploads for HTTP" says, in the interop versions a
+phone's system speaks: 3 with `Upload-Incomplete` and 5 and 6 with `Upload-Complete` each request naming its
+own in `Upload-Draft-Interop-Version` which every answer about it repeats. A request with neither header is
+an ordinary one, as above.
+
+- `OPTIONS /file` with a version spoken here answers 200 with `Upload-Limit: min-size=0`
+- `PUT /file` that says whether its body ends the upload makes one at `/v1/ns/{ns}/file/uploads/<revision>`
+  which a `104 Upload Resumption Supported` names in `Location` once the first of the body has come. Its
+  bytes are received into a file of their own, and once the last is in they are stored and committed as any
+  `PUT /file` is, with the same `op_id` and answer, with `Upload-Offset` the whole length. A body that says
+  more is to come answers 201 with `Location` and `Upload-Offset`
+- `HEAD` of the upload answers 204 with `Upload-Offset` where it stands, whether it is complete, and
+  `Cache-Control: no-store` 400 a request with upload headers; 404 an upload not there or another user's
+- `PATCH` with `Upload-Offset` where it stands, `Content-Type: application/partial-upload` for version 6,
+  and whether it ends the upload, appends its body; 409 at another offset, saying where it stands; 400 to one
+  already complete
+- `DELETE` gives it up, its bytes removed, 204
+
+An upload left alone a day is given up, and a committed one is remembered an hour, for a client asking where
+it stands after its answer was lost. What waits is in memory and in the data directory's `web/resumable/`
+which a start empties, so after a restart a client sends the file again whole, and as its revision is its
+`op_id` a file committed before the restart is answered as it was. A proxy in front must pass the 104, as
+nginx does.
 
 ## Revisions
 

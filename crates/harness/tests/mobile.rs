@@ -813,3 +813,306 @@ fn a_change_killed_at_each_step_lands_once_after_the_retry() {
         server.fsck();
     }
 }
+
+/// Begins a resumable upload on a socket of its own and sends `sent` bytes of `data`; returns the
+/// upload's address from the 104, once it has come, with the socket still open.
+fn begin_resumable(
+    server: &Server,
+    q: &FileQuery,
+    data: &[u8],
+    sent: usize,
+    headers: &[(&str, &str)],
+) -> (String, std::net::TcpStream) {
+    let addr = server.url.strip_prefix("http://").unwrap();
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let mut head = format!(
+        "PUT /v1/ns/cloud/file?{} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n",
+        f::query_string(q),
+        token(server),
+        data.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    conn.write_all(head.as_bytes()).unwrap();
+    conn.write_all(&data[..sent]).unwrap();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = conn.read(&mut buf).expect("a 104 within 20 s");
+        assert!(
+            n > 0,
+            "closed before a 104: {}",
+            String::from_utf8_lossy(&got)
+        );
+        got.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&got).to_lowercase();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let interim = &text[..end];
+            assert!(interim.starts_with("http/1.1 104 "), "{text}");
+            let location = interim
+                .lines()
+                .find_map(|l| l.strip_prefix("location: "))
+                .expect("the 104 says where")
+                .to_string();
+            return (location, conn);
+        }
+    }
+}
+
+fn upload_request(
+    server: &Server,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Answer {
+    let t = token(server);
+    request(server, method, path, Auth::Bearer(&t), headers, body)
+}
+
+/// A resumable upload cut off midway goes on from where the server stands, in the draft's interop
+/// versions the phones speak, and is one file and one commit; one given up leaves nothing; another
+/// user's is not there.
+#[test]
+fn a_resumable_upload_cut_off_goes_on_from_where_it_stood_and_is_one_file() {
+    let sb = Sandbox::on_disk("mobile-resume");
+    let server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let options = |version: Option<&str>| {
+        let mut h = vec![];
+        if let Some(v) = version {
+            h.push(("Upload-Draft-Interop-Version", v));
+        }
+        upload_request(&server, "OPTIONS", "/v1/ns/cloud/file", &h, b"")
+    };
+    let asked = options(Some("6"));
+    assert_eq!(asked.code, 200, "{}", asked.text());
+    assert!(asked.header("upload-limit").is_some());
+    assert_eq!(options(None).code, 501);
+    assert_eq!(options(Some("99")).code, 501);
+
+    // Version 6: cut off after a third, then the rest from where the server stands.
+    let data = bytes(5 * 1024 * 1024 + 99, 4);
+    let q = query("Photos/long.mov", Taken::Rename);
+    let v6 = [
+        ("Upload-Draft-Interop-Version", "6"),
+        ("Upload-Complete", "?1"),
+    ];
+    let (at, conn) = begin_resumable(&server, &q, &data, data.len() / 3, &v6);
+    assert_eq!(at, format!("/v1/ns/cloud/file/uploads/{}", q.revision));
+    let head = c.info().unwrap().head;
+    drop(conn);
+    let mut stands = 0;
+    for _ in 0..200 {
+        let h = upload_request(
+            &server,
+            "HEAD",
+            &at,
+            &[("Upload-Draft-Interop-Version", "6")],
+            b"",
+        );
+        assert_eq!(h.code, 204, "{}", h.text());
+        assert_eq!(h.header("upload-complete").as_deref(), Some("?0"));
+        stands = h.header("upload-offset").unwrap().parse().unwrap();
+        if stands == data.len() / 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(stands > 0 && stands <= data.len() / 3, "{stands}");
+    assert_eq!(
+        c.info().unwrap().head,
+        head,
+        "nothing committed of half a file"
+    );
+    // Another user's upload is not there for them.
+    let bob = std::fs::read_to_string(server.user("bob")).unwrap();
+    let theirs = request(
+        &server,
+        "HEAD",
+        &at,
+        Auth::Bearer(bob.trim()),
+        &[("Upload-Draft-Interop-Version", "6")],
+        b"",
+    );
+    assert_eq!(theirs.code, 404);
+    // From the wrong offset, refused, saying where it stands.
+    let offset = (stands + 1).to_string();
+    let wrong = upload_request(
+        &server,
+        "PATCH",
+        &at,
+        &[
+            ("Upload-Draft-Interop-Version", "6"),
+            ("Upload-Complete", "?1"),
+            ("Upload-Offset", &offset),
+            ("Content-Type", "application/partial-upload"),
+        ],
+        &data[stands + 1..],
+    );
+    assert_eq!(wrong.code, 409, "{}", wrong.text());
+    assert_eq!(wrong.header("upload-offset"), Some(stands.to_string()));
+    let offset = stands.to_string();
+    let rest = upload_request(
+        &server,
+        "PATCH",
+        &at,
+        &[
+            ("Upload-Draft-Interop-Version", "6"),
+            ("Upload-Complete", "?1"),
+            ("Upload-Offset", &offset),
+            ("Content-Type", "application/partial-upload"),
+        ],
+        &data[stands..],
+    );
+    assert_eq!(rest.code, 201, "{}", rest.text());
+    assert_eq!(rest.header("upload-offset"), Some(data.len().to_string()));
+    assert_eq!(
+        rest.header(f::HEADER_REVISION),
+        Some(q.revision.to_string())
+    );
+    assert_eq!(c.info().unwrap().head, head + 1, "one commit");
+    let h = upload_request(
+        &server,
+        "HEAD",
+        &at,
+        &[("Upload-Draft-Interop-Version", "6")],
+        b"",
+    );
+    assert_eq!(h.header("upload-complete").as_deref(), Some("?1"));
+    let again = upload_request(
+        &server,
+        "PATCH",
+        &at,
+        &[
+            ("Upload-Draft-Interop-Version", "6"),
+            ("Upload-Complete", "?1"),
+            ("Upload-Offset", &data.len().to_string()),
+        ],
+        b"",
+    );
+    assert_eq!(again.code, 400, "{}", again.text());
+    // The whole request sent again, as a client that lost every answer: the first answer.
+    let (name, seq) = created(&put(&c, &q, &data));
+    assert_eq!((name.as_str(), seq), ("long.mov", head + 1));
+
+    // Version 3, in two parts by design: the first says more is to come.
+    let small = bytes(300_000, 5);
+    let q3 = query("Photos/two-parts.jpg", Taken::Rename);
+    let addr = server.url.strip_prefix("http://").unwrap();
+    let first = request(
+        &server,
+        "PUT",
+        &format!("/v1/ns/cloud/file?{}", f::query_string(&q3)),
+        Auth::Bearer(&token(&server)),
+        &[
+            ("Upload-Draft-Interop-Version", "3"),
+            ("Upload-Incomplete", "?1"),
+            ("Host", addr),
+        ],
+        &small[..100_000],
+    );
+    assert_eq!(first.code, 201, "{}", first.text());
+    assert_eq!(first.header("upload-offset").as_deref(), Some("100000"));
+    let at3 = first.header("location").unwrap();
+    let second = upload_request(
+        &server,
+        "PATCH",
+        &at3,
+        &[
+            ("Upload-Draft-Interop-Version", "3"),
+            ("Upload-Incomplete", "?0"),
+            ("Upload-Offset", "100000"),
+        ],
+        &small[100_000..],
+    );
+    assert_eq!(second.code, 201, "{}", second.text());
+
+    // Given up: nothing of it stays.
+    let q4 = query("Photos/given-up.mov", Taken::Rename);
+    let (at4, conn) = begin_resumable(&server, &q4, &data, 1024 * 1024, &v6);
+    drop(conn);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let gone = upload_request(&server, "DELETE", &at4, &[], b"");
+    assert_eq!(gone.code, 204, "{}", gone.text());
+    let h = upload_request(
+        &server,
+        "HEAD",
+        &at4,
+        &[("Upload-Draft-Interop-Version", "6")],
+        b"",
+    );
+    assert_eq!(h.code, 404);
+    assert!(
+        std::fs::read_dir(server.data.join("web/resumable"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "the given-up upload's bytes are removed, the committed ones' too"
+    );
+
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert_eq!(names(&d, "Photos"), ["long.mov", "two-parts.jpg"]);
+    assert!(d.read("Photos/long.mov") == data, "the bytes differ");
+    assert!(d.read("Photos/two-parts.jpg") == small, "the bytes differ");
+    let mut server = server;
+    server.fsck();
+}
+
+/// A server killed with a resumable upload's bytes all in but not committed forgets the upload, which a
+/// start empties; the phone's system sends it again whole, and it is one file.
+#[test]
+fn a_server_killed_before_a_resumable_upload_commits_leaves_one_file_after_it_is_sent_again() {
+    let sb = Sandbox::on_disk("mobile-resume-kill");
+    let mut server = Server::start(sb.path("data"));
+    let c = client(&server);
+    server.set_env(vec![(
+        "CAIRN_FP_CRASH".into(),
+        "server.resumable.stored".into(),
+    )]);
+    server.restart();
+    let data = bytes(2 * 1024 * 1024, 6);
+    let q = query("Photos/k.mov", Taken::Rename);
+    // Sent whole, and its answer never comes: the server is gone after the 104.
+    let (_, mut conn) = begin_resumable(
+        &server,
+        &q,
+        &data,
+        1,
+        &[
+            ("Upload-Draft-Interop-Version", "6"),
+            ("Upload-Complete", "?1"),
+        ],
+    );
+    let _ = conn.write_all(&data[1..]);
+    let mut rest = Vec::new();
+    let _ = conn.read_to_end(&mut rest);
+    assert!(
+        !String::from_utf8_lossy(&rest).contains("HTTP/1.1 2"),
+        "answered: {}",
+        String::from_utf8_lossy(&rest)
+    );
+    assert!(!server.alive_after_a_kill(), "never reached");
+    server.set_env(vec![]);
+    server.restart();
+    let at = format!("/v1/ns/cloud/file/uploads/{}", q.revision);
+    let h = upload_request(
+        &server,
+        "HEAD",
+        &at,
+        &[("Upload-Draft-Interop-Version", "6")],
+        b"",
+    );
+    assert_eq!(h.code, 404, "a start forgets what waited");
+    assert_eq!(created(&put(&c, &q, &data)).0, "k.mov");
+    let d = Device::new(&sb, &server, "laptop");
+    d.synced();
+    assert_eq!(names(&d, "Photos"), ["k.mov"]);
+    assert!(d.read("Photos/k.mov") == data);
+    server.fsck();
+}

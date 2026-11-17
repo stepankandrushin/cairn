@@ -22,6 +22,9 @@
   a file deleted since comes back where it was. So a phone's Files app can change files in one request.
 - Thumbnails at `GET B/thumb/{object}` made on the first ask from JPEG, PNG, WebP and GIF, turned as their
   EXIF says, and kept; for HEIC and video a client sends its own, which every size is made from.
+- Resumable uploads: `PUT /file` speaks the IETF's resumable uploads draft in interop versions 3 5 and 6 as
+  the phones' systems do, a 104 telling where an upload can go on from, so a large video cut off sends only
+  what is left. The server answers on its own accept loop, which can send that 104.
 
 **Changed:**
 

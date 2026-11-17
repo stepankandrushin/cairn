@@ -30,13 +30,24 @@ use std::sync::Arc;
 /// How many times a commit refused for a name taken meanwhile is planned again under `rename`.
 const RENAME_TRIES: u32 = 5;
 
-/// No resumable uploads: what a client that asks first, as the Photos system does, is told.
-pub(crate) async fn options() -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "no resumable uploads").into_response()
+/// What a client that asks first, as the Photos system does, is told: resumable uploads to one that
+/// names an interop version of the draft spoken here, none to anyone else.
+pub(crate) async fn options(headers: HeaderMap) -> Response {
+    match crate::resumable::interop(&headers) {
+        Some(v) => (
+            StatusCode::OK,
+            [
+                (crate::resumable::VERSION, v),
+                ("upload-limit", "min-size=0"),
+            ],
+        )
+            .into_response(),
+        None => (StatusCode::NOT_IMPLEMENTED, "no resumable uploads").into_response(),
+    }
 }
 
 /// A refusal, its reason in the body and in a header, for a sender that keeps only headers.
-fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
+pub(crate) fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
     let why = why.into();
     let mut r = (status, why.clone()).into_response();
     if let Ok(v) = HeaderValue::from_str(&f::header_text(&why)) {
@@ -59,7 +70,7 @@ impl IntoResponse for Refusal {
 }
 
 /// An error as a refusal: a full disk says so, as the rest of the API does.
-fn failed(e: anyhow::Error) -> Response {
+pub(crate) fn failed(e: anyhow::Error) -> Response {
     if cairn_store::is_disk_full(&e) {
         return refuse(
             StatusCode::INSUFFICIENT_STORAGE,
@@ -94,16 +105,17 @@ fn answer(status: StatusCode, a: FileAnswer) -> Response {
 }
 
 /// What the request asks, checked before a byte of the body is read.
-struct Asked {
-    ns: String,
-    user: String,
+#[derive(Clone)]
+pub(crate) struct Asked {
+    pub(crate) ns: String,
+    pub(crate) user: String,
     parent: ObjectId,
     folders: Vec<Name>,
     /// The new file's name; `None` for a change, whose file is named by its ID.
     name: Option<Name>,
-    size: u64,
+    pub(crate) size: u64,
     metadata: Metadata,
-    q: FileQuery,
+    pub(crate) q: FileQuery,
 }
 
 fn asked(
@@ -526,10 +538,13 @@ fn conflict_beside(
     }
 }
 
+// An axum handler: each argument is one thing it takes from the request.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn put(
     State(app): State<Arc<App>>,
     Extension(caller): Extension<Caller>,
     Extension(allowed): Extension<Allowed>,
+    interim: Option<Extension<crate::conn::Interim>>,
     Path(ns): Path<String>,
     headers: HeaderMap,
     query: std::result::Result<Query<FileQuery>, QueryRejection>,
@@ -566,6 +581,23 @@ pub(crate) async fn put(
         Err(e) => return failed(e.0),
     }
 
+    // One that may be resumed: received whole first, then stored and committed as below.
+    if let Some(version) = crate::resumable::interop(&headers) {
+        if let Some(complete) = crate::resumable::completes(&headers, version) {
+            let length = crate::resumable::length(&headers);
+            return crate::resumable::create(
+                app,
+                (*a).clone(),
+                version,
+                complete,
+                length,
+                interim.map(|Extension(i)| i),
+                body,
+            )
+            .await;
+        }
+    }
+
     // The bytes, cut and stored as they come.
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(8);
     let (app2, a2) = (app.clone(), a.clone());
@@ -600,7 +632,11 @@ pub(crate) async fn put(
         Err(e) => return failed(e.into()),
     };
     cairn_failpoint::hit("server.file.stored");
+    commit_file(app, a, manifest).await
+}
 
+/// The file's bytes stored as `manifest` committed as the request asks, or refused: the answer.
+pub(crate) async fn commit_file(app: Arc<App>, a: Arc<Asked>, manifest: Hash) -> Response {
     let (app2, a2) = (app.clone(), a.clone());
     let done = crate::blocking(move || {
         for _ in 0..RENAME_TRIES {

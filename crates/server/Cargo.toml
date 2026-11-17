@@ -27,12 +27,18 @@ clap.workspace = true
 fastcdc.workspace = true
 futures-util = { version = "0.3", default-features = false }
 hex.workspace = true
+# The accept loop of its own src/conn.rs so that a handler may send an informational answer, a 104 to a
+# resumable upload, which hyper cannot.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+socket2 = "0.6"
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["termios"] }

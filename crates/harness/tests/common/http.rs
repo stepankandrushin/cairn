@@ -80,9 +80,17 @@ pub fn request(
     }
     head.push_str("\r\n");
     conn.write_all(head.as_bytes()).unwrap();
-    conn.write_all(body).unwrap();
+    // A server may answer before it reads the body, and close: the answer is still there to read.
+    let _ = conn.write_all(body);
     let mut raw = Vec::new();
     let _ = conn.read_to_end(&mut raw);
+    // Interim answers before the answer, as a resumable upload's 104: passed over, as a client does.
+    while raw.starts_with(b"HTTP/1.1 1") && !raw.starts_with(b"HTTP/1.1 101") {
+        let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            break;
+        };
+        raw.drain(..end + 4);
+    }
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")

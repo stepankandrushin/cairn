@@ -6,7 +6,14 @@ use common::*;
 use serde_json::{json, Value};
 
 /// Every feature this build's server names.
-const FEATURES: &[&str] = &["note_groups", "item_hash", "tokens", "pairing", "passwords"];
+const FEATURES: &[&str] = &[
+    "note_groups",
+    "item_hash",
+    "tokens",
+    "pairing",
+    "passwords",
+    "file_update",
+];
 
 fn token(server: &Server) -> String {
     std::fs::read_to_string(&server.token_file)

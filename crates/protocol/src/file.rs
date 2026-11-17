@@ -19,15 +19,29 @@ pub enum Taken {
     Rename,
 }
 
+/// What to do when the file was changed since `base`, the revision the client saw.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stale {
+    /// Put the bytes beside it as a conflict copy, so that both stay.
+    #[default]
+    Copy,
+    /// Refuse, and change nothing.
+    Fail,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileQuery {
     /// The folder `path` starts in; absent for the namespace's root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ObjectId>,
-    /// Names joined by `/`, the last the file's own. Folders missing before it are made.
+    /// Names joined by `/`, the last the file's own. Folders missing before it are made. Not given for a
+    /// change of a file already there, which `object` names.
+    #[serde(default)]
     pub path: String,
-    /// The new file's ID and its revision's, chosen by the client. The commit's `op_id` is the
-    /// revision's bytes, so a retry is the same commit, and its answer the first one's.
+    /// The new file's ID and its revision's, chosen by the client; with `base`, the ID of the file to
+    /// change. The commit's `op_id` is the revision's bytes, so a retry is the same commit, and its answer
+    /// the first one's.
     pub object: ObjectId,
     pub revision: RevisionId,
     pub device: DeviceId,
@@ -38,6 +52,12 @@ pub struct FileQuery {
     pub btime: Option<String>,
     #[serde(default)]
     pub taken: Taken,
+    /// The revision of `object` the client saw, which these bytes change (`feature::FILE_UPDATE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<RevisionId>,
+    /// With `base`, what to do if the file changed since.
+    #[serde(default)]
+    pub stale: Stale,
 }
 
 /// The answer, 201 for a file made (or a retry of the request that made it), 200 for one that was
@@ -51,6 +71,9 @@ pub struct FileAnswer {
     pub name: Name,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub existed: bool,
+    /// The file had changed since `base`, so the bytes are a conflict copy beside it, `object`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
 }
 
 /// The answer's headers, lower case as HTTP/2 and the Photos system give them. The name is base64 of
@@ -60,6 +83,7 @@ pub const HEADER_REVISION: &str = "x-cairn-revision";
 pub const HEADER_SEQ: &str = "x-cairn-seq";
 pub const HEADER_NAME: &str = "x-cairn-name";
 pub const HEADER_EXISTED: &str = "x-cairn-existed";
+pub const HEADER_CONFLICT: &str = "x-cairn-conflict";
 pub const HEADER_ERROR: &str = "x-cairn-error";
 
 /// A time as the query carries it, to `precision_ns`.
@@ -111,7 +135,9 @@ pub fn query_string(q: &FileQuery) -> String {
     if let Some(p) = q.parent {
         parts.push(("parent", p.to_string()));
     }
-    parts.push(("path", q.path.clone()));
+    if !q.path.is_empty() || q.base.is_none() {
+        parts.push(("path", q.path.clone()));
+    }
     parts.push(("object", q.object.to_string()));
     parts.push(("revision", q.revision.to_string()));
     parts.push(("device", q.device.to_string()));
@@ -128,6 +154,17 @@ pub fn query_string(q: &FileQuery) -> String {
         }
         .into(),
     ));
+    if let Some(b) = q.base {
+        parts.push(("base", b.to_string()));
+        parts.push((
+            "stale",
+            match q.stale {
+                Stale::Copy => "copy",
+                Stale::Fail => "fail",
+            }
+            .into(),
+        ));
+    }
     parts
         .iter()
         .map(|(k, v)| format!("{k}={}", percent_encode(v.as_bytes())))
@@ -285,6 +322,8 @@ mod tests {
             mtime: "1731650000.123".into(),
             btime: None,
             taken: Taken::Rename,
+            base: None,
+            stale: Stale::Copy,
         };
         let s = query_string(&q);
         assert!(!s.contains(' ') && !s.contains('\''), "{s}");

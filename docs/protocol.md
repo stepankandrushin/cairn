@@ -130,6 +130,7 @@ every client must speak. A server before features sends none.
 | `tokens` | A user's own tokens through `/v1/tokens` and `token` in `/v1/me` [Tokens](#tokens) |
 | `pairing` | A signed-in device makes a code another device trades for a token of its own [Pairing](#pairing) |
 | `passwords` | A user signs in to the web with a password [Passwords](#passwords) |
+| `file_update` | `PUT /file` changes a file already there, given the revision the client saw [One-request uploads](#one-request-uploads) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -219,6 +220,18 @@ existed?}`, and the same in headers: `X-Cairn-Object`, `X-Cairn-Revision`, `X-Ca
 `X-Cairn-Name` base64 of the name's bytes and `X-Cairn-Existed: 1` A refusal says why in its body
 and in `X-Cairn-Error` printable ASCII with any other byte as `%XX` 507 is a full disk; a body that
 stops short of its length commits nothing. `OPTIONS` answers 501 - uploads are not resumable yet
+
+**A change in one request.** With `base` the revision of a file the client saw, and `object` that file, the
+bytes change it [Features](#features) `file_update` with no `path`: the file stays where it is. While its head
+is still `base` they are an `update` that keeps everything of its metadata but its mtime, as it keeps what a
+device stored that the phone never saw. Once another changed it since, `stale` decides: `copy` the default,
+puts them beside it as a conflict copy, named as a device names one with `device_name` and the day, a new
+object of the request's revision, and answers it with `conflict: true` and `X-Cairn-Conflict: 1`; `fail`
+refuses 409 and changes nothing. A file deleted since comes back in the same commit where it was last, as
+itself if it was not changed before its delete, else as a copy there, either named as a restore is where its
+name was taken; and 409 if the folder it was in is gone too. The same bytes as its head answer that file, 200
+`existed` with no commit. A retry is answered as the first was, the copy's too, as its `op_id` is the
+revision.
 
 ## Revisions
 

@@ -239,6 +239,8 @@ impl Store {
             mtime: mtime.0,
             btime: mtime.1,
             taken: Taken::Rename,
+            base: None,
+            stale: Default::default(),
         })
     }
 

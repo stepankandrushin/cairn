@@ -52,6 +52,8 @@ fn query(path: &str, taken: Taken) -> FileQuery {
         mtime: "1691920214.250".into(),
         btime: Some("1691920214.250".into()),
         taken,
+        base: None,
+        stale: Default::default(),
     }
 }
 
@@ -611,4 +613,203 @@ fn a_folder_made_and_a_file_added_from_the_files_app_arrive() {
     assert_eq!(d.read("Scans/doc.pdf"), b"%PDF-1.7 a scan");
     assert_eq!(mtime_of(&d.path("Scans/doc.pdf")).0, 1_700_000_000);
     assert!(Path::new(&d.path("Scans")).is_dir());
+}
+
+const ROOT: &str = "00000000000000000000000000000000";
+
+/// A file's object and head revision, as the web's listing of its folder has them.
+fn listed(server: &Server, dir: &str, name: &str) -> (ObjectId, RevisionId) {
+    let t = token(server);
+    let listing = get(server, &format!("/v1/ns/cloud/dir/{dir}"), Auth::Bearer(&t))
+        .ok()
+        .json();
+    let e = listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["display"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {listing}"))
+        .clone();
+    (
+        e["object"].as_str().unwrap().parse().unwrap(),
+        e["revision"].as_str().unwrap().parse().unwrap(),
+    )
+}
+
+/// A change of the file `object` was at `base` when the phone saw it.
+fn change(object: ObjectId, base: RevisionId, stale: f::Stale) -> FileQuery {
+    FileQuery {
+        path: String::new(),
+        object,
+        base: Some(base),
+        stale,
+        ..query("unused", Taken::Fail)
+    }
+}
+
+/// A file changed in one request, against the revision the phone saw, takes the new bytes and keeps
+/// everything of it the phone never saw but its mtime; changed since by another, the bytes go beside it as
+/// a conflict copy, or with `stale=fail` nowhere; the same request sent again is the same answer; and a file
+/// deleted since comes back where it was, as itself or, changed before its delete, as a copy.
+#[test]
+fn a_change_in_one_request_lands_on_what_the_phone_saw_and_beside_anything_else() {
+    let sb = Sandbox::on_disk("mobile-change");
+    let mut server = Server::start(sb.path("data"));
+    let c = client(&server);
+    let a = Device::new(&sb, &server, "laptop");
+    a.write("notes/f.txt", "as the laptop wrote it");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            a.path("notes/f.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    a.synced();
+    let (notes, _) = listed(&server, ROOT, "notes");
+    let (f_id, seen) = listed(&server, &notes.to_string(), "f.txt");
+
+    let q = change(f_id, seen, f::Stale::Copy);
+    let answer = put(&c, &q, b"as the phone changed it");
+    assert_eq!(
+        answer.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(header(&answer, f::HEADER_CONFLICT).is_none());
+    assert_eq!(created(&answer).0, "f.txt");
+    assert_eq!(
+        header(&answer, f::HEADER_OBJECT),
+        Some(f_id.to_string().as_str())
+    );
+    let head = c.info().unwrap().head;
+    // Again, as a phone whose answer was lost: the same answer, and nothing more committed.
+    let again = put(&c, &q, b"as the phone changed it");
+    assert_eq!(created(&again), created(&answer));
+    assert_eq!(c.info().unwrap().head, head);
+    a.synced();
+    assert_eq!(a.read("notes/f.txt"), b"as the phone changed it");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(a.path("notes/f.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the mode the phone never saw is kept");
+    }
+
+    // The same bytes again, against what is there now: that file, nothing committed.
+    let (_, now) = listed(&server, &notes.to_string(), "f.txt");
+    let same = put(
+        &c,
+        &change(f_id, now, f::Stale::Copy),
+        b"as the phone changed it",
+    );
+    assert_eq!(same.status, 200);
+    assert_eq!(header(&same, f::HEADER_EXISTED), Some("1"));
+    assert_eq!(c.info().unwrap().head, head);
+
+    // Against what the phone saw before the laptop changed it: beside it, never in its place.
+    a.write("notes/f.txt", "the laptop changed it again");
+    a.synced();
+    let refused = put(&c, &change(f_id, now, f::Stale::Fail), b"a stale change");
+    assert_eq!(refused.status, 409);
+    let stale = change(f_id, now, f::Stale::Copy);
+    let copied = put(&c, &stale, b"a stale change");
+    assert_eq!(
+        copied.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&copied.body)
+    );
+    assert_eq!(header(&copied, f::HEADER_CONFLICT), Some("1"));
+    let (copy_name, _) = created(&copied);
+    assert!(
+        copy_name.starts_with("f (conflict Phone of the test ") && copy_name.ends_with(").txt"),
+        "{copy_name}"
+    );
+    let again = put(&c, &stale, b"a stale change");
+    assert_eq!(created(&again), created(&copied), "the copy's retry");
+    assert_eq!(header(&again, f::HEADER_CONFLICT), Some("1"));
+    a.synced();
+    assert_eq!(a.read("notes/f.txt"), b"the laptop changed it again");
+    assert_eq!(a.read(&format!("notes/{copy_name}")), b"a stale change");
+
+    // Deleted since, unchanged before: back at its name, with the new bytes, as itself.
+    let (_, last) = listed(&server, &notes.to_string(), "f.txt");
+    std::fs::remove_file(a.path("notes/f.txt")).unwrap();
+    a.synced();
+    let back = put(
+        &c,
+        &change(f_id, last, f::Stale::Copy),
+        b"brought back by the phone",
+    );
+    assert_eq!(created(&back).0, "f.txt");
+    assert!(header(&back, f::HEADER_CONFLICT).is_none());
+    assert_eq!(
+        header(&back, f::HEADER_OBJECT),
+        Some(f_id.to_string().as_str())
+    );
+    a.synced();
+    assert_eq!(a.read("notes/f.txt"), b"brought back by the phone");
+
+    // Deleted after a change the phone did not see: a copy where it was.
+    let (_, seen) = listed(&server, &notes.to_string(), "f.txt");
+    a.write("notes/f.txt", "changed, then deleted");
+    a.synced();
+    std::fs::remove_file(a.path("notes/f.txt")).unwrap();
+    a.synced();
+    let copied = put(
+        &c,
+        &change(f_id, seen, f::Stale::Copy),
+        b"the phone's, after both",
+    );
+    assert_eq!(header(&copied, f::HEADER_CONFLICT), Some("1"));
+    let (name, _) = created(&copied);
+    a.synced();
+    assert!(!a.path("notes/f.txt").exists());
+    assert_eq!(a.read(&format!("notes/{name}")), b"the phone's, after both");
+    server.fsck();
+}
+
+/// A change killed at each step on the server lands once, after the phone sends it again.
+#[test]
+fn a_change_killed_at_each_step_lands_once_after_the_retry() {
+    for point in [
+        "server.chunk.before_write",
+        "server.file.stored",
+        "server.file.before_ack",
+    ] {
+        let sb = Sandbox::on_disk("mobile-change-kill");
+        let mut server = Server::start(sb.path("data"));
+        let c = client(&server);
+        let a = Device::new(&sb, &server, "laptop");
+        a.write("f.bin", bytes(1024, 1));
+        a.synced();
+        let (f_id, seen) = listed(&server, ROOT, "f.bin");
+        server.set_env(vec![("CAIRN_FP_CRASH".into(), point.into())]);
+        server.restart();
+        let data = bytes(3 * 1024 * 1024, 9);
+        let q = change(f_id, seen, f::Stale::Copy);
+        let lost = c.put_file(&f::query_string(&q), &mut &data[..], data.len() as u64);
+        assert!(
+            lost.as_ref().is_err() || lost.as_ref().is_ok_and(|a| a.status >= 500),
+            "{point}: answered {:?}",
+            lost.map(|a| a.status)
+        );
+        assert!(!server.alive_after_a_kill(), "{point} was not reached");
+        server.set_env(vec![]);
+        server.restart();
+        let answer = put(&c, &q, &data);
+        assert_eq!(created(&answer).0, "f.bin", "{point}");
+        assert!(header(&answer, f::HEADER_CONFLICT).is_none(), "{point}");
+        a.synced();
+        assert_eq!(names(&a, "."), [".cairn", "f.bin"], "{point}");
+        assert!(a.read("f.bin") == data, "{point}: the bytes differ");
+        server.fsck();
+    }
 }

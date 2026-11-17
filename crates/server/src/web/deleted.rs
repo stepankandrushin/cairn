@@ -95,6 +95,18 @@ fn lock(index: &Mutex<Replayed>) -> MutexGuard<'_, Replayed> {
     index.lock().expect("a panic aborts the process")
 }
 
+/// Where a deleted object was last and the sequence that left it with no entry: `None` if it is not
+/// deleted now, as far as the journal says.
+pub(crate) fn last_link(app: &App, ns: &str, object: ObjectId) -> Result<Option<(Link, u64)>> {
+    let index = app.deleted.of(ns);
+    let mut index = lock(&index);
+    index.catch_up(app, ns)?;
+    if let Some(why) = &index.broken {
+        anyhow::bail!("the journal did not replay: {why}");
+    }
+    Ok(index.gone.get(&object).map(|g| (g.link.clone(), g.seq)))
+}
+
 /// Every index brought up to its namespace's head: at the start each namespace's, replayed from its
 /// first commit, and after a commit those already made.
 pub(crate) fn keep_up(app: &App, every_namespace: bool) -> Result<()> {

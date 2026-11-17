@@ -503,6 +503,8 @@ impl Folder {
             ),
             btime: None,
             taken: if rename { Taken::Rename } else { Taken::Fail },
+            base: None,
+            stale: Default::default(),
         };
         self.send(&q, &|| File::open(&local), len, progress.as_ref())
     }

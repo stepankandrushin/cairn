@@ -115,8 +115,8 @@ fn check_name(what: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A day as `2026-11-09`, UTC.
-fn date(epoch: i64) -> String {
+/// A day as `2026-11-09` UTC.
+pub(crate) fn date(epoch: i64) -> String {
     let days = epoch.div_euclid(86_400);
     // Howard Hinnant's civil-from-days.
     let z = days + 719_468;

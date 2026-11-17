@@ -87,6 +87,9 @@ fn answer(status: StatusCode, a: FileAnswer) -> Response {
     if a.existed {
         put(f::HEADER_EXISTED, "1".into());
     }
+    if a.conflict {
+        put(f::HEADER_CONFLICT, "1".into());
+    }
     (status, headers, Json(a)).into_response()
 }
 
@@ -96,7 +99,8 @@ struct Asked {
     user: String,
     parent: ObjectId,
     folders: Vec<Name>,
-    name: Name,
+    /// The new file's name; `None` for a change, whose file is named by its ID.
+    name: Option<Name>,
     size: u64,
     metadata: Metadata,
     q: FileQuery,
@@ -108,13 +112,25 @@ fn asked(
     headers: &HeaderMap,
     q: FileQuery,
 ) -> std::result::Result<Asked, Refusal> {
-    let Some(mut names) = f::path_names(&q.path) else {
-        return Err(no(
-            StatusCode::BAD_REQUEST,
-            "the path is not names joined by `/`",
-        ));
+    let (names, name) = if q.base.is_some() {
+        // A change: the file is named by its ID, and stays where it is.
+        if !q.path.is_empty() {
+            return Err(no(
+                StatusCode::BAD_REQUEST,
+                "a change of a file names it by object, with no path",
+            ));
+        }
+        (Vec::new(), None)
+    } else {
+        let Some(mut names) = f::path_names(&q.path) else {
+            return Err(no(
+                StatusCode::BAD_REQUEST,
+                "the path is not names joined by `/`",
+            ));
+        };
+        let name = names.pop().expect("a path has a name");
+        (names, Some(name))
     };
-    let name = names.pop().expect("a path has a name");
     let Some((mtime, precision)) = f::parse_time(&q.mtime) else {
         return Err(no(StatusCode::BAD_REQUEST, "mtime is not a time"));
     };
@@ -162,23 +178,32 @@ fn committed(
     let Some(rev) = m.revision(&a.ns, a.q.revision)? else {
         return Ok(None);
     };
-    if rev.object != a.q.object {
+    // A change that found the file changed made a copy beside it, a new object with this revision, by
+    // this request's own commit.
+    let copy = rev.object != a.q.object
+        && a.q.base.is_some()
+        && m.committed(&a.ns, &OpId(a.q.revision.0))? == Some(rev.seq);
+    if rev.object != a.q.object && !copy {
         return Ok(Some(Err(no(
             StatusCode::CONFLICT,
             "that revision is another object's",
         ))));
     }
-    let name = m
-        .links_of(&a.ns, rev.object)?
-        .into_iter()
-        .next()
-        .map_or_else(|| a.name.clone(), |l| l.name);
+    let name = match m.links_of(&a.ns, rev.object)?.into_iter().next() {
+        Some(l) => l.name,
+        None => match &a.name {
+            Some(n) => n.clone(),
+            // Deleted since: named by its ID.
+            None => Name::new(rev.object.to_string().into_bytes())?,
+        },
+    };
     Ok(Some(Ok(FileAnswer {
         object: rev.object,
         revision: rev.revision,
         seq: rev.seq,
         name,
         existed: false,
+        conflict: copy,
     })))
 }
 
@@ -206,6 +231,8 @@ impl Read for BodyReader {
 /// What the commit does, against the tree as it is now.
 enum Plan {
     Commit(Vec<Op>, Name),
+    /// A change made a conflict copy beside the file it was meant for.
+    Copy(Vec<Op>, Name),
     /// The file there already has these bytes: nothing to commit.
     Existed(FileAnswer),
 }
@@ -281,7 +308,8 @@ fn plan(
         manifest,
         size: a.size,
     };
-    let mut name = a.name.clone();
+    let asked = a.name.clone().expect("a new file has a name");
+    let mut name = asked.clone();
     if !made {
         let children = m.children(&a.ns, dir)?;
         if let Some(c) = children.iter().find(|c| c.name == name) {
@@ -293,6 +321,7 @@ fn plan(
                     seq,
                     name,
                     existed: true,
+                    conflict: false,
                 })));
             }
             if a.q.taken == Taken::Fail {
@@ -304,7 +333,7 @@ fn plan(
             let taken: std::collections::HashSet<&Name> =
                 children.iter().map(|c| &c.name).collect();
             name = (2..)
-                .map(|n| f::numbered(&a.name, n))
+                .map(|n| f::numbered(&asked, n))
                 .find(|n| !taken.contains(n))
                 .expect("a free name is found among the numbered ones");
         }
@@ -323,6 +352,178 @@ fn plan(
         conflict_of: None,
     });
     Ok(Ok(Plan::Commit(ops, name)))
+}
+
+/// A change of a file already there, against `base`, the revision the client saw: an update keeping
+/// everything of its metadata but its mtime (invariant 2) while it is still that revision; beside it a
+/// conflict copy once another changed it, never in its place (invariant 3), or with `stale=fail` nothing;
+/// and once deleted, brought back where it was last, as itself or, changed since, as a copy.
+fn plan_change(
+    m: &mut dyn MetaStore,
+    a: &Asked,
+    base: RevisionId,
+    manifest: Hash,
+    last: Option<(Link, u64)>,
+) -> Result<std::result::Result<Plan, Refusal>> {
+    let refused = |s, why: &str| Ok(Err(no(s, why)));
+    let content = Content::File {
+        manifest,
+        size: a.size,
+    };
+    let Some(head) = m.object_head(&a.ns, a.q.object)? else {
+        return refused(StatusCode::NOT_FOUND, "no such file");
+    };
+    if head.kind != ObjectKind::File {
+        return refused(StatusCode::CONFLICT, "that is not a file");
+    }
+    let current = head.revision == base;
+    if !current && a.q.stale == f::Stale::Fail {
+        return refused(
+            StatusCode::CONFLICT,
+            "the file changed since that revision, and was left as it is",
+        );
+    }
+    // Everything it has but its mtime, as the web's replace keeps it.
+    let mut kept = head.body.metadata.clone();
+    kept.mtime = a.metadata.mtime;
+    kept.time_precision_ns = a.metadata.time_precision_ns;
+    let update = Op::Update {
+        object: a.q.object,
+        base,
+        revision: a.q.revision,
+        body: RevisionBody {
+            content: content.clone(),
+            metadata: kept,
+        },
+        restored_from: None,
+    };
+    let links = m.links_of(&a.ns, a.q.object)?;
+    if let Some(at) = links.into_iter().next() {
+        if head.body.content == content {
+            let seq = m.revision(&a.ns, head.revision)?.map_or(0, |r| r.seq);
+            return Ok(Ok(Plan::Existed(FileAnswer {
+                object: a.q.object,
+                revision: head.revision,
+                seq,
+                name: at.name,
+                existed: true,
+                conflict: false,
+            })));
+        }
+        if current {
+            return Ok(Ok(Plan::Commit(vec![update], at.name)));
+        }
+        let name = conflict_beside(m, a, at.parent, &at.name, None)?;
+        return Ok(Ok(copy(a, &head, content, at.parent, name)));
+    }
+    // Deleted: where it was last, if that folder is there.
+    let Some((was, seq)) = last else {
+        return refused(
+            StatusCode::CONFLICT,
+            "the file is deleted, and where it was is not known: send it as a new file",
+        );
+    };
+    let live = was.parent == ObjectId::ROOT || !m.links_of(&a.ns, was.parent)?.is_empty();
+    if !live {
+        return refused(
+            StatusCode::CONFLICT,
+            "the file is deleted, and the folder it was in too: send it as a new file",
+        );
+    }
+    let free = !m
+        .children(&a.ns, was.parent)?
+        .iter()
+        .any(|c| c.name == was.name);
+    if current {
+        let name = if free {
+            was.name.clone()
+        } else {
+            conflict_beside(m, a, was.parent, &was.name, Some(seq))?
+        };
+        let link = Op::Link {
+            object: a.q.object,
+            link: Link {
+                parent: was.parent,
+                name: name.clone(),
+            },
+        };
+        return Ok(Ok(Plan::Commit(vec![link, update], name)));
+    }
+    let name = conflict_beside(m, a, was.parent, &was.name, None)?;
+    Ok(Ok(copy(a, &head, content, was.parent, name)))
+}
+
+/// The bytes as a new file beside the one they were meant to change, a conflict of it.
+fn copy(
+    a: &Asked,
+    head: &cairn_store::Head,
+    content: Content,
+    parent: ObjectId,
+    name: Name,
+) -> Plan {
+    let mut metadata = a.metadata.clone();
+    metadata.mode = head.body.metadata.mode;
+    Plan::Copy(
+        vec![Op::Create {
+            object: ObjectId::random(),
+            revision: a.q.revision,
+            body: RevisionBody { content, metadata },
+            link: Link {
+                parent,
+                name: name.clone(),
+            },
+            conflict_of: Some(cairn_protocol::ConflictOf {
+                object: a.q.object,
+                competing_revision: head.revision,
+            }),
+        }],
+        name,
+    )
+}
+
+/// A free name beside `name` in `parent` for a conflict copy made by this request's device today, or,
+/// given the sequence that deleted it, for a file brought back where its name was taken since.
+fn conflict_beside(
+    m: &mut dyn MetaStore,
+    a: &Asked,
+    parent: ObjectId,
+    name: &Name,
+    restored: Option<u64>,
+) -> Result<Name> {
+    let taken: std::collections::HashSet<Name> = m
+        .children(&a.ns, parent)?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    // The names of the folders above it, for git's own folders, whose copies are named apart.
+    let mut folder = Vec::new();
+    let mut at = parent;
+    while at != ObjectId::ROOT && folder.len() < 4096 {
+        let Some(l) = m.links_of(&a.ns, at)?.into_iter().next() else {
+            break;
+        };
+        folder.push(l.name);
+        at = l.parent;
+    }
+    folder.reverse();
+    let in_git = cairn_protocol::name::in_git_dir(&folder);
+    let (host, date) = match restored {
+        Some(seq) => ("restored".to_string(), format!("seq {seq}")),
+        None => (a.q.device_name.clone(), crate::admin::date(now())),
+    };
+    let mut attempt = 0;
+    loop {
+        let n = cairn_protocol::name::conflict_name(name, &host, &date, attempt, in_git);
+        if !taken.contains(&n)
+            && !(parent == ObjectId::ROOT && n.as_bytes() == cairn_protocol::STATE_DIR)
+        {
+            return Ok(n);
+        }
+        attempt += 1;
+        if attempt > 10_000 {
+            anyhow::bail!("no free name for a conflict copy beside {name}");
+        }
+    }
 }
 
 pub(crate) async fn put(
@@ -403,9 +604,18 @@ pub(crate) async fn put(
     let (app2, a2) = (app.clone(), a.clone());
     let done = crate::blocking(move || {
         for _ in 0..RENAME_TRIES {
-            let planned = app2.repo.with_meta(|m| plan(m, &a2, manifest))?;
+            // Where the file was last, should it be deleted: from the index, outside the store's lock,
+            // which the index takes to catch up.
+            let last = match a2.q.base {
+                Some(_) => crate::web::deleted::last_link(&app2, &a2.ns, a2.q.object)?,
+                None => None,
+            };
+            let planned = app2.repo.with_meta(|m| match a2.q.base {
+                Some(base) => plan_change(m, &a2, base, manifest, last),
+                None => plan(m, &a2, manifest),
+            })?;
             let (ops, name) = match planned {
-                Ok(Plan::Commit(ops, name)) => (ops, name),
+                Ok(Plan::Commit(ops, name) | Plan::Copy(ops, name)) => (ops, name),
                 Ok(Plan::Existed(e)) => return Ok(Ok((StatusCode::OK, e))),
                 Err(r) => return Ok(Err(r)),
             };
@@ -435,7 +645,15 @@ pub(crate) async fn put(
                             reason: OpReject::NameTaken(_),
                             ..
                         },
-                } if a2.q.taken == Taken::Rename => continue,
+                } if a2.q.taken == Taken::Rename || a2.q.base.is_some() => continue,
+                // Changed or deleted between the plan and the commit: planned again against that.
+                CommitResponse::Rejected {
+                    reject:
+                        RejectReason::Op {
+                            reason: OpReject::StaleBase(_) | OpReject::Deleted(_),
+                            ..
+                        },
+                } if a2.q.base.is_some() => continue,
                 CommitResponse::Rejected { reject } => {
                     return Ok(Err(no(StatusCode::CONFLICT, refusal(&reject))))
                 }

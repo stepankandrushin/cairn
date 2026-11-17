@@ -17,6 +17,9 @@
 - Passwords for the web: `cairn-server user password` sets one, a user changes their own at `PUT
   /v1/me/password` and a sign-in by one makes a token for that browser alone, which signing out takes back.
   A password changed signs out every browser it signed in.
+- `PUT /file` changes a file already there given `base` the revision the client saw, keeping everything of it
+  but its mtime; changed since by another, the bytes go beside it as a conflict copy, never in its place, and
+  a file deleted since comes back where it was. So a phone's Files app can change files in one request.
 
 **Changed:**
 

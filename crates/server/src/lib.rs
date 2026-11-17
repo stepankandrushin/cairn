@@ -285,6 +285,7 @@ fn features() -> Vec<String> {
         f::TOKENS,
         f::PAIRING,
         f::PASSWORDS,
+        f::FILE_UPDATE,
     ]
     .into_iter()
     .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))

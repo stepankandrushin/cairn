@@ -25,6 +25,42 @@ pub struct Info {
     /// asked by one goes on working, and takes this one up. Absent from a server before renaming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// What this server does beyond what every server of this protocol does, by the names in
+    /// [`feature`]: a client asks here before it uses any of it, and does without it otherwise. Absent
+    /// from a server before features, which has none of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl Info {
+    /// Whether the server says it has this feature, one of [`feature`]'s.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+/// The names of what a server may do beyond what every server of this protocol does, in
+/// `Info::features` and `Me::features`. A client never asks a server for something it does not name
+/// here; a name it does not know it passes over.
+pub mod feature {
+    /// A note may name more objects than one (also `Info::note_groups`, for clients before features).
+    pub const NOTE_GROUPS: &str = "note_groups";
+    /// A web `Item` carries its file's manifest hash.
+    pub const ITEM_HASH: &str = "item_hash";
+    /// `PUT /file` changes a file already there, given the revision the client saw (`base`).
+    pub const FILE_UPDATE: &str = "file_update";
+    /// `GET B/thumb/{object}`, and `PUT` of a client's own thumbnail.
+    pub const THUMBS: &str = "thumbs";
+    /// A user's own tokens through `/v1/tokens`, and `Me::token`.
+    pub const TOKENS: &str = "tokens";
+    /// A signed-in device makes a code another device trades for a token of its own: `/v1/pair`.
+    pub const PAIRING: &str = "pairing";
+    /// A user may sign in to the web with a password: `POST /v1/session` with `{user, password}`.
+    pub const PASSWORDS: &str = "passwords";
+    /// `PUT /file` is resumable, as the IETF's resumable uploads draft says.
+    pub const RESUMABLE: &str = "resumable";
+    /// A folder may keep less than its whole history: `B/retention`, and revisions marked pruned.
+    pub const RETENTION: &str = "retention";
 }
 
 /// What a user may do in a namespace, which a person knows as a folder: each level holds the one
@@ -78,6 +114,16 @@ impl std::str::FromStr for Access {
 pub struct Me {
     pub user: String,
     pub folders: Vec<FolderAccess>,
+    /// As `Info::features`, for a client that has no namespace to ask yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl Me {
+    /// Whether the server says it has this feature, one of [`feature`]'s.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

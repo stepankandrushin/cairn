@@ -257,7 +257,22 @@ async fn info(
         // A harness build can say what a server before them says.
         note_groups: !cairn_failpoint::unsupported("server.note_groups"),
         folder: Some(ns),
+        features: features(),
     }))
+}
+
+/// What this server does beyond what every server of the protocol does (`cairn_protocol::wire::feature`).
+fn features() -> Vec<String> {
+    use cairn_protocol::wire::feature as f;
+    // A harness build can say what a server before features says, or before one of them.
+    if cairn_failpoint::unsupported("server.features") {
+        return Vec::new();
+    }
+    [f::NOTE_GROUPS]
+        .into_iter()
+        .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
+        .map(String::from)
+        .collect()
 }
 
 /// The caller's own name for the namespace, which only they see, in place of its name: set, or with
@@ -436,6 +451,7 @@ async fn me(
     Ok(Json(Me {
         user: caller.user,
         folders,
+        features: features(),
     }))
 }
 

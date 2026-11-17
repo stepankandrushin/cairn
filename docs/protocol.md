@@ -26,9 +26,9 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /v1/me` | | `{user, folders: [{folder, access, name?}]}` whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)) |
+| `GET /v1/me` | | `{user, folders: [{folder, access, name?}], features}` whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)); `features` as in `/info` [Features](#features) |
 | `POST /v1/folders` | `{folder, name?}` | 201 `{folder, access, name?}` a new namespace, which the caller manages, with `name` as their own name for it, all at once ([Names](#names)). 400 no such name. 409 the name is or was another namespace's, of which the answer says nothing more |
-| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups, folder}` - `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups` absent before them, says that a note may name more objects than one. `folder` absent before renaming, is the namespace's name now, which a client that asked by a former one takes up ([Names](#names)) |
+| `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups, folder, features}` - `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups` absent before them, says that a note may name more objects than one. `folder` absent before renaming, is the namespace's name now, which a client that asked by a former one takes up ([Names](#names)) |
 | `POST /chunks/missing` | `{hashes}` | `{hashes}` those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
 | `POST /chunks/upload` | chunk batch | 204 all durable, made so together. 400 damaged batch, of which nothing is kept. Needs `write` |
 | `POST /chunks/download` | `{hashes}` | chunk batch, in the order asked. 404 one is missing |
@@ -61,6 +61,21 @@ No level is no access: the namespace answers 404 word for word as one that does 
 do is looked up on every request, so a change holds from the next one, and a device whose access went keeps
 what it holds. A client that learns from `Info.access` that it may only read sends nothing up (PLAN.md
 "Sharing and access"); one from before accounts tries, and is answered 403 with the reason.
+
+## Features
+
+What a server does beyond what every server of this protocol does, it names in `features` in `/info` and
+in `/v1/me` by the names in `cairn_protocol::wire::feature` A client asks there before it uses any of it,
+and does without it on a server that does not name it; a name it does not know it passes over. So a client
+newer than its server needs no upgrade of the server first, and the protocol's version changes only for what
+every client must speak. A server before features sends none.
+
+| Feature | What it adds |
+|---|---|
+| `note_groups` | A note may name more objects than one [Committing](#committing) also `note_groups: true` for clients before features |
+
+A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
+it as not there, never as an error to try again.
 
 ## Names
 

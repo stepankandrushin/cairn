@@ -20,7 +20,7 @@
 //!   that name (`*` for any) with that raw OS error, while the file `<while>` exists if one is given,
 //!   as a system refuses a file this process may not read or write: an access list, a lock, an
 //!   antivirus. Not a step either.
-//! - `CAIRN_FP_UNSUPPORTED=<name>`: `unsupported` says yes at that point, as a filesystem says it
+//! - `CAIRN_FP_UNSUPPORTED=<name>[,<name>…]`: `unsupported` says yes at each point named, as a filesystem says it
 //!   cannot do what is asked, the way NTFS cannot swap two names. Not a step either.
 //! - `CAIRN_FP_TUNE=<name>=<n>[,...]`: `tuned` gives `n` for that name instead of its default, to
 //!   make a limit small enough for a test to cross. Not a step either.
@@ -330,7 +330,8 @@ mod imp {
     }
 
     pub fn unsupported(name: &str) -> bool {
-        std::env::var("CAIRN_FP_UNSUPPORTED").is_ok_and(|point| point == name)
+        std::env::var("CAIRN_FP_UNSUPPORTED")
+            .is_ok_and(|points| points.split(',').any(|p| p == name))
     }
 
     pub fn tuned(name: &str) -> Option<u64> {

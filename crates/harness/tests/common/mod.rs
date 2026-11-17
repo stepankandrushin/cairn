@@ -12,6 +12,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+pub mod http;
+#[allow(unused_imports)]
+pub use http::{get, post, request, Answer, Auth};
+
 pub const CAIRN: &str = env!("CARGO_BIN_EXE_h-cairn");
 pub const SERVER: &str = env!("CARGO_BIN_EXE_h-cairn-server");
 

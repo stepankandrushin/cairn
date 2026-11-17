@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Added:**
+
+- The server names what it does beyond what every server of the protocol does in `features` in `/info` and
+  `/v1/me` so a newer client asks first and does without what an older server lacks, with no upgrade of the
+  server first.
+
 **Fixed:**
 
 - The server looks a commit's operation ID up before it checks the commit's chunks, so a commit it took whose

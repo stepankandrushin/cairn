@@ -234,8 +234,10 @@ to the server named there (`CAIRN_UPLOAD_URL_BASE`) and does not run in the simu
 
 android/ is the app, for Android 11 and later, on the same Rust core as the iPhone's (crates/mobile, its Kotlin
 bindings made by uniffi). Sign in as on the iPhone, with a token made for the phone (`cairn-server token add
-alice --label android`). [docs/android.md](docs/android.md) is its manual: installing the APK, signing in and
-each screen, with screenshots.
+alice --label android`). Each release since 0.1.29 has its APK, `cairn-<v>-android.apk`, signed by the
+project's key, among its files on [cairn.storage/download](https://cairn.storage/download/) and GitHub.
+[docs/android.md](docs/android.md) is its manual: installing the APK, signing in and each screen, with
+screenshots.
 
 - **Photos:** each photo and video of the folders switched on goes to the folder and path chosen as it was
   taken. The camera's (DCIM) is on by default. Screenshots and screen recordings are off until switched on,
@@ -255,9 +257,11 @@ each screen, with screenshots.
   Renaming, moving, deleting and writing over a file are not offered yet.
 
 The uploads are the iPhone's: one request each, its IDs chosen and kept before it is sent. `bash
-scripts/release-android.sh` builds a signed APK in build/android (`--emulator` installs it on the emulator,
-`--debug` builds one signed by the machine's debug key); it needs the Android SDK and NDK, `cargo-ndk`, and
-`rustup target add aarch64-linux-android x86_64-linux-android`.
+scripts/release-android.sh` builds a signed APK in build/android, and the same as `dist/cairn-<v>-android.apk`
+for a release (`--emulator` installs it on the emulator, `--debug` builds one signed by the machine's debug key);
+it needs the Android SDK and NDK, `cargo-ndk`, and `rustup target add aarch64-linux-android
+x86_64-linux-android`. Android installs an update only over an app signed by the same key, so a phone with
+the released APK takes only released ones, and one with an APK of your own key only yours.
 
 ## The daemon
 

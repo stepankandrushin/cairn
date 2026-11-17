@@ -11,7 +11,9 @@
   did, found by MediaStore's generation numbers and sent by WorkManager soon after they are taken, on Wi-Fi
   only unless chosen otherwise; the server's folders browsed live, with thumbnails, a file downloaded only when
   opened and a video streamed; and each chosen folder in the system's Files picker, which downloads on demand
-  and adds new files and folders, each queued like a photo before it is sent.
+  and adds new files and folders, each queued like a photo before it is sent. Its APK,
+  `cairn-<v>-android.apk`, is among the release's files on cairn.storage and GitHub, signed by the project's
+  key; the app does not update itself, so a later one is installed over it.
 - crates/mobile builds for Android (a shared library, and its start for Android's certificate checks), and the
   engine, a client library there, builds for Android as on Linux.
 

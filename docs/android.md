@@ -2,7 +2,7 @@
 
 The app backs up the phone's photos and videos to a folder on your Cairn server, browses the server's folders,
 and puts the folders you choose into the system's Files picker. It runs on Android 11 and later. It is in no
-store yet, so you install its APK yourself.
+store yet, so you install its APK, from the release downloads, yourself.
 
 The screenshots come from an Android 16 phone signed in to a demo server, whose users are alice, bob and carol.
 Other phones word the system's screens a little differently.
@@ -13,15 +13,19 @@ Other phones word the system's screens a little differently.
 - **A token for this phone**, which whoever runs the server makes for your user, one per device:
   `cairn-server token add alice --label android --data <data dir>`. A lost phone's token is then taken back
   alone, by `cairn-server token remove <id>`, with the ID from `cairn-server token list`.
-- **The APK**, `Cairn-<version>.apk`. It is not among the release downloads yet: build it from the source
-  (`bash scripts/release-android.sh`, see the README's "The Android app"), or get it from whoever runs your
-  server. Android installs an update only when the same key signed it, so take every later APK from the same
-  place.
+- **The APK**, `cairn-<version>-android.apk`, one for every phone, among the files of each release from
+  0.1.29 on: on [cairn.storage/download](https://cairn.storage/download/), the latest release's page, and
+  [GitHub's latest release](https://github.com/stepankandrushin/cairn/releases/latest). Each is signed by the
+  project's key, whose certificate's SHA-256 is
+  `dc981e26f3084defacb05268103e31ba30eb7cd6c01734ae9f19742f56009006`; `apksigner verify --print-certs` on the
+  APK shows it. Android installs an update only when the same key signed it, so an APK built from the source
+  (`bash scripts/release-android.sh`, see the README's "The Android app") is signed by your own key, and every
+  later one must then be your own build too.
 
 ## Install
 
 Open the APK on the phone, from a browser's download, the Files app or a chat. From a computer with USB
-debugging turned on, `adb install Cairn-<version>.apk` installs it instead.
+debugging turned on, `adb install cairn-<version>-android.apk` installs it instead.
 
 <table>
 <tr><td width="50%">
@@ -171,6 +175,6 @@ computer.
 
 ## Updates
 
-The app does not update itself yet. Install a newer APK over it as above: it keeps its settings and what waits
-to be sent. Android refuses an APK signed by another key; uninstalling the app to get past that forgets what
+The app does not update itself yet. Install a later release's APK over it as above: it keeps its settings and
+what waits to be sent. Android refuses an APK signed by another key; uninstalling the app to get past that forgets what
 was waiting.

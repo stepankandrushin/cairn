@@ -4,7 +4,9 @@
 # then one of
 #
 #   --apk         the app built for release and signed: build/android/Cairn-<version>.apk, which installs
-#                 on any phone from Android 11 on. Signed by the key that CAIRN_ANDROID_KEYSTORE names, its
+#                 on any phone from Android 11 on, and the same file as dist/cairn-<version>-android.apk, the
+#                 name a release publishes it under beside the other platforms' files (release-update.sh
+#                 puts it in the release's SHA-256 list). Signed by the key that CAIRN_ANDROID_KEYSTORE names, its
 #                 password in CAIRN_ANDROID_KEYSTORE_PASSWORD and its alias in CAIRN_ANDROID_KEY_ALIAS
 #                 (cairn by default), or by those in the file CAIRN_ANDROID_ENV names. Every build an
 #                 installed copy takes as an update must be signed by the same key;
@@ -73,7 +75,10 @@ case $mode in
         cp android/app/build/outputs/apk/release/app-release.apk "$apk"
         tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
         "$tools/apksigner" verify --print-certs "$apk" | grep -m1 'SHA-256'
+        mkdir -p dist
+        cp "$apk" "dist/cairn-$version-android.apk"
         echo "$apk"
+        echo "dist/cairn-$version-android.apk"
         if [[ $mode == --emulator ]]; then
             adb=$ANDROID_HOME/platform-tools/adb
             "$adb" -e install -r "$apk"

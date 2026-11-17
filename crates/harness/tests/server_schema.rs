@@ -273,10 +273,28 @@ fn a_server_moves_a_database_of_schema_3_when_it_starts_and_answers_the_same() {
         run.text()
     );
     assert_eq!(schema(&db), 6);
-    same_state(&state_everything(&db), &four, "moved again by the server");
+    same_state(
+        &unused(state_everything(&db)),
+        &unused(four),
+        "moved again by the server",
+    );
     a.write("d6/new", "new");
     converge(&[&a, &b]);
     assert_eq!(b.read("d6/new"), b"new");
+}
+
+/// A state with each token's last use taken out: an hour the server writes after a request, in the
+/// background, which a state read right after one may hold or not.
+fn unused(mut state: Vec<(String, Vec<String>)>) -> Vec<(String, Vec<String>)> {
+    for (t, rows) in &mut state {
+        if t == "tokens" {
+            for r in rows.iter_mut() {
+                let cut = r.rfind(", ").expect("a token's last use");
+                *r = format!("{}, Null]", &r[..cut]);
+            }
+        }
+    }
+    state
 }
 
 /// A state with what schema 6 adds taken out: its three tables, and the column it adds to `users` and the

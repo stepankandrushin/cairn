@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.32 2026-11-18
+
+**Fixed:**
+
+- A sync that rebuilds its record of the tree from the state, and the daemon's daily check of that record,
+  read the state on several threads and use what each read in order, but went on reading while one thread was
+  held up, as a busy machine holds threads up, so all the others read meanwhile waited in memory behind it,
+  with no limit. They now wait for it after two batches a thread, about a megabyte of the state, however busy
+  the machine.
+
 ## 0.1.31 2026-11-17
 
 **Added:**

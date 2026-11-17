@@ -4,12 +4,13 @@
 use anyhow::{bail, Context, Result};
 use cairn_failpoint::{check, hit};
 use cairn_protocol::Hash;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::SystemTime;
 
 pub trait ChunkStore: Send + Sync {
     /// Durable on return.
@@ -177,8 +178,70 @@ fn read_in_order<T: Sync>(
     })
 }
 
+/// One chunk directory's store. A collection (`crate::gc`) removes chunks from it while commits and
+/// uploads go on, and its gate is what keeps every acknowledged commit's chunks there.
 pub struct FsChunkStore {
     root: PathBuf,
+    gate: Arc<Gate>,
+    /// Opened to be read alone, as `fsck` opens a store: nothing is made, emptied or written.
+    read_only: bool,
+}
+
+/// What stands between a collection and the chunks something is about to rely on (docs/format.md,
+/// "Collection"). A commit holds the lock shared from the check of its chunks to its commit; a
+/// collection takes it alone to begin vouching, and for each batch it removes. While a collection runs,
+/// every hash a commit's check, a `missing` or an upload looks at is vouched for first, and the
+/// collection takes none of them; and an upload in one request holds its chunks until its commit
+/// returns, whenever it began.
+#[derive(Default)]
+pub struct Gate {
+    lock: RwLock<()>,
+    sets: Mutex<Spared>,
+}
+
+#[derive(Default)]
+struct Spared {
+    /// While a collection runs: each hash looked at since it began.
+    vouched: Option<HashSet<Hash>>,
+    /// The chunks uploads in one request hold, each with how many hold it.
+    held: HashMap<Hash, usize>,
+}
+
+/// Chunks held for an upload until this is dropped: no collection removes them meanwhile.
+pub struct Held {
+    gate: Arc<Gate>,
+    hashes: Vec<Hash>,
+}
+
+impl Held {
+    /// These too, from now on.
+    pub fn add(&mut self, hashes: &[Hash]) {
+        let mut sets = self.gate.sets();
+        for h in hashes {
+            *sets.held.entry(*h).or_insert(0) += 1;
+        }
+        self.hashes.extend_from_slice(hashes);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut sets = self.gate.sets();
+        for h in &self.hashes {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = sets.held.entry(*h) {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove();
+                }
+            }
+        }
+    }
+}
+
+impl Gate {
+    fn sets(&self) -> std::sync::MutexGuard<'_, Spared> {
+        self.sets.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Make a directory's entries durable.
@@ -253,7 +316,11 @@ fn in_parallel<T: Sync>(items: &[T], f: impl Fn(&T) -> Result<()> + Sync) -> Res
 
 impl FsChunkStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let store = Self { root: root.into() };
+        let store = Self {
+            root: root.into(),
+            gate: Arc::default(),
+            read_only: false,
+        };
         fs::create_dir_all(store.root.join("chunks"))?;
         fs::create_dir_all(store.root.join("incoming"))?;
         // A killed server may have acknowledged nothing yet left a rename not fsynced. From here on
@@ -267,6 +334,17 @@ impl FsChunkStore {
         }
         sync_dir(&store.root)?;
         Ok(store)
+    }
+
+    /// A store to read alone, as `fsck` reads one: nothing in it is made, emptied, synced or written,
+    /// so that a check of a backup beside a live store, through links to its chunks, leaves the live
+    /// store's `incoming/` alone. A store with no `chunks/` holds nothing.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            gate: Arc::default(),
+            read_only: true,
+        }
     }
 
     fn path(&self, hash: &Hash) -> PathBuf {
@@ -292,10 +370,128 @@ impl FsChunkStore {
         }
         Ok(true)
     }
+
+    /// Held by a commit from the check of its chunks to its commit: no batch of a collection's removes
+    /// runs meanwhile.
+    pub fn shared(&self) -> RwLockReadGuard<'_, ()> {
+        self.gate.lock.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A collection's, to begin vouching with no commit between its check and its commit, and for
+    /// each batch it removes.
+    pub fn exclusive(&self) -> RwLockWriteGuard<'_, ()> {
+        self.gate.lock.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Before each of these is looked at: a collection running takes none of them.
+    pub fn vouch<'a>(&self, hashes: impl IntoIterator<Item = &'a Hash>) {
+        let mut sets = self.gate.sets();
+        if let Some(v) = sets.vouched.as_mut() {
+            v.extend(hashes);
+        }
+    }
+
+    /// Holds these, and those added to what this gives, until it is dropped.
+    pub fn hold(&self, hashes: &[Hash]) -> Held {
+        let mut held = Held {
+            gate: self.gate.clone(),
+            hashes: Vec::new(),
+        };
+        held.add(hashes);
+        held
+    }
+
+    /// From now on each hash looked at is vouched for, until `stop_vouching`. Under `exclusive`.
+    pub fn start_vouching(&self) {
+        self.gate.sets().vouched = Some(HashSet::new());
+    }
+
+    pub fn stop_vouching(&self) {
+        self.gate.sets().vouched = None;
+    }
+
+    /// Every chunk whose file was last written before `before`; none of a store with no `chunks/`. The
+    /// times are only read.
+    pub fn stored_before(&self, before: SystemTime) -> Result<Vec<Hash>> {
+        let mut out = Vec::new();
+        let fans = match fs::read_dir(self.root.join("chunks")) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for fan in fans {
+            for e in fs::read_dir(fan?.path())? {
+                let e = e?;
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                let hash: Hash = name
+                    .parse()
+                    .with_context(|| format!("stray file in chunk store: {name}"))?;
+                let modified = match e.metadata() {
+                    Ok(m) => m.modified()?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if modified < before {
+                    out.push(hash);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// A collection's removal of one chunk: unless it is vouched for or held, or was written at or
+    /// after `before`, it is unlinked, all while no vouch or hold can begin, so that whatever looks at
+    /// it after either finds it or finds it gone. Its size if it was removed.
+    pub fn remove_unless_spared(&self, hash: &Hash, before: SystemTime) -> Result<Option<u64>> {
+        if self.read_only {
+            bail!("a store opened to be read removes nothing");
+        }
+        let sets = self.gate.sets();
+        if sets.held.contains_key(hash) || sets.vouched.as_ref().is_some_and(|v| v.contains(hash)) {
+            return Ok(None);
+        }
+        let path = self.path(hash);
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if meta.modified()? >= before {
+            return Ok(None);
+        }
+        hit("server.gc.unlink");
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        drop(sets);
+        Ok(Some(meta.len()))
+    }
+
+    /// The fan directories of these chunks synced, so that what a batch removed stays removed.
+    pub fn sync_fans(&self, hashes: &[Hash]) -> Result<()> {
+        let fans: BTreeSet<PathBuf> = hashes
+            .iter()
+            .filter_map(|h| self.path(h).parent().map(Path::to_path_buf))
+            .collect();
+        for fan in fans {
+            sync_dir(&fan)?;
+        }
+        Ok(())
+    }
 }
 
 impl ChunkStore for FsChunkStore {
     fn put_all(&self, chunks: &[(Hash, &[u8])]) -> Result<()> {
+        if self.read_only {
+            bail!("a store opened to be read stores nothing");
+        }
+        // No batch of a collection's removals beside an upload; and each chunk vouched for before it is
+        // looked for, so that one found here is not taken before its commit is checked.
+        let _gate = self.shared();
+        self.vouch(chunks.iter().map(|(h, _)| h));
         // All checked before any is written: a damaged batch leaves nothing behind.
         in_parallel(chunks, |(hash, data)| {
             if Hash::of(data) != *hash {
@@ -414,7 +610,12 @@ impl ChunkStore for FsChunkStore {
 
     fn list(&self) -> Result<Vec<Hash>> {
         let mut out = Vec::new();
-        for fan in fs::read_dir(self.root.join("chunks"))? {
+        let fans = match fs::read_dir(self.root.join("chunks")) {
+            Ok(f) => f,
+            Err(e) if self.read_only && e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for fan in fans {
             for e in fs::read_dir(fan?.path())? {
                 let name = e?.file_name();
                 let name = name.to_string_lossy();

@@ -1,11 +1,16 @@
 //! `fsck`: every chunk hash, every manifest reference, and the tables against a replay of the journal.
+//! It only reads: each chunk store is opened to be read alone, so a check of a backup's database
+//! against a live store's chunks, through links to them, changes nothing of the live store.
+//!
+//! A revision retention gave up may have lost its content to a collection: that is counted, not
+//! damage. One given up that is an object's head with an entry, or a mark naming no revision, is.
 
 use crate::chunks::ChunkStore;
 use crate::meta::TreeState;
 use crate::repo::Repo;
 use anyhow::Result;
 use cairn_protocol::{Content, Hash, Manifest, ObjectId, Op, OpReject, RevisionId, Tree};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Default)]
 pub struct FsckReport {
@@ -15,6 +20,11 @@ pub struct FsckReport {
     pub chunks: usize,
     /// Stored chunks no revision names: an interrupted upload, not damage.
     pub unreferenced: usize,
+    /// Revisions retention gave up, and of them those whose content is gone, wholly or in part.
+    pub pruned: usize,
+    pub pruned_gone: usize,
+    /// Stored chunks only revisions given up name: what a collection takes once their delay is past.
+    pub awaiting: usize,
     pub errors: Vec<String>,
 }
 
@@ -33,60 +43,122 @@ pub fn fsck(repo: &Repo) -> Result<FsckReport> {
     Ok(report)
 }
 
+/// Who names a manifest: each revision, with the size it says when it is the revision's file.
+#[derive(Default)]
+struct Naming {
+    kept: Vec<(RevisionId, ObjectId, Option<u64>)>,
+    pruned: Vec<(RevisionId, Option<u64>)>,
+}
+
 fn check_namespace(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<()> {
-    let store = repo.chunks(ns)?;
+    let store = repo.chunks_read_only(ns)?;
     let stored = store.list()?;
     let revisions = repo.with_meta(|m| m.revisions(ns))?;
+    let pruned: HashMap<RevisionId, i64> =
+        repo.with_meta(|m| m.all_pruned(ns))?.into_iter().collect();
     report.revisions += revisions.len();
+    report.pruned += pruned.len();
 
-    let mut referenced: BTreeSet<Hash> = BTreeSet::new();
-    let mut manifests: BTreeSet<Hash> = BTreeSet::new();
+    let mut naming: BTreeMap<Hash, Naming> = BTreeMap::new();
+    let mut known: HashSet<RevisionId> = HashSet::new();
     for r in &revisions {
-        if let Content::File { manifest, size } = &r.body.content {
-            manifests.insert(*manifest);
-            match store.get(manifest) {
-                Ok(Some(bytes)) => match Manifest::decode(&bytes) {
-                    Ok(m) if m.size == *size => {}
-                    Ok(m) => report.errors.push(format!(
-                        "{ns}: revision {} says {size} bytes, manifest {manifest} says {}",
-                        r.revision, m.size
-                    )),
-                    Err(e) => report
-                        .errors
-                        .push(format!("{ns}: manifest {manifest}: {e}")),
-                },
-                Ok(None) => report.errors.push(format!(
-                    "{ns}: revision {} of object {} names missing manifest {manifest}",
-                    r.revision, r.object
-                )),
-                Err(e) => report
-                    .errors
-                    .push(format!("{ns}: manifest {manifest}: {e}")),
+        known.insert(r.revision);
+        let is_pruned = pruned.contains_key(&r.revision);
+        let file = match &r.body.content {
+            Content::File { manifest, size } => Some((*manifest, Some(*size))),
+            _ => None,
+        };
+        let streams = r.body.metadata.streams.iter().map(|s| (s.manifest, None));
+        for (manifest, size) in file.into_iter().chain(streams) {
+            let n = naming.entry(manifest).or_default();
+            if is_pruned {
+                n.pruned.push((r.revision, size));
+            } else {
+                n.kept.push((r.revision, r.object, size));
             }
         }
-        manifests.extend(r.body.metadata.streams.iter().map(|s| s.manifest));
     }
-    for hash in &manifests {
-        referenced.insert(*hash);
-        let Ok(Some(bytes)) = store.get(hash) else {
-            continue;
+
+    // What revisions kept name must all be here; what only revisions given up name may be gone.
+    let mut referenced: BTreeSet<Hash> = BTreeSet::new();
+    let mut given_up: BTreeSet<Hash> = BTreeSet::new();
+    let mut gone: HashSet<RevisionId> = HashSet::new();
+    for (manifest, n) in &naming {
+        let kept = !n.kept.is_empty();
+        let into = if kept { &mut referenced } else { &mut given_up };
+        into.insert(*manifest);
+        let m = match store.get(manifest) {
+            Ok(Some(bytes)) => match Manifest::decode(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{ns}: manifest {manifest}: {e}"));
+                    continue;
+                }
+            },
+            Ok(None) if !kept => {
+                gone.extend(n.pruned.iter().map(|(r, _)| *r));
+                continue;
+            }
+            Ok(None) => {
+                let (rev, object, _) = n.kept[0];
+                report.errors.push(format!(
+                    "{ns}: revision {rev} of object {object} names missing manifest {manifest}"
+                ));
+                continue;
+            }
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("{ns}: manifest {manifest}: {e}"));
+                continue;
+            }
         };
-        let Ok(m) = Manifest::decode(&bytes) else {
-            continue;
-        };
+        let sizes = n
+            .kept
+            .iter()
+            .map(|(r, _, s)| (r, s))
+            .chain(n.pruned.iter().map(|(r, s)| (r, s)));
+        for (rev, size) in sizes {
+            if let Some(size) = size.filter(|s| *s != m.size) {
+                report.errors.push(format!(
+                    "{ns}: revision {rev} says {size} bytes, manifest {manifest} says {}",
+                    m.size
+                ));
+            }
+        }
         for c in m.chunks() {
-            referenced.insert(c.hash);
+            into.insert(c.hash);
             match store.len_of(&c.hash)? {
+                None if !kept => gone.extend(n.pruned.iter().map(|(r, _)| *r)),
                 None => report.errors.push(format!(
-                    "{ns}: manifest {hash} names missing chunk {}",
+                    "{ns}: manifest {manifest} names missing chunk {}",
                     c.hash
                 )),
                 Some(len) if len != u64::from(c.len) => report.errors.push(format!(
-                    "{ns}: chunk {} is {len} bytes, manifest {hash} says {}",
+                    "{ns}: chunk {} is {len} bytes, manifest {manifest} says {}",
                     c.hash, c.len
                 )),
                 Some(_) => {}
             }
+        }
+    }
+    report.pruned_gone += gone.len();
+    for rev in pruned.keys() {
+        if !known.contains(rev) {
+            report.errors.push(format!(
+                "{ns}: revision {rev} is marked as given up by retention, and there is no such revision"
+            ));
+        }
+    }
+    let state = repo.with_meta(|m| m.tree_state(ns))?;
+    let linked: HashSet<ObjectId> = state.entries.iter().map(|(_, _, o)| *o).collect();
+    for (object, head) in &state.heads {
+        if pruned.contains_key(head) && linked.contains(object) {
+            report.errors.push(format!(
+                "{ns}: object {object} has an entry, and its head {head} is marked as given up by retention"
+            ));
         }
     }
     for hash in &stored {
@@ -95,7 +167,11 @@ fn check_namespace(repo: &Repo, ns: &str, report: &mut FsckReport) -> Result<()>
             report.errors.push(format!("{ns}: {e}"));
         }
         if !referenced.contains(hash) {
-            report.unreferenced += 1;
+            if given_up.contains(hash) {
+                report.awaiting += 1;
+            } else {
+                report.unreferenced += 1;
+            }
         }
     }
 

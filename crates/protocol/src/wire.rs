@@ -424,6 +424,46 @@ pub struct HashList {
     pub hashes: Vec<Hash>,
 }
 
+/// `GET /v1/ns/{ns}/retention`, and `PUT` of it with `policy` alone (`feature::RETENTION`): the
+/// folder's retention policy as text (`crate::retention::Policy`), `None` for none, which keeps every
+/// revision and removes nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    pub policy: Option<String>,
+    /// How long a deleted file's last revision is kept, in seconds: the policy's trash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash: Option<u64>,
+    /// Who set it, and when, in seconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_at: Option<i64>,
+    /// In the answer to a `PUT`: the revisions given up that came back, as no collection had taken
+    /// their content yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<u64>,
+}
+
+/// `POST /v1/ns/{ns}/pruned`: which of these revisions the folder's retention gave up.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedAsk {
+    pub revisions: Vec<RevisionId>,
+}
+
+/// One revision retention gave up, and when, in seconds since the epoch: from then on its content may
+/// be gone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedRevision {
+    pub revision: RevisionId,
+    pub at: i64,
+}
+
+/// The answer to `POST /v1/ns/{ns}/pruned`: those of the revisions asked about that were given up.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedList {
+    pub pruned: Vec<PrunedRevision>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitRequest {
     pub op_id: OpId,

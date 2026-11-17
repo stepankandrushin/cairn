@@ -94,6 +94,24 @@ pub enum FolderCommand {
         #[arg(long)]
         data: PathBuf,
     },
+    /// How much of a folder's history is kept, while the server serves or not: with neither flag, what
+    /// it is now. With no policy, which is how a folder starts, every revision is kept and nothing is
+    /// removed. The server gives up what a policy gives up once a day, and removes its content a
+    /// collection's delay later (`serve --gc-delay`); a policy set or taken away before that brings
+    /// back what was given up.
+    Retention {
+        folder: String,
+        /// The tiers kept, from now back, each after the one before, and how long a deleted file is
+        /// kept: `all 2d, hourly 1d, daily 30d, weekly forever; trash 30d`. Durations are in h, d, w
+        /// or y; the trash is 30d when not given.
+        #[arg(long, conflicts_with = "none")]
+        keep: Option<String>,
+        /// No policy: keep everything from now on.
+        #[arg(long)]
+        none: bool,
+        #[arg(long)]
+        data: PathBuf,
+    },
 }
 
 #[derive(clap::Args)]
@@ -357,6 +375,51 @@ pub fn folder(what: FolderCommand) -> Result<()> {
             check_name("folder", &to)?;
             let repo = open(&data)?;
             println!("{}", repo.rename_namespace(&from, &to)?);
+        }
+        FolderCommand::Retention {
+            folder,
+            keep,
+            none,
+            data,
+        } => {
+            let policy = keep
+                .as_deref()
+                .map(str::parse::<cairn_protocol::retention::Policy>)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let repo = open(&data)?;
+            if !repo.with_meta(|m| m.namespace_exists(&folder))? {
+                bail!("no folder {folder:?}");
+            }
+            if policy.is_none() && !none {
+                match repo.with_meta(|m| m.retention(&folder))? {
+                    None => println!(
+                        "folder {folder} has no policy: every revision is kept and nothing is removed"
+                    ),
+                    Some(r) => println!(
+                        "folder {folder} keeps {}, set by {} on {}",
+                        r.policy()?,
+                        r.set_by,
+                        date(r.set_at)
+                    ),
+                }
+                return Ok(());
+            }
+            let now = crate::gc::set(&repo, &folder, policy.as_ref(), "administrator")?;
+            let back = now.restored.unwrap_or(0);
+            match now.policy {
+                Some(p) => println!(
+                    "folder {folder} keeps {p}; what it gives up goes in the server's next daily run, and its content a collection delay after that"
+                ),
+                None => println!(
+                    "folder {folder} has no policy now: every revision is kept and nothing is removed"
+                ),
+            }
+            if back > 0 {
+                println!(
+                    "{back} revision(s) given up before, whose content was still there, are history again"
+                );
+            }
         }
     }
     Ok(())

@@ -18,7 +18,8 @@ use cairn_protocol::{
     ChunkRef, Content, Hash, Link, Manifest, Metadata, ObjectId, ObjectKind, Op, RevisionBody,
     RevisionId, Segment,
 };
-use cairn_store::ChunkStore;
+use cairn_store::chunks::Held;
+use cairn_store::{ChunkStore, FsChunkStore};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -394,17 +395,22 @@ pub(crate) fn chunk_file(
 }
 
 /// Cut `size` bytes of `file` as `chunk_file` does, and make every chunk durable, in batches of about
-/// `BATCH_BYTES`, each told to `stored` by its size, and then the manifest: its hash.
+/// `BATCH_BYTES`, each told to `stored` by its size, and then the manifest: its hash, and every chunk
+/// and the manifest held, each from before it was looked for, so that no collection takes one before
+/// the commit that names them returns and drops what this gives.
 pub(crate) fn store_bytes(
-    chunks: &dyn ChunkStore,
+    chunks: &FsChunkStore,
     file: impl Read,
     size: u64,
     stored: &mut dyn FnMut(u64),
-) -> Result<Hash> {
+) -> Result<(Hash, Held)> {
+    let mut held = chunks.hold(&[]);
     let mut batch: Vec<(Hash, Vec<u8>)> = Vec::new();
     let mut pending = 0usize;
     let mut flush = |batch: &mut Vec<(Hash, Vec<u8>)>, pending: &mut usize| -> Result<()> {
         let frames: Vec<(Hash, &[u8])> = batch.iter().map(|(h, d)| (*h, d.as_slice())).collect();
+        let hashes: Vec<Hash> = frames.iter().map(|(h, _)| *h).collect();
+        held.add(&hashes);
         chunks.put_all(&frames)?;
         let n: u64 = batch.iter().map(|(_, d)| d.len() as u64).sum();
         batch.clear();
@@ -423,8 +429,9 @@ pub(crate) fn store_bytes(
     flush(&mut batch, &mut pending)?;
     let encoded = manifest.encode();
     let mhash = Hash::of(&encoded);
+    held.add(&[mhash]);
     chunks.put(&mhash, &encoded)?;
-    Ok(mhash)
+    Ok((mhash, held))
 }
 
 /// Cut, store and commit an upload: `Ok(Err)` is a refusal a person reads.
@@ -438,8 +445,9 @@ fn store(app: &App, view: &View, up: &Mutex<Upload>) -> Result<Result<w::UploadD
     if file.metadata()?.len() != start.size {
         bail!("the upload's file is not the size it was given");
     }
-    let mhash = store_bytes(
-        &*chunks,
+    // Held until this returns, past the commit that names them.
+    let (mhash, _held) = store_bytes(
+        &chunks,
         std::io::BufReader::with_capacity(1 << 20, file),
         start.size,
         &mut |n| up.lock().expect("a panic aborts the process").stored += n,

@@ -137,6 +137,10 @@ pub struct HistoryEntry {
     pub size: Option<u64>,
     pub mode: u32,
     pub mtime: Timestamp,
+    /// When the folder's retention gave this revision up, in seconds since the epoch: its content may
+    /// be gone, and it is neither downloaded nor restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<i64>,
 }
 
 /// `GET B/history/{object}`: newest first.

@@ -2,8 +2,8 @@
 
 use crate::codec::{decode_body, decode_ops, encode_body, encode_ops, json_len};
 use crate::meta::{
-    Child, CommitOutcome, Head, MetaStore, Revisioned, ShareRow, StoredRevision, TokenInfo,
-    TreeState, UserInfo,
+    Child, CommitOutcome, GcRun, Head, MetaStore, RetentionRow, Revisioned, ShareRow,
+    StoredRevision, TokenInfo, TreeState, UserInfo,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
@@ -96,7 +96,8 @@ CREATE INDEX folder_names_user ON folder_names (user);
 /// kind, `device` for one a person handed a device, `browser` for one a password's sign-in made for a
 /// browser, `paired` for one a device took with a pairing code, and the time it was last used, to the
 /// hour; each folder's retention policy (no row: keep everything); the revisions retention gave up
-/// (`at` when), whose content a collection then takes; and each collection run.
+/// (`at` when), whose content a collection then takes; and each collection run, with why it stopped
+/// if it did.
 pub(crate) const MIGRATION_6: &str = r#"
 ALTER TABLE users ADD COLUMN password TEXT;
 ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'device';
@@ -112,7 +113,7 @@ CREATE TABLE pruned (
 CREATE TABLE gc_runs (
     id INTEGER PRIMARY KEY, ns INTEGER NOT NULL REFERENCES namespaces (id),
     started INTEGER NOT NULL, cutoff INTEGER NOT NULL, state TEXT NOT NULL,
-    chunks INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, ended INTEGER
+    chunks INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, ended INTEGER, error TEXT
 );
 CREATE INDEX gc_runs_ns ON gc_runs (ns, started);
 "#;
@@ -340,6 +341,36 @@ impl SqliteStore {
 
     pub fn in_memory() -> Result<Self> {
         Self::with_connection(Connection::open_in_memory()?, Opening::default(), None)
+    }
+
+    /// A connection that only reads, beside the one that writes, at this binary's schema alone: what a
+    /// collection marks from, holding no lock of the server's.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open {} to read", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA {
+            bail!("this database has schema {version}, and this binary reads {SCHEMA}");
+        }
+        Ok(Self { conn })
+    }
+
+    /// Begins a read transaction and reads once, so that every read until `unpin` sees the database
+    /// as it is now, whatever is committed meanwhile.
+    pub fn pin(&mut self) -> Result<()> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        self.conn
+            .query_row("SELECT count(*) FROM namespaces", [], |_| Ok(()))?;
+        Ok(())
+    }
+
+    pub fn unpin(&mut self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
     }
 
     fn with_connection(
@@ -1105,6 +1136,27 @@ impl MetaStore for SqliteStore {
                 )?;
             }
         }
+        // What retention gave up is gone for good: a deleted object whose head it gave up is not
+        // brought back as it was, whatever else the commit does after the link but give it a new head.
+        for (i, op) in req.ops.iter().enumerate() {
+            let Op::Link { object, .. } = op else {
+                continue;
+            };
+            let gone: Option<i64> = tx
+                .prepare_cached(
+                    "SELECT 1 FROM objects o JOIN pruned p ON p.ns = o.ns AND p.revision = o.head
+                     WHERE o.ns = ?1 AND o.id = ?2
+                       AND EXISTS (SELECT 1 FROM entries e WHERE e.ns = o.ns AND e.object = o.id)",
+                )?
+                .query_row(params![ns_id, object.0], |r| r.get(0))
+                .optional()?;
+            if gone.is_some() {
+                return Ok(CommitOutcome::Rejected {
+                    op_index: i,
+                    reason: OpReject::NoSuchObject(*object),
+                });
+            }
+        }
         // Each body is in `revisions` now, under its revision, and only named here.
         tx.execute(
             "INSERT INTO journal (ns, seq, op_id, device, device_name, time, user, ops, json_len) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1397,8 +1449,9 @@ impl MetaStore for SqliteStore {
     fn history(&mut self, ns: &str, object: ObjectId) -> Result<Vec<Revisioned>> {
         let ns_id = self.ns_id(ns)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT r.id, r.seq, r.body, j.time, j.device_name, j.user FROM revisions r
+            "SELECT r.id, r.seq, r.body, j.time, j.device_name, j.user, p.at FROM revisions r
              LEFT JOIN journal j ON j.ns = r.ns AND j.seq = r.seq
+             LEFT JOIN pruned p ON p.ns = r.ns AND p.revision = r.id
              WHERE r.ns = ?1 AND r.object = ?2 ORDER BY r.seq DESC, r.id",
         )?;
         let rows = stmt.query_map(params![ns_id, object.0], |r| {
@@ -1409,11 +1462,12 @@ impl MetaStore for SqliteStore {
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, seq, body, time, device_name, user) = row?;
+            let (id, seq, body, time, device_name, user, pruned) = row?;
             out.push(Revisioned {
                 revision: StoredRevision {
                     revision: RevisionId(blob16(id)?),
@@ -1424,6 +1478,7 @@ impl MetaStore for SqliteStore {
                 time: time.unwrap_or(0),
                 device_name: device_name.unwrap_or_default(),
                 user,
+                pruned,
             });
         }
         Ok(out)
@@ -1556,7 +1611,197 @@ impl MetaStore for SqliteStore {
             .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
     }
+
+    fn retention(&mut self, ns: &str) -> Result<Option<RetentionRow>> {
+        let ns_id = self.ns_id(ns)?;
+        Ok(self
+            .conn
+            .prepare_cached("SELECT keep, trash, set_by, set_at FROM retention WHERE ns = ?1")?
+            .query_row([ns_id], |r| {
+                Ok(RetentionRow {
+                    keep: r.get(0)?,
+                    trash: r.get(1)?,
+                    set_by: r.get(2)?,
+                    set_at: r.get(3)?,
+                })
+            })
+            .optional()?)
+    }
+
+    fn set_retention(&mut self, ns: &str, row: Option<&RetentionRow>) -> Result<u64> {
+        let ns_id = self.ns_id(ns)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match row {
+            Some(r) => tx.execute(
+                "INSERT INTO retention (ns, keep, trash, set_by, set_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (ns) DO UPDATE SET keep = ?2, trash = ?3, set_by = ?4, set_at = ?5",
+                params![ns_id, r.keep, r.trash, r.set_by, r.set_at],
+            )?,
+            None => tx.execute("DELETE FROM retention WHERE ns = ?1", [ns_id])?,
+        };
+        // A collection keeps the content of what was given up from its cutoff on, and one may be
+        // running: what was given up at or after the latest cutoff of any that may delete is whole.
+        let back = tx.execute(
+            &format!("DELETE FROM pruned WHERE ns = ?1 AND at >= {SWEPT_BEFORE}"),
+            [ns_id],
+        )?;
+        check("server.retention.set")?;
+        tx.commit()?;
+        Ok(back as u64)
+    }
+
+    fn pruned(&mut self, ns: &str, revisions: &[RevisionId]) -> Result<Vec<(RevisionId, i64)>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT at FROM pruned WHERE ns = ?1 AND revision = ?2")?;
+        let mut out = Vec::new();
+        for r in revisions {
+            if let Some(at) = stmt
+                .query_row(params![ns_id, r.0], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                out.push((*r, at));
+            }
+        }
+        Ok(out)
+    }
+
+    fn all_pruned(&mut self, ns: &str) -> Result<Vec<(RevisionId, i64)>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT revision, at FROM pruned WHERE ns = ?1")?;
+        let rows = stmt.query_map([ns_id], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (rev, at) = row?;
+            out.push((RevisionId(blob16(rev)?), at));
+        }
+        Ok(out)
+    }
+
+    fn prune(
+        &mut self,
+        ns: &str,
+        revisions: &[RevisionId],
+        at: i64,
+        policy: &RetentionRow,
+    ) -> Result<Option<u64>> {
+        let ns_id = self.ns_id(ns)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT keep, trash, set_at FROM retention WHERE ns = ?1",
+                [ns_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if now != Some((policy.keep.clone(), policy.trash, policy.set_at)) {
+            return Ok(None);
+        }
+        let mut made = 0u64;
+        {
+            // Never an object's head while it has an entry: one brought back since the rule read the
+            // journal stays.
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO pruned (ns, revision, at)
+                 SELECT r.ns, r.id, ?3 FROM revisions r
+                 WHERE r.ns = ?1 AND r.id = ?2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM objects o WHERE o.ns = r.ns AND o.id = r.object AND o.head = r.id
+                       AND EXISTS (SELECT 1 FROM entries e WHERE e.ns = o.ns AND e.object = o.id))
+                 ON CONFLICT DO NOTHING",
+            )?;
+            for r in revisions {
+                made += stmt.execute(params![ns_id, r.0, at])? as u64;
+            }
+        }
+        check("server.retention.batch")?;
+        tx.commit()?;
+        Ok(Some(made))
+    }
+
+    fn gc_begin(&mut self, ns: &str, started: i64, cutoff: i64) -> Result<i64> {
+        let ns_id = self.ns_id(ns)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO gc_runs (ns, started, cutoff, state) VALUES (?1, ?2, ?3, 'marking')",
+            params![ns_id, started, cutoff],
+        )?;
+        let id = tx.last_insert_rowid();
+        check("server.gc.begin")?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn gc_update(
+        &mut self,
+        id: i64,
+        state: &str,
+        chunks: u64,
+        bytes: u64,
+        ended: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE gc_runs SET state = ?2, chunks = ?3, bytes = ?4, ended = ?5, error = ?6 WHERE id = ?1",
+            params![id, state, chunks as i64, bytes as i64, ended, error],
+        )?;
+        Ok(())
+    }
+
+    fn gc_runs(&mut self, ns: &str, limit: u32) -> Result<Vec<GcRun>> {
+        let ns_id = self.ns_id(ns)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, started, cutoff, state, chunks, bytes, ended, error FROM gc_runs
+             WHERE ns = ?1 ORDER BY started DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ns_id, limit], |r| {
+            Ok(GcRun {
+                id: r.get(0)?,
+                started: r.get(1)?,
+                cutoff: r.get(2)?,
+                state: r.get(3)?,
+                chunks: r.get::<_, i64>(4)? as u64,
+                bytes: r.get::<_, i64>(5)? as u64,
+                ended: r.get(6)?,
+                error: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn swept_before(&mut self, ns: &str) -> Result<Option<i64>> {
+        let ns_id = self.ns_id(ns)?;
+        Ok(self.conn.query_row(
+            "SELECT max(cutoff) FROM gc_runs WHERE ns = ?1 AND state IN ('marking', 'deleting', 'done', 'interrupted')",
+            [ns_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn gc_unfinished(&mut self, ended: i64) -> Result<u64> {
+        Ok(self.conn.execute(
+            "UPDATE gc_runs SET state = CASE state WHEN 'marking' THEN 'aborted' ELSE 'interrupted' END,
+                 ended = ?1, error = COALESCE(error, 'the process ended before it did')
+             WHERE ended IS NULL",
+            [ended],
+        )? as u64)
+    }
 }
+
+/// The latest cutoff of a namespace's collections that may have removed what was given up before it,
+/// for a statement whose `?1` is the namespace: one still running among them, as it may yet.
+const SWEPT_BEFORE: &str = "COALESCE((SELECT max(cutoff) FROM gc_runs WHERE ns = ?1 AND state IN ('marking', 'deleting', 'done', 'interrupted')), -9223372036854775808)";
 
 #[cfg(test)]
 mod tests {

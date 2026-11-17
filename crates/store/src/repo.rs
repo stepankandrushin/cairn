@@ -8,17 +8,25 @@ use anyhow::{Context, Result};
 use cairn_protocol::manifest::ManifestError;
 use cairn_protocol::wire::{Change, CommitRequest, CommitResponse, ConflictEntry, RejectReason};
 use cairn_protocol::{Content, Hash, Manifest};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// The file in the data directory a backup holds exclusively for its whole run, and a collection
+/// shared before each batch it removes.
+pub const BACKUP_LOCK: &str = "backup.lock";
 
 /// One namespace's chunks live apart from every other's: dedup never crosses a namespace, so
 /// "which chunks are missing" reveals nothing about what another namespace stores.
 pub struct Repo {
     root: PathBuf,
     meta: Mutex<Box<dyn MetaStore>>,
+    /// One store for each chunk directory, by the directory: a namespace's names, now and former, all
+    /// reach its one store, and so its one gate (`crate::chunks::Gate`).
     chunks: Mutex<BTreeMap<String, std::sync::Arc<FsChunkStore>>>,
+    /// The chunk directory each name reaches, which never changes for a name.
+    dirs: Mutex<HashMap<String, String>>,
     /// Holds an exclusive lock on the data directory for the life of the process. `None` for an
     /// administrator's command while a server holds it, which touches nothing but the database.
     _lock: Option<File>,
@@ -72,6 +80,14 @@ impl Repo {
 
     fn opened(root: PathBuf, lock: File) -> Result<Self> {
         let first_token = token_file(&root)?;
+        // What a backup holds for its whole run, and a collection shared before each batch it
+        // removes: made by the store's owner, so that a backup run as root makes no file here.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(BACKUP_LOCK))
+            .with_context(|| format!("create {}", root.join(BACKUP_LOCK).display()))?;
         let meta = SqliteStore::open_with(
             &root.join("meta.sqlite"),
             Opening {
@@ -84,6 +100,7 @@ impl Repo {
             root,
             meta: Mutex::new(Box::new(meta)),
             chunks: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(HashMap::new()),
             _lock: Some(lock),
         })
     }
@@ -111,10 +128,6 @@ impl Repo {
         self.meta()
             .rename_namespace(from, to)
             .context("nothing renamed")?;
-        self.chunks
-            .lock()
-            .expect("a store panic aborts the process")
-            .remove(from);
         let dir = self.ns_dir(to)?;
         Ok(format!(
             "renamed the folder {from:?} to {to:?}; its chunks stay in {}. Who had access has it still, and {from:?} goes on reaching it, so every device and link made with it goes on working; no other folder can take that name",
@@ -147,6 +160,7 @@ impl Repo {
                     root,
                     meta: Mutex::new(Box::new(meta)),
                     chunks: Mutex::new(BTreeMap::new()),
+                    dirs: Mutex::new(HashMap::new()),
                     _lock: None,
                 })
             }
@@ -178,30 +192,64 @@ impl Repo {
         self.meta().namespaces()
     }
 
-    pub fn chunks(&self, ns: &str) -> Result<std::sync::Arc<FsChunkStore>> {
-        let cached = self
-            .chunks
+    /// The name of the directory under `ns/` that a name's chunks are in.
+    fn dir_of(&self, ns: &str) -> Result<String> {
+        let known = self
+            .dirs
             .lock()
             .expect("a store panic aborts the process")
             .get(ns)
             .cloned();
-        if let Some(store) = cached {
-            return Ok(store);
+        if let Some(dir) = known {
+            return Ok(dir);
         }
-        // Asked of the database with no other lock held. A namespace's name now has a directory,
-        // never a former one: `ns_dir` knows only the first.
-        let dir = self.ns_dir(ns)?;
+        // Asked of the database with no other lock held.
+        let dir = self.meta().chunk_dir(ns)?;
+        self.dirs
+            .lock()
+            .expect("a store panic aborts the process")
+            .insert(ns.to_string(), dir.clone());
+        Ok(dir)
+    }
+
+    /// A namespace's chunk store: one for each directory, whatever name it is asked by.
+    pub fn chunks(&self, ns: &str) -> Result<std::sync::Arc<FsChunkStore>> {
+        let dir = self.dir_of(ns)?;
         let mut map = self
             .chunks
             .lock()
             .expect("a store panic aborts the process");
-        if let Some(store) = map.get(ns) {
+        if let Some(store) = map.get(&dir) {
             return Ok(store.clone());
         }
-        let store = std::sync::Arc::new(FsChunkStore::open(dir)?);
+        let store = std::sync::Arc::new(FsChunkStore::open(self.root.join("ns").join(&dir))?);
         sync_dir(&self.root.join("ns"))?;
-        map.insert(ns.to_string(), store.clone());
+        map.insert(dir, store.clone());
         Ok(store)
+    }
+
+    /// A namespace's chunks to read alone, as `fsck` reads them: nothing in the directory is made,
+    /// emptied or written.
+    pub fn chunks_read_only(&self, ns: &str) -> Result<FsChunkStore> {
+        Ok(FsChunkStore::open_read_only(
+            self.root.join("ns").join(self.dir_of(ns)?),
+        ))
+    }
+
+    /// The data directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether this process has the data directory to itself, as a server does.
+    pub fn owns_directory(&self) -> bool {
+        self._lock.is_some()
+    }
+
+    /// A connection of its own to the database that only reads, for a collection to mark from with no
+    /// lock of the server's held.
+    pub fn reader(&self) -> Result<SqliteStore> {
+        SqliteStore::open_read_only(&self.root.join("meta.sqlite"))
     }
 
     pub fn head(&self, ns: &str) -> Result<u64> {
@@ -212,6 +260,8 @@ impl Repo {
         let chunks = self.chunks(ns)?;
         let mut out = Vec::new();
         for h in hashes {
+            // Vouched for before it is looked at: one found here is not collected before its commit.
+            chunks.vouch([h]);
             // A damaged chunk counts as missing, so that the client's good copy replaces it.
             if !chunks.is_intact(h)? {
                 out.push(*h);
@@ -232,7 +282,11 @@ impl Repo {
         if let Some(seq) = self.meta().committed(ns, &req.op_id)? {
             return Ok(CommitResponse::Committed { seq });
         }
-        if let Some(reject) = self.check_content(ns, req)? {
+        let chunks = self.chunks(ns)?;
+        // From the check of its chunks to its commit, no collection removes any: what is checked
+        // here is what the commit names when it is acknowledged.
+        let _gate = chunks.shared();
+        if let Some(reject) = self.check_content(&chunks, req)? {
             // A copy of the same commit, sent at once, may have been taken while this one was looked at.
             if let Some(seq) = self.meta().committed(ns, &req.op_id)? {
                 return Ok(CommitResponse::Committed { seq });
@@ -249,8 +303,11 @@ impl Repo {
     }
 
     /// Everything the commit's revisions point at must already be here and durable.
-    fn check_content(&self, ns: &str, req: &CommitRequest) -> Result<Option<RejectReason>> {
-        let chunks = self.chunks(ns)?;
+    fn check_content(
+        &self,
+        chunks: &FsChunkStore,
+        req: &CommitRequest,
+    ) -> Result<Option<RejectReason>> {
         let mut seen: HashSet<Hash> = HashSet::new();
         for op in &req.ops {
             let Some(body) = op.body() else { continue };
@@ -263,7 +320,7 @@ impl Repo {
                 if !seen.insert(hash) {
                     continue;
                 }
-                if let Some(reject) = check_manifest(&*chunks, &hash, want_size)? {
+                if let Some(reject) = check_manifest(chunks, &hash, want_size)? {
                     return Ok(Some(reject));
                 }
             }
@@ -305,10 +362,12 @@ impl Repo {
 }
 
 fn check_manifest(
-    chunks: &dyn ChunkStore,
+    chunks: &FsChunkStore,
     hash: &Hash,
     want_size: Option<u64>,
 ) -> Result<Option<RejectReason>> {
+    // Each hash vouched for before it is looked at, so that a collection running takes none of them.
+    chunks.vouch([hash]);
     let Some(bytes) = chunks.get(hash)? else {
         return Ok(Some(RejectReason::MissingChunk { hash: *hash }));
     };
@@ -334,6 +393,7 @@ fn check_manifest(
         ));
     }
     for c in manifest.chunks() {
+        chunks.vouch([&c.hash]);
         match chunks.len_of(&c.hash)? {
             None => return Ok(Some(RejectReason::MissingChunk { hash: c.hash })),
             Some(len) if len != u64::from(c.len) => {

@@ -23,6 +23,7 @@ use std::sync::Arc;
 mod admin;
 mod conn;
 mod file;
+mod gc;
 mod pairing;
 mod passwords;
 mod resumable;
@@ -58,6 +59,8 @@ struct App {
     thumbs: web::thumbs::Thumbs,
     /// The uploads to `PUT /file` that may be resumed.
     resumable: resumable::Resumable,
+    /// How its daily collection goes.
+    gc: gc::Settings,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -294,6 +297,7 @@ fn features() -> Vec<String> {
         f::FILE_UPDATE,
         f::THUMBS,
         f::RESUMABLE,
+        f::RETENTION,
     ]
     .into_iter()
     .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
@@ -742,6 +746,8 @@ fn router(app: Arc<App>) -> Router {
         .route("/access/{user}", put(grant).delete(revoke))
         .route("/name", put(set_name).delete(clear_name))
         .route("/rename", post(rename_folder))
+        .route("/retention", get(gc::get_retention).put(gc::put_retention))
+        .route("/pruned", post(gc::pruned))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BATCH_BYTES * 2))
         // A streamed body, of any size: outside the limit above.
         .route("/file", put(file::put).options(file::options))
@@ -843,6 +849,34 @@ enum Command {
         /// to anyone while the server's own address is not: each link is this followed by `/s/<link>`.
         #[arg(long, value_name = "URL")]
         link_url: Option<String>,
+        /// How long what a folder's retention gives up keeps its content before a collection may take
+        /// it: at least a day, far longer than a backup takes, so that a backup's database checked
+        /// against the live chunks finds all it names.
+        #[arg(long, value_name = "DURATION", default_value = gc::DEFAULT_DELAY)]
+        gc_delay: String,
+        /// How long a chunk nothing names yet is left for the commit that will name it.
+        #[arg(long, value_name = "DURATION", default_value = gc::DEFAULT_GRACE)]
+        upload_grace: String,
+    },
+    /// Give up what each folder's retention policy gives up, and remove the chunks nothing kept
+    /// names, with the server stopped: the server does it by itself every day. Beside a running
+    /// server only --dry-run, which says what it would do, and --status.
+    Gc {
+        #[arg(long)]
+        data: PathBuf,
+        /// Only this folder.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Say what it would give up and remove, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Each folder's policy and its last collections.
+        #[arg(long, conflicts_with = "dry_run")]
+        status: bool,
+        #[arg(long, value_name = "DURATION", default_value = gc::DEFAULT_DELAY)]
+        gc_delay: String,
+        #[arg(long, value_name = "DURATION", default_value = gc::DEFAULT_GRACE)]
+        upload_grace: String,
     },
     /// Check every chunk hash, every manifest reference, and the tables against the journal.
     Fsck {
@@ -942,6 +976,7 @@ async fn serve(
     listen: SocketAddr,
     behind_tls_proxy: bool,
     link_url: Option<String>,
+    gc: gc::Settings,
 ) -> Result<()> {
     let link_url = link_url.as_deref().map(link_base).transpose()?;
     if !listen.ip().is_loopback() && !behind_tls_proxy {
@@ -957,6 +992,12 @@ async fn serve(
     }
     let repo = Repo::open(&data)?;
     let former = former_names(&repo)?;
+    let left = repo.with_meta(|m| m.gc_unfinished(now()))?;
+    if left > 0 {
+        eprintln!(
+            "cairn-server: gc: {left} collection(s) a server before this one left unfinished are marked so; the next starts over"
+        );
+    }
     if repo.with_meta(|m| m.users())?.is_empty() {
         eprintln!(
             "cairn-server: there are no users, so every request is refused: add one with `cairn-server user add`"
@@ -976,7 +1017,10 @@ async fn serve(
         pairing: pairing::Codes::default(),
         thumbs: web::thumbs::Thumbs::open(&data)?,
         resumable: resumable::Resumable::open(&data)?,
+        gc,
     });
+    // Each folder's retention and a collection of what it gave up, every day.
+    gc::spawn(app.clone());
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();
     tokio::spawn(async move {
@@ -1054,11 +1098,25 @@ fn run_inner() -> Result<std::process::ExitCode> {
             listen,
             behind_tls_proxy,
             link_url,
+            gc_delay,
+            upload_grace,
         } => {
+            let gc = gc::Settings::from_flags(&gc_delay, &upload_grace)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(serve(data, listen, behind_tls_proxy, link_url))?;
+                .block_on(serve(data, listen, behind_tls_proxy, link_url, gc))?;
+        }
+        Command::Gc {
+            data,
+            folder,
+            dry_run,
+            status,
+            gc_delay,
+            upload_grace,
+        } => {
+            let settings = gc::Settings::from_flags(&gc_delay, &upload_grace)?;
+            return gc::command(&data, settings, dry_run, status, folder.as_deref());
         }
         Command::Downgrade {
             data,
@@ -1070,12 +1128,15 @@ fn run_inner() -> Result<std::process::ExitCode> {
             let repo = Repo::open(&data)?;
             let report = cairn_store::fsck::fsck(&repo)?;
             println!(
-                "{} namespace(s), {} commits, {} revisions, {} chunks, {} unreferenced",
+                "{} namespace(s), {} commits, {} revisions, {} chunks, {} unreferenced, {} revisions given up by retention ({} of them without all their content), {} chunks awaiting collection",
                 report.namespaces,
                 report.commits,
                 report.revisions,
                 report.chunks,
-                report.unreferenced
+                report.unreferenced,
+                report.pruned,
+                report.pruned_gone,
+                report.awaiting
             );
             for e in &report.errors {
                 println!("error: {e}");

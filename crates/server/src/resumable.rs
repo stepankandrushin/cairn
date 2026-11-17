@@ -16,6 +16,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cairn_protocol::RevisionId;
+use cairn_store::chunks::Held;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
@@ -218,24 +219,20 @@ async fn finish(app: Arc<App>, pending: Arc<tokio::sync::Mutex<Pending>>) -> Res
     let received = asked.size;
     let a = Arc::new(asked);
     let (app2, a2) = (app.clone(), a.clone());
-    let stored = tokio::task::spawn_blocking(move || -> Result<cairn_protocol::Hash> {
+    let stored = tokio::task::spawn_blocking(move || -> Result<(cairn_protocol::Hash, Held)> {
         let chunks = app2.repo.chunks(&a2.ns)?;
         let file = std::fs::File::open(&spool)?;
-        store_bytes(
-            &*chunks,
-            std::io::BufReader::new(file),
-            a2.size,
-            &mut |_| {},
-        )
+        store_bytes(&chunks, std::io::BufReader::new(file), a2.size, &mut |_| {})
     })
     .await;
-    let manifest = match stored {
+    // Held until the commit returns, as any upload's chunks are.
+    let (manifest, held) = match stored {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => return failed(e),
         Err(e) => return failed(e.into()),
     };
     cairn_failpoint::hit("server.resumable.stored");
-    let mut answer = commit_file(app.clone(), a.clone(), manifest).await;
+    let mut answer = commit_file(app.clone(), a.clone(), manifest, held).await;
     standing(&mut answer, version, received, None);
     if answer.status().is_success() {
         {

@@ -15,6 +15,7 @@ const FEATURES: &[&str] = &[
     "file_update",
     "thumbs",
     "resumable",
+    "retention",
 ];
 
 fn token(server: &Server) -> String {

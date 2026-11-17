@@ -270,7 +270,13 @@ pub(super) async fn restore(
                 return Ok(Err(not_found("such object")));
             };
             match m.revision(&view.ns, req.revision)? {
-                Some(old) if old.object == req.object => Ok(Ok((head.revision, old.body))),
+                Some(old) if old.object == req.object => {
+                    // What retention gave up is not brought back, whatever of it is left.
+                    if let Some(at) = crate::gc::pruned_at(m, &view.ns, req.revision)? {
+                        return Ok(Err(crate::gc::gone(at)));
+                    }
+                    Ok(Ok((head.revision, old.body)))
+                }
                 _ => Ok(Err(not_found("such revision"))),
             }
         })?;

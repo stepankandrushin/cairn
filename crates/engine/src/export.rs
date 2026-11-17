@@ -9,7 +9,9 @@ use crate::scan::display_path;
 use crate::sync::fetch_changes;
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_protocol::wire::MAX_CHUNK_BATCH_BYTES;
-use cairn_protocol::{Content, Hash, Manifest, Name, ObjectId, ObjectKind, Skip, SkipKind, Tree};
+use cairn_protocol::{
+    Content, Hash, Manifest, Name, ObjectId, ObjectKind, RevisionId, Skip, SkipKind, Tree,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -87,14 +89,75 @@ fn write_file(
     Ok(fd)
 }
 
-/// Write the subtree at `path` as of `at` into `dest`, which must be missing or empty.
+/// What an export wrote, and what it did not.
+#[derive(Debug, Default)]
+pub struct Exported {
+    /// The sequence it is the tree as of.
+    pub seq: u64,
+    /// What was written and could not be applied in full.
+    pub warnings: Vec<Skip>,
+    /// What the folder's retention gave up, left out by `skip_pruned`: each path, and when.
+    pub left_out: Vec<(Vec<Name>, i64)>,
+}
+
+/// Those of `objects` whose revision in `tree` the folder's retention gave up, and when.
+pub(crate) fn given_up(
+    client: &Client,
+    tree: &Tree,
+    objects: impl IntoIterator<Item = ObjectId>,
+) -> Result<BTreeMap<ObjectId, i64>> {
+    let mut by_rev = BTreeMap::new();
+    for id in objects {
+        if let Some(n) = tree.nodes.get(&id) {
+            if crate::export::names_content(&n.body) {
+                by_rev.insert(n.rev, id);
+            }
+        }
+    }
+    if by_rev.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let revs: Vec<RevisionId> = by_rev.keys().copied().collect();
+    Ok(client
+        .pruned(&revs)?
+        .into_iter()
+        .filter_map(|p| by_rev.get(&p.revision).map(|o| (*o, p.at)))
+        .collect())
+}
+
+/// Whether a revision names content a collection could take: a file's, or a stream's.
+pub(crate) fn names_content(body: &cairn_protocol::RevisionBody) -> bool {
+    matches!(body.content, Content::File { .. }) || !body.metadata.streams.is_empty()
+}
+
+/// The refusal of a restore or export that would need what retention gave up, naming the first few.
+pub(crate) fn refuse_given_up(what: &str, gone: &[(Vec<Name>, i64)]) -> anyhow::Error {
+    let mut names: Vec<String> = gone
+        .iter()
+        .take(10)
+        .map(|(p, at)| format!("{} (on {})", display_path(p), crate::sync::utc_date(*at)))
+        .collect();
+    if gone.len() > 10 {
+        names.push(format!("and {} more", gone.len() - 10));
+    }
+    anyhow!(
+        "the folder's retention removed {} file(s) this {what} would need: {}. --skip-pruned does the rest and lists them",
+        gone.len(),
+        names.join(", ")
+    )
+}
+
+/// Write the subtree at `path` as of `at` into `dest`, which must be missing or empty. A file whose
+/// revision then the folder's retention gave up refuses it, unless `skip_pruned`, which leaves it out
+/// and says so.
 pub fn export(
     config: &Config,
     at: Option<u64>,
     path: &[Name],
     dest: &Path,
     policy: &ApplyPolicy,
-) -> Result<(u64, Vec<Skip>)> {
+    skip_pruned: bool,
+) -> Result<Exported> {
     let client = Client::new(config, Retries::Short)?;
     let (tree, seq) = tree_at(&client, at)?;
     let top = tree
@@ -105,6 +168,28 @@ pub fn export(
             "{} is not a directory; export its parent",
             display_path(path)
         );
+    }
+    // What retention gave up is known before anything is written.
+    let mut inside = Vec::new();
+    let mut stack = vec![(top, Vec::new())];
+    while let Some((d, p)) = stack.pop() {
+        for (name, child) in tree.children(d) {
+            let mut q: Vec<Name> = p.clone();
+            q.push(name.clone());
+            if tree.nodes[&child].kind() == ObjectKind::Dir {
+                stack.push((child, q.clone()));
+            }
+            inside.push((child, q));
+        }
+    }
+    let gone = given_up(&client, &tree, inside.iter().map(|(o, _)| *o))?;
+    let mut left_out: Vec<(Vec<Name>, i64)> = inside
+        .iter()
+        .filter_map(|(o, p)| gone.get(o).map(|at| (p.clone(), *at)))
+        .collect();
+    left_out.sort();
+    if !left_out.is_empty() && !skip_pruned {
+        return Err(refuse_given_up("export", &left_out));
     }
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let dest_dir = Dir::open_root(dest)?;
@@ -150,6 +235,9 @@ pub fn export(
 
     let mut first_path: BTreeMap<ObjectId, Vec<Name>> = BTreeMap::new();
     for (id, p) in &files {
+        if gone.contains_key(id) {
+            continue;
+        }
         let (name, parents) = p.split_last().expect("a file has a name");
         let dir = dest_dir.open_path(parents.iter())?;
         if let Some(first) = first_path.get(id) {
@@ -219,5 +307,9 @@ pub fn export(
         );
     }
     dest_dir.sync()?;
-    Ok((seq, warnings))
+    Ok(Exported {
+        seq,
+        warnings,
+        left_out,
+    })
 }

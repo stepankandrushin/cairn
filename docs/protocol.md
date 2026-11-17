@@ -42,6 +42,9 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 | `PUT /name` | `{name, if_none?}` | `{name}` the caller's own name for the namespace now ([Names](#names)). With `if_none` set only if they have none. 400 no such name |
 | `DELETE /name` | | 204 the caller has no name of their own for it now |
 | `POST /rename` | `{folder}` | `{folder}` the namespace's name now, for everyone who has it ([Names](#names)). Needs `manage` 400 no such name. 409 as for `POST /v1/folders` its own former name it may take back |
+| `GET /retention` | | `{policy, trash?, set_by?, set_at?}` the folder's retention policy as text, `null` for none, and its trash period in seconds [Retention](#retention) |
+| `PUT /retention` | `{policy}` | The same, set, or with `null` taken away, and `restored` the revisions given up that came back with it. Needs `manage` 400 a policy that does not parse |
+| `POST /pruned` | `{revisions}` | `{pruned: [{revision, at}]}` those of the revisions asked about that the folder's retention gave up, and when, in seconds since the epoch; at most 100,000 in one ask |
 
 401 means a missing or wrong token, 404 an unknown namespace or one the token has no access to, alike, 403
 a level too low for the request, and 507 a full disk on the server; in each case nothing changed.
@@ -133,6 +136,7 @@ every client must speak. A server before features sends none.
 | `file_update` | `PUT /file` changes a file already there, given the revision the client saw [One-request uploads](#one-request-uploads) |
 | `thumbs` | `B/thumb/{object}` thumbnails, and a client's own sent there [Thumbnails](#thumbnails) |
 | `resumable` | `PUT /file` resumable as the IETF's resumable uploads draft says [Resumable uploads](#resumable-uploads) |
+| `retention` | A folder may keep less than its whole history: `/retention` and `/pruned` and revisions answered as given up [Retention](#retention) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -346,15 +350,15 @@ the object is brought back or that user given `manage` again.
 |---|---|---|
 | `GET B/item/{object}` | | `{item, path, access}` |
 | `GET B/dir/{object}` | | `{dir, path, entries, access}` - entries are the directory's items in name-byte order |
-| `GET B/content/{object}?revision=R&download=1` | | The file's bytes, at `R` (a revision of that object) or its head; one `Range: bytes=` range is answered 206 `download=1` asks for `Content-Disposition: attachment` |
+| `GET B/content/{object}?revision=R&download=1` | | The file's bytes, at `R` (a revision of that object) or its head; one `Range: bytes=` range is answered 206 `download=1` asks for `Content-Disposition: attachment` 410 a revision the folder's retention gave up [Retention](#retention) |
 | `GET B/zip/{object}` | | A folder and everything in it as a zip, stored uncompressed, streamed. Symbolic links are left out |
-| `GET B/history/{object}` | | `{revisions}` newest first, each `{revision, seq, time, user?, device_name, kind, size?, mode, mtime}` Not by link |
+| `GET B/history/{object}` | | `{revisions}` newest first, each `{revision, seq, time, user?, device_name, kind, size?, mode, mtime, pruned?}` - `pruned` when retention gave it up. Not by link |
 | `GET B/thumb/{object}?revision=R&size=S` | | A JPEG of a picture, `S` 128 256 512 or 1024 pixels on its longer side, 256 if not given, never larger than the picture. 404 `no thumbnail` for what has none [Thumbnails](#thumbnails) |
 | `PUT B/thumb/{object}?revision=R` | a JPEG | 204 the client's own thumbnail of a file the server does not decode. Needs `write` [Thumbnails](#thumbnails) |
 | `POST B/mkdir` | `{parent, name}` | `{object, seq}` Needs `write` |
 | `POST B/move` | `{object, from, to}` | `{seq}` - `from` and `to` are links `{parent, name}` a rename is a move in one folder. Needs `write` |
 | `POST B/delete` | `{object, link, base?}` | `{seq, objects}` - a folder goes with everything in it, deepest first, in one commit. With `base` refused unless the object's head is still that revision. Needs `write` |
-| `POST B/restore` | `{object, revision}` | `{seq, revision}` - a new revision with that one's content and metadata invariant 7 Needs `write` |
+| `POST B/restore` | `{object, revision}` | `{seq, revision}` - a new revision with that one's content and metadata invariant 7 Needs `write` 410 a revision retention gave up |
 | `POST B/uploads` | `{parent, name, size, mtime?, replace?}` | `{id}` an upload begun. `replace` is the revision of the file at that name the client saw, which becomes the base of an update; without it the name must be free. Needs `write` |
 | `PUT B/uploads/{id}?offset=N` | bytes | `{received}` `N` must be what was received so far, or 409 answers `{received}` to go on from |
 | `POST B/uploads/{id}/commit` | | 202 `{state}` - once `received` is `size` the server stores it |
@@ -387,7 +391,9 @@ index of the whole journal kept in memory, so `complete` is true. `POST
 /v1/ns/{ns}/undelete` with `{objects}` brings each back in one commit, as `cairn undelete` does: to the entry it
 last had, a deleted folder above it first, what was deleted with a folder with it, and to `name (conflict
 restored seq N).ext` where the name is taken. It answers `{seq, items}`, each `{object, display, path,
-renamed}`. Needs `write`.
+renamed}`. Needs `write`. Under a retention policy neither reaches past the folder's trash period: what was
+deleted before it is not listed, refused 409 when asked for, and left out of a folder brought back
+[Retention](#retention)
 
 **Sharing.** A folder's managers share any object in it, the folder's root too: with a user of the server at
 `read` or `write` or as a public link, which reads only. Each share is `{id, object, kind, path?, user?,
@@ -422,6 +428,47 @@ system that decodes it sends its own, a JPEG of at most 512 KB and 1024 pixels o
 size is then made from. Anything with neither answers 404 `no thumbnail` and a client shows what it would
 without one. With `revision` the answer is kept by a browser for good, `immutable` without it `no-cache` with
 an `ETag` that `If-None-Match` is answered 304 by. A public link reads thumbnails and sends none.
+
+## Retention
+
+A folder keeps every revision it ever had until its managers give it a policy, and with none its server
+removes nothing, chunks no revision names included. A policy is text, in `cairn_protocol::retention`
+
+```
+all 2d, hourly 1d, daily 30d, weekly forever; trash 30d
+```
+
+Its tiers go back from now one after another, each for its span after the one before ends: `all` keeps
+every revision, `hourly` `daily` and `weekly` the state at the start of each hour, day and Monday in UTC,
+and `forever` is the last tier's span alone. A tier is coarser than the one before it, each at most once,
+so what a policy gives up today it gives up on every day after. `trash` is how long a deleted file's last
+revision is kept after its delete, 30 days if not given, and `trash 7d` alone keeps no history but each
+file as it is now. Durations are a whole number of `h` `d` `w` or `y` hours, days, weeks or 365 days.
+
+Retention gives a revision up, and only one that names content, a file's or a stream's: the journal and
+every revision's body, metadata and history stay, so a device away for any length of time still replays
+all it missed, and nothing on a client's merge, apply or replay needs what was given up. Never given up:
+an object's head while it has an entry; a revision that was the head of an object with an entry at a
+point a tier keeps; any revision of an `all` tier's span; a deleted file's last revision within its trash
+period. The server gives up what its policy does once a day, and a collection removes the content a
+delay later, 7 days unless `serve --gc-delay` says more docs/format.md "Collection"
+
+What was given up answers so, never as damage:
+- `GET B/content/{object}?revision=R` and `POST B/restore` answer 410 `removed by this folder's retention
+  on <date>` and so do thumbnails of it;
+- a history entry carries `pruned` the time it was given up;
+- `GET /deleted` lists nothing deleted longer ago than the trash period, and `POST /undelete` refuses it
+  with 409 and the reason, as a commit linking an object whose head was given up is refused with
+  `no_such_object` [Committing](#committing) unless the same commit gives the object a new head;
+- `cairn export` and `cairn restore` of a past state ask `/pruned` first and refuse, naming each file the
+  folder's retention removed, unless given `--skip-pruned` which leaves each out, or as it is now, and
+  lists it. `cairn history` says which revisions were given up, and `cairn deleted` leaves out what is past
+  the trash period.
+
+A policy set again or taken away gives back, in the same transaction, every revision given up whose content
+no collection may have taken yet, which the next day's run gives up again if the new policy does. The
+server's administrator sets one with `cairn-server folder retention <folder> --keep <policy>` and takes it
+away with `--none` while the server serves.
 
 ## Local API
 

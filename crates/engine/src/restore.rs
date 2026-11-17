@@ -22,6 +22,8 @@ pub struct HistoryEntry {
     pub size: Option<u64>,
     pub mode: u32,
     pub restored_from: Option<RevisionId>,
+    /// When the folder's retention gave it up, whose content may be gone since.
+    pub pruned: Option<i64>,
 }
 
 /// Every change in the journal.
@@ -86,8 +88,18 @@ pub fn history(config: &Config, path: &[Name], at: Option<u64>) -> Result<Vec<Hi
                 },
                 mode: body.metadata.mode,
                 restored_from,
+                pruned: None,
             });
         }
+    }
+    let revisions: Vec<RevisionId> = out.iter().map(|h| h.revision).collect();
+    let given_up: BTreeMap<RevisionId, i64> = client
+        .pruned(&revisions)?
+        .into_iter()
+        .map(|p| (p.revision, p.at))
+        .collect();
+    for h in &mut out {
+        h.pruned = given_up.get(&h.revision).copied();
     }
     Ok(out)
 }
@@ -323,15 +335,23 @@ fn free_name(desired: &BTreeMap<Link, ObjectId>, link: &Link, seq: u64, in_git: 
     }
 }
 
-/// The operations that bring the subtree at `path` back to how it was at `at`.
-fn restore_ops(now: &Tree, then: &Tree, top: ObjectId, seq: u64) -> Result<Vec<Op>> {
-    let restored: BTreeSet<ObjectId> = then.subtree(top);
+/// The operations that bring the subtree at `path` back to how it was at `at`, but for `skip`, left
+/// as they are now.
+fn restore_ops(
+    now: &Tree,
+    then: &Tree,
+    top: ObjectId,
+    seq: u64,
+    skip: &BTreeSet<ObjectId>,
+) -> Result<Vec<Op>> {
+    let mut restored: BTreeSet<ObjectId> = then.subtree(top);
+    restored.retain(|o| !skip.contains(o));
     let mut to = topo(now);
     // What is under this path now and was not then goes away; the journal keeps it.
     if now.is_live(top) {
         let inside = now.subtree(top);
         for o in &inside {
-            if *o == ObjectId::ROOT || restored.contains(o) {
+            if *o == ObjectId::ROOT || restored.contains(o) || skip.contains(o) {
                 continue;
             }
             // A hard link outside this path is not part of what is being restored.
@@ -431,11 +451,17 @@ fn restore_ops(now: &Tree, then: &Tree, top: ObjectId, seq: u64) -> Result<Vec<O
 pub struct RestoreOutcome {
     pub seq: Option<u64>,
     pub ops: usize,
+    /// What the folder's retention gave up, left as it is now by `skip_pruned`: each path, and when.
+    pub left_out: Vec<(Vec<Name>, i64)>,
 }
 
 fn commit(client: &Client, root: &Root, ops: Vec<Op>) -> Result<RestoreOutcome> {
     if ops.is_empty() {
-        return Ok(RestoreOutcome { seq: None, ops: 0 });
+        return Ok(RestoreOutcome {
+            seq: None,
+            ops: 0,
+            left_out: Vec::new(),
+        });
     }
     let count = ops.len();
     let req = CommitRequest {
@@ -448,6 +474,7 @@ fn commit(client: &Client, root: &Root, ops: Vec<Op>) -> Result<RestoreOutcome> 
         CommitResponse::Committed { seq } => Ok(RestoreOutcome {
             seq: Some(seq),
             ops: count,
+            left_out: Vec::new(),
         }),
         CommitResponse::Rejected { reject } => {
             bail!("the server refused the restore, probably because something just changed; try again: {reject:?}")
@@ -456,14 +483,41 @@ fn commit(client: &Client, root: &Root, ops: Vec<Op>) -> Result<RestoreOutcome> 
 }
 
 /// Bring `path` back to its state as of sequence `at`, as a new commit. `cairn sync` then applies it.
-pub fn restore_at(root: &Root, path: &[Name], at: u64) -> Result<RestoreOutcome> {
+/// A file whose revision then the folder's retention gave up refuses it, unless `skip_pruned`, which
+/// leaves that file as it is now and says so.
+pub fn restore_at(
+    root: &Root,
+    path: &[Name],
+    at: u64,
+    skip_pruned: bool,
+) -> Result<RestoreOutcome> {
     let client = Client::new(&root.config, Retries::Short)?;
     let (then, seq) = tree_at(&client, Some(at))?;
     let (now, _) = tree_at(&client, None)?;
     let top = then
         .resolve(path)
         .ok_or_else(|| anyhow!("nothing at {} as of sequence {seq}", display_path(path)))?;
-    commit(&client, root, restore_ops(&now, &then, top, seq)?)
+    let gone = crate::export::given_up(&client, &then, then.subtree(top))?;
+    let mut left_out: Vec<(Vec<Name>, i64)> = gone
+        .iter()
+        .map(|(o, at)| {
+            let p = then
+                .nodes
+                .get(o)
+                .and_then(|n| n.links.iter().next())
+                .and_then(|l| then.path_of_link(l))
+                .unwrap_or_default();
+            (p, *at)
+        })
+        .collect();
+    left_out.sort();
+    if !left_out.is_empty() && !skip_pruned {
+        return Err(crate::export::refuse_given_up("restore", &left_out));
+    }
+    let skip: BTreeSet<ObjectId> = gone.keys().copied().collect();
+    let mut outcome = commit(&client, root, restore_ops(&now, &then, top, seq, &skip)?)?;
+    outcome.left_out = left_out;
+    Ok(outcome)
 }
 
 /// Bring the object at `path` back to one revision, as a new revision. Only its own state changes.
@@ -503,6 +557,13 @@ pub fn restore_revision(
         }
     }
     let body = body.ok_or_else(|| anyhow!("{} has no revision {revision}", display_path(path)))?;
+    if let Some(p) = client.pruned(&[revision])?.first() {
+        bail!(
+            "revision {revision} of {} was removed by the folder's retention on {}",
+            display_path(path),
+            crate::sync::utc_date(p.at)
+        );
+    }
     commit(
         &client,
         root,

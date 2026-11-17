@@ -31,8 +31,27 @@
   and its QR code with the time it has left. A folder shows a thumbnail in place of each picture's and
   video's icon where there is one, loaded as it scrolls near, and a picture's preview shows the larger one
   while the file itself loads, a HEIC's in place of the file no browser shows.
+- Retention, each folder's own: `cairn-server folder retention <folder> --keep` or a manager at `PUT
+  /v1/ns/{ns}/retention` sets a policy such as `all 2d, hourly 1d, daily 30d, weekly forever; trash 30d` and
+  the server gives up what it does once a day, the content of each revision and nothing else of it, so a
+  device away for any length of time still replays all it missed. With no policy, how every folder starts,
+  everything is kept and nothing removed. What was given up answers so: a download or restore with Gone, a
+  history entry with `pruned` an undelete past the trash period refused, and `cairn export` and `cairn
+  restore` of a past state refuse, naming what is gone, unless given `--skip-pruned` which leaves it out and
+  says so. A policy set again
+  gives back what no collection took yet.
+- A collection inside the server, once a day, removes the chunks nothing kept names, those given up a delay
+  ago, `serve --gc-delay` a week by default, and orphans older than the upload grace `--upload-grace` two
+  days by default; `cairn-server gc` does it with the server stopped, and beside one says what it would do
+  with `--dry-run` or what was done with `--status` No commit is ever acknowledged without its chunks: a
+  commit holds its chunk directory's gate from its check to its commit and vouches for each chunk it looks at,
+  and one-request uploads hold theirs until their commit returns. A backup holding `data/backup.lock` holds
+  every removal back.
 
 **Changed:**
+
+- `cairn-server fsck` only reads the chunk stores, so a backup's database checked against a live store's
+  chunks changes nothing there, and counts what retention gave up apart from damage.
 
 - The server's database moves to schema 6 when a server opens it, in one transaction: room for users'
   passwords, each token's kind and last use, and each folder's retention and collections. `cairn-server

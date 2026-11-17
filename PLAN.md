@@ -399,10 +399,26 @@ kind, size and entries without their bodies, a fraction of a replayed tree's mem
 ten minutes after the last request, taking only what is new to answer the next. The server keeps a smaller
 one for the web in memory, replayed when it starts and kept up after each commit.
 
-Retention is configurable (for example hourly for a day, daily for a month, weekly forever).
-Mark-and-sweep GC removes a chunk only after accounting for retained revisions and in-progress uploads.
-The server looks a commit's operation ID up before it checks the commit's chunks, so a retry of a commit it
-took, whose chunks were collected since, is answered as it was rather than refused.
+Retention is each folder's, set by its managers or the administrator, and with none every revision is kept and
+nothing removed docs/protocol.md "Retention" A policy is tiers back from now, each after the one before,
+`all 2d, hourly 1d, daily 30d, weekly forever; trash 30d` and only ever gives up more as time goes on. It gives
+up a revision's content and nothing else: the journal, every revision's body and every tombstone stay, so a
+device may stay away for any length of time and replay what it missed, and nothing on a client's merge, apply
+or replay needs what was given up. Never given up: an object's head while it has an entry, the head at each
+point a tier keeps, anything of an `all` tier, and a deleted file's last revision within its trash period. What
+was given up answers as such: a download or restore with Gone, a history entry marked, an undelete refused, an
+export or restore of a past state refused unless told to leave it out; a policy set again gives back what no
+collection took yet.
+
+A mark-and-sweep collection inside the server, daily, removes a chunk only after accounting for what is kept,
+what was given up within the delay D, far longer than a backup, and in-progress uploads docs/format.md
+"Collection" It marks from a read of its own, begun with its chunk directory's gate held alone; every commit
+holds the gate shared from the check of its chunks to its commit, and while a collection runs vouches for each
+hash before it looks at it, which the collection never takes, so no commit is acknowledged without its chunks.
+One-request uploads hold their chunks until their commit returns; a chunk younger than the upload grace G is
+never taken; a backup holding `data/backup.lock` holds every removal back. The server looks a commit's
+operation ID up before it checks the commit's chunks, so a retry of a commit it took, whose chunks were
+collected since, is answered as it was rather than refused.
 
 ## Sharing and access
 
@@ -464,7 +480,9 @@ the default.
   checked and run once, put in place by a rename with the one before kept, and a version on which a daemon keeps
   dying before a sync taken back by itself; a kill at any step leaves a whole program. The server is upgraded by
   a person replacing its binary and restarting, before any client takes a release on a new protocol.
-- Backup: snapshot the metadata DB, rsync the append-only chunk directory.
+- Backup: hold `data/backup.lock` for the whole run, snapshot the metadata DB, rsync the chunk directory; a
+  collection removes nothing while it is held, and what retention gives up keeps its content a week, far
+  longer than a backup takes, so a snapshot checks clean against the live chunks.
 - A built-in `fsck` checks every chunk hash and every manifest reference.
 - WebDAV is an optional gateway module for legacy tools, never the sync protocol.
 
@@ -478,7 +496,7 @@ Each milestone ends at its exit criterion, and the next does not start before it
 | 1 | Chunk store, manifests, journal; a one-shot CLI that syncs one Linux folder with full metadata and three-way merge, and restores | A tree with every metadata type round-trips byte-exact and metadata-exact through the server |
 | 2 | Failure harness: `kill -9` at every step, disk full, rename storms, lost events, missing mounts, long-offline clients; randomized operations checked against the invariants, and `fsck` which the harness uses as an oracle | The harness runs in CI and finds no violation |
 | 3 | Daemon: watcher, reconcile, persistent change feed, ignore rules and selective sync, the acceptance scenario across two machines | Runs for weeks on real trees with no silent loss. The code and its failure tests are in; the real deployment started with one tree, and its weeks are running |
-| 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal until this API holds it | GC under load never removes a reachable chunk |
+| 4 | History and trash API, retention, GC. Recently deleted came early, at the owner's asking, read by the client from the journal; the web's history and recently deleted are the API | GC under load never removes a reachable chunk. Retention and the collection came at the owner's asking, before the weeks milestone 3 waits for are over: each folder's policy, what it gives up answered cleanly, a daily collection inside the server and `cairn-server gc` with failure tests of load, kills at every step, pauses between a commit's check and its commit, a full disk and a backup's lock |
 | 5 | Namespaces, sharing, multi-user, OIDC, PostgreSQL | Both stores pass the same suite. Accounts came early, at the owner's asking: users, their tokens, folders as namespaces with read, write and manage access, sharing by a folder's managers, folders added by any user and renamed by their managers while the server serves, and read-only folders on the client, with their failure tests; OIDC, PostgreSQL and mounting a share into another root wait here |
 | 6 | Web UI: browse, share, activity, history, conflict inbox, previews | Everything in it works through the public API. Most of it came early, at the owner's asking: browsing, uploads, downloads and folders as zips, previews, history and restore, recently deleted, a folder's members, and shares with users and public links, each through endpoints any client may use, with failure tests for uploads killed or starved of disk; activity and the conflict inbox wait here |
 | 7 | macOS and Windows clients, Tauri, installers | A file edited on each platform keeps its Linux metadata; filename policies pass. The macOS and Windows CLIs and daemons came early, to join milestone 3 run: a name a filesystem cannot hold is skipped and reported, not yet mapped. On Windows that includes what Windows programs cannot open `:` `CON` a trailing dot, refused before NTFS is asked, and every path operation goes by handle with links never followed, as `openat` does on Unix. NTFS cannot swap two names, so a replacement holds the old file under a third, a hard link, and looks at it there, as a swap lets it on Unix. The failure harness runs on Windows too, outside CI, for what Windows holds. The tray came early as well, at the owner's asking, on macOS and Windows; logging in from it waits for milestone 5 accounts. Updates came early too, at the owner's asking, so that a fix reaches milestone 3 devices as soon as it is published: the feed, the updater in each daemon, the release built and signed for each platform. So did Explorer's badges, at the owner's asking, with the daemon's badges on the local API that any file manager can use; Finder's and Linux file managers' wait here. Installers wait here |
@@ -503,5 +521,5 @@ it when a decision leans on it, and save the page in sources/
   when checked at the first release. No trademark register has been searched yet.
 - **Moves between namespaces.** Two journals cannot share one atomic entry: decide whether object
   identity and history survive, or a move is a copy plus a delete.
-- **Offline interval.** How long tombstones live, against how long a device may stay away. No limit so
-  far, since the journal is kept whole; retention in milestone 4 has to set one.
+- **Offline interval.** Settled: no limit. Retention gives up revisions' content and keeps the journal and every
+  tombstone whole, so a device away for any length of time still replays what it missed.

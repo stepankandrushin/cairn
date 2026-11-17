@@ -67,6 +67,9 @@ pub struct Index {
     device_ix: HashMap<String, u32>,
     /// The last sequence replayed.
     pub head: u64,
+    /// The folder's trash period, in seconds, as its retention policy said at the last update: what
+    /// was deleted longer ago than this is gone, and not listed. `None` for no policy, which keeps it.
+    pub trash: Option<u64>,
 }
 
 /// One delete as a person sees it: a file, or a folder with what was deleted with it.
@@ -145,7 +148,16 @@ impl Index {
                 break;
             }
         }
+        self.trash = client.retention()?.and_then(|r| r.trash);
         Ok(())
+    }
+
+    /// The time before which what was deleted is past the folder's trash period: `None` for none. A
+    /// harness build may take the clock for later, as the server's collections do there.
+    fn trash_since(&self) -> Option<i64> {
+        let now =
+            days_ago(0).saturating_add(cairn_failpoint::tuned("client.clock_ahead", 0) as i64);
+        self.trash.map(|t| now.saturating_sub(t as i64))
     }
 
     fn device(&mut self, name: &str) -> u32 {
@@ -301,6 +313,7 @@ impl Index {
     /// deleted, newest first: a folder once, with what went with it.
     pub fn list(&self, since: i64) -> Vec<Deleted> {
         let with = self.with_folder();
+        let since = since.max(self.trash_since().unwrap_or(i64::MIN));
         let mut out = Vec::new();
         for (id, o) in &self.objects {
             let Some(g) = &o.gone else { continue };
@@ -369,6 +382,16 @@ impl Index {
                 out.already.push((*id, self.path(*id).unwrap_or_default()));
                 continue;
             }
+            let past = self.trash_since();
+            if let (Some(g), Some(t)) = (&o.gone, past) {
+                if g.time < t {
+                    bail!(
+                        "{} was deleted on {}, past this folder's trash period, and its retention has removed it",
+                        display_path(&self.path(*id).unwrap_or_default()),
+                        crate::sync::utc_date(g.time)
+                    );
+                }
+            }
             if placed.contains_key(id) && !bare.contains(id) {
                 // Already coming back with something asked for before it.
                 continue;
@@ -406,6 +429,14 @@ impl Index {
                 let Some(g) = &self.objects[m].gone else {
                     continue;
                 };
+                // A file that went with it past the trash period stays gone; a folder comes back to
+                // hold what does.
+                if m != id
+                    && self.objects[m].kind != ObjectKind::Dir
+                    && past.is_some_and(|t| g.time < t)
+                {
+                    continue;
+                }
                 let parent = g.link.parent;
                 let folder_new = placed.contains_key(&parent);
                 let names = taken.entry(parent).or_insert_with(|| {

@@ -9,6 +9,7 @@ pub mod metadata;
 pub mod name;
 pub mod ops;
 pub mod record;
+pub mod retention;
 pub mod skip;
 pub mod tree;
 pub mod update;

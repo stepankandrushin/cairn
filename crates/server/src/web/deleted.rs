@@ -431,6 +431,25 @@ pub(super) struct DeletedQuery {
     days: Option<u32>,
 }
 
+/// The time before which what was deleted is past the folder's trash period, and gone to its
+/// retention: `None` for a folder with no policy, which keeps it all. A harness build may take the
+/// clock for later, as its collections do.
+pub(crate) fn trash_since(m: &mut dyn MetaStore, ns: &str) -> Result<Option<i64>> {
+    let now = now().saturating_add(cairn_failpoint::tuned("server.clock_ahead", 0) as i64);
+    Ok(match m.retention(ns)? {
+        Some(row) => Some(now.saturating_sub(row.policy()?.trash as i64)),
+        None => None,
+    })
+}
+
+/// Whether a deleted object's last revision is one retention gave up.
+fn given_up(m: &mut dyn MetaStore, ns: &str, object: ObjectId) -> Result<bool> {
+    Ok(match m.object_head(ns, object)? {
+        Some(h) => !m.pruned(ns, &[h.revision])?.is_empty(),
+        None => false,
+    })
+}
+
 pub(super) async fn list(
     State(app): State<Arc<App>>,
     Extension(view): Extension<View>,
@@ -438,10 +457,13 @@ pub(super) async fn list(
 ) -> ApiResult<Response> {
     let days = i64::from(q.days.unwrap_or(30).min(36_500));
     let list = blocking(move || {
+        // Past the trash period it is not there to bring back.
+        let trash = app.repo.with_meta(|m| trash_since(m, &view.ns))?;
         let index = app.deleted.of(&view.ns);
         let mut index = lock(&index);
         index.catch_up(&app, &view.ns)?;
-        Ok(index.list(&view, now() - days * 86_400))
+        let since = (now() - days * 86_400).max(trash.unwrap_or(i64::MIN));
+        Ok(index.list(&view, since))
     })
     .await?;
     Ok(Json(list).into_response())
@@ -457,6 +479,7 @@ fn plan(
     index: &Replayed,
     asked: &[ObjectId],
 ) -> Result<Result<Planned, String>> {
+    let trash = trash_since(m, &view.ns)?;
     let groups = index.groups();
     let mut placed: BTreeMap<ObjectId, Link> = BTreeMap::new();
     let mut taken: HashMap<ObjectId, HashSet<Name>> = HashMap::new();
@@ -469,6 +492,13 @@ fn plan(
         let (Some(g), true) = (index.gone.get(id), m.links_of(&view.ns, *id)?.is_empty()) else {
             return Ok(Err(format!("{id} is not deleted now: reload")));
         };
+        if trash.is_some_and(|t| g.time < t) || given_up(m, &view.ns, *id)? {
+            return Ok(Err(format!(
+                "{} was deleted on {}, past this folder's trash period, and its retention has removed it",
+                display_bytes(g.link.name.as_bytes()),
+                crate::admin::date(g.time)
+            )));
+        }
         // The deleted folders above it, which come back holding only what is asked for.
         let mut chain = Vec::new();
         let mut up = g.link.parent;
@@ -504,6 +534,16 @@ fn plan(
             let Some(og) = index.gone.get(&o) else {
                 continue;
             };
+            // A file that went with it and is past the trash period stays gone; a folder, which
+            // names no content, comes back to hold what does.
+            let file = index
+                .objects
+                .get(&o)
+                .is_some_and(|x| x.kind != ObjectKind::Dir);
+            if o != *id && file && (trash.is_some_and(|t| og.time < t) || given_up(m, &view.ns, o)?)
+            {
+                continue;
+            }
             let parent = og.link.parent;
             if let std::collections::hash_map::Entry::Vacant(e) = taken.entry(parent) {
                 let names = if placed.contains_key(&parent) {

@@ -76,6 +76,41 @@ pub struct Revisioned {
     pub time: i64,
     pub device_name: String,
     pub user: Option<String>,
+    /// When the folder's retention gave it up.
+    pub pruned: Option<i64>,
+}
+
+/// A folder's retention policy as kept: its tiers as text (`Policy::keep_text`), its trash in seconds,
+/// and who set it when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionRow {
+    pub keep: String,
+    pub trash: i64,
+    pub set_by: String,
+    pub set_at: i64,
+}
+
+impl RetentionRow {
+    pub fn policy(&self) -> Result<cairn_protocol::retention::Policy> {
+        cairn_protocol::retention::Policy::from_parts(&self.keep, self.trash.max(0) as u64)
+            .map_err(|e| anyhow::anyhow!("in the database, a retention policy: {e}"))
+    }
+}
+
+/// One collection of a namespace's chunks, as `gc_runs` keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcRun {
+    pub id: i64,
+    pub started: i64,
+    /// Revisions given up before this kept nothing from it.
+    pub cutoff: i64,
+    /// `marking`, `deleting`, `done`, `aborted` (it removed nothing) or `interrupted` (it may have
+    /// removed some).
+    pub state: String,
+    pub chunks: u64,
+    pub bytes: u64,
+    pub ended: Option<i64>,
+    pub error: Option<String>,
 }
 
 /// An object shared with a user, or by a public link: one or the other.
@@ -222,6 +257,46 @@ pub trait MetaStore: Send {
     fn shares_to(&mut self, user: &str) -> Result<Vec<ShareRow>>;
     /// Whether there was such a share in that namespace to remove.
     fn remove_share(&mut self, ns: &str, id: &[u8; 16]) -> Result<bool>;
+
+    /// Retention. A folder's policy, `None` for none, which keeps everything.
+    fn retention(&mut self, ns: &str) -> Result<Option<RetentionRow>>;
+    /// Sets a folder's policy, or with `None` takes it away, and in the same transaction gives back
+    /// every revision given up whose content no collection can have taken yet: how many.
+    fn set_retention(&mut self, ns: &str, row: Option<&RetentionRow>) -> Result<u64>;
+    /// Of these revisions, those given up, and when.
+    fn pruned(&mut self, ns: &str, revisions: &[RevisionId]) -> Result<Vec<(RevisionId, i64)>>;
+    /// Every revision of the namespace given up, and when.
+    fn all_pruned(&mut self, ns: &str) -> Result<Vec<(RevisionId, i64)>>;
+    /// Gives these revisions up at `at`, in one transaction, but any that is an object's head with an
+    /// entry now, or given up already; `None`, and nothing given up, if the folder's policy is no
+    /// longer `policy`.
+    fn prune(
+        &mut self,
+        ns: &str,
+        revisions: &[RevisionId],
+        at: i64,
+        policy: &RetentionRow,
+    ) -> Result<Option<u64>>;
+    /// A collection begun, in state `marking`: its ID.
+    fn gc_begin(&mut self, ns: &str, started: i64, cutoff: i64) -> Result<i64>;
+    /// How far a collection got.
+    fn gc_update(
+        &mut self,
+        id: i64,
+        state: &str,
+        chunks: u64,
+        bytes: u64,
+        ended: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<()>;
+    /// A namespace's collections, the latest first, at most `limit`.
+    fn gc_runs(&mut self, ns: &str, limit: u32) -> Result<Vec<GcRun>>;
+    /// The latest cutoff of the namespace's collections that may have removed content given up before
+    /// it: `None` if none may have.
+    fn swept_before(&mut self, ns: &str) -> Result<Option<i64>>;
+    /// Every collection a process left unfinished, ended now: `aborted` if it was still marking, as
+    /// it removed nothing, else `interrupted`. How many.
+    fn gc_unfinished(&mut self, ended: i64) -> Result<u64>;
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -368,6 +443,180 @@ pub mod suite {
         accounts(s);
         shares(s);
         names(s);
+        retention(s);
+    }
+
+    /// A policy, what it gives up, which is never a head with an entry, its marks, and collections.
+    fn retention(s: &mut dyn MetaStore) {
+        s.create_namespace("r").unwrap();
+        let file = |n: u8| RevisionBody {
+            content: Content::File {
+                manifest: Hash::of(&[n]),
+                size: 1,
+            },
+            metadata: Metadata::default(),
+        };
+        let (f1, f2) = (ObjectId::random(), ObjectId::random());
+        let (r1, r2, r3) = (
+            RevisionId::random(),
+            RevisionId::random(),
+            RevisionId::random(),
+        );
+        let at = |n: &str| Link {
+            parent: ObjectId::ROOT,
+            name: name(n),
+        };
+        let ok = |s: &mut dyn MetaStore, ops: Vec<Op>| {
+            assert!(matches!(
+                s.commit("r", &req(ops), 10, None).unwrap(),
+                CommitOutcome::Committed { .. }
+            ))
+        };
+        ok(
+            s,
+            vec![
+                Op::Create {
+                    object: f1,
+                    revision: r1,
+                    body: file(1),
+                    link: at("one"),
+                    conflict_of: None,
+                },
+                Op::Create {
+                    object: f2,
+                    revision: r3,
+                    body: file(3),
+                    link: at("two"),
+                    conflict_of: None,
+                },
+            ],
+        );
+        ok(
+            s,
+            vec![
+                Op::Update {
+                    object: f1,
+                    base: r1,
+                    revision: r2,
+                    body: file(2),
+                    restored_from: None,
+                },
+                Op::Unlink {
+                    object: f2,
+                    link: at("two"),
+                    base: None,
+                },
+            ],
+        );
+        assert_eq!(s.retention("r").unwrap(), None);
+        let row = RetentionRow {
+            keep: "daily 30d".into(),
+            trash: 86_400,
+            set_by: "u".into(),
+            set_at: 50,
+        };
+        assert_eq!(s.set_retention("r", Some(&row)).unwrap(), 0);
+        assert_eq!(s.retention("r").unwrap().as_ref(), Some(&row));
+
+        // A head with an entry is never given up, nor what is no revision; the rest once.
+        let none = RevisionId::random();
+        assert_eq!(
+            s.prune("r", &[r1, r2, r3, none], 100, &row).unwrap(),
+            Some(2)
+        );
+        assert_eq!(s.prune("r", &[r1], 101, &row).unwrap(), Some(0));
+        let mut changed = row.clone();
+        changed.set_at = 51;
+        assert_eq!(s.prune("r", &[r1], 102, &changed).unwrap(), None);
+        let mut got = s.pruned("r", &[r1, r2, r3]).unwrap();
+        got.sort();
+        let mut want = vec![(r1, 100), (r3, 100)];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(s.all_pruned("r").unwrap().len(), 2);
+        let hist = s.history("r", f1).unwrap();
+        assert_eq!(
+            hist.iter()
+                .map(|h| (h.revision.revision, h.pruned))
+                .collect::<Vec<_>>(),
+            [(r2, None), (r1, Some(100))]
+        );
+
+        // A deleted file whose head was given up does not come back as it was; with a new head, it does.
+        let back = Op::Link {
+            object: f2,
+            link: at("two"),
+        };
+        assert!(matches!(
+            s.commit("r", &req(vec![back.clone()]), 11, None).unwrap(),
+            CommitOutcome::Rejected {
+                op_index: 0,
+                reason: OpReject::NoSuchObject(_)
+            }
+        ));
+        let r4 = RevisionId::random();
+        ok(
+            s,
+            vec![
+                back,
+                Op::Update {
+                    object: f2,
+                    base: r3,
+                    revision: r4,
+                    body: file(4),
+                    restored_from: None,
+                },
+            ],
+        );
+
+        // A collection's cutoff: what was given up before it may be gone, and a policy set again
+        // brings back only what was given up after it.
+        assert_eq!(s.swept_before("r").unwrap(), None);
+        let run = s.gc_begin("r", 200, 150).unwrap();
+        assert_eq!(
+            s.swept_before("r").unwrap(),
+            Some(150),
+            "a run going on counts"
+        );
+        s.gc_update(run, "done", 3, 30, Some(201), None).unwrap();
+        assert_eq!(
+            s.set_retention("r", None).unwrap(),
+            0,
+            "given up at 100, before the cutoff"
+        );
+        assert_eq!(s.retention("r").unwrap(), None);
+        s.set_retention("r", Some(&row)).unwrap();
+        assert_eq!(s.prune("r", &[r2], 160, &row).unwrap(), Some(0), "a head");
+        let r5 = RevisionId::random();
+        ok(
+            s,
+            vec![Op::Update {
+                object: f1,
+                base: r2,
+                revision: r5,
+                body: file(5),
+                restored_from: None,
+            }],
+        );
+        assert_eq!(s.prune("r", &[r2], 160, &row).unwrap(), Some(1));
+        assert_eq!(s.set_retention("r", Some(&row)).unwrap(), 1);
+        assert!(s.pruned("r", &[r2]).unwrap().is_empty());
+        assert_eq!(s.pruned("r", &[r1]).unwrap().len(), 1);
+
+        // A run a process left unfinished is ended as such: aborted while it marked, else interrupted.
+        let marking = s.gc_begin("r", 300, 250).unwrap();
+        let deleting = s.gc_begin("r", 301, 251).unwrap();
+        s.gc_update(deleting, "deleting", 1, 10, None, None)
+            .unwrap();
+        assert_eq!(s.gc_unfinished(400).unwrap(), 2);
+        let runs = s.gc_runs("r", 10).unwrap();
+        let state = |id: i64| runs.iter().find(|r| r.id == id).unwrap().state.clone();
+        assert_eq!(
+            (state(run), state(marking), state(deleting)),
+            ("done".into(), "aborted".into(), "interrupted".into())
+        );
+        assert!(runs.iter().all(|r| r.ended.is_some()));
+        assert_eq!(s.gc_runs("r", 1).unwrap().len(), 1);
     }
 
     /// What the web interface reads: a folder's entries, an object's head, links and history, and the

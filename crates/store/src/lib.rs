@@ -4,9 +4,11 @@
 pub mod chunks;
 pub mod codec;
 pub mod fsck;
+pub mod gc;
 pub mod meta;
 pub mod migrate;
 pub mod repo;
+pub mod retention;
 pub mod sqlite;
 
 pub use chunks::{ChunkStore, FsChunkStore};

@@ -98,6 +98,11 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<NotFound>())
 }
 
+/// An endpoint a server does not have, as one from before it answers: 404 or 405.
+fn not_there(e: &anyhow::Error) -> bool {
+    is_not_found(e) || format!("{e:#}").contains("server answered 405")
+}
+
 /// An answer as it came, whatever its status: what `put_file` gives, read as the Photos system's
 /// answer to the same request is read.
 #[derive(Clone, Debug)]
@@ -768,6 +773,42 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// The folder's retention policy (`feature::RETENTION`): `None` from a server before retention,
+    /// which keeps everything as a folder with no policy does.
+    pub fn retention(&self) -> Result<Option<wire::Retention>> {
+        match self.get_json(
+            "reading the folder's retention",
+            "client.retention",
+            "/retention",
+        ) {
+            Ok(r) => Ok(Some(r)),
+            Err(e) if not_there(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Of these revisions, those the folder's retention gave up, each with when, in seconds since the
+    /// epoch: whose content may be gone. None from a server before retention, which gives none up.
+    pub fn pruned(&self, revisions: &[RevisionId]) -> Result<Vec<wire::PrunedRevision>> {
+        let mut out = Vec::new();
+        for batch in revisions.chunks(50_000) {
+            let ask = wire::PrunedAsk {
+                revisions: batch.to_vec(),
+            };
+            match self.post_json::<_, wire::PrunedList>(
+                "asking what retention gave up",
+                "client.pruned",
+                "/pruned",
+                &ask,
+            ) {
+                Ok(list) => out.extend(list.pruned),
+                Err(e) if not_there(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 
     /// Give `user` this level here, or with `None` take all of it away. Only a manager may.

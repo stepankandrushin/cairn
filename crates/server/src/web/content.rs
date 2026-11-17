@@ -278,14 +278,21 @@ pub(super) fn file_at(
             // A link gives what is there now, and no more.
             Some(_) if view.via == Via::Link => return Ok(None),
             Some(r) => match m.revision(&view.ns, r)? {
-                Some(stored) if stored.object == object => (r, stored.body),
+                Some(stored) if stored.object == object => {
+                    if let Some(at) = crate::gc::pruned_at(m, &view.ns, r)? {
+                        return Ok(Some(Err(at)));
+                    }
+                    (r, stored.body)
+                }
                 _ => return Ok(None),
             },
         };
-        Ok(Some((name, revision, body.content)))
+        Ok(Some(Ok((name, revision, body.content))))
     })?;
-    let Some((name, revision, content)) = found else {
-        return Ok(Err(not_found("such file")));
+    let (name, revision, content) = match found {
+        None => return Ok(Err(not_found("such file"))),
+        Some(Err(at)) => return Ok(Err(crate::gc::gone(at))),
+        Some(Ok(f)) => f,
     };
     let Content::File { manifest, size } = content else {
         return Ok(Err(bad_request("that is not a file")));

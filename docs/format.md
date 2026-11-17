@@ -6,6 +6,8 @@
 data/
   token                  the first user's token, 0600: made by `init`, or one from before accounts
   lock                   flock held while a server has the directory
+  backup.lock            held by a backup for its whole run, and shared by each batch a collection removes;
+                         made by the server as it starts, so a backup run as another user makes no file here
   meta.sqlite            metadata: WAL, synchronous=FULL
   ns/<hex of namespace name>/
                          or, once it is renamed, of the name it had first (below)
@@ -22,10 +24,16 @@ data/
 Nothing is renamed or linked between `ns/` and the rest, so `ns/` may be a mount of another filesystem:
 the chunks on large, slow disks and the database on a fast one.
 
-**Backup:** snapshot `meta.sqlite` (the SQLite backup API, or stop the server), then rsync `ns/`
-Chunks are immutable and named by content, and this release never removes one. After a restore, each
-device notices that the server no longer has what it last saw and pauses. Removing that root's `.cairn`
-and running `cairn init` again merges by name and content and sends the server what it lost.
+**Backup:** take `backup.lock` exclusively for the whole run, opening it only if it is there, then snapshot
+`meta.sqlite` (the SQLite backup API, or stop the server) and rsync `ns/` Chunks are immutable and named by
+content, and the server removes one only in a collection [Collection](#collection) of a folder with a
+retention policy; while a backup holds the lock no collection removes anything, so every chunk the snapshot
+names is still there when rsync lists `ns/` and when the snapshot is checked against the live chunks. What
+retention gives up keeps its content the collection's delay, 7 days by default and never under one, far
+longer than a backup takes, so a snapshot taken before a revision was given up checks clean against the live
+store for that long. After a restore, each device notices that the server no longer has what it last saw and
+pauses. Removing that root's `.cairn` and running `cairn init` again merges by name and content and sends the
+server what it lost.
 
 **Chunks** are the raw bytes, with no compression in this format version. A chunk reaches its final
 path only by: write to `incoming/` fsync, rename, fsync the directory. An upload request's chunks go
@@ -64,6 +72,9 @@ refused.
 | `shares` | An object of a namespace shared with a user at `read` or `write` or by a public link's token, which reads only; who made it, when, and when it expires |
 | `former_names` | A name a renamed namespace had, and the namespace, which it still reaches |
 | `folder_names` | A user's own name for a namespace, which they see in its place |
+| `retention` | A namespace's retention policy: its tiers as text, its trash period in seconds, who set it and when |
+| `pruned` | Each revision retention gave up, and when |
+| `gc_runs` | Each collection: its namespace, start, cutoff, state, what it removed, when it ended and why it stopped if it did |
 
 The `journal` also says, from schema 2 on, the user whose token made each commit. Schema 2 brought accounts:
 the migration to it, in its one transaction, makes the `token` file's token, if there is one, the user
@@ -146,7 +157,60 @@ its own.
 `cairn-server fsck` reads every chunk, follows every manifest reference, checks `entries` and `objects`
 against a replay of `journal` and that each revision is named by the commit that made it, but the first
 of a namespace's root, made with the namespace. Chunks nothing refers to are reported and are not damage:
-they are what an interrupted upload leaves behind.
+they are what an interrupted upload leaves behind. It only reads the chunk stores, making, emptying and
+syncing nothing in them, so a backup's snapshot is checked in a data directory of its own whose
+`ns/<dir>/chunks` are links to the live store's. A revision retention gave up may have lost its manifest or
+chunks to a collection: fsck counts those and does not call them damage, and counts the chunks only such
+revisions name, which a collection takes once their delay has passed. A revision given up that is the head of
+an object with an entry is damage, and so is a mark in `pruned` that names no revision.
+
+## Collection
+
+What a folder's retention policy gives up docs/protocol.md "Retention" a server finds once a day, about an
+hour after it starts and every day after, or `cairn-server gc --data <dir>` with it stopped; beside a running
+server that command only says what it would do, `--dry-run` and what the folders' policies and last
+collections were, `--status` A folder with no policy is left alone, the chunks nothing names included.
+
+**The pass.** The rule is a pure function of the namespace's journal, the policy and the time, in
+`cairn_store::retention` It replays the journal from a connection of its own that only reads, takes the
+state at each point a tier keeps as the state after the last commit at or before it, each commit at the
+latest time of any up to it, and gives up each revision naming content that none of its rules keeps. What
+it gives up is marked in `pruned` with the time, in transactions of at most 10,000 revisions, each skipping
+any revision that has become the head of an object with an entry since and stopping if the policy changed
+since the journal was read. For a fixed policy the rule only ever gives up more, so a pass killed anywhere
+leaves the store whole, and the next one does the rest.
+
+**The sweep**, each run of each namespace with a policy:
+1. A `gc_runs` row, committed first, `marking` with its cutoff: the run's time less the delay D, `serve
+   --gc-delay` 7 days by default and at least a day, and never before an earlier run's cutoff.
+2. With its chunk directory's gate held alone, so that no commit is between the check of its chunks and its
+   commit, it begins vouching and begins its read of the database.
+3. It marks the manifests of every revision not given up, and of every one given up at or after the cutoff,
+   then their chunks. A manifest it marks that is missing or does not decode ends the run, `aborted`, before
+   anything is removed.
+4. Its candidates are the chunks it did not mark whose file was last written before the run began less the
+   upload grace G, `--upload-grace` 2 days by default. It only reads the files' times.
+5. `deleting` then in batches of 256 chunks: `backup.lock` taken shared, waiting while a backup holds it, then the
+   gate alone; each candidate vouched for or held is skipped, and each other whose time is still old enough
+   unlinked; then the batch's folders synced, and the thumbnails of each manifest removed go with it.
+6. `done` with what it removed, and the vouching stops.
+
+**The gate**, one for each chunk directory, so every name of a namespace reaches the same one: a commit
+holds it shared from the check of its chunks to its commit, and while a collection runs the check of a
+commit, `missing` and each upload vouch for every hash before looking at it, so that a commit either is in
+what the collection read or vouches for all it names. `PUT /file` and the web's uploads hold their chunks,
+whenever they began, until their commit returns. A chunk is unlinked only while no vouch or hold can begin,
+so whatever looks at it after finds it gone and uploads it again. The worst a device sees is a commit refused
+once for a chunk taken between its `missing` and its commit, sent again on its next round; a commit is never
+acknowledged without its chunks.
+
+A run killed anywhere leaves only fewer orphans: the next start of a server, or of `cairn-server gc` marks
+every run a process left unfinished `aborted` if it was marking, as it removed nothing, or `interrupted` and
+the next run starts over. A full disk as the row would be written stops the run before it removes anything,
+and says so. `cairn-server downgrade` to schema 5 refuses once a run that reached `deleting` has a cutoff
+after a revision was given up, as its content may be gone; a policy set again or taken away gives back the
+revisions given up at or after the latest cutoff of any run that may remove, which is all whose content is
+whole.
 
 ## Client state
 

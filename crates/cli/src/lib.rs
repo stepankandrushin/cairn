@@ -242,6 +242,9 @@ enum Command {
         /// One revision of one object, from `cairn history`.
         #[arg(long)]
         revision: Option<String>,
+        /// Leave what the folder's retention removed as it is now, and list it, rather than refuse.
+        #[arg(long)]
+        skip_pruned: bool,
         #[arg(long)]
         no_sync: bool,
     },
@@ -258,6 +261,9 @@ enum Command {
         /// security.selinux. Needs privileges; what cannot be applied is listed.
         #[arg(long)]
         exact: bool,
+        /// Leave out what the folder's retention removed, and list it, rather than refuse.
+        #[arg(long)]
+        skip_pruned: bool,
     },
     /// The conflict inbox: competing versions kept as copies, until the copy is deleted, renamed or
     /// moved, which is how a person deals with one.
@@ -1165,6 +1171,13 @@ fn run_inner() -> Result<u8> {
                     h.restored_from
                         .map_or(String::new(), |r| format!("  restored from {r}")),
                 );
+                if let Some(at) = h.pruned {
+                    outln!(
+                        "{:>8}  removed by the folder's retention on {}",
+                        "",
+                        cairn_engine::sync::utc_date(at)
+                    );
+                }
             }
             Ok(EXIT_OK)
         }
@@ -1172,6 +1185,7 @@ fn run_inner() -> Result<u8> {
             path,
             at,
             revision,
+            skip_pruned,
             no_sync,
         } => {
             let root_path = find_root(cli.root)?;
@@ -1179,7 +1193,7 @@ fn run_inner() -> Result<u8> {
             let outcome = {
                 let root = Root::open(&root_path)?;
                 match (at, revision) {
-                    (Some(at), None) => restore::restore_at(&root, &names, at)?,
+                    (Some(at), None) => restore::restore_at(&root, &names, at, skip_pruned)?,
                     (None, Some(r)) => {
                         let revision: RevisionId =
                             r.parse().map_err(|_| anyhow!("{r} is not a revision ID"))?;
@@ -1188,6 +1202,13 @@ fn run_inner() -> Result<u8> {
                     _ => bail!("say which state: --at SEQ or --revision ID"),
                 }
             };
+            for (p, at) in &outcome.left_out {
+                outln!(
+                    "left as it is: {}, removed by the folder's retention on {}",
+                    display_path(p),
+                    cairn_engine::sync::utc_date(*at)
+                );
+            }
             match outcome.seq {
                 Some(seq) => outln!(
                     "restored {} as sequence {seq} ({} op(s))",
@@ -1206,6 +1227,7 @@ fn run_inner() -> Result<u8> {
             at,
             path,
             exact,
+            skip_pruned,
         } => {
             let config = open_config(&find_root(cli.root)?)?;
             let names = path
@@ -1218,13 +1240,20 @@ fn run_inner() -> Result<u8> {
             } else {
                 config.policy.clone()
             };
-            let (seq, warnings) =
-                cairn_engine::export::export(&config, at, &names, &dest, &policy)?;
-            for w in &warnings {
+            let done =
+                cairn_engine::export::export(&config, at, &names, &dest, &policy, skip_pruned)?;
+            for w in &done.warnings {
                 outln!("not applied: {w}");
             }
-            outln!("exported sequence {seq} to {}", dest.display());
-            Ok(if warnings.is_empty() {
+            for (p, at) in &done.left_out {
+                outln!(
+                    "left out: {}, removed by the folder's retention on {}",
+                    display_path(p),
+                    cairn_engine::sync::utc_date(*at)
+                );
+            }
+            outln!("exported sequence {} to {}", done.seq, dest.display());
+            Ok(if done.warnings.is_empty() && done.left_out.is_empty() {
                 EXIT_OK
             } else {
                 EXIT_PARTIAL

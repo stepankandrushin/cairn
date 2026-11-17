@@ -22,6 +22,7 @@ use cairn_protocol::{
     Content, Hash, Link, Metadata, Name, ObjectId, ObjectKind, Op, OpId, OpReject, RevisionBody,
     RevisionId,
 };
+use cairn_store::chunks::Held;
 use cairn_store::MetaStore;
 use futures_util::StreamExt;
 use std::io::{self, Read};
@@ -569,14 +570,13 @@ pub(crate) async fn put(
     // The bytes, cut and stored as they come.
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(8);
     let (app2, a2) = (app.clone(), a.clone());
-    let storing = tokio::task::spawn_blocking(move || -> Result<Hash> {
+    let storing = tokio::task::spawn_blocking(move || -> Result<(Hash, Held)> {
         let chunks = app2.repo.chunks(&a2.ns)?;
         let reader = BodyReader {
             rx,
             cur: Bytes::new(),
         };
-        let manifest = store_bytes(&*chunks, reader, a2.size, &mut |_| {})?;
-        Ok(manifest)
+        store_bytes(&chunks, reader, a2.size, &mut |_| {})
     });
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
@@ -588,7 +588,8 @@ pub(crate) async fn put(
         }
     }
     drop(tx);
-    let manifest = match storing.await {
+    // The chunks are held until the commit that names them returns: no collection takes one between.
+    let (manifest, held) = match storing.await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) if cairn_store::is_disk_full(&e) => return failed(e),
         Ok(Err(e)) => {
@@ -603,6 +604,7 @@ pub(crate) async fn put(
 
     let (app2, a2) = (app.clone(), a.clone());
     let done = crate::blocking(move || {
+        let _held = held;
         for _ in 0..RENAME_TRIES {
             // Where the file was last, should it be deleted: from the index, outside the store's lock,
             // which the index takes to catch up.

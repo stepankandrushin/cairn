@@ -343,6 +343,7 @@ async fn history(
                         },
                         mode: body.metadata.mode,
                         mtime: body.metadata.mtime,
+                        pruned: r.pruned,
                     }
                 })
                 .collect();

@@ -26,7 +26,7 @@ deserialize, so nothing a peer sends can address anything but one entry in its p
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /v1/me` | | `{user, folders: [{folder, access, name?}], features}` whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)); `features` as in `/info` [Features](#features) |
+| `GET /v1/me` | | `{user, folders: [{folder, access, name?}], features, token?, password?}` whose the token is, and every namespace it reaches; `name` is the user's own name for it, if they have one ([Names](#names)); `features` as in `/info` [Features](#features) |
 | `POST /v1/folders` | `{folder, name?}` | 201 `{folder, access, name?}` a new namespace, which the caller manages, with `name` as their own name for it, all at once ([Names](#names)). 400 no such name. 409 the name is or was another namespace's, of which the answer says nothing more |
 | `GET /info` | | `{protocol, server_version, head, max_batch_bytes, access, note_groups, folder, features}` - `access` is the token's level here; a server before accounts sends none, and its one token may do everything. `note_groups` absent before them, says that a note may name more objects than one. `folder` absent before renaming, is the namespace's name now, which a client that asked by a former one takes up ([Names](#names)) |
 | `POST /chunks/missing` | `{hashes}` | `{hashes}` those not stored intact in this namespace. A damaged chunk counts as missing, so a good copy replaces it. Needs `write` |
@@ -62,6 +62,25 @@ do is looked up on every request, so a change holds from the next one, and a dev
 what it holds. A client that learns from `Info.access` that it may only read sends nothing up (PLAN.md
 "Sharing and access"); one from before accounts tries, and is answered 403 with the reason.
 
+## Tokens
+
+Each user lists, makes, relabels and takes back their own tokens through the API, never another user's,
+so that a lost phone or an old browser is signed out from any of their devices. A token is named by its ID,
+the first 12 hex digits of its hash, as `cairn-server token list` shows it; the token itself the server
+never keeps, and shows only in the answer that makes it.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `GET /v1/tokens` | | `{tokens: [{id, label, kind, created, used?, current?}]}` the caller's, oldest first: `kind` is `device` `browser` or `paired`; `used` the hour it was last used, in seconds since the epoch; `current` for the one the request came with |
+| `POST /v1/tokens` | `{label}` | 201 `{id, token}` a new token of the caller's, a `device`'s, shown this once |
+| `PATCH /v1/tokens/{id}` | `{label}` | The token as listed, with its new label |
+| `DELETE /v1/tokens/{id}` | | 204 taken back, the request's own too: what it signed in is signed out from its next request |
+
+A label is what a person knows the token by: 1 to 100 characters, no control characters, else 400. Another
+user's token is not there, 404 alike. `/v1/me` names the request's own token as `token: {id, label, kind}`
+and says `password: true` when the user has one to sign in to the web with. A server keeps a token's last use
+to the hour, written by the first request of each hour.
+
 ## Features
 
 What a server does beyond what every server of this protocol does, it names in `features` in `/info` and
@@ -74,6 +93,7 @@ every client must speak. A server before features sends none.
 |---|---|
 | `note_groups` | A note may name more objects than one [Committing](#committing) also `note_groups: true` for clients before features |
 | `item_hash` | A web `item` carries a file's manifest hash [Web](#web) |
+| `tokens` | A user's own tokens through `/v1/tokens` and `token` in `/v1/me` [Tokens](#tokens) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.

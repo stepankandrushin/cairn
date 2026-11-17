@@ -7,7 +7,9 @@ use crate::meta::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use cairn_failpoint::{check, hit};
-use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
+use cairn_protocol::wire::{
+    Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member, TokenKind,
+};
 use cairn_protocol::{
     check_and_apply, Content, Hash, Link, Metadata, Name, ObjectId, ObjectKind, Op, OpId, OpReject,
     RevisionBody, RevisionId, TreeStore,
@@ -843,19 +845,65 @@ impl MetaStore for SqliteStore {
         Ok(out)
     }
 
-    fn add_token(&mut self, user: &str, hash: &Hash, label: &str, time: i64) -> Result<()> {
+    fn add_token(
+        &mut self,
+        user: &str,
+        hash: &Hash,
+        label: &str,
+        kind: TokenKind,
+        time: i64,
+    ) -> Result<()> {
         let id = self.user_id(user)?;
         self.conn.execute(
-            "INSERT INTO tokens (hash, user, label, created) VALUES (?1, ?2, ?3, ?4)",
-            params![hash.0, id, label, time],
+            "INSERT INTO tokens (hash, user, label, created, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![hash.0, id, label, time, kind.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn set_token_label(&mut self, hash: &Hash, label: &str) -> Result<()> {
+        if self.conn.execute(
+            "UPDATE tokens SET label = ?2 WHERE hash = ?1",
+            params![hash.0, label],
+        )? == 0
+        {
+            bail!("no such token");
+        }
+        Ok(())
+    }
+
+    fn touch_token(&mut self, hash: &Hash, hour: i64) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE tokens SET used = ?2 WHERE hash = ?1 AND (used IS NULL OR used < ?2)",
+            )?
+            .execute(params![hash.0, hour])?;
+        Ok(())
+    }
+
+    fn password(&mut self, user: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT password FROM users WHERE name = ?1", [user], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    fn set_password(&mut self, user: &str, phc: Option<&str>) -> Result<()> {
+        let id = self.user_id(user)?;
+        self.conn.execute(
+            "UPDATE users SET password = ?2 WHERE id = ?1",
+            params![id, phc],
         )?;
         Ok(())
     }
 
     fn tokens(&mut self) -> Result<Vec<TokenInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.hash, u.name, t.label, t.created FROM tokens t JOIN users u ON u.id = t.user
-             ORDER BY u.name, t.created, t.hash",
+            "SELECT t.hash, u.name, t.label, t.created, t.kind, t.used FROM tokens t
+             JOIN users u ON u.id = t.user ORDER BY u.name, t.created, t.hash",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -863,11 +911,14 @@ impl MetaStore for SqliteStore {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (hash, user, label, created) = row?;
+            let (hash, user, label, created, kind, used) = row?;
+            let kind = kind.parse().map_err(|e: String| anyhow!(e))?;
             let hash = Hash(
                 hash.try_into()
                     .map_err(|_| anyhow!("a stored token hash is not 32 bytes"))?,
@@ -878,6 +929,8 @@ impl MetaStore for SqliteStore {
                 user,
                 label,
                 created,
+                kind,
+                used,
             });
         }
         Ok(out)

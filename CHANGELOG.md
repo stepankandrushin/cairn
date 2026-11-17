@@ -9,6 +9,9 @@
   server first.
 - A web item carries its file's manifest hash, the one a client makes of the same bytes, so a phone after a
   reinstall skips what it sent before without sending it again.
+- Each user lists, makes, relabels and takes back their own tokens through `/v1/tokens` and `/v1/me` names
+  the token a request came with, so a lost phone is signed out from any of the user's devices. Each token has
+  a kind, `device` `browser` or `paired` and the hour it was last used, which `cairn-server token list` shows.
 
 **Changed:**
 

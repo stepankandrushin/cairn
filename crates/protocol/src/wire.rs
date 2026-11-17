@@ -117,6 +117,106 @@ pub struct Me {
     /// As `Info::features`, for a client that has no namespace to ask yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// The token the request came with, as `/v1/tokens` lists it (`feature::TOKENS`): which of the
+    /// user's devices or browsers this is. Absent from a server before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<MeToken>,
+    /// Whether the user has a password to sign in to the web with (`feature::PASSWORDS`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password: bool,
+}
+
+/// The token a request came with, in `Me`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeToken {
+    pub id: String,
+    pub label: String,
+    pub kind: TokenKind,
+}
+
+/// What a token was made for. A server before kinds made every token as a `device`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// Handed to a device by a person: `cairn-server token add`, or `POST /v1/tokens`.
+    Device,
+    /// Made for one browser when it signed in with a password; its text was never shown to anyone.
+    Browser,
+    /// Taken by a device with a pairing code another of the user's made: `POST /v1/pair/claim`.
+    Paired,
+}
+
+impl TokenKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Device => "device",
+            TokenKind::Browser => "browser",
+            TokenKind::Paired => "paired",
+        }
+    }
+}
+
+impl std::str::FromStr for TokenKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        [TokenKind::Device, TokenKind::Browser, TokenKind::Paired]
+            .into_iter()
+            .find(|k| k.as_str() == s)
+            .ok_or_else(|| format!("{s:?} is not a kind of token: device, browser or paired"))
+    }
+}
+
+/// One of the caller's tokens, as `GET /v1/tokens` lists them: never the token itself, which the
+/// server does not keep, but the first digits of its hash, by which it is named.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenView {
+    pub id: String,
+    pub label: String,
+    pub kind: TokenKind,
+    /// Seconds since the epoch.
+    pub created: i64,
+    /// The hour it was last used, in seconds since the epoch; absent if it has not been since the
+    /// server began keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<i64>,
+    /// The token this request came with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current: bool,
+}
+
+/// `GET /v1/tokens`: the caller's tokens, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    pub tokens: Vec<TokenView>,
+}
+
+/// `POST /v1/tokens` and `PATCH /v1/tokens/{id}`: the label a person knows a token by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLabel {
+    pub label: String,
+}
+
+/// The answer to `POST /v1/tokens`: the new token, shown this once, and its ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewToken {
+    pub id: String,
+    pub token: String,
+}
+
+/// A token's label: what a person knows it by, at most 100 characters and no control characters, and
+/// not empty.
+pub fn check_token_label(label: &str) -> Result<(), String> {
+    if label.trim().is_empty() {
+        return Err("a token's label is empty".into());
+    }
+    if label.chars().count() > 100 {
+        return Err("a token's label is longer than 100 characters".into());
+    }
+    if label.chars().any(char::is_control) {
+        return Err("a token's label holds a control character".into());
+    }
+    Ok(())
 }
 
 impl Me {

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 mod admin;
 mod file;
+mod tokens;
 mod web;
 
 struct App {
@@ -45,6 +46,8 @@ struct App {
     /// Held by each rename and each namespace added, one at a time, so that a name found free is still
     /// free when it is taken, and the names in memory follow the database's in its order.
     naming: std::sync::Mutex<()>,
+    /// The hour each token was last said to be used in.
+    touched: tokens::Touched,
 }
 
 /// The name a request asked for its namespace by, where that was a former one.
@@ -195,9 +198,13 @@ async fn authorize(State(app): State<Arc<App>>, mut req: Request, next: Next) ->
             None => return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
         },
     };
-    let found = blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await;
+    let found = {
+        let app = app.clone();
+        blocking(move || app.repo.with_meta(|m| m.token_user(&hash))).await
+    };
     match found {
         Ok(Some(user)) => {
+            tokens::touch(&app, hash);
             req.extensions_mut().insert(Caller { user });
             req.extensions_mut().insert(web::session::Presented(hash));
             next.run(req).await
@@ -268,7 +275,7 @@ fn features() -> Vec<String> {
     if cairn_failpoint::unsupported("server.features") {
         return Vec::new();
     }
-    [f::NOTE_GROUPS, f::ITEM_HASH]
+    [f::NOTE_GROUPS, f::ITEM_HASH, f::TOKENS]
         .into_iter()
         .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
         .map(String::from)
@@ -445,13 +452,22 @@ async fn rename_folder(
 async fn me(
     State(app): State<Arc<App>>,
     Extension(caller): Extension<Caller>,
+    Extension(web::session::Presented(hash)): Extension<web::session::Presented>,
 ) -> ApiResult<Json<Me>> {
     let user = caller.user.clone();
-    let folders = blocking(move || app.repo.with_meta(|m| m.folders_of(&user))).await?;
+    let (folders, token, password) = blocking(move || {
+        let folders = app.repo.with_meta(|m| m.folders_of(&user))?;
+        let token = tokens::current(&app, &user, &hash)?;
+        let password = app.repo.with_meta(|m| m.password(&user))?.is_some();
+        Ok((folders, token, password))
+    })
+    .await?;
     Ok(Json(Me {
         user: caller.user,
         folders,
         features: features(),
+        token,
+        password,
     }))
 }
 
@@ -521,7 +537,7 @@ async fn download(
     })
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -716,6 +732,11 @@ fn router(app: Arc<App>) -> Router {
     let routes = Router::new()
         .route("/v1/me", get(me))
         .route("/v1/folders", post(add_folder))
+        .route("/v1/tokens", get(tokens::list).post(tokens::add))
+        .route(
+            "/v1/tokens/{id}",
+            axum::routing::patch(tokens::relabel).delete(tokens::remove),
+        )
         .with_state(app.clone())
         .nest("/v1/ns/{ns}", api)
         .merge(web::user_routes(&app))
@@ -920,6 +941,7 @@ async fn serve(
         closing: tokio::sync::watch::channel(false).0,
         former: std::sync::RwLock::new(former),
         naming: std::sync::Mutex::new(()),
+        touched: tokens::Touched::default(),
     });
     // Uploads given up on are removed, with their bytes.
     let sweeper = app.clone();

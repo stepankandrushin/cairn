@@ -3,7 +3,7 @@
 //! alone, which the server reads on every request, so a change holds from its next one.
 
 use anyhow::{bail, Context, Result};
-use cairn_protocol::wire::{valid_account_name, Access};
+use cairn_protocol::wire::{valid_account_name, Access, TokenKind};
 use cairn_store::{token_hash, token_id, Repo};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
@@ -132,7 +132,15 @@ fn issue(repo: &Repo, user: &str, how: &NewToken) -> Result<()> {
     let token = crate::new_token();
     if let Some(path) = &how.token_file {
         crate::write_secret(path, &token)?;
-        let added = repo.with_meta(|m| m.add_token(user, &token_hash(&token), &how.label, now()));
+        let added = repo.with_meta(|m| {
+            m.add_token(
+                user,
+                &token_hash(&token),
+                &how.label,
+                TokenKind::Device,
+                now(),
+            )
+        });
         if let Err(e) = added {
             let _ = std::fs::remove_file(path);
             return Err(e);
@@ -143,7 +151,15 @@ fn issue(repo: &Repo, user: &str, how: &NewToken) -> Result<()> {
             path.display()
         );
     } else {
-        repo.with_meta(|m| m.add_token(user, &token_hash(&token), &how.label, now()))?;
+        repo.with_meta(|m| {
+            m.add_token(
+                user,
+                &token_hash(&token),
+                &how.label,
+                TokenKind::Device,
+                now(),
+            )
+        })?;
         println!(
             "token {} of user {user}, shown only now:",
             token_id(&token_hash(&token))
@@ -210,7 +226,17 @@ pub fn token(what: TokenCommand) -> Result<()> {
                 } else {
                     format!("  {}", t.label)
                 };
-                println!("{}  {}  since {}{label}", t.id, t.user, date(t.created));
+                let used = match t.used {
+                    Some(at) => format!("used {}", date(at)),
+                    None => "not used since kept".to_string(),
+                };
+                println!(
+                    "{}  {}  since {}  {}  {used}{label}",
+                    t.id,
+                    t.user,
+                    date(t.created),
+                    t.kind.as_str()
+                );
             }
         }
         TokenCommand::Remove { id, data } => {

@@ -1,7 +1,9 @@
 //! The metadata store trait: all a server needs from a database.
 
 use anyhow::Result;
-use cairn_protocol::wire::{Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member};
+use cairn_protocol::wire::{
+    Access, Change, CommitRequest, ConflictEntry, FolderAccess, Member, TokenKind,
+};
 use cairn_protocol::{
     Hash, Link, Name, ObjectId, ObjectKind, OpId, OpReject, RevisionBody, RevisionId,
 };
@@ -46,6 +48,9 @@ pub struct TokenInfo {
     pub user: String,
     pub label: String,
     pub created: i64,
+    pub kind: TokenKind,
+    /// The hour it was last used, if it has been since schema 6.
+    pub used: Option<i64>,
 }
 
 /// An object's head: its kind, head revision and that revision's body.
@@ -140,9 +145,23 @@ pub trait MetaStore: Send {
     fn remove_user(&mut self, name: &str) -> Result<()>;
     fn users(&mut self) -> Result<Vec<UserInfo>>;
     /// A token is kept as its hash only.
-    fn add_token(&mut self, user: &str, hash: &Hash, label: &str, time: i64) -> Result<()>;
+    fn add_token(
+        &mut self,
+        user: &str,
+        hash: &Hash,
+        label: &str,
+        kind: TokenKind,
+        time: i64,
+    ) -> Result<()>;
     fn tokens(&mut self) -> Result<Vec<TokenInfo>>;
     fn remove_token(&mut self, hash: &Hash) -> Result<()>;
+    fn set_token_label(&mut self, hash: &Hash, label: &str) -> Result<()>;
+    /// Says a token was used in the hour that begins at `hour`, unless a later one is said already.
+    fn touch_token(&mut self, hash: &Hash, hour: i64) -> Result<()>;
+    /// A user's password, as its argon2id hash in a PHC string; `None` for none, or no such user.
+    fn password(&mut self, user: &str) -> Result<Option<String>>;
+    /// Sets a user's password hash, or with `None` takes it away.
+    fn set_password(&mut self, user: &str, phc: Option<&str>) -> Result<()>;
     /// Whose token has this hash.
     fn token_user(&mut self, hash: &Hash) -> Result<Option<String>>;
     /// What a user may do in a namespace; `None` is nothing at all.
@@ -486,10 +505,14 @@ pub mod suite {
 
         // A token is found by its hash, and only by it.
         let (ta, tb, tb2) = (Hash::of(b"a"), Hash::of(b"b"), Hash::of(b"b2"));
-        s.add_token("alice", &ta, "laptop", 20).unwrap();
-        s.add_token("bob", &tb, "", 21).unwrap();
-        s.add_token("bob", &tb2, "phone", 22).unwrap();
-        assert!(s.add_token("nobody", &Hash::of(b"x"), "", 23).is_err());
+        s.add_token("alice", &ta, "laptop", TokenKind::Device, 20)
+            .unwrap();
+        s.add_token("bob", &tb, "", TokenKind::Device, 21).unwrap();
+        s.add_token("bob", &tb2, "phone", TokenKind::Paired, 22)
+            .unwrap();
+        assert!(s
+            .add_token("nobody", &Hash::of(b"x"), "", TokenKind::Device, 23)
+            .is_err());
         assert_eq!(s.token_user(&ta).unwrap().as_deref(), Some("alice"));
         assert_eq!(s.token_user(&tb2).unwrap().as_deref(), Some("bob"));
         assert_eq!(s.token_user(&Hash::of(b"none")).unwrap(), None);
@@ -546,7 +569,31 @@ pub mod suite {
         let tokens = s.tokens().unwrap();
         let mine: Vec<_> = tokens.iter().filter(|t| t.user == "bob").collect();
         assert_eq!(mine.len(), 2);
-        assert!(mine.iter().any(|t| t.hash == tb2 && t.label == "phone"));
+        assert!(mine
+            .iter()
+            .any(|t| t.hash == tb2 && t.label == "phone" && t.kind == TokenKind::Paired));
+        assert!(mine.iter().all(|t| t.used.is_none()));
+
+        // A label changed, a use said once an hour and never moved back.
+        s.set_token_label(&tb2, "the phone").unwrap();
+        assert!(s.set_token_label(&Hash::of(b"none"), "x").is_err());
+        s.touch_token(&tb2, 7200).unwrap();
+        s.touch_token(&tb2, 3600).unwrap();
+        let t = s
+            .tokens()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.hash == tb2)
+            .unwrap();
+        assert_eq!((t.label.as_str(), t.used), ("the phone", Some(7200)));
+
+        // A password's hash, set and taken away.
+        assert_eq!(s.password("bob").unwrap(), None);
+        s.set_password("bob", Some("$argon2id$x")).unwrap();
+        assert_eq!(s.password("bob").unwrap().as_deref(), Some("$argon2id$x"));
+        assert!(s.set_password("nobody", Some("$argon2id$x")).is_err());
+        s.set_password("bob", None).unwrap();
+        assert_eq!(s.password("bob").unwrap(), None);
 
         // One token goes alone; a removed user takes its tokens and access with it.
         s.remove_token(&tb2).unwrap();

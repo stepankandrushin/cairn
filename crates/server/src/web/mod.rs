@@ -194,10 +194,10 @@ pub(crate) fn steps(view: &View, chain: &[(ObjectId, Option<Name>)]) -> Vec<Step
 
 pub(crate) fn item(view: &View, object: ObjectId, name: Option<Name>, head: &Head) -> Item {
     let meta = &head.body.metadata;
-    let (size, target) = match &head.body.content {
-        Content::File { size, .. } => (Some(*size), None),
-        Content::Symlink { target } => (None, Some(target.clone())),
-        Content::Dir => (None, None),
+    let (size, hash, target) = match &head.body.content {
+        Content::File { size, manifest } => (Some(*size), Some(*manifest), None),
+        Content::Symlink { target } => (None, None, Some(target.clone())),
+        Content::Dir => (None, None, None),
     };
     Item {
         object,
@@ -206,6 +206,7 @@ pub(crate) fn item(view: &View, object: ObjectId, name: Option<Name>, head: &Hea
         display: display_name(view, name.as_ref()),
         name,
         size,
+        hash,
         mtime: meta.mtime,
         mode: meta.mode,
         target_display: target.as_ref().map(|t| display_bytes(&t.0)),

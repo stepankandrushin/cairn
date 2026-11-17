@@ -1,7 +1,7 @@
 //! The endpoints the web interface uses, which any client may (docs/protocol.md, "Web"): a tree's items,
 //! their contents and history, uploads, what was deleted, shares and public links.
 
-use crate::ids::{ObjectId, RevisionId};
+use crate::ids::{Hash, ObjectId, RevisionId};
 use crate::metadata::{Bytes, Timestamp};
 use crate::name::Name;
 use crate::ops::{Link, ObjectKind};
@@ -78,6 +78,11 @@ pub struct Item {
     pub display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// A file's manifest hash, the one a client makes of the same bytes (`feature::ITEM_HASH`): so a
+    /// client tells a file it has from one it has not without reading it. Absent for anything else, and
+    /// from a server before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Hash>,
     pub mtime: Timestamp,
     pub mode: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

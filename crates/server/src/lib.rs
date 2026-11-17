@@ -268,7 +268,7 @@ fn features() -> Vec<String> {
     if cairn_failpoint::unsupported("server.features") {
         return Vec::new();
     }
-    [f::NOTE_GROUPS]
+    [f::NOTE_GROUPS, f::ITEM_HASH]
         .into_iter()
         .filter(|name| !cairn_failpoint::unsupported(&format!("server.{name}")))
         .map(String::from)

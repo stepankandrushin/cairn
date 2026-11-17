@@ -7,6 +7,8 @@
 - The server names what it does beyond what every server of the protocol does in `features` in `/info` and
   `/v1/me` so a newer client asks first and does without what an older server lacks, with no upgrade of the
   server first.
+- A web item carries its file's manifest hash, the one a client makes of the same bytes, so a phone after a
+  reinstall skips what it sent before without sending it again.
 
 **Fixed:**
 

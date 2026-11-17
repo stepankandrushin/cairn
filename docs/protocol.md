@@ -73,6 +73,7 @@ every client must speak. A server before features sends none.
 | Feature | What it adds |
 |---|---|
 | `note_groups` | A note may name more objects than one [Committing](#committing) also `note_groups: true` for clients before features |
+| `item_hash` | A web `item` carries a file's manifest hash [Web](#web) |
 
 A request for something a server does not have is answered 404 or 405: a client that did not ask first takes
 it as not there, never as an error to try again.
@@ -262,9 +263,10 @@ the object is brought back or that user given `manage` again.
 
 Every view of a share or link stops at its root: `path` runs from the view's root, as `path[0]` to the item
 itself, each step `{object, display}` and no further up. An `item` is `{object, revision, kind, name?,
-display, size?, mtime, mode, target?, target_display?}`: `name` is the bytes, as base64 absent for a
-namespace's root; `display` the name as text, invalid UTF-8 as `\xNN` and for a namespace's root its name.
-`access` is what this caller may do in the view.
+display, size?, hash?, mtime, mode, target?, target_display?}`: `name` is the bytes, as base64 absent for a
+namespace's root; `display` the name as text, invalid UTF-8 as `\xNN` and for a namespace's root its name;
+`hash` a file's manifest hash, the one a client makes of the same bytes, so a phone after a reinstall tells
+what it sent from what it did not without sending it again. `access` is what this caller may do in the view.
 
 A web commit is like any device's: its device is `web` its ID the first half of BLAKE3 of `cairn web device
 <user>`, and the journal names the user. An upload is received into a file of its own under the data directory's `web/uploads/` (emptied at

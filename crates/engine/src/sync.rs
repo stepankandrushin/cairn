@@ -941,13 +941,48 @@ fn truncate_ops(ops: &mut Vec<Op>) -> bool {
     truncated
 }
 
-enum Upload {
-    Done {
-        chunks: u64,
-        bytes: u64,
-    },
-    /// A file no longer holds what was scanned.
-    FileChanged,
+#[derive(Default)]
+struct Upload {
+    chunks: u64,
+    bytes: u64,
+    changed: BTreeSet<ObjectId>,
+}
+
+fn op_object(op: &Op) -> ObjectId {
+    match op {
+        Op::Create { object, .. }
+        | Op::Update { object, .. }
+        | Op::Link { object, .. }
+        | Op::Unlink { object, .. }
+        | Op::Move { object, .. }
+        | Op::Note { object, .. } => *object,
+    }
+}
+
+/// Removing an operation can leave an occupied name, a nonempty directory, or a missing parent.
+/// Use the server's checks to close the set, always removing an object's operations together:
+/// in particular, a staged move must never survive without the move out of the staging name.
+fn defer_uploads(landed: &Tree, batches: &mut [Vec<Op>], held: &mut BTreeSet<ObjectId>) {
+    loop {
+        let mut trial = landed.clone();
+        let before = held.len();
+        for op in batches.iter().flatten() {
+            if held.contains(&op_object(op)) || op.noted().any(|id| held.contains(&id)) {
+                continue;
+            }
+            if trial.apply(op).is_err() {
+                held.insert(op_object(op));
+            }
+        }
+        if held.len() == before {
+            break;
+        }
+    }
+    for batch in batches {
+        batch.retain(|op| {
+            !held.contains(&op_object(op)) && !op.noted().any(|id| held.contains(&id))
+        });
+    }
 }
 
 /// Send what the server is missing. Every chunk is durable there before the commit that names it.
@@ -986,30 +1021,47 @@ fn upload(
             }
         }
     }
+    crate::progress::phase(Phase::Uploading);
     let missing: HashSet<Hash> = client.missing(&wanted)?.into_iter().collect();
     if missing.is_empty() {
-        return Ok(Upload::Done {
-            chunks: 0,
-            bytes: 0,
-        });
+        return Ok(Upload::default());
     }
 
     // Where each missing chunk can be read from.
-    let by_manifest: HashMap<Hash, ObjectId> = cur
-        .iter()
-        .filter_map(|(id, n)| match &n.content {
-            Content::File { manifest, .. } if n.fp.is_some() => Some((*manifest, *id)),
-            _ => None,
-        })
-        .collect();
-    let mut sources: HashMap<Hash, (ObjectId, u64, ChunkRef)> = HashMap::new();
+    let mut by_manifest: HashMap<Hash, Vec<ObjectId>> = HashMap::new();
+    for (id, n) in cur {
+        if let Content::File { manifest, .. } = &n.content {
+            if n.fp.is_some() {
+                by_manifest.entry(*manifest).or_default().push(*id);
+            }
+        }
+    }
+    let mut sources: HashMap<Hash, Vec<(ObjectId, u64, ChunkRef)>> = HashMap::new();
+    let mut consumers: HashMap<Hash, BTreeSet<ObjectId>> = HashMap::new();
+    let mut owners: HashMap<Hash, Vec<ObjectId>> = HashMap::new();
+    for op in ops {
+        if let Some(cairn_protocol::RevisionBody {
+            content: Content::File { manifest, .. },
+            ..
+        }) = op.body()
+        {
+            owners.entry(*manifest).or_default().push(op_object(op));
+        }
+    }
     for (hash, m) in &parsed {
-        let Some(id) = by_manifest.get(hash) else {
-            continue;
-        };
         for (offset, c) in m.placed_chunks() {
-            if missing.contains(&c.hash) {
-                sources.entry(c.hash).or_insert((*id, offset, c.clone()));
+            if !missing.contains(&c.hash) {
+                continue;
+            }
+            consumers
+                .entry(c.hash)
+                .or_default()
+                .extend(owners[hash].iter().copied());
+            for id in by_manifest.get(hash).into_iter().flatten() {
+                sources
+                    .entry(c.hash)
+                    .or_default()
+                    .push((*id, offset, c.clone()));
             }
         }
     }
@@ -1021,12 +1073,12 @@ fn upload(
             .iter()
             .map(|h| match (manifests.get(h), sources.get(h)) {
                 (Some(m), _) => m.len() as u64,
-                (None, Some((_, _, c))) => u64::from(c.len),
+                (None, Some(s)) => s.first().map_or(0, |(_, _, c)| u64::from(c.len)),
                 (None, None) => 0,
             })
             .sum(),
     );
-    let (mut chunks, mut bytes) = (0u64, 0u64);
+    let mut result = Upload::default();
     let mut frames = Vec::new();
     let mut in_frames = 0;
     let mut in_bytes = 0u64;
@@ -1047,13 +1099,31 @@ fn upload(
         }
         let data = if let Some(bytes) = manifests.get(hash) {
             bytes.clone()
-        } else if let Some((id, offset, chunk)) = sources.get(hash) {
-            match read_for_upload(root, cur, *id, *offset, chunk)? {
-                Some(d) => d,
-                None => return Ok(Upload::FileChanged),
-            }
         } else {
-            return Ok(Upload::FileChanged);
+            let mut data = None;
+            for (id, offset, chunk) in sources.get(hash).into_iter().flatten() {
+                if result.changed.contains(id) {
+                    continue;
+                }
+                match read_for_upload(root, cur, *id, *offset, chunk)? {
+                    Some(d) => {
+                        data = Some(d);
+                        break;
+                    }
+                    None => {
+                        result.changed.insert(*id);
+                    }
+                }
+            }
+            let Some(data) = data else {
+                // Every operation needing these bytes waits, but a good alternate source above
+                // lets an untouched file sharing the chunk go through.
+                result
+                    .changed
+                    .extend(consumers.get(hash).into_iter().flatten().copied());
+                continue;
+            };
+            data
         };
         if frames.len() + data.len() + 36 > MAX_CHUNK_BATCH_BYTES
             || in_frames >= MAX_CHUNKS_A_REQUEST
@@ -1065,11 +1135,11 @@ fn upload(
         wire::write_frame(&mut frames, hash, &data);
         in_frames += 1;
         in_bytes += data.len() as u64;
-        chunks += 1;
-        bytes += data.len() as u64;
+        result.chunks += 1;
+        result.bytes += data.len() as u64;
     }
     flush(&mut frames, in_frames as u64, in_bytes)?;
-    Ok(Upload::Done { chunks, bytes })
+    Ok(result)
 }
 
 /// Before anything else: commits queued by an earlier run go out with their original IDs, so a
@@ -1604,7 +1674,20 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     let client = Client::new(&root.config, Retries::Sync)?;
     report.followed = follow_rename(&mut root, &client);
     let retried = client.retried();
+    let pending_uploads: Vec<Skip> = serde_json::from_str(
+        &root
+            .state
+            .get("upload_deferred")?
+            .unwrap_or_else(|| "[]".into()),
+    )?;
     let counted = |mut report: SyncReport| {
+        if opts.dry_run || report.outcome != SyncOutcome::Synced {
+            for skip in &pending_uploads {
+                if !report.skips.contains(skip) {
+                    report.skips.push(skip.clone());
+                }
+            }
+        }
         report.retries = retried.load(std::sync::atomic::Ordering::SeqCst);
         report
     };
@@ -1629,7 +1712,16 @@ fn sync_once(path: &Path, opts: &SyncOptions) -> Result<SyncReport> {
     // The check is of what the incremental path decides, which a sync with nothing to do never asks.
     let check = full_check_due(&root, opts);
     // A sync that sees what the last one with nothing to do saw has nothing to do either.
-    let fast = match !opts.dry_run && !opts.changed_here && !check && report.events.is_empty() {
+    let upload_pending = root
+        .state
+        .get("upload_deferred")?
+        .is_some_and(|s| s != "[]");
+    let fast = match !opts.dry_run
+        && !opts.changed_here
+        && !check
+        && report.events.is_empty()
+        && !upload_pending
+    {
         true => {
             crate::steady::try_fast(&mut root, &client, &accounts, &selection, opts, generation)
                 .unwrap_or(None)
@@ -1740,6 +1832,16 @@ fn sync_full(
     let date = utc_date(now_secs());
     let mut seen_events: BTreeSet<String> = report.events.iter().cloned().collect();
     let mut retryable = false;
+    let previous_uploads = root
+        .state
+        .get("upload_deferred")?
+        .unwrap_or_else(|| "[]".into());
+    let mut upload_skips: BTreeMap<String, Skip> =
+        serde_json::from_str::<Vec<Skip>>(&previous_uploads)?
+            .into_iter()
+            .map(|s| (s.path.clone(), s))
+            .collect();
+    let mut last_changing: Option<String> = None;
     // Losers of metadata conflicts not yet in a commit the server took. Nothing else says them again:
     // the next round finds the conflict settled.
     let mut notes: Vec<(ObjectId, String)> = Vec::new();
@@ -1762,8 +1864,12 @@ fn sync_full(
         crate::progress::round(report.rounds);
         round_work = std::time::Duration::ZERO;
         if report.rounds > MAX_ROUNDS {
+            let at = last_changing
+                .as_ref()
+                .map(|p| format!(", last at {p}"))
+                .unwrap_or_default();
             report.events.push(format!(
-                "the tree kept changing for {MAX_ROUNDS} rounds; sync again once it settles"
+                "the tree kept changing for {MAX_ROUNDS} rounds{at}; sync again once it settles"
             ));
             break SyncOutcome::Partial;
         }
@@ -2236,6 +2342,13 @@ fn sync_full(
                 report.warnings.push(w);
             }
         }
+        if let Some(s) = outcome
+            .changed
+            .last()
+            .or_else(|| report.skips.iter().rev().find(|s| s.kind.in_motion()))
+        {
+            last_changing = Some(s.path.clone());
+        }
         if outcome.halted || (!outcome.changed.is_empty() && report.rounds < ROUNDS_BEFORE_PUSHING)
         {
             report.skips.extend(outcome.failed);
@@ -2393,18 +2506,48 @@ fn sync_full(
         let mut landed: Tree = view.remote.clone().into_owned();
         // Nothing went up: the next round looks again against the same sequence.
         journal = Journal::Pinned;
-        let batches = commits(ops);
+        let mut batches = commits(ops);
         let batch_count = batches.len() as u64;
-        for (sent, ops) in batches.into_iter().enumerate() {
-            match upload(&client, &root, &cur, &ops)? {
-                Upload::FileChanged => {
-                    retryable = true;
-                    break;
+        let mut deferred = BTreeSet::new();
+        for sent in 0..batches.len() {
+            if batches[sent].is_empty() {
+                continue;
+            }
+            hit("sync.upload.begin");
+            let uploaded = upload(&client, &root, &cur, &batches[sent])?;
+            report.chunks_uploaded += uploaded.chunks;
+            report.bytes_uploaded += uploaded.bytes;
+            if !uploaded.changed.is_empty() {
+                retryable = true;
+                for id in &uploaded.changed {
+                    let Some(link) = cur.get(id).and_then(|n| n.links.iter().next()) else {
+                        continue;
+                    };
+                    let path = crate::scan::display_path(&apply::step_path(&cur, link));
+                    last_changing = Some(path.clone());
+                    report.events.push(format!(
+                        "round {}: {path}: changed during upload; left for a fresh scan",
+                        report.rounds
+                    ));
+                    upload_skips.insert(
+                        path.clone(),
+                        Skip {
+                            path,
+                            kind: cairn_protocol::SkipKind::KeepsChanging,
+                            detail: Some("changed during upload".into()),
+                        },
+                    );
                 }
-                Upload::Done { chunks, bytes } => {
-                    report.chunks_uploaded += chunks;
-                    report.bytes_uploaded += bytes;
-                }
+                root.state.set(
+                    "upload_deferred",
+                    &serde_json::to_string(&upload_skips.values().collect::<Vec<_>>())?,
+                )?;
+                deferred.extend(uploaded.changed);
+                defer_uploads(&landed, &mut batches[sent..], &mut deferred);
+            }
+            let ops = std::mem::take(&mut batches[sent]);
+            if ops.is_empty() {
+                continue;
             }
             hit("sync.uploaded");
 
@@ -2441,7 +2584,11 @@ fn sync_full(
                 CommitResponse::Committed { .. } => {
                     // The next round reads the journal again, to see this commit there.
                     journal = Journal::Head;
-                    notes.drain(..delivered.len());
+                    let delivered: HashSet<_> = note_intents(&req)
+                        .into_iter()
+                        .map(|(_, n)| (n.object, n.text))
+                        .collect();
+                    notes.retain(|note| !delivered.contains(note));
                     report.commits += 1;
                     report.ops_pushed += req.ops.len() as u64;
                     report
@@ -2471,6 +2618,18 @@ fn sync_full(
         SyncOutcome::Synced if retryable => SyncOutcome::Partial,
         other => other,
     };
+    if !opts.dry_run && report.outcome == SyncOutcome::Synced {
+        if !upload_skips.is_empty() {
+            root.state.set("upload_deferred", "[]")?;
+        }
+    } else {
+        report.skips.extend(
+            upload_skips
+                .into_values()
+                .filter(|s| !report.skips.contains(s))
+                .collect::<Vec<_>>(),
+        );
+    }
     // Every decision the full sync's: the last round took the whole tree, which covers whatever the
     // rounds before it decided, or a ledger rebuilt from the state, or this was the check, which took up
     // whatever it found the ledger had missed. Not on every sync the harness's oracle confirms, as the

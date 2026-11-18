@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
+#[cfg(unix)]
+mod verified;
+
 pub trait ChunkStore: Send + Sync {
     /// Durable on return.
     fn put(&self, hash: &Hash, data: &[u8]) -> Result<()> {
@@ -185,6 +188,8 @@ pub struct FsChunkStore {
     gate: Arc<Gate>,
     /// Opened to be read alone, as `fsck` opens a store: nothing is made, emptied or written.
     read_only: bool,
+    #[cfg(unix)]
+    verified: Mutex<verified::Verified>,
 }
 
 /// What stands between a collection and the chunks something is about to rely on (docs/format.md,
@@ -315,11 +320,23 @@ fn in_parallel<T: Sync>(items: &[T], f: impl Fn(&T) -> Result<()> + Sync) -> Res
 }
 
 impl FsChunkStore {
+    fn forget_verified(&self, hash: &Hash) {
+        #[cfg(unix)]
+        self.verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(hash);
+        #[cfg(not(unix))]
+        let _ = hash;
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let store = Self {
             root: root.into(),
             gate: Arc::default(),
             read_only: false,
+            #[cfg(unix)]
+            verified: Mutex::default(),
         };
         fs::create_dir_all(store.root.join("chunks"))?;
         fs::create_dir_all(store.root.join("incoming"))?;
@@ -344,6 +361,8 @@ impl FsChunkStore {
             root: root.into(),
             gate: Arc::default(),
             read_only: true,
+            #[cfg(unix)]
+            verified: Mutex::default(),
         }
     }
 
@@ -366,6 +385,7 @@ impl FsChunkStore {
         #[cfg(target_os = "linux")]
         let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed);
         if Hash::of(&data) != *hash {
+            self.forget_verified(hash);
             bail!("chunk {hash} is damaged on disk: its content does not match its hash");
         }
         Ok(true)
@@ -588,17 +608,71 @@ impl ChunkStore for FsChunkStore {
     }
 
     fn is_intact(&self, hash: &Hash) -> Result<bool> {
-        match fs::read(self.path(hash)) {
-            Ok(data) => Ok(Hash::of(&data) == *hash),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
+        let path = self.path(hash);
+        #[cfg(unix)]
+        {
+            let stamp = match fs::metadata(&path) {
+                Ok(m) => verified::Stamp::of(&m),
+                Err(e) => {
+                    self.forget_verified(hash);
+                    return if e.kind() == std::io::ErrorKind::NotFound {
+                        Ok(false)
+                    } else {
+                        Err(e.into())
+                    };
+                }
+            };
+            if self
+                .verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has(hash, &stamp)
+            {
+                return Ok(true);
+            }
         }
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.forget_verified(hash);
+                return if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(false)
+                } else {
+                    Err(e.into())
+                };
+            }
+        };
+        #[cfg(unix)]
+        let before = verified::Stamp::of(&file.metadata()?);
+        hit("server.chunk.verify");
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut data)?;
+        if Hash::of(&data) != *hash {
+            self.forget_verified(hash);
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            // Never vouch for bytes reached through a replacement or a file written during the read.
+            if before != verified::Stamp::of(&file.metadata()?)
+                || !fs::metadata(&path).is_ok_and(|m| before == verified::Stamp::of(&m))
+            {
+                self.forget_verified(hash);
+                return Ok(false);
+            }
+            self.verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(*hash, before);
+        }
+        Ok(true)
     }
 
     fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
         match fs::read(self.path(hash)) {
             Ok(data) => {
                 if Hash::of(&data) != *hash {
+                    self.forget_verified(hash);
                     bail!("chunk {hash} is damaged on disk: its content does not match its hash");
                 }
                 Ok(Some(data))

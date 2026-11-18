@@ -9,7 +9,7 @@
 //!   `KILLED_EXIT_CODE`.
 //! - `CAIRN_FP_ENOSPC=<n>`: `check` returns ENOSPC from the n-th hit on, or `<name>` on that name.
 //! - `CAIRN_FP_PAUSE=<name>:<dir>`: on the hit, create `<dir>/reached` and wait for `<dir>/go`; with
-//!   `<name>#<n>:<dir>`, on the n-th hit of that name alone.
+//!   `<name>#<n>:<dir>`, on the n-th hit of that name alone; `#each` removes `go` before each hit.
 //! - `CAIRN_FP_DELAY=<name>:<ms>[,...]`: sleep that long on every hit of that name, as a slow disk or
 //!   a busy machine makes a step take. Not a step either.
 //! - `CAIRN_FP_REFUSE_NAME=<name>`: `refuse_name` refuses that name as a filesystem refuses bytes it
@@ -257,6 +257,12 @@ mod imp {
                 };
                 if point == name && wanted.is_none_or(|n| n == nth) {
                     let dir = Path::new(dir);
+                    if spec
+                        .split_once(':')
+                        .is_some_and(|(p, _)| p.ends_with("#each"))
+                    {
+                        let _ = std::fs::remove_file(dir.join("go"));
+                    }
                     let _ = std::fs::write(dir.join("reached"), b"");
                     while !dir.join("go").exists() {
                         std::thread::sleep(std::time::Duration::from_millis(5));

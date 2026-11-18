@@ -130,7 +130,19 @@ then writes, stalled on a busy machine, leaves exactly that) → chunk it → as
 its base revision and a unique operation ID → durable acknowledgement. A retried operation ID returns
 the first result, so a lost response is harmless. Small files take a simpler batched path, and the server
 makes a request's chunks durable together before it answers. A change too big for one commit goes in several
-from one scan, the server checking each against what the ones before it left.
+from one scan, the server checking each against what the ones before it left. A file whose bytes changed
+under the upload waits for a fresh scan: its operations and everything that depends on them leave the
+remaining commits, checked with the server's tree rules, while unrelated files go through. A shared chunk
+can come from another unchanged file. Only queued operations are recorded as sent. Each such wait names
+the escaped path, kept in status until a sync settles; a run that exhausts its twelve rounds names the last
+file that kept changing.
+
+On Unix the server remembers a chunk it verified for at most an hour, in a bounded memory cache, and answers
+a missing-chunk query from that verification only while device, inode, length, mtime and ctime still match.
+Recent timestamps cannot vouch for it. A changed, missing or expired entry is read again, and damaged bytes
+still count as missing so an upload repairs them. Downloads and fsck always verify the bytes. Corruption
+that changes no metadata can wait for that hour to expire before a missing-chunk query finds it; a server
+restart forgets every verification. Other platforms rehash each query.
 
 **Applying a change.** Download to a temp file in the same directory → verify hashes → set metadata →
 fsync, once for both, as a flush empties the disk's cache → check the destination has not changed locally →

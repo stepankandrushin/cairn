@@ -1004,6 +1004,7 @@ fn run_inner() -> Result<u8> {
                 let report = if busy { None } else { Some(dry_run?) };
                 out["busy"] = busy.into();
                 out["planned"] = serde_json::to_value(report.as_ref().map(|r| &r.planned))?;
+                out["skips"] = serde_json::to_value(report.as_ref().map(|r| &r.skips))?;
                 out["excluded_here"] =
                     serde_json::to_value(report.as_ref().map(|r| &r.excluded_here))?;
                 out["not_synced_here"] =

@@ -3231,3 +3231,50 @@ fn wait_log(d: &Daemon, text: &str) -> bool {
     }
     false
 }
+
+#[test]
+fn status_names_a_file_changed_during_upload_until_the_daemon_settles() {
+    let sb = Sandbox::on_disk("daemon-hot-upload");
+    let server = Server::start(sb.path("server"));
+    let a = Device::new(&sb, &server, "a");
+    a.write("hot", "scanned");
+    a.write("cold", "unrelated");
+    let gate = sb.path("upload-gate");
+    std::fs::create_dir(&gate).unwrap();
+    let pause = format!("sync.upload.begin#each:{}", gate.display());
+    let d = Daemon::start_env(&a, &[], &[("CAIRN_FP_PAUSE", &pause)]);
+    for n in 0..12 {
+        wait_for("the next upload", &d.log, || gate.join("reached").exists());
+        a.write("hot", format!("write {n}"));
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::remove_file(gate.join("reached")).unwrap();
+        std::fs::write(gate.join("go"), b"").unwrap();
+    }
+    wait_for("the named upload skip", &d.log, || {
+        d.status()["skips"].as_array().is_some_and(|ss| {
+            ss.iter().any(|s| {
+                s.as_str()
+                    .is_some_and(|s| s.contains("hot: file keeps changing"))
+            })
+        })
+    });
+    let status = a.cairn(&["status"]);
+    assert!(
+        status.text().contains("hot: file keeps changing"),
+        "{}",
+        status.text()
+    );
+    let b = Device::new(&sb, &server, "b");
+    b.synced();
+    assert_eq!(b.read("cold"), b"unrelated");
+    wait_for("settled with its skip cleared", &d.log, || {
+        if gate.join("reached").exists() {
+            std::fs::remove_file(gate.join("reached")).unwrap();
+            std::fs::write(gate.join("go"), b"").unwrap();
+        }
+        let status = d.status();
+        status["state"] == "synced" && status["skips"].as_array().is_some_and(|s| s.is_empty())
+    });
+    b.synced();
+    assert_eq!(b.read("hot"), a.read("hot"));
+}

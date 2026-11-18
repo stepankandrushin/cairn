@@ -59,11 +59,17 @@ impl Name {
     }
 }
 
-/// Printable form: UTF-8 stays as it is, any other byte becomes `\xNN`.
+/// Printable form: ordinary UTF-8 stays; controls, backslashes and invalid bytes are escaped.
 pub fn display_bytes(bytes: &[u8]) -> String {
     let mut out = String::new();
     for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
+        for c in chunk.valid().chars() {
+            if c.is_control() || c == '\\' {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+        }
         for b in chunk.invalid() {
             out.push_str(&format!("\\x{b:02x}"));
         }

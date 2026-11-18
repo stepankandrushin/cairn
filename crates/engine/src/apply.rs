@@ -531,7 +531,7 @@ pub struct Applier<'a> {
     vouched: HashMap<ObjectId, Fingerprint>,
 }
 
-fn step_path(cur: &BTreeMap<ObjectId, CurNode>, link: &Link) -> Vec<Name> {
+pub(crate) fn step_path(cur: &BTreeMap<ObjectId, CurNode>, link: &Link) -> Vec<Name> {
     let mut path = vec![link.name.clone()];
     let mut at = link.parent;
     while at != ObjectId::ROOT {

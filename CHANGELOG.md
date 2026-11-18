@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.33 2026-11-19
+
+**Fixed:**
+
+- A file changed while being uploaded holds back its own operations and those that depend on them.
+  The rest of the batch is committed, including unchanged files sharing its chunks. The changed file
+  stays dirty for a fresh scan; hard links, directory moves, staged swaps and notes remain consistent.
+- Each upload that finds a file changed names its path, with control characters and invalid bytes escaped.
+  A sync that exhausts its rounds names the last changing file. Status keeps the upload's path across
+  restarts and paused runs until a sync settles.
+
+**Changed:**
+
+- On Unix, missing-chunk queries reuse a successful verification for at most an hour while the chunk's
+  identity, size and timestamps match, saving repeated reads of already uploaded data. Changed chunks
+  are checked again and damaged ones still count as missing so a good upload replaces them. Downloads
+  and fsck always verify bytes. Damage that changes no metadata can wait until verification expires
+  before a missing-chunk query discovers it.
+
 ## 0.1.32 2026-11-18
 
 **Fixed:**
